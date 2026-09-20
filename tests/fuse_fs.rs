@@ -9,7 +9,9 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use jmeisel_raft5_fuse::filesystem::{CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, chunk_prefix};
+use jmeisel_raft5_fuse::filesystem::{
+    CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_prefix,
+};
 
 /// Position-dependent bytes, so a chunk landing at the wrong offset (or
 /// in the wrong order) fails loudly instead of matching by luck. 251 is
@@ -228,6 +230,29 @@ fn the_default_chunk_size_handles_a_multi_megabyte_file() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
+/// A chunk this size only fits in a transaction because each chunk is
+/// stored on its own: an overwrite straddling a boundary rewrites two
+/// full chunks, which together exceed what one transaction may hold.
+#[test]
+fn the_max_chunk_size_survives_an_overwrite_across_a_boundary() {
+    let h = support::setup_with_chunk_size(MAX_CHUNK_SIZE);
+    let c = MAX_CHUNK_SIZE;
+    let path = h.path().join("max-chunk.bin");
+
+    let mut expected = pattern(c as usize * 2);
+    fs::write(&path, &expected).unwrap();
+
+    let patch = vec![0xCDu8; 4096];
+    let at = c - 2048;
+    let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.write_all(&patch).unwrap();
+    drop(file);
+
+    expected[at as usize..at as usize + patch.len()].copy_from_slice(&patch);
+    assert_same_bytes(&fs::read(&path).unwrap(), &expected);
+}
+
 #[test]
 fn overwrite_spanning_a_chunk_boundary() {
     let h = support::setup();
@@ -407,9 +432,9 @@ fn an_out_of_range_stored_chunk_size_is_refused() {
     let h = support::setup();
     let _ = fs::read_dir(h.path()).unwrap().count();
 
-    // Bigger than the client can ever read back, so adopting it would
-    // produce chunks nothing could fetch.
-    h.write_key(CHUNK_SIZE_KEY, Some(&(8u64 * 1024 * 1024).to_be_bytes()));
+    // Bigger than a transaction can hold or the client can read back, so
+    // adopting it would produce chunks nothing could store or fetch.
+    h.write_key(CHUNK_SIZE_KEY, Some(&(MAX_CHUNK_SIZE * 2).to_be_bytes()));
 
     let fs_over_same_store = h.unmounted_fs(h.chunk_size);
     let err = fs_over_same_store

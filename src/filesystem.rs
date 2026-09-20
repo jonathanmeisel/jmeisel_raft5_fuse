@@ -38,19 +38,27 @@ pub const CHUNK_SIZE_KEY: &[u8] = b"\x00chunk_size";
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
 pub const MIN_CHUNK_SIZE: u64 = 4096;
-/// `raft5_client` reads through a tonic client that never raises tonic's
-/// default decode limit, and a `ReadResponse` wraps the value in ~25
-/// bytes of framing -- so a chunk at that limit would write fine and then
-/// be impossible to read back. 2 MiB is the largest power of two that
-/// clears the ceiling.
-pub const MAX_CHUNK_SIZE: u64 = 2 << 20;
+/// The largest chunk we will create. A chunk is written in a transaction
+/// of its own (see `write_range`), so it has to fit in one transaction
+/// along with the attributes, and a read has to fit in one gRPC message.
+/// 8 MiB clears both with room to spare; the largest power of two under
+/// `MAX_TRANSACTION_BYTES`.
+pub const MAX_CHUNK_SIZE: u64 = 8 << 20;
 
-/// tonic's default `max_decoding_message_size`, which `raft5_client`
-/// leaves alone (`raft5-client/src/routing.rs`). Nothing we store may
-/// approach it, because a value that exceeds it can be written and then
-/// never read back.
-const CLIENT_READ_LIMIT: u64 = 4 * 1024 * 1024;
-const _: () = assert!(MAX_CHUNK_SIZE < CLIENT_READ_LIMIT);
+/// Mirrors `raft5_shared::MAX_TRANSACTION_BYTES`, the most a transaction
+/// may buffer, which the server enforces.
+const SERVER_TXN_LIMIT: u64 = 10 * 1024 * 1024;
+
+/// Mirrors `raft5_shared::MAX_KV_MESSAGE_BYTES`, the decoding limit
+/// `raft5_client` sets (`raft5-client/src/routing.rs`): a transaction's
+/// worth plus 1 MiB of framing. A value larger than it could be written
+/// and then never read back.
+const CLIENT_READ_LIMIT: u64 = SERVER_TXN_LIMIT + 1024 * 1024;
+
+// Slack for the attributes and framing that share the chunk's transaction.
+const TXN_SLACK: u64 = 64 * 1024;
+const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK <= SERVER_TXN_LIMIT);
+const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK < CLIENT_READ_LIMIT);
 
 // Key layout in the KV store:
 //   0x00 ++ name                        -> filesystem-wide singletons
@@ -248,6 +256,13 @@ async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// A failed `write_range`: how many leading bytes of the write had
+/// already been stored (each chunk commits on its own). Every failure is
+/// reported to the kernel as `EIO`, so the cause is not kept.
+struct WriteError {
+    written: usize,
 }
 
 pub struct Raft5Fs {
@@ -459,16 +474,61 @@ impl Raft5Fs {
         Ok(data)
     }
 
-    /// Splices `data` in at `offset` and updates the attributes to match,
-    /// all in one transaction: reading the attributes inside it takes
-    /// their lock, so concurrent writers to one file serialize instead of
-    /// clobbering each other's size. `Ok(None)` means there is no such
-    /// inode.
+    /// Splices `data` in at `offset` and updates the attributes to match.
+    /// `Ok(None)` means there is no such inode.
+    ///
+    /// Each chunk is stored in its own transaction, so no transaction
+    /// buffers more than one chunk plus the attributes, however large the
+    /// write. The cost is atomicity: a reader can see the early chunks of
+    /// a write without the later ones, and a failure part-way leaves the
+    /// chunks already stored in place. Every transaction extends the size
+    /// to cover what it stored, so the size never runs ahead of the data.
+    /// Reading the attributes inside each one takes their lock, so
+    /// concurrent writers to one file still serialize per chunk instead of
+    /// clobbering each other's size.
+    ///
+    /// On failure the error carries how many leading bytes were stored, so
+    /// `write` can report a short write instead of losing track of them.
     async fn write_range(
         &self,
         ino: u64,
         offset: u64,
         data: &[u8],
+    ) -> Result<Option<FileAttr>, WriteError> {
+        if data.is_empty() {
+            // Still a write as far as mtime is concerned.
+            return self
+                .write_chunk(ino, offset, None)
+                .await
+                .map_err(|_| WriteError { written: 0 });
+        }
+
+        let mut attr = None;
+        let mut cursor = 0usize;
+        for (index, within, n) in chunk_spans(self.chunk_size, offset, data.len()) {
+            let slice = &data[cursor..cursor + n];
+            let end = offset + (cursor + n) as u64;
+            let stored = self
+                .write_chunk(ino, end, Some((index, within, slice)))
+                .await
+                .map_err(|_| WriteError { written: cursor })?;
+            cursor += n;
+            match stored {
+                Some(a) => attr = Some(a),
+                None => return Ok(None),
+            }
+        }
+        Ok(attr)
+    }
+
+    /// One transaction of `write_range`: stores `piece` (a chunk index,
+    /// the offset within it, and the bytes) and extends the file to at
+    /// least `end`.
+    async fn write_chunk(
+        &self,
+        ino: u64,
+        end: u64,
+        piece: Option<(u64, usize, &[u8])>,
     ) -> Result<Option<FileAttr>, KvError> {
         loop {
             let txn = self.client.transaction(TXN_TTL).await?;
@@ -477,31 +537,25 @@ impl Raft5Fs {
             };
             let mut entry = decode_entry(ino, &bytes);
 
-            let mut cursor = 0usize;
-            for (index, within, n) in chunk_spans(self.chunk_size, offset, data.len()) {
+            if let Some((index, within, slice)) = piece {
                 let key = chunk_key(ino, index);
-                let slice = &data[cursor..cursor + n];
-                cursor += n;
-
                 // A write covering a whole chunk replaces it outright, so
                 // there is nothing to preserve and nothing to read first.
                 // This is the path aligned sequential writes take.
-                if within == 0 && n as u64 == self.chunk_size {
+                if within == 0 && slice.len() as u64 == self.chunk_size {
                     txn.write(&key, Some(slice)).await?;
-                    continue;
+                } else {
+                    let mut buf = txn.read(&key).await?.value.unwrap_or_default();
+                    // Covers both a hole ahead of `within` and extending
+                    // the chunk to hold the new bytes.
+                    if buf.len() < within + slice.len() {
+                        buf.resize(within + slice.len(), 0);
+                    }
+                    buf[within..within + slice.len()].copy_from_slice(slice);
+                    txn.write(&key, Some(&buf)).await?;
                 }
-
-                let mut buf = txn.read(&key).await?.value.unwrap_or_default();
-                // Covers both a hole ahead of `within` and extending the
-                // chunk to hold the new bytes.
-                if buf.len() < within + n {
-                    buf.resize(within + n, 0);
-                }
-                buf[within..within + n].copy_from_slice(slice);
-                txn.write(&key, Some(&buf)).await?;
             }
 
-            let end = offset + data.len() as u64;
             if end > entry.attr.size {
                 entry.attr.size = end;
                 entry.attr.blocks = end.div_ceil(512);
@@ -514,19 +568,17 @@ impl Raft5Fs {
 
             match txn.commit().await {
                 Ok(_) => {
-                    if !data.is_empty() {
-                        let first = offset / self.chunk_size;
-                        let last = (offset + data.len() as u64 - 1) / self.chunk_size;
+                    if let Some((index, ..)) = piece {
                         self.chunk_cache
                             .lock()
                             .unwrap()
-                            .invalidate(ino, first..=last);
+                            .invalidate(ino, index..=index);
                     }
                     return Ok(Some(entry.attr));
                 }
                 Err(KvError::Aborted { .. }) => continue,
                 // The outcome is unknown, so the cache can't be trusted
-                // for these chunks either.
+                // for this chunk either.
                 Err(e) => {
                     self.chunk_cache.lock().unwrap().invalidate_ino(ino);
                     return Err(e);
@@ -609,8 +661,11 @@ impl Raft5Fs {
 
     /// Accepts `data` at `offset` into `ino`'s buffer, storing it when the
     /// buffered run reaches the end of a chunk, stops being contiguous, or
-    /// is too big to be worth buffering.
-    fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<(), Errno> {
+    /// is too big to be worth buffering. Returns how many bytes were
+    /// accepted: all of them, or on a failed oversized write just the
+    /// chunks that got stored before it.
+    fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<usize, Errno> {
+        let total = data.len();
         let slot = self.write_slot(ino);
         let mut buf = slot.lock().unwrap();
         if let Some(e) = buf.err.take() {
@@ -620,9 +675,10 @@ impl Raft5Fs {
         if data.len() as u64 >= self.chunk_size {
             self.flush_buf(ino, &mut buf)?;
             return match self.block(self.write_range(ino, offset, data)) {
-                Ok(Some(_)) => Ok(()),
+                Ok(Some(_)) => Ok(total),
                 Ok(None) => Err(Errno::ENOENT),
-                Err(_) => Err(Errno::EIO),
+                Err(WriteError { written: 0, .. }) => Err(Errno::EIO),
+                Err(WriteError { written, .. }) => Ok(written),
             };
         }
 
@@ -639,7 +695,7 @@ impl Raft5Fs {
                 self.flush_buf(ino, &mut buf)?;
             }
         }
-        Ok(())
+        Ok(total)
     }
 
     /// Deletes every chunk of `ino` from `first_index` on, in bounded
@@ -1094,14 +1150,15 @@ impl Filesystem for Raft5Fs {
     ) {
         if self.write_buffering {
             return match self.buffered_write(ino.0, offset, data) {
-                Ok(()) => reply.written(data.len() as u32),
+                Ok(n) => reply.written(n as u32),
                 Err(e) => reply.error(e),
             };
         }
         match self.block(self.write_range(ino.0, offset, data)) {
             Ok(Some(_)) => reply.written(data.len() as u32),
             Ok(None) => reply.error(Errno::ENOENT),
-            Err(_) => reply.error(Errno::EIO),
+            Err(WriteError { written: 0 }) => reply.error(Errno::EIO),
+            Err(WriteError { written }) => reply.written(written as u32),
         }
     }
 
