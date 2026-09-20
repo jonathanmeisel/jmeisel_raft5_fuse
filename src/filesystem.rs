@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -10,9 +12,19 @@ use fuser::{
 use raft5_client::{Client, Error as KvError};
 use tokio::runtime::Handle;
 
+use crate::read_cache::ChunkCache;
+use crate::write_buffer::WriteBuf;
+
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
 const TXN_TTL: Duration = Duration::from_secs(10);
+
+/// Default byte budget of the chunk read cache.
+pub const DEFAULT_READ_CACHE_BYTES: usize = 64 << 20;
+/// How long a cached chunk is trusted. Local writes invalidate exactly;
+/// this only bounds staleness from other mounts' writes, and matches the
+/// attribute TTL the kernel already applies.
+const READ_CACHE_TTL: Duration = TTL;
 const COUNTER_KEY: &[u8] = b"\x00next_ino";
 
 /// Keys deleted per transaction when tearing down a file's chunks. Each
@@ -245,6 +257,12 @@ pub struct Raft5Fs {
     /// whatever the store already records, and the size actually in force
     /// after that.
     chunk_size: u64,
+    chunk_cache: Mutex<ChunkCache>,
+    /// Per-inode buffers of accepted-but-unstored writes. The map lock is
+    /// only held to find or insert a slot, never across a network call;
+    /// the slot's own lock is what serializes a file's writes and flushes.
+    write_bufs: Mutex<HashMap<u64, Arc<Mutex<WriteBuf>>>>,
+    write_buffering: bool,
 }
 
 impl Raft5Fs {
@@ -253,7 +271,22 @@ impl Raft5Fs {
             client,
             rt,
             chunk_size,
+            chunk_cache: Mutex::new(ChunkCache::new(DEFAULT_READ_CACHE_BYTES, READ_CACHE_TTL)),
+            write_bufs: Mutex::new(HashMap::new()),
+            write_buffering: true,
         }
+    }
+
+    /// Sets the read cache's byte budget; 0 disables it.
+    pub fn with_read_cache_bytes(mut self, bytes: usize) -> Self {
+        self.chunk_cache = Mutex::new(ChunkCache::new(bytes, READ_CACHE_TTL));
+        self
+    }
+
+    /// Turns write buffering on or off (on by default).
+    pub fn with_write_buffering(mut self, enabled: bool) -> Self {
+        self.write_buffering = enabled;
+        self
     }
 
     pub fn chunk_size(&self) -> u64 {
@@ -395,15 +428,35 @@ impl Raft5Fs {
 
         let mut cursor = 0usize;
         for (index, within, n) in chunk_spans(self.chunk_size, offset, len) {
-            if let Some(stored) = self.client.read(&chunk_key(ino, index)).await?.value
-                && within < stored.len()
-            {
+            let stored = self.chunk(ino, index).await?;
+            if within < stored.len() {
                 let end = (within + n).min(stored.len());
                 out[cursor..cursor + (end - within)].copy_from_slice(&stored[within..end]);
             }
             cursor += n;
         }
         Ok(out)
+    }
+
+    /// The stored bytes of one chunk (empty if absent), through the read
+    /// cache. The cache lock is released while the chunk is fetched.
+    async fn chunk(&self, ino: u64, index: u64) -> Result<Arc<[u8]>, KvError> {
+        let generation = match self.chunk_cache.lock().unwrap().get(ino, index) {
+            Ok(hit) => return Ok(hit),
+            Err(generation) => generation,
+        };
+        let data: Arc<[u8]> = self
+            .client
+            .read(&chunk_key(ino, index))
+            .await?
+            .value
+            .unwrap_or_default()
+            .into();
+        self.chunk_cache
+            .lock()
+            .unwrap()
+            .insert(ino, index, data.clone(), generation);
+        Ok(data)
     }
 
     /// Splices `data` in at `offset` and updates the attributes to match,
@@ -460,11 +513,133 @@ impl Raft5Fs {
                 .await?;
 
             match txn.commit().await {
-                Ok(_) => return Ok(Some(entry.attr)),
+                Ok(_) => {
+                    if !data.is_empty() {
+                        let first = offset / self.chunk_size;
+                        let last = (offset + data.len() as u64 - 1) / self.chunk_size;
+                        self.chunk_cache
+                            .lock()
+                            .unwrap()
+                            .invalidate(ino, first..=last);
+                    }
+                    return Ok(Some(entry.attr));
+                }
                 Err(KvError::Aborted { .. }) => continue,
-                Err(e) => return Err(e),
+                // The outcome is unknown, so the cache can't be trusted
+                // for these chunks either.
+                Err(e) => {
+                    self.chunk_cache.lock().unwrap().invalidate_ino(ino);
+                    return Err(e);
+                }
             }
         }
+    }
+
+    fn write_slot(&self, ino: u64) -> Arc<Mutex<WriteBuf>> {
+        self.write_bufs
+            .lock()
+            .unwrap()
+            .entry(ino)
+            .or_default()
+            .clone()
+    }
+
+    fn existing_write_slot(&self, ino: u64) -> Option<Arc<Mutex<WriteBuf>>> {
+        self.write_bufs.lock().unwrap().get(&ino).cloned()
+    }
+
+    /// Stores whatever `buf` holds. On failure the bytes are gone, so the
+    /// errno is also kept in `buf.err` for the next `flush`/`fsync`/`write`
+    /// to report.
+    fn flush_buf(&self, ino: u64, buf: &mut WriteBuf) -> Result<(), Errno> {
+        let Some((start, data)) = buf.take() else {
+            return Ok(());
+        };
+        let err = match self.block(self.write_range(ino, start, &data)) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => Errno::ENOENT,
+            Err(_) => Errno::EIO,
+        };
+        buf.err = Some(err);
+        Err(err)
+    }
+
+    /// Stores `ino`'s buffered writes, if any. Called before anything that
+    /// must observe them: reads, attribute queries, truncation.
+    fn flush_ino(&self, ino: u64) -> Result<(), Errno> {
+        if let Some(slot) = self.existing_write_slot(ino) {
+            self.flush_buf(ino, &mut slot.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
+    /// `flush_ino`, then reports any error an earlier flush left behind.
+    fn sync_ino(&self, ino: u64) -> Result<(), Errno> {
+        let Some(slot) = self.existing_write_slot(ino) else {
+            return Ok(());
+        };
+        let mut buf = slot.lock().unwrap();
+        let flushed = self.flush_buf(ino, &mut buf);
+        match buf.err.take() {
+            Some(e) => Err(e),
+            None => flushed,
+        }
+    }
+
+    /// Drops `ino`'s buffered writes because the file is being deleted.
+    fn discard_ino(&self, ino: u64) {
+        if let Some(slot) = self.existing_write_slot(ino) {
+            slot.lock().unwrap().discard();
+        }
+    }
+
+    /// Forgets `ino`'s slot once nothing is using it or waiting in it, so
+    /// the map doesn't grow with every file ever written.
+    fn prune_slot(&self, ino: u64) {
+        let mut bufs = self.write_bufs.lock().unwrap();
+        if let Some(slot) = bufs.get(&ino)
+            && Arc::strong_count(slot) == 1
+            && slot
+                .try_lock()
+                .is_ok_and(|b| b.is_empty() && b.err.is_none())
+        {
+            bufs.remove(&ino);
+        }
+    }
+
+    /// Accepts `data` at `offset` into `ino`'s buffer, storing it when the
+    /// buffered run reaches the end of a chunk, stops being contiguous, or
+    /// is too big to be worth buffering.
+    fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<(), Errno> {
+        let slot = self.write_slot(ino);
+        let mut buf = slot.lock().unwrap();
+        if let Some(e) = buf.err.take() {
+            return Err(e);
+        }
+
+        if data.len() as u64 >= self.chunk_size {
+            self.flush_buf(ino, &mut buf)?;
+            return match self.block(self.write_range(ino, offset, data)) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(Errno::ENOENT),
+                Err(_) => Err(Errno::EIO),
+            };
+        }
+
+        while !data.is_empty() {
+            if !buf.accepts(offset) {
+                self.flush_buf(ino, &mut buf)?;
+            }
+            let room = (self.chunk_size - offset % self.chunk_size) as usize;
+            let n = room.min(data.len());
+            buf.append(offset, &data[..n]);
+            offset += n as u64;
+            data = &data[n..];
+            if offset.is_multiple_of(self.chunk_size) {
+                self.flush_buf(ino, &mut buf)?;
+            }
+        }
+        Ok(())
     }
 
     /// Deletes every chunk of `ino` from `first_index` on, in bounded
@@ -525,7 +700,18 @@ impl Raft5Fs {
             let last = new_size / self.chunk_size;
             let rem = (new_size % self.chunk_size) as usize;
             let first_dead = if rem == 0 { last } else { last + 1 };
-            self.delete_chunks_from(ino, first_dead).await?;
+            // Invalidated before and after: the boundary chunk changes
+            // only at commit, and the dead ones vanish right now.
+            self.chunk_cache
+                .lock()
+                .unwrap()
+                .invalidate(ino, last..=u64::MAX);
+            let deleted = self.delete_chunks_from(ino, first_dead).await;
+            self.chunk_cache
+                .lock()
+                .unwrap()
+                .invalidate(ino, last..=u64::MAX);
+            deleted?;
         }
 
         loop {
@@ -572,7 +758,15 @@ impl Raft5Fs {
             txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
                 .await?;
             match txn.commit().await {
-                Ok(_) => return Ok(Some(entry.attr)),
+                Ok(_) => {
+                    if let Some(new_size) = size {
+                        self.chunk_cache
+                            .lock()
+                            .unwrap()
+                            .invalidate(ino, new_size / self.chunk_size..=u64::MAX);
+                    }
+                    return Ok(Some(entry.attr));
+                }
                 Err(KvError::Aborted { .. }) => continue,
                 Err(e) => return Err(e),
             }
@@ -643,7 +837,9 @@ impl Raft5Fs {
     /// unreachable, so a crash the other way round would strand them with
     /// nothing left able to find them.
     async fn remove_child(&self, parent: u64, name: &OsStr, ino: u64) -> Result<(), KvError> {
-        self.delete_chunks_from(ino, 0).await?;
+        let deleted = self.delete_chunks_from(ino, 0).await;
+        self.chunk_cache.lock().unwrap().invalidate_ino(ino);
+        deleted?;
         let dirent = dirent_key(parent, name);
         loop {
             let txn = self.client.transaction(TXN_TTL).await?;
@@ -693,6 +889,9 @@ impl Filesystem for Raft5Fs {
             Ok(None) => return reply.error(Errno::ENOENT),
             Err(_) => return reply.error(Errno::EIO),
         };
+        if let Err(e) = self.flush_ino(child_ino) {
+            return reply.error(e);
+        }
         match self.read_entry(child_ino) {
             Some(entry) => reply.entry(&TTL, &entry.attr, Generation(0)),
             None => reply.error(Errno::ENOENT),
@@ -700,6 +899,9 @@ impl Filesystem for Raft5Fs {
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if let Err(e) = self.flush_ino(ino.0) {
+            return reply.error(e);
+        }
         match self.resolve(req, ino.0) {
             Some(entry) => reply.attr(&TTL, &entry.attr),
             None => reply.error(Errno::ENOENT),
@@ -725,6 +927,12 @@ impl Filesystem for Raft5Fs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        // Buffered bytes predate this change, so they have to be stored
+        // before it applies (a truncate must cut them, not be undone by
+        // them landing afterwards).
+        if let Err(e) = self.flush_ino(ino.0) {
+            return reply.error(e);
+        }
         match self.block(self.apply_setattr(ino.0, mode, uid, gid, size, atime, mtime)) {
             Ok(Some(attr)) => reply.attr(&TTL, &attr),
             Ok(None) => reply.error(Errno::ENOENT),
@@ -778,6 +986,7 @@ impl Filesystem for Raft5Fs {
             Err(_) => return reply.error(Errno::EIO),
         }
 
+        self.discard_ino(child_ino);
         match self.block(self.remove_child(parent.0, name, child_ino)) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(Errno::EIO),
@@ -798,6 +1007,7 @@ impl Filesystem for Raft5Fs {
             None => return reply.error(Errno::ENOENT),
         }
 
+        self.discard_ino(child_ino);
         match self.block(self.remove_child(parent.0, name, child_ino)) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(Errno::EIO),
@@ -857,6 +1067,9 @@ impl Filesystem for Raft5Fs {
         // End-of-file lives in the attributes, not in the chunks: an
         // absent chunk is a hole, not the end, so the size has to come
         // from here before any of the data does.
+        if let Err(e) = self.flush_ino(ino.0) {
+            return reply.error(e);
+        }
         let Some(entry) = self.read_entry(ino.0) else {
             return reply.error(Errno::ENOENT);
         };
@@ -879,6 +1092,12 @@ impl Filesystem for Raft5Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        if self.write_buffering {
+            return match self.buffered_write(ino.0, offset, data) {
+                Ok(()) => reply.written(data.len() as u32),
+                Err(e) => reply.error(e),
+            };
+        }
         match self.block(self.write_range(ino.0, offset, data)) {
             Ok(Some(_)) => reply.written(data.len() as u32),
             Ok(None) => reply.error(Errno::ENOENT),
@@ -886,17 +1105,64 @@ impl Filesystem for Raft5Fs {
         }
     }
 
+    /// Called on every `close()` of a descriptor. Storing buffered writes
+    /// here is what lets a failure reach the application that wrote them.
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        match self.sync_ino(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.sync_ino(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        // `flush` normally got here first; this covers a release without
+        // one, and the error is best-effort since `close()` never sees it.
+        let result = self.sync_ino(ino.0);
+        self.prune_slot(ino.0);
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    /// Unmount: nothing after this can store what is still buffered.
+    fn destroy(&mut self) {
+        let inos: Vec<u64> = self.write_bufs.lock().unwrap().keys().copied().collect();
+        for ino in inos {
+            if let Err(e) = self.sync_ino(ino) {
+                eprintln!("failed to store buffered writes to inode {ino}: {e:?}");
+            }
+        }
     }
 
     fn readdir(

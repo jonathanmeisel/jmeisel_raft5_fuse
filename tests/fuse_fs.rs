@@ -417,3 +417,241 @@ fn an_out_of_range_stored_chunk_size_is_refused() {
         .expect_err("an unusable recorded chunk size should be refused");
     assert!(err.contains("unusable"), "unexpected message: {err}");
 }
+
+// ------------------------------------------------- write buffer / read cache
+
+/// The inode of `name` in the mount's root, learned from `readdir` --
+/// unlike `stat`, that doesn't make the filesystem store buffered writes,
+/// so it can be used to look at the store while a file still has some.
+fn ino_from_readdir(dir: &std::path::Path, name: &str) -> u64 {
+    use std::os::unix::fs::DirEntryExt;
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .find(|e| e.file_name() == name)
+        .unwrap_or_else(|| panic!("{name} not listed"))
+        .ino()
+}
+
+#[test]
+fn many_small_sequential_writes_round_trip() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("streamed.bin");
+    let want = pattern(c * 3 + c / 2 + 123);
+
+    let mut f = fs::File::create(&path).unwrap();
+    for piece in want.chunks(4096) {
+        f.write_all(piece).unwrap();
+    }
+    drop(f);
+
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+}
+
+#[test]
+fn small_sequential_reads_round_trip() {
+    use std::io::Read;
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("read_streamed.bin");
+    let want = pattern(c * 2 + 777);
+    fs::write(&path, &want).unwrap();
+
+    let mut f = fs::File::open(&path).unwrap();
+    let mut got = Vec::new();
+    let mut piece = [0u8; 1000];
+    loop {
+        let n = f.read(&mut piece).unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&piece[..n]);
+    }
+    assert_same_bytes(&got, &want);
+}
+
+#[test]
+fn buffered_writes_reach_the_store_on_fsync_and_close() {
+    let h = support::setup();
+    let path = h.path().join("buffered.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(&pattern(4096)).unwrap();
+    let ino = ino_from_readdir(h.path(), "buffered.bin");
+    assert!(
+        h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "a small write should still be buffered"
+    );
+
+    f.sync_all().unwrap();
+    assert_eq!(h.keys_with_prefix(&chunk_prefix(ino)).len(), 1);
+
+    let more = vec![9u8; 100];
+    f.write_all(&more).unwrap();
+    drop(f);
+    let mut want = pattern(4096);
+    want.extend_from_slice(&more);
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+}
+
+#[test]
+fn a_filled_chunk_is_stored_without_waiting_for_close() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("filling.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    for piece in pattern(c).chunks(4096) {
+        f.write_all(piece).unwrap();
+    }
+    let ino = ino_from_readdir(h.path(), "filling.bin");
+    assert_eq!(h.keys_with_prefix(&chunk_prefix(ino)).len(), 1);
+    drop(f);
+}
+
+#[test]
+fn stat_sees_buffered_writes() {
+    let h = support::setup();
+    let path = h.path().join("sized.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(&pattern(1000)).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), 1000);
+    f.write_all(&pattern(500)).unwrap();
+    assert_eq!(f.metadata().unwrap().len(), 1500);
+}
+
+#[test]
+fn reading_through_the_same_handle_sees_buffered_writes() {
+    use std::io::Read;
+    let h = support::setup();
+    let path = h.path().join("readback.bin");
+
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    f.write_all(b"hello buffered world").unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    let mut got = String::new();
+    f.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "hello buffered world");
+}
+
+#[test]
+fn truncating_a_file_with_buffered_writes() {
+    let h = support::setup();
+    let path = h.path().join("cut.bin");
+
+    let f = {
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(&pattern(10_000)).unwrap();
+        f
+    };
+    f.set_len(100).unwrap();
+    drop(f);
+
+    assert_same_bytes(&fs::read(&path).unwrap(), &pattern(100));
+}
+
+#[test]
+fn unlinking_a_file_with_buffered_writes_leaves_nothing() {
+    let h = support::setup();
+    let path = h.path().join("dropped.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(&pattern(5000)).unwrap();
+    let ino = ino_from_readdir(h.path(), "dropped.bin");
+    fs::remove_file(&path).unwrap();
+    drop(f);
+
+    assert!(h.keys_with_prefix(&chunk_prefix(ino)).is_empty());
+    let mut attr_key = vec![0x01];
+    attr_key.extend_from_slice(&ino.to_be_bytes());
+    assert!(h.read_key(&attr_key).is_none());
+}
+
+#[test]
+fn non_sequential_and_overlapping_writes_land_in_order() {
+    let h = support::setup();
+    let path = h.path().join("scattered.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(b"aaaa").unwrap();
+    f.seek(SeekFrom::Start(100)).unwrap();
+    f.write_all(b"bbbb").unwrap();
+    f.seek(SeekFrom::Start(2)).unwrap();
+    f.write_all(b"cc").unwrap();
+    f.seek(SeekFrom::Start(3)).unwrap();
+    f.write_all(b"dd").unwrap();
+    drop(f);
+
+    let mut want = vec![0u8; 104];
+    want[..4].copy_from_slice(b"aaaa");
+    want[100..].copy_from_slice(b"bbbb");
+    want[2..4].copy_from_slice(b"cc");
+    want[3..5].copy_from_slice(b"dd");
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+}
+
+#[test]
+fn a_write_straddling_a_chunk_boundary_through_the_buffer() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("straddle.bin");
+    let want = pattern(c + 5000);
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(&want[..c - 100]).unwrap();
+    f.write_all(&want[c - 100..c + 200]).unwrap();
+    f.write_all(&want[c + 200..]).unwrap();
+    drop(f);
+
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+}
+
+#[test]
+fn reads_see_writes_made_after_the_chunk_was_cached() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("fresh.bin");
+    fs::write(&path, pattern(c * 2)).unwrap();
+
+    // Populate the cache for both chunks.
+    assert_same_bytes(&fs::read(&path).unwrap(), &pattern(c * 2));
+
+    let mut want = pattern(c * 2);
+    let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start(c as u64 - 10)).unwrap();
+    f.write_all(&[0xEE; 20]).unwrap();
+    drop(f);
+    want[c - 10..c + 10].fill(0xEE);
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+
+    // Truncate then grow must read zeros, not the cached old bytes.
+    let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(c as u64 + 5).unwrap();
+    f.set_len(c as u64 * 2).unwrap();
+    drop(f);
+    want[c + 5..].fill(0);
+    assert_same_bytes(&fs::read(&path).unwrap(), &want);
+}
+
+#[test]
+fn buffered_data_survives_a_remount() {
+    let mut h = support::setup();
+    let c = h.chunk_size;
+    let path = h.path().join("durable.bin");
+    fs::write(&path, pattern(3000)).unwrap();
+
+    h.remount(c);
+
+    assert_same_bytes(
+        &fs::read(h.path().join("durable.bin")).unwrap(),
+        &pattern(3000),
+    );
+}
