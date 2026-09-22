@@ -617,13 +617,14 @@ fn an_idle_partial_batch_reaches_the_store_on_its_own() {
     drop(f);
 }
 
-/// Far more chunks than may be in flight at once, so `write` has to wait
-/// for room and the chunks have to land in order for the bytes to match.
+/// Many chunks, several batches' worth, written in small pieces --
+/// exercises the batch splitting in `write_range` and that the bytes land
+/// in order across it.
 #[test]
-fn many_pipelined_chunks_round_trip_in_order() {
+fn many_small_writes_across_several_batches_round_trip_in_order() {
     let h = support::setup();
     let c = h.chunk_size as usize;
-    let path = h.path().join("pipelined.bin");
+    let path = h.path().join("multi-batch-small-writes.bin");
 
     let data = pattern(c * 24 + 123);
     let mut f = fs::File::create(&path).unwrap();
@@ -636,12 +637,12 @@ fn many_pipelined_chunks_round_trip_in_order() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// A read must see chunks that are still queued.
+/// A read must see writes that are still buffered, not yet committed.
 #[test]
-fn reads_wait_for_queued_chunks() {
+fn reads_wait_for_buffered_writes() {
     let h = support::setup();
     let c = h.chunk_size as usize;
-    let path = h.path().join("read-while-queued.bin");
+    let path = h.path().join("read-while-buffered.bin");
 
     let data = pattern(c * 6);
     let mut f = fs::File::create(&path).unwrap();
@@ -651,16 +652,18 @@ fn reads_wait_for_queued_chunks() {
     drop(f);
 }
 
-/// Deleting a file while its chunks are queued must not leave any behind:
-/// a chunk stored after the delete's scan would have nothing to find it.
+/// Deleting a file with several batches' worth of writes on it must not
+/// leave any chunks behind: a chunk stored after the delete's scan would
+/// have nothing left to find it. Each batch commits synchronously as
+/// `write_all` fills it, so by the time `remove_file` runs, only the last,
+/// still-partial run is actually buffered -- the rest is already
+/// committed and has to be cleaned up like any other stored data.
 #[test]
-fn unlinking_a_file_with_queued_chunks_leaves_nothing() {
+fn unlinking_a_file_with_several_buffered_batches_leaves_nothing() {
     let h = support::setup();
     let path = h.path().join("doomed.bin");
 
     let mut f = fs::File::create(&path).unwrap();
-    // Several batches' worth, so this really does race queued transactions
-    // rather than only discarding a buffer that never left.
     f.write_all(&pattern(batch_bytes(h.chunk_size) as usize * 3))
         .unwrap();
     let ino = ino_from_readdir(h.path(), "doomed.bin");

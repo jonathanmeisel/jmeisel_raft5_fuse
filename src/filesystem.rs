@@ -13,7 +13,7 @@ use raft5_client::{Client, Error as KvError};
 use tokio::runtime::Handle;
 
 use crate::read_cache::{ChunkCache, Lookup};
-use crate::write_buffer::{Slot, WriteBuf};
+use crate::write_buffer::WriteBuf;
 
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
@@ -318,14 +318,16 @@ async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
 }
 
 /// A failed `write_range`: how many leading bytes of the write had
-/// already been stored (each chunk commits on its own). Every failure is
+/// already been stored (each batch commits on its own). Every failure is
 /// reported to the kernel as `EIO`, so the cause is not kept.
 struct WriteError {
     written: usize,
 }
 
 /// What it takes to store a write: enough of `Raft5Fs` to be cloned into
-/// the background tasks that commit a file's chunks.
+/// the auto-flush timer's task, which has no `Raft5Fs` to borrow. Also
+/// used directly (not cloned) by the synchronous commit path, since it is
+/// the same logic either way.
 #[derive(Clone)]
 struct Committer {
     client: Client,
@@ -412,8 +414,8 @@ impl Committer {
             let txn = self.client.transaction(TXN_TTL).await?;
             // First, and load-bearing: the attributes are deleted last
             // when a file goes away, so finding them absent here is what
-            // stops a queued batch from storing chunks nothing could ever
-            // reach again.
+            // stops a batch from storing chunks nothing could ever reach
+            // again.
             let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
                 return Ok(None);
             };
@@ -479,69 +481,17 @@ impl Committer {
     }
 }
 
-/// Queues whatever `buf` holds to be stored, and returns without waiting
-/// for it. Waits only for room: at most `MAX_IN_FLIGHT` batches per file
-/// are outstanding, so a writer that outruns the store slows down instead
-/// of piling up data.
-///
-/// Batches commit one at a time, in the order they were queued -- each
-/// task waits on the one before it. That keeps every transaction whole
-/// (attribute read, chunks, size, all together), so the size never covers
-/// data that isn't stored and a file deleted mid-flight makes the
-/// remaining transactions find no inode rather than leak chunks. A failure
-/// is kept in the pipeline for the next `flush`/`fsync`/`write` to report,
-/// and batches queued behind it are dropped.
-///
-/// A free function rather than a method: the auto-flush timer has to do
-/// this from a task that holds no `Raft5Fs`, only the cheap clones below.
-fn enqueue_flush(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) {
-    if buf.is_empty() {
-        return;
+/// Maps a committed run's outcome to the errno a caller should see, or
+/// `None` on success. Shared by every path that commits a buffer, whether
+/// synchronously (a fuse thread, reporting directly) or from the
+/// auto-flush timer (stashing it in `WriteBuf::err` instead, since nothing
+/// is synchronously waiting on that one).
+fn commit_errno(result: Result<Option<FileAttr>, WriteError>) -> Option<Errno> {
+    match result {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(Errno::ENOENT),
+        Err(_) => Some(Errno::EIO),
     }
-    buf.pipe.reserve();
-    spawn_queued(rt, committer, ino, buf);
-}
-
-/// `enqueue_flush` for a caller that must not block, and so may find the
-/// pipeline full. Returns whether bytes are still waiting to be stored --
-/// that is, whether it is worth trying again.
-fn try_enqueue_flush(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) -> bool {
-    if buf.is_empty() {
-        return false;
-    }
-    if !buf.pipe.try_reserve() {
-        return true;
-    }
-    spawn_queued(rt, committer, ino, buf);
-    false
-}
-
-/// Takes `buf`'s run and spawns the task that commits it, chained behind
-/// whatever was queued before it. The caller has already reserved the
-/// pipeline slot this consumes.
-fn spawn_queued(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) {
-    let Some((start, data)) = buf.take() else {
-        // Nothing to store, so give the reserved slot straight back.
-        buf.pipe.complete(None);
-        return;
-    };
-    let slot = Slot::new(Arc::clone(&buf.pipe));
-    let pipe = Arc::clone(&buf.pipe);
-    let prev = buf.tail.take();
-    let committer = committer.clone();
-    buf.tail = Some(rt.spawn(async move {
-        if let Some(prev) = prev {
-            let _ = prev.await;
-        }
-        if pipe.should_skip() {
-            return slot.finish(None);
-        }
-        slot.finish(match committer.write_range(ino, start, &data).await {
-            Ok(Some(_)) => None,
-            Ok(None) => Some(Errno::ENOENT),
-            Err(_) => Some(Errno::EIO),
-        });
-    }));
 }
 
 pub struct Raft5Fs {
@@ -804,70 +754,71 @@ impl Raft5Fs {
         self.write_bufs.lock().unwrap().get(&ino).cloned()
     }
 
-    /// Queues whatever `buf` holds to be stored; see `enqueue_flush`.
-    fn flush_buf(&self, ino: u64, buf: &mut WriteBuf) {
-        enqueue_flush(&self.rt, &self.committer(), ino, buf);
+    /// Commits whatever `buf` holds, synchronously. Blocks the calling
+    /// thread for the round trip -- fine on a fuse thread (that's what
+    /// `n_threads` > 1 is for: an unrelated file's operations don't queue
+    /// up behind it). The auto-flush timer's task must not hold `buf`'s
+    /// lock across this; see `schedule_auto_flush`.
+    fn commit_buf(&self, ino: u64, buf: &mut WriteBuf) -> Result<(), Errno> {
+        let Some((start, data)) = buf.take() else {
+            return Ok(());
+        };
+        match commit_errno(self.block(self.committer().write_range(ino, start, &data))) {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 
-    /// Arranges for `ino`'s buffer to be stored within `AUTO_FLUSH_DELAY`
+    /// Arranges for `ino`'s buffer to be committed within `AUTO_FLUSH_DELAY`
     /// even if nothing else asks for it, so a writer that stops short of a
     /// full batch and neither closes nor syncs does not leave its bytes in
     /// memory indefinitely. Called when a buffer goes from empty to
     /// holding something.
     ///
-    /// Nothing cancels this, and nothing needs to. If the buffer is
-    /// flushed by any other route first, the timer finds it empty and does
-    /// nothing. If a later run has started by then, flushing that one
-    /// early is harmless -- sooner is always safe -- and the timer it
-    /// scheduled for itself then finds nothing to do. `destroy` drains
-    /// every buffer before an unmount completes, so correctness never
-    /// rests on this firing; and a task parked in `sleep` is at an await
-    /// point, so dropping the runtime cancels it rather than waiting.
+    /// One-shot, and nothing cancels it: if the buffer is flushed by any
+    /// other route first, the timer finds it empty and does nothing. If a
+    /// later run has started by then, flushing that one early is harmless
+    /// -- sooner is always safe -- and the timer it scheduled for itself
+    /// then finds nothing to do. `destroy` drains every buffer before an
+    /// unmount completes, so correctness never rests on this firing; and a
+    /// task parked in `sleep` is at an await point, so dropping the
+    /// runtime cancels it rather than waiting.
     fn schedule_auto_flush(&self, ino: u64, slot: Arc<Mutex<WriteBuf>>) {
         let committer = self.committer();
-        let rt = self.rt.clone();
         self.rt.spawn(async move {
-            loop {
-                tokio::time::sleep(AUTO_FLUSH_DELAY).await;
-                // Nothing in here may block, because this runs on an
-                // async worker and the tasks that commit batches need
-                // those workers to make progress. Blocking one while a
-                // fuse thread holds this buffer and waits for a commit
-                // would deadlock the pair. So: `try_lock` rather than
-                // `lock`, and `try_enqueue_flush`, which gives up instead
-                // of waiting for a pipeline slot. Either way another
-                // interval costs nothing -- whoever holds the lock or
-                // filled the pipeline is already storing this file.
-                let waiting = match slot.try_lock() {
-                    Ok(mut buf) => try_enqueue_flush(&rt, &committer, ino, &mut buf),
-                    Err(std::sync::TryLockError::WouldBlock) => true,
-                    // Some other thread panicked holding this buffer;
-                    // its bytes are not ours to recover.
-                    Err(std::sync::TryLockError::Poisoned(_)) => return,
-                };
-                if !waiting {
-                    return;
-                }
+            tokio::time::sleep(AUTO_FLUSH_DELAY).await;
+            // `try_lock`, not `lock`: this runs on an async worker, and a
+            // fuse thread may be holding this buffer's lock for an entire
+            // commit's round trip. Blocking the worker on that would be
+            // counter-productive at best; there's nothing to gain by
+            // waiting, since whoever holds the lock is already handling
+            // this file one way or another. `WouldBlock` and `Poisoned`
+            // both mean there's nothing useful for the timer to do.
+            let taken = match slot.try_lock() {
+                Ok(mut buf) => buf.take(),
+                Err(_) => return,
+            };
+            let Some((start, data)) = taken else { return };
+            if let Some(e) = commit_errno(committer.write_range(ino, start, &data).await) {
+                // No one is synchronously waiting on this commit, so the
+                // failure has nowhere to go but back into the buffer, for
+                // the next flush/fsync/write to report.
+                slot.lock().unwrap().err.get_or_insert(e);
             }
         });
     }
 
-    /// Queues `buf`'s run, then waits until everything queued for the file
-    /// has been stored.
-    fn drain_buf(&self, ino: u64, buf: &mut WriteBuf) {
-        self.flush_buf(ino, buf);
-        buf.pipe.wait_drained();
-    }
-
-    /// Stores `ino`'s buffered writes, if any. Called before anything that
-    /// must observe them: reads, attribute queries, truncation. An error
-    /// from any of them is reported but left for `flush`/`fsync`/`write`
-    /// to take.
+    /// Commits `ino`'s buffered writes, if any. Called before anything
+    /// that must observe them: reads, attribute queries, truncation. A
+    /// stashed error (from an earlier auto-flush) is reported but left in
+    /// place for `flush`/`fsync`/`write` to take, matching how a `read`
+    /// surfaces a pending write failure without being the thing that
+    /// clears it.
     fn flush_ino(&self, ino: u64) -> Result<(), Errno> {
         if let Some(slot) = self.existing_write_slot(ino) {
             let mut buf = slot.lock().unwrap();
-            self.drain_buf(ino, &mut buf);
-            if let Some(e) = buf.pipe.peek_err() {
+            self.commit_buf(ino, &mut buf)?;
+            if let Some(e) = buf.err {
                 return Err(e);
             }
         }
@@ -880,16 +831,18 @@ impl Raft5Fs {
             return Ok(());
         };
         let mut buf = slot.lock().unwrap();
-        self.drain_buf(ino, &mut buf);
-        match buf.pipe.take_err() {
+        self.commit_buf(ino, &mut buf)?;
+        match buf.err.take() {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
 
-    /// Drops `ino`'s buffered and queued writes because the file is being
-    /// deleted. Returns once none is still running, so nothing can store
-    /// a chunk after the caller starts deleting them.
+    /// Drops `ino`'s buffered writes because the file is being deleted.
+    /// Acquiring the buffer's lock is what makes this wait out a commit
+    /// already in progress -- committing holds that same lock for the
+    /// whole round trip -- so nothing can store a chunk after this
+    /// returns and before the caller starts deleting them.
     fn discard_ino(&self, ino: u64) {
         if let Some(slot) = self.existing_write_slot(ino) {
             slot.lock().unwrap().discard();
@@ -904,37 +857,34 @@ impl Raft5Fs {
             && Arc::strong_count(slot) == 1
             && slot
                 .try_lock()
-                .is_ok_and(|b| b.is_empty() && b.pipe.is_idle())
+                .is_ok_and(|b| b.is_empty() && b.err.is_none())
         {
             bufs.remove(&ino);
         }
     }
 
-    /// Accepts `data` at `offset` into `ino`'s buffer, queueing the run to
-    /// be stored when it fills a batch or stops being contiguous -- or,
-    /// failing both, when `AUTO_FLUSH_DELAY` has passed. A write already
-    /// big enough to fill a batch is stored before this returns, since
-    /// there is nothing left to coalesce it with.
+    /// Accepts `data` at `offset` into `ino`'s buffer, committing the run
+    /// when it fills a batch or stops being contiguous -- or, failing
+    /// both, when `AUTO_FLUSH_DELAY` has passed. A write already big
+    /// enough to fill a batch is committed directly, since there is
+    /// nothing left to coalesce it with.
     ///
-    /// Returns how many bytes were accepted: all of them, or on a failed
-    /// oversized write just the batches that got stored before it. Errors
-    /// from earlier queued batches are reported here too.
+    /// Returns how many bytes were durably accepted: all of them on
+    /// success, or on a failed commit just the bytes from earlier in this
+    /// same call whose own commit (if any) already succeeded.
     fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<usize, Errno> {
-        let total = data.len();
         let batch_bytes = batch_bytes(self.chunk_size);
         let slot = self.write_slot(ino);
         let mut buf = slot.lock().unwrap();
-        if let Some(e) = buf.pipe.take_err() {
+        if let Some(e) = buf.err.take() {
             return Err(e);
         }
 
         if data.len() as u64 >= batch_bytes {
-            // Stored directly, so everything queued ahead of it has to be
-            // stored first.
-            self.drain_buf(ino, &mut buf);
-            if let Some(e) = buf.pipe.take_err() {
-                return Err(e);
-            }
+            // Committed directly, so whatever was buffered ahead of it has
+            // to land first.
+            self.commit_buf(ino, &mut buf)?;
+            let total = data.len();
             return match self.block(self.committer().write_range(ino, offset, data)) {
                 Ok(Some(_)) => Ok(total),
                 Ok(None) => Err(Errno::ENOENT),
@@ -943,9 +893,18 @@ impl Raft5Fs {
             };
         }
 
+        // Only ever appended for iterations of this call whose own commit
+        // (if one was triggered) has already succeeded, so it is always
+        // safe to report as written.
+        let mut written = 0usize;
         while !data.is_empty() {
-            if !buf.accepts(offset) {
-                self.flush_buf(ino, &mut buf);
+            // Can only be true on this loop's first iteration: `offset` is
+            // otherwise always exactly what the previous iteration just
+            // appended, which `accepts` by construction.
+            if !buf.accepts(offset)
+                && let Err(e) = self.commit_buf(ino, &mut buf)
+            {
+                return if written > 0 { Ok(written) } else { Err(e) };
             }
             // Stepping to the batch grid rather than the chunk grid is
             // what lets a run span chunks, and keeps the batch it becomes
@@ -960,11 +919,14 @@ impl Raft5Fs {
             }
             offset += n as u64;
             data = &data[n..];
-            if offset.is_multiple_of(batch_bytes) {
-                self.flush_buf(ino, &mut buf);
+            if offset.is_multiple_of(batch_bytes)
+                && let Err(e) = self.commit_buf(ino, &mut buf)
+            {
+                return if written > 0 { Ok(written) } else { Err(e) };
             }
+            written += n;
         }
-        Ok(total)
+        Ok(written)
     }
 
     /// Deletes every chunk of `ino` from `first_index` on, in bounded

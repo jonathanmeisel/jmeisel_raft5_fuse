@@ -143,6 +143,10 @@ impl MountedFs {
 
         let mut options = Config::default();
         options.mount_options = vec![MountOption::FSName("raft5fs-test".to_string())];
+        // Matches main.rs: writes commit synchronously now, so this is
+        // what keeps one file's commit from stalling every other fuse
+        // request in tests too.
+        options.n_threads = Some(8);
 
         let session = fuser::spawn_mount(fs, &path, &options)
             .unwrap_or_else(|e| panic!("failed to mount at {path:?}: {e}"));

@@ -93,6 +93,10 @@ fn main() {
         MountOption::DefaultPermissions,
         MountOption::CUSTOM("allow_other".to_string()),
     ];
+    // Writes now commit synchronously, so without this, one file's slow
+    // commit would stall every other fuse request on the mount --
+    // `fuser` dispatches from a single thread unless told otherwise.
+    options.n_threads = Some(8);
 
     fuser::mount(fs, mountpoint, &options).expect("failed to mount filesystem");
 }
