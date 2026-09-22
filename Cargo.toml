@@ -7,7 +7,7 @@ edition = "2024"
 fuser = "0.18.0"
 libc = "0.2"
 raft5-client = { git = "https://github.com/jonathanmeisel/jmeisel_raft5", version = "0.1.0" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
 raft5-server = { git = "https://github.com/jonathanmeisel/jmeisel_raft5", version = "0.1.0" }

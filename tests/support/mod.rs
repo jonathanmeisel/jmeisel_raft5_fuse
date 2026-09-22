@@ -64,7 +64,7 @@ impl TestCluster {
         let id_clone = id.clone();
 
         let task = runtime.spawn(async move {
-            let _ = raft5_server::serve(
+            let result = raft5_server::serve(
                 id_clone,
                 &db_dir_clone,
                 client_addr,
@@ -74,6 +74,15 @@ impl TestCluster {
                 cancel_clone,
             )
             .await;
+            // Swallowing this turns "the port was taken, so nothing ever
+            // listened" into a bare 30 s bootstrap timeout, which says
+            // nothing about why. Reported unconditionally: `serve` cancels
+            // the token itself on its way out (a bind failure on either
+            // port brings the node down), so gating this on the token
+            // would hide precisely the failure worth seeing.
+            if let Err(e) = result {
+                eprintln!("test cluster on {client_addr} never served: {e}");
+            }
         });
 
         let client = runtime.block_on(async {
@@ -202,10 +211,30 @@ impl Harness {
             .value
     }
 
+    /// The sequence number `key`'s current value was written at. Every
+    /// key a transaction writes lands at the same seq, so this is how a
+    /// test can tell which writes shared a commit.
+    pub fn key_version(&self, key: &[u8]) -> u64 {
+        self.runtime
+            .block_on(self.client.get_version(key))
+            .expect("get_version failed")
+    }
+
     pub fn write_key(&self, key: &[u8], value: Option<&[u8]>) {
         self.runtime
             .block_on(self.client.write(key, value))
             .expect("write failed");
+    }
+
+    /// A second filesystem mounted over the same cluster, standing in for
+    /// another host's mount: its own read cache and write buffers, the
+    /// same store underneath.
+    ///
+    /// Bind it to a local declared *after* the `Harness`, so that it is
+    /// dropped -- and unmounted -- before the cluster and runtime it
+    /// talks to go away.
+    pub fn second_mount(&self) -> MountedFs {
+        MountedFs::mount(&self.runtime, self.client.clone(), self.chunk_size)
     }
 
     /// A `Raft5Fs` over the same cluster that is deliberately *not*
@@ -236,9 +265,38 @@ pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
     }
 }
 
+/// An address for a test cluster to listen on, such that no two tests in
+/// this process are ever handed the same one.
+///
+/// Binding `127.0.0.1:0` and reading the port back cannot do this. The
+/// listener is dropped to free the port for the server, and two tests
+/// starting at once are then readily handed the *same* port by the
+/// kernel. The loser's `serve` fails to bind while its client, pointed at
+/// that port, connects to the winner's cluster -- so two tests silently
+/// share one store. That surfaces as a test seeing keys it never wrote,
+/// or as a node that never manages to bootstrap.
+///
+/// So the port comes from a counter instead, which cannot repeat, and is
+/// only probed to confirm nothing outside this process already holds it.
 fn free_local_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr")
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Offset per process as well, so two concurrent `cargo test` runs of
+    // this suite do not line up with each other.
+    let base = u64::from(std::process::id()) * 8;
+    for _ in 0..1_000 {
+        let n = base + NEXT.fetch_add(1, Ordering::Relaxed);
+        // Below `ip_local_port_range` (32768 on Linux by default). Inside
+        // it, a port confirmed free here can be taken by one of the many
+        // outgoing gRPC connections these tests open before the server
+        // gets to bind it -- which shows up only as a node that never
+        // becomes reachable.
+        let port = 10_000 + (n % 22_000);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
+        if TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("no free local port after 1000 tries");
 }
 
 fn temp_dir(label: &str) -> PathBuf {

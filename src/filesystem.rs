@@ -12,8 +12,8 @@ use fuser::{
 use raft5_client::{Client, Error as KvError};
 use tokio::runtime::Handle;
 
-use crate::read_cache::ChunkCache;
-use crate::write_buffer::WriteBuf;
+use crate::read_cache::{ChunkCache, Lookup};
+use crate::write_buffer::{Slot, WriteBuf};
 
 const ROOT_INO: u64 = 1;
 const TTL: Duration = Duration::from_secs(1);
@@ -21,11 +21,14 @@ const TXN_TTL: Duration = Duration::from_secs(10);
 
 /// Default byte budget of the chunk read cache.
 pub const DEFAULT_READ_CACHE_BYTES: usize = 64 << 20;
-/// How long a cached chunk is trusted. Local writes invalidate exactly;
-/// this only bounds staleness from other mounts' writes, and matches the
-/// attribute TTL the kernel already applies.
-const READ_CACHE_TTL: Duration = TTL;
-const COUNTER_KEY: &[u8] = b"\x00next_ino";
+/// How long a cached chunk may go unconfirmed before it is dropped rather
+/// than revalidated. Not a staleness bound: every hit confirms the chunk's
+/// seq against the store first (see `Raft5Fs::chunk`), so what this buys
+/// is only that a chunk nothing has read for this long stops being held
+/// against the cache's byte budget. Generous on purpose -- expiring an
+/// entry costs a full re-fetch, where confirming one costs eight bytes.
+const READ_CACHE_TTL: Duration = Duration::from_secs(60);
+const COUNTER_KEY: &[u8] = b"\x04next_ino";
 
 /// Keys deleted per transaction when tearing down a file's chunks. Each
 /// buffered write is its own round trip, so this bounds how long one
@@ -34,15 +37,15 @@ const DELETE_BATCH: usize = 256;
 
 /// Records the chunk size a filesystem was created with, so later mounts
 /// adopt it rather than reinterpreting every chunk boundary.
-pub const CHUNK_SIZE_KEY: &[u8] = b"\x00chunk_size";
+pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
 pub const MIN_CHUNK_SIZE: u64 = 4096;
-/// The largest chunk we will create. A chunk is written in a transaction
-/// of its own (see `write_range`), so it has to fit in one transaction
-/// along with the attributes, and a read has to fit in one gRPC message.
-/// 8 MiB clears both with room to spare; the largest power of two under
-/// `MAX_TRANSACTION_BYTES`.
+/// The largest chunk we will create. A chunk has to fit in one
+/// transaction along with the attributes even when it is the only one in
+/// its batch (see `chunks_per_batch`), and a read of it has to fit in one
+/// gRPC message. 8 MiB clears both with room to spare; the largest power
+/// of two under `MAX_TRANSACTION_BYTES`.
 pub const MAX_CHUNK_SIZE: u64 = 8 << 20;
 
 /// Mirrors `raft5_shared::MAX_TRANSACTION_BYTES`, the most a transaction
@@ -55,16 +58,72 @@ const SERVER_TXN_LIMIT: u64 = 10 * 1024 * 1024;
 /// and then never read back.
 const CLIENT_READ_LIMIT: u64 = SERVER_TXN_LIMIT + 1024 * 1024;
 
-// Slack for the attributes and framing that share the chunk's transaction.
+// Slack for the attributes and the per-key overhead the server charges
+// (64 bytes a key, so a full batch's worth is a kilobyte) alongside the
+// chunk data in one transaction.
 const TXN_SLACK: u64 = 64 * 1024;
 const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK <= SERVER_TXN_LIMIT);
 const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK < CLIENT_READ_LIMIT);
 
+/// How many bytes of chunk data one transaction may carry. Sized well
+/// under `SERVER_TXN_LIMIT` so that one commit's replicate-and-apply stays
+/// a fraction of `TXN_TTL` even on a slow cluster, and so that an aborted
+/// batch is not too much work to redo.
+const MAX_BATCH_BYTES: u64 = 4 << 20;
+
+/// How many chunk keys one transaction may touch.
+///
+/// The byte budget alone would not bound this: at `MIN_CHUNK_SIZE` a
+/// batch's worth of bytes is a thousand keys. That matters because every
+/// buffered write is its own round trip and every key a transaction takes
+/// stays locked until it commits -- including the attributes, the one key
+/// everything else on the inode contends for. This caps how long a batch
+/// can hold them.
+const MAX_BATCH_CHUNKS: usize = 16;
+
+// A batch is at most `MAX_BATCH_CHUNKS` chunks *or* `MAX_BATCH_BYTES`,
+// whichever binds first -- except that a single chunk always gets a
+// transaction even when it alone is over the budget, which is what the
+// `MAX_CHUNK_SIZE` assert above covers.
+const _: () = assert!(MAX_BATCH_BYTES + TXN_SLACK <= SERVER_TXN_LIMIT);
+
+/// How long buffered bytes may sit unstored when nothing else flushes
+/// them. A writer that stops short of a full batch, and neither closes nor
+/// syncs, would otherwise leave them in memory indefinitely.
+const AUTO_FLUSH_DELAY: Duration = Duration::from_millis(500);
+
+/// How many chunks one transaction covers at this filesystem's chunk size.
+///
+/// At least one: a chunk that alone fills the budget still has to be
+/// stored. At `chunk_size` of `MAX_BATCH_BYTES` or more this is 1 and
+/// batching does nothing, which is the honest outcome -- one chunk already
+/// fills a transaction.
+fn chunks_per_batch(chunk_size: u64) -> usize {
+    ((MAX_BATCH_BYTES / chunk_size) as usize).clamp(1, MAX_BATCH_CHUNKS)
+}
+
+/// How much contiguous data one transaction stores at this chunk size, and
+/// so how much a buffer accumulates before it is handed off. Public for
+/// tests, which need to write exactly a batch to exercise that trigger.
+pub fn batch_bytes(chunk_size: u64) -> u64 {
+    chunks_per_batch(chunk_size) as u64 * chunk_size
+}
+
 // Key layout in the KV store:
-//   0x00 ++ name                        -> filesystem-wide singletons
 //   0x01 ++ ino(BE8)                    -> encoded Entry (attributes + parent)
 //   0x02 ++ ino(BE8) ++ index(BE8)      -> one chunk of a file's data
 //   0x03 ++ parent(BE8) ++ name         -> child ino(BE8), one per directory entry
+//   0x04 ++ name                        -> filesystem-wide singletons
+//
+// The singletons were once `0x00 ++ name`, which the cluster has since
+// reserved for itself (`raft5-server`'s `keyspace`): keys under `\x00`
+// are no longer addressable through the client API at all, so those two
+// rows can be neither read nor migrated from here. A store written before
+// that change therefore has no reachable record of its chunk size or its
+// inode counter. It will mount -- adopting the requested chunk size and
+// restarting the counter -- and reinterpret every chunk boundary while
+// handing out inode numbers that already exist. Such a store must be
+// discarded, not mounted.
 //
 // A file's bytes are split across chunks of `chunk_size` each. A chunk
 // that was never written is simply absent and reads as zeros, so holes
@@ -265,6 +324,226 @@ struct WriteError {
     written: usize,
 }
 
+/// What it takes to store a write: enough of `Raft5Fs` to be cloned into
+/// the background tasks that commit a file's chunks.
+#[derive(Clone)]
+struct Committer {
+    client: Client,
+    chunk_size: u64,
+    chunk_cache: Arc<Mutex<ChunkCache>>,
+}
+
+impl Committer {
+    /// Splices `data` in at `offset` and updates the attributes to match.
+    /// `Ok(None)` means there is no such inode.
+    ///
+    /// The chunks are stored in batches of up to `chunks_per_batch`, each
+    /// batch one transaction, so a write spanning many chunks costs one
+    /// commit per batch rather than one per chunk -- the commit being the
+    /// expensive part, since it is what replicates. The cost is atomicity
+    /// *between* batches: a reader can see the early batches of a write
+    /// without the later ones, and a failure part-way leaves the batches
+    /// already stored in place. Within a batch there is no such seam, as
+    /// a transaction commits whole or not at all.
+    ///
+    /// Every transaction extends the size only to cover what it stored, so
+    /// the size never runs ahead of the data. Reading the attributes
+    /// inside each one takes their lock, so concurrent writers to one file
+    /// still serialize per batch instead of clobbering each other's size.
+    ///
+    /// On failure the error carries how many leading bytes were stored, so
+    /// `write` can report a short write instead of losing track of them.
+    /// That count is per batch: a batch that failed contributes nothing,
+    /// since none of it can be assumed to have landed.
+    async fn write_range(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<FileAttr>, WriteError> {
+        if data.is_empty() {
+            // Still a write as far as mtime is concerned.
+            return self
+                .write_batch(ino, offset, &[], &[])
+                .await
+                .map_err(|_| WriteError { written: 0 });
+        }
+
+        // One span per chunk the range touches, ascending, so grouping
+        // them by count bounds both what a transaction may hold: at most
+        // `per_batch` keys, and at most `per_batch * chunk_size` bytes.
+        let spans: Vec<(u64, usize, usize)> =
+            chunk_spans(self.chunk_size, offset, data.len()).collect();
+        let per_batch = chunks_per_batch(self.chunk_size);
+
+        let mut attr = None;
+        let mut cursor = 0usize;
+        for group in spans.chunks(per_batch) {
+            let bytes: usize = group.iter().map(|&(_, _, n)| n).sum();
+            let end = offset + (cursor + bytes) as u64;
+            let stored = self
+                .write_batch(ino, end, group, &data[cursor..cursor + bytes])
+                .await
+                .map_err(|_| WriteError { written: cursor })?;
+            cursor += bytes;
+            match stored {
+                Some(a) => attr = Some(a),
+                None => return Ok(None),
+            }
+        }
+        Ok(attr)
+    }
+
+    /// One transaction of `write_range`: stores every span in `spans` --
+    /// each a chunk index, the offset within that chunk, and how many
+    /// bytes of `data` belong to it -- and extends the file to at least
+    /// `end`. `data` holds exactly the bytes those spans cover, in order.
+    ///
+    /// An empty `spans` writes no chunk at all, which is how a zero-length
+    /// write still touches mtime.
+    async fn write_batch(
+        &self,
+        ino: u64,
+        end: u64,
+        spans: &[(u64, usize, usize)],
+        data: &[u8],
+    ) -> Result<Option<FileAttr>, KvError> {
+        loop {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            // First, and load-bearing: the attributes are deleted last
+            // when a file goes away, so finding them absent here is what
+            // stops a queued batch from storing chunks nothing could ever
+            // reach again.
+            let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
+                return Ok(None);
+            };
+            let mut entry = decode_entry(ino, &bytes);
+
+            let mut cursor = 0usize;
+            for &(index, within, n) in spans {
+                let slice = &data[cursor..cursor + n];
+                cursor += n;
+                let key = chunk_key(ino, index);
+                // A write covering a whole chunk replaces it outright, so
+                // there is nothing to preserve and nothing to read first.
+                // Batches are aligned to the chunk grid, so this is the
+                // path every chunk of an aligned sequential write takes --
+                // such a batch reads no chunks at all.
+                if within == 0 && n as u64 == self.chunk_size {
+                    txn.write(&key, Some(slice)).await?;
+                } else {
+                    let mut buf = txn.read(&key).await?.value.unwrap_or_default();
+                    // Covers both a hole ahead of `within` and extending
+                    // the chunk to hold the new bytes.
+                    if buf.len() < within + n {
+                        buf.resize(within + n, 0);
+                    }
+                    buf[within..within + n].copy_from_slice(slice);
+                    txn.write(&key, Some(&buf)).await?;
+                }
+            }
+
+            if end > entry.attr.size {
+                entry.attr.size = end;
+                entry.attr.blocks = end.div_ceil(512);
+            }
+            let now = SystemTime::now();
+            entry.attr.mtime = now;
+            entry.attr.ctime = now;
+            txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
+                .await?;
+
+            match txn.commit().await {
+                Ok(_) => {
+                    // One call for the whole batch: `invalidate` bumps the
+                    // cache's generation each time, and a single bump
+                    // costs concurrent readers fewer failed confirmations
+                    // than one per chunk would.
+                    if let (Some(&(first, ..)), Some(&(last, ..))) = (spans.first(), spans.last()) {
+                        self.chunk_cache
+                            .lock()
+                            .unwrap()
+                            .invalidate(ino, first..=last);
+                    }
+                    return Ok(Some(entry.attr));
+                }
+                Err(KvError::Aborted { .. }) => continue,
+                // The outcome is unknown, so the cache can't be trusted
+                // for these chunks either.
+                Err(e) => {
+                    self.chunk_cache.lock().unwrap().invalidate_ino(ino);
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Queues whatever `buf` holds to be stored, and returns without waiting
+/// for it. Waits only for room: at most `MAX_IN_FLIGHT` batches per file
+/// are outstanding, so a writer that outruns the store slows down instead
+/// of piling up data.
+///
+/// Batches commit one at a time, in the order they were queued -- each
+/// task waits on the one before it. That keeps every transaction whole
+/// (attribute read, chunks, size, all together), so the size never covers
+/// data that isn't stored and a file deleted mid-flight makes the
+/// remaining transactions find no inode rather than leak chunks. A failure
+/// is kept in the pipeline for the next `flush`/`fsync`/`write` to report,
+/// and batches queued behind it are dropped.
+///
+/// A free function rather than a method: the auto-flush timer has to do
+/// this from a task that holds no `Raft5Fs`, only the cheap clones below.
+fn enqueue_flush(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) {
+    if buf.is_empty() {
+        return;
+    }
+    buf.pipe.reserve();
+    spawn_queued(rt, committer, ino, buf);
+}
+
+/// `enqueue_flush` for a caller that must not block, and so may find the
+/// pipeline full. Returns whether bytes are still waiting to be stored --
+/// that is, whether it is worth trying again.
+fn try_enqueue_flush(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    if !buf.pipe.try_reserve() {
+        return true;
+    }
+    spawn_queued(rt, committer, ino, buf);
+    false
+}
+
+/// Takes `buf`'s run and spawns the task that commits it, chained behind
+/// whatever was queued before it. The caller has already reserved the
+/// pipeline slot this consumes.
+fn spawn_queued(rt: &Handle, committer: &Committer, ino: u64, buf: &mut WriteBuf) {
+    let Some((start, data)) = buf.take() else {
+        // Nothing to store, so give the reserved slot straight back.
+        buf.pipe.complete(None);
+        return;
+    };
+    let slot = Slot::new(Arc::clone(&buf.pipe));
+    let pipe = Arc::clone(&buf.pipe);
+    let prev = buf.tail.take();
+    let committer = committer.clone();
+    buf.tail = Some(rt.spawn(async move {
+        if let Some(prev) = prev {
+            let _ = prev.await;
+        }
+        if pipe.should_skip() {
+            return slot.finish(None);
+        }
+        slot.finish(match committer.write_range(ino, start, &data).await {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(Errno::ENOENT),
+            Err(_) => Some(Errno::EIO),
+        });
+    }));
+}
+
 pub struct Raft5Fs {
     client: Client,
     rt: Handle,
@@ -272,7 +551,7 @@ pub struct Raft5Fs {
     /// whatever the store already records, and the size actually in force
     /// after that.
     chunk_size: u64,
-    chunk_cache: Mutex<ChunkCache>,
+    chunk_cache: Arc<Mutex<ChunkCache>>,
     /// Per-inode buffers of accepted-but-unstored writes. The map lock is
     /// only held to find or insert a slot, never across a network call;
     /// the slot's own lock is what serializes a file's writes and flushes.
@@ -286,7 +565,10 @@ impl Raft5Fs {
             client,
             rt,
             chunk_size,
-            chunk_cache: Mutex::new(ChunkCache::new(DEFAULT_READ_CACHE_BYTES, READ_CACHE_TTL)),
+            chunk_cache: Arc::new(Mutex::new(ChunkCache::new(
+                DEFAULT_READ_CACHE_BYTES,
+                READ_CACHE_TTL,
+            ))),
             write_bufs: Mutex::new(HashMap::new()),
             write_buffering: true,
         }
@@ -294,7 +576,7 @@ impl Raft5Fs {
 
     /// Sets the read cache's byte budget; 0 disables it.
     pub fn with_read_cache_bytes(mut self, bytes: usize) -> Self {
-        self.chunk_cache = Mutex::new(ChunkCache::new(bytes, READ_CACHE_TTL));
+        self.chunk_cache = Arc::new(Mutex::new(ChunkCache::new(bytes, READ_CACHE_TTL)));
         self
     }
 
@@ -306,6 +588,14 @@ impl Raft5Fs {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    fn committer(&self) -> Committer {
+        Committer {
+            client: self.client.clone(),
+            chunk_size: self.chunk_size,
+            chunk_cache: Arc::clone(&self.chunk_cache),
+        }
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -454,137 +744,51 @@ impl Raft5Fs {
     }
 
     /// The stored bytes of one chunk (empty if absent), through the read
-    /// cache. The cache lock is released while the chunk is fetched.
+    /// cache. The cache lock is released while the store is consulted.
+    ///
+    /// A cached chunk is never served on trust, because another mount's
+    /// writes are invisible here: `get_version` says what seq the chunk
+    /// currently holds, and only bytes read at that same seq are handed
+    /// back. That call is answered on exactly the terms `read` is -- the
+    /// stale, local-read terms -- so a confirmed hit is no less fresh than
+    /// re-reading the chunk, and costs eight bytes on the wire instead of
+    /// up to `MAX_CHUNK_SIZE`.
     async fn chunk(&self, ino: u64, index: u64) -> Result<Arc<[u8]>, KvError> {
-        let generation = match self.chunk_cache.lock().unwrap().get(ino, index) {
-            Ok(hit) => return Ok(hit),
-            Err(generation) => generation,
+        let key = chunk_key(ino, index);
+        // Bound to a name so the cache lock is released here: the arms
+        // below both await, and one of them locks the cache again.
+        let lookup = self.chunk_cache.lock().unwrap().get(ino, index);
+        let generation = match lookup {
+            Lookup::Unconfirmed {
+                data,
+                version,
+                generation,
+            } => {
+                // Both the seq check and the generation check have to pass:
+                // the first rules out another mount's write, the second a
+                // local one that landed while this was asking.
+                if self.client.get_version(&key).await? == version
+                    && self
+                        .chunk_cache
+                        .lock()
+                        .unwrap()
+                        .confirm(ino, index, generation)
+                {
+                    return Ok(data);
+                }
+                generation
+            }
+            Lookup::Miss { generation } => generation,
         };
-        let data: Arc<[u8]> = self
-            .client
-            .read(&chunk_key(ino, index))
-            .await?
-            .value
-            .unwrap_or_default()
-            .into();
+        // `seq` is the version these very bytes were read at, so caching
+        // the two together costs no extra round trip.
+        let fetched = self.client.read(&key).await?;
+        let data: Arc<[u8]> = fetched.value.unwrap_or_default().into();
         self.chunk_cache
             .lock()
             .unwrap()
-            .insert(ino, index, data.clone(), generation);
+            .insert(ino, index, data.clone(), fetched.seq, generation);
         Ok(data)
-    }
-
-    /// Splices `data` in at `offset` and updates the attributes to match.
-    /// `Ok(None)` means there is no such inode.
-    ///
-    /// Each chunk is stored in its own transaction, so no transaction
-    /// buffers more than one chunk plus the attributes, however large the
-    /// write. The cost is atomicity: a reader can see the early chunks of
-    /// a write without the later ones, and a failure part-way leaves the
-    /// chunks already stored in place. Every transaction extends the size
-    /// to cover what it stored, so the size never runs ahead of the data.
-    /// Reading the attributes inside each one takes their lock, so
-    /// concurrent writers to one file still serialize per chunk instead of
-    /// clobbering each other's size.
-    ///
-    /// On failure the error carries how many leading bytes were stored, so
-    /// `write` can report a short write instead of losing track of them.
-    async fn write_range(
-        &self,
-        ino: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<Option<FileAttr>, WriteError> {
-        if data.is_empty() {
-            // Still a write as far as mtime is concerned.
-            return self
-                .write_chunk(ino, offset, None)
-                .await
-                .map_err(|_| WriteError { written: 0 });
-        }
-
-        let mut attr = None;
-        let mut cursor = 0usize;
-        for (index, within, n) in chunk_spans(self.chunk_size, offset, data.len()) {
-            let slice = &data[cursor..cursor + n];
-            let end = offset + (cursor + n) as u64;
-            let stored = self
-                .write_chunk(ino, end, Some((index, within, slice)))
-                .await
-                .map_err(|_| WriteError { written: cursor })?;
-            cursor += n;
-            match stored {
-                Some(a) => attr = Some(a),
-                None => return Ok(None),
-            }
-        }
-        Ok(attr)
-    }
-
-    /// One transaction of `write_range`: stores `piece` (a chunk index,
-    /// the offset within it, and the bytes) and extends the file to at
-    /// least `end`.
-    async fn write_chunk(
-        &self,
-        ino: u64,
-        end: u64,
-        piece: Option<(u64, usize, &[u8])>,
-    ) -> Result<Option<FileAttr>, KvError> {
-        loop {
-            let txn = self.client.transaction(TXN_TTL).await?;
-            let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
-                return Ok(None);
-            };
-            let mut entry = decode_entry(ino, &bytes);
-
-            if let Some((index, within, slice)) = piece {
-                let key = chunk_key(ino, index);
-                // A write covering a whole chunk replaces it outright, so
-                // there is nothing to preserve and nothing to read first.
-                // This is the path aligned sequential writes take.
-                if within == 0 && slice.len() as u64 == self.chunk_size {
-                    txn.write(&key, Some(slice)).await?;
-                } else {
-                    let mut buf = txn.read(&key).await?.value.unwrap_or_default();
-                    // Covers both a hole ahead of `within` and extending
-                    // the chunk to hold the new bytes.
-                    if buf.len() < within + slice.len() {
-                        buf.resize(within + slice.len(), 0);
-                    }
-                    buf[within..within + slice.len()].copy_from_slice(slice);
-                    txn.write(&key, Some(&buf)).await?;
-                }
-            }
-
-            if end > entry.attr.size {
-                entry.attr.size = end;
-                entry.attr.blocks = end.div_ceil(512);
-            }
-            let now = SystemTime::now();
-            entry.attr.mtime = now;
-            entry.attr.ctime = now;
-            txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
-                .await?;
-
-            match txn.commit().await {
-                Ok(_) => {
-                    if let Some((index, ..)) = piece {
-                        self.chunk_cache
-                            .lock()
-                            .unwrap()
-                            .invalidate(ino, index..=index);
-                    }
-                    return Ok(Some(entry.attr));
-                }
-                Err(KvError::Aborted { .. }) => continue,
-                // The outcome is unknown, so the cache can't be trusted
-                // for this chunk either.
-                Err(e) => {
-                    self.chunk_cache.lock().unwrap().invalidate_ino(ino);
-                    return Err(e);
-                }
-            }
-        }
     }
 
     fn write_slot(&self, ino: u64) -> Arc<Mutex<WriteBuf>> {
@@ -600,45 +804,92 @@ impl Raft5Fs {
         self.write_bufs.lock().unwrap().get(&ino).cloned()
     }
 
-    /// Stores whatever `buf` holds. On failure the bytes are gone, so the
-    /// errno is also kept in `buf.err` for the next `flush`/`fsync`/`write`
-    /// to report.
-    fn flush_buf(&self, ino: u64, buf: &mut WriteBuf) -> Result<(), Errno> {
-        let Some((start, data)) = buf.take() else {
-            return Ok(());
-        };
-        let err = match self.block(self.write_range(ino, start, &data)) {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => Errno::ENOENT,
-            Err(_) => Errno::EIO,
-        };
-        buf.err = Some(err);
-        Err(err)
+    /// Queues whatever `buf` holds to be stored; see `enqueue_flush`.
+    fn flush_buf(&self, ino: u64, buf: &mut WriteBuf) {
+        enqueue_flush(&self.rt, &self.committer(), ino, buf);
+    }
+
+    /// Arranges for `ino`'s buffer to be stored within `AUTO_FLUSH_DELAY`
+    /// even if nothing else asks for it, so a writer that stops short of a
+    /// full batch and neither closes nor syncs does not leave its bytes in
+    /// memory indefinitely. Called when a buffer goes from empty to
+    /// holding something.
+    ///
+    /// Nothing cancels this, and nothing needs to. If the buffer is
+    /// flushed by any other route first, the timer finds it empty and does
+    /// nothing. If a later run has started by then, flushing that one
+    /// early is harmless -- sooner is always safe -- and the timer it
+    /// scheduled for itself then finds nothing to do. `destroy` drains
+    /// every buffer before an unmount completes, so correctness never
+    /// rests on this firing; and a task parked in `sleep` is at an await
+    /// point, so dropping the runtime cancels it rather than waiting.
+    fn schedule_auto_flush(&self, ino: u64, slot: Arc<Mutex<WriteBuf>>) {
+        let committer = self.committer();
+        let rt = self.rt.clone();
+        self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(AUTO_FLUSH_DELAY).await;
+                // Nothing in here may block, because this runs on an
+                // async worker and the tasks that commit batches need
+                // those workers to make progress. Blocking one while a
+                // fuse thread holds this buffer and waits for a commit
+                // would deadlock the pair. So: `try_lock` rather than
+                // `lock`, and `try_enqueue_flush`, which gives up instead
+                // of waiting for a pipeline slot. Either way another
+                // interval costs nothing -- whoever holds the lock or
+                // filled the pipeline is already storing this file.
+                let waiting = match slot.try_lock() {
+                    Ok(mut buf) => try_enqueue_flush(&rt, &committer, ino, &mut buf),
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    // Some other thread panicked holding this buffer;
+                    // its bytes are not ours to recover.
+                    Err(std::sync::TryLockError::Poisoned(_)) => return,
+                };
+                if !waiting {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Queues `buf`'s run, then waits until everything queued for the file
+    /// has been stored.
+    fn drain_buf(&self, ino: u64, buf: &mut WriteBuf) {
+        self.flush_buf(ino, buf);
+        buf.pipe.wait_drained();
     }
 
     /// Stores `ino`'s buffered writes, if any. Called before anything that
-    /// must observe them: reads, attribute queries, truncation.
+    /// must observe them: reads, attribute queries, truncation. An error
+    /// from any of them is reported but left for `flush`/`fsync`/`write`
+    /// to take.
     fn flush_ino(&self, ino: u64) -> Result<(), Errno> {
         if let Some(slot) = self.existing_write_slot(ino) {
-            self.flush_buf(ino, &mut slot.lock().unwrap())?;
+            let mut buf = slot.lock().unwrap();
+            self.drain_buf(ino, &mut buf);
+            if let Some(e) = buf.pipe.peek_err() {
+                return Err(e);
+            }
         }
         Ok(())
     }
 
-    /// `flush_ino`, then reports any error an earlier flush left behind.
+    /// `flush_ino`, but takes the error it reports.
     fn sync_ino(&self, ino: u64) -> Result<(), Errno> {
         let Some(slot) = self.existing_write_slot(ino) else {
             return Ok(());
         };
         let mut buf = slot.lock().unwrap();
-        let flushed = self.flush_buf(ino, &mut buf);
-        match buf.err.take() {
+        self.drain_buf(ino, &mut buf);
+        match buf.pipe.take_err() {
             Some(e) => Err(e),
-            None => flushed,
+            None => Ok(()),
         }
     }
 
-    /// Drops `ino`'s buffered writes because the file is being deleted.
+    /// Drops `ino`'s buffered and queued writes because the file is being
+    /// deleted. Returns once none is still running, so nothing can store
+    /// a chunk after the caller starts deleting them.
     fn discard_ino(&self, ino: u64) {
         if let Some(slot) = self.existing_write_slot(ino) {
             slot.lock().unwrap().discard();
@@ -653,46 +904,64 @@ impl Raft5Fs {
             && Arc::strong_count(slot) == 1
             && slot
                 .try_lock()
-                .is_ok_and(|b| b.is_empty() && b.err.is_none())
+                .is_ok_and(|b| b.is_empty() && b.pipe.is_idle())
         {
             bufs.remove(&ino);
         }
     }
 
-    /// Accepts `data` at `offset` into `ino`'s buffer, storing it when the
-    /// buffered run reaches the end of a chunk, stops being contiguous, or
-    /// is too big to be worth buffering. Returns how many bytes were
-    /// accepted: all of them, or on a failed oversized write just the
-    /// chunks that got stored before it.
+    /// Accepts `data` at `offset` into `ino`'s buffer, queueing the run to
+    /// be stored when it fills a batch or stops being contiguous -- or,
+    /// failing both, when `AUTO_FLUSH_DELAY` has passed. A write already
+    /// big enough to fill a batch is stored before this returns, since
+    /// there is nothing left to coalesce it with.
+    ///
+    /// Returns how many bytes were accepted: all of them, or on a failed
+    /// oversized write just the batches that got stored before it. Errors
+    /// from earlier queued batches are reported here too.
     fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<usize, Errno> {
         let total = data.len();
+        let batch_bytes = batch_bytes(self.chunk_size);
         let slot = self.write_slot(ino);
         let mut buf = slot.lock().unwrap();
-        if let Some(e) = buf.err.take() {
+        if let Some(e) = buf.pipe.take_err() {
             return Err(e);
         }
 
-        if data.len() as u64 >= self.chunk_size {
-            self.flush_buf(ino, &mut buf)?;
-            return match self.block(self.write_range(ino, offset, data)) {
+        if data.len() as u64 >= batch_bytes {
+            // Stored directly, so everything queued ahead of it has to be
+            // stored first.
+            self.drain_buf(ino, &mut buf);
+            if let Some(e) = buf.pipe.take_err() {
+                return Err(e);
+            }
+            return match self.block(self.committer().write_range(ino, offset, data)) {
                 Ok(Some(_)) => Ok(total),
                 Ok(None) => Err(Errno::ENOENT),
-                Err(WriteError { written: 0, .. }) => Err(Errno::EIO),
-                Err(WriteError { written, .. }) => Ok(written),
+                Err(WriteError { written: 0 }) => Err(Errno::EIO),
+                Err(WriteError { written }) => Ok(written),
             };
         }
 
         while !data.is_empty() {
             if !buf.accepts(offset) {
-                self.flush_buf(ino, &mut buf)?;
+                self.flush_buf(ino, &mut buf);
             }
-            let room = (self.chunk_size - offset % self.chunk_size) as usize;
+            // Stepping to the batch grid rather than the chunk grid is
+            // what lets a run span chunks, and keeps the batch it becomes
+            // aligned: a sequential writer then fills every chunk of its
+            // batch completely, so storing it reads nothing back.
+            let room = (batch_bytes - offset % batch_bytes) as usize;
             let n = room.min(data.len());
+            let idle = buf.is_empty();
             buf.append(offset, &data[..n]);
+            if idle {
+                self.schedule_auto_flush(ino, Arc::clone(&slot));
+            }
             offset += n as u64;
             data = &data[n..];
-            if offset.is_multiple_of(self.chunk_size) {
-                self.flush_buf(ino, &mut buf)?;
+            if offset.is_multiple_of(batch_bytes) {
+                self.flush_buf(ino, &mut buf);
             }
         }
         Ok(total)
@@ -1154,7 +1423,7 @@ impl Filesystem for Raft5Fs {
                 Err(e) => reply.error(e),
             };
         }
-        match self.block(self.write_range(ino.0, offset, data)) {
+        match self.block(self.committer().write_range(ino.0, offset, data)) {
             Ok(Some(_)) => reply.written(data.len() as u32),
             Ok(None) => reply.error(Errno::ENOENT),
             Err(WriteError { written: 0 }) => reply.error(Errno::EIO),
@@ -1350,6 +1619,45 @@ mod tests {
         assert!(!is_chunk_key(&chunk_key(10, 0), &prefix));
         // The pre-chunking layout kept a whole file under this key.
         assert!(!is_chunk_key(&chunk_prefix(9), &prefix));
+    }
+
+    #[test]
+    fn batches_respect_both_the_byte_and_the_chunk_cap() {
+        // Small chunks: the count cap binds, which is the point of having
+        // it -- the byte budget alone would allow a thousand keys here.
+        assert_eq!(chunks_per_batch(MIN_CHUNK_SIZE), MAX_BATCH_CHUNKS);
+        assert_eq!(chunks_per_batch(64 * 1024), MAX_BATCH_CHUNKS);
+
+        // Where the two caps meet.
+        assert_eq!(
+            chunks_per_batch(MAX_BATCH_BYTES / MAX_BATCH_CHUNKS as u64),
+            16
+        );
+
+        // Large chunks: the byte budget binds.
+        assert_eq!(chunks_per_batch(DEFAULT_CHUNK_SIZE), 4);
+        assert_eq!(chunks_per_batch(MAX_BATCH_BYTES), 1);
+
+        // A chunk bigger than the whole budget still gets a transaction,
+        // rather than rounding down to none.
+        assert_eq!(chunks_per_batch(MAX_CHUNK_SIZE), 1);
+
+        for size in [
+            MIN_CHUNK_SIZE,
+            64 * 1024,
+            DEFAULT_CHUNK_SIZE,
+            MAX_CHUNK_SIZE,
+        ] {
+            let bytes = batch_bytes(size);
+            assert!(chunks_per_batch(size) <= MAX_BATCH_CHUNKS, "size {size}");
+            // The one permitted overshoot is a lone chunk, which the
+            // `MAX_CHUNK_SIZE` assert covers instead.
+            assert!(
+                bytes <= MAX_BATCH_BYTES || chunks_per_batch(size) == 1,
+                "size {size} batches {bytes} bytes"
+            );
+            assert!(bytes + TXN_SLACK <= SERVER_TXN_LIMIT, "size {size}");
+        }
     }
 
     #[test]

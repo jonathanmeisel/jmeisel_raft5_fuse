@@ -10,7 +10,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use jmeisel_raft5_fuse::filesystem::{
-    CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_prefix,
+    CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, batch_bytes, chunk_prefix,
 };
 
 /// Position-dependent bytes, so a chunk landing at the wrong offset (or
@@ -502,8 +502,12 @@ fn buffered_writes_reach_the_store_on_fsync_and_close() {
     let path = h.path().join("buffered.bin");
 
     let mut f = fs::File::create(&path).unwrap();
-    f.write_all(&pattern(4096)).unwrap();
+    // Before the write, not after: `ino_from_readdir` costs a round trip
+    // per entry, and "still buffered" only holds for `AUTO_FLUSH_DELAY`.
+    // Learning the inode first leaves one fast key scan between the write
+    // and the assertion instead of a whole readdir.
     let ino = ino_from_readdir(h.path(), "buffered.bin");
+    f.write_all(&pattern(4096)).unwrap();
     assert!(
         h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
         "a small write should still be buffered"
@@ -520,19 +524,153 @@ fn buffered_writes_reach_the_store_on_fsync_and_close() {
     assert_same_bytes(&fs::read(&path).unwrap(), &want);
 }
 
+/// Waits for `ino` to have at least `want` chunk keys stored, giving up
+/// after `within`. A deadline rather than a sleep because storing happens
+/// in the background, and a short one is how a test distinguishes the
+/// size trigger from the 500 ms timer.
+fn await_chunk_keys(
+    h: &support::Harness,
+    ino: u64,
+    want: usize,
+    within: std::time::Duration,
+    why: &str,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let have = h.keys_with_prefix(&chunk_prefix(ino)).len();
+        if have >= want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{why}: {have} of {want} chunks stored after {within:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A run that fills a batch is handed off as soon as the `write` that
+/// completed it returns -- not left for the timer.
+///
+/// Run at the smallest chunk size so a batch is only 64 KiB: the deadline
+/// has to stay comfortably under `AUTO_FLUSH_DELAY` for this to be
+/// testing the size trigger at all, and a small batch commits well inside
+/// it. Written in chunk-sized pieces so no single `write` is big enough to
+/// take the bypass.
 #[test]
-fn a_filled_chunk_is_stored_without_waiting_for_close() {
-    let h = support::setup();
-    let c = h.chunk_size as usize;
+fn a_full_batch_is_stored_without_waiting_for_close() {
+    let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
+    let batch = batch_bytes(MIN_CHUNK_SIZE) as usize;
+    let chunks = batch / MIN_CHUNK_SIZE as usize;
     let path = h.path().join("filling.bin");
 
     let mut f = fs::File::create(&path).unwrap();
-    for piece in pattern(c).chunks(4096) {
+    for piece in pattern(batch).chunks(MIN_CHUNK_SIZE as usize) {
         f.write_all(piece).unwrap();
     }
     let ino = ino_from_readdir(h.path(), "filling.bin");
-    assert_eq!(h.keys_with_prefix(&chunk_prefix(ino)).len(), 1);
+
+    await_chunk_keys(
+        &h,
+        ino,
+        chunks,
+        std::time::Duration::from_millis(400),
+        "a filled batch should be stored without the timer",
+    );
     drop(f);
+}
+
+/// A run too short to fill a batch, which the application never closes,
+/// syncs or reads, still reaches the store on its own. Without the
+/// auto-flush timer it would sit in memory until one of those happened.
+///
+/// Run on its own this isolates the timer, and fails without it. Run
+/// alongside other tests it does not, and the reason is worth recording:
+/// the kernel sends a FUSE flush on *every* `close` of a descriptor,
+/// including the copies a child process inherits. `fuser` fork+execs
+/// `fusermount3` to mount and unmount, so any other test starting or
+/// ending makes the child's close-on-exec generate a flush against every
+/// open file in every mount this process holds -- which stores this
+/// buffer early, by a route that has nothing to do with the timer. So
+/// what this asserts under concurrency is the weaker, still useful claim
+/// in the first paragraph.
+#[test]
+fn an_idle_partial_batch_reaches_the_store_on_its_own() {
+    let h = support::setup();
+    let path = h.path().join("idle.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    let ino = ino_from_readdir(h.path(), "idle.bin");
+    f.write_all(&pattern(4096)).unwrap();
+    assert!(
+        h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "a write this small should not be stored before the timer fires"
+    );
+
+    await_chunk_keys(
+        &h,
+        ino,
+        1,
+        std::time::Duration::from_secs(10),
+        "the timer should have stored an idle buffer",
+    );
+    drop(f);
+}
+
+/// Far more chunks than may be in flight at once, so `write` has to wait
+/// for room and the chunks have to land in order for the bytes to match.
+#[test]
+fn many_pipelined_chunks_round_trip_in_order() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("pipelined.bin");
+
+    let data = pattern(c * 24 + 123);
+    let mut f = fs::File::create(&path).unwrap();
+    for piece in data.chunks(c / 4) {
+        f.write_all(piece).unwrap();
+    }
+    drop(f);
+
+    assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
+    assert_same_bytes(&fs::read(&path).unwrap(), &data);
+}
+
+/// A read must see chunks that are still queued.
+#[test]
+fn reads_wait_for_queued_chunks() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let path = h.path().join("read-while-queued.bin");
+
+    let data = pattern(c * 6);
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(&data).unwrap();
+    // Still open, nothing closed or synced.
+    assert_same_bytes(&fs::read(&path).unwrap(), &data);
+    drop(f);
+}
+
+/// Deleting a file while its chunks are queued must not leave any behind:
+/// a chunk stored after the delete's scan would have nothing to find it.
+#[test]
+fn unlinking_a_file_with_queued_chunks_leaves_nothing() {
+    let h = support::setup();
+    let path = h.path().join("doomed.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    // Several batches' worth, so this really does race queued transactions
+    // rather than only discarding a buffer that never left.
+    f.write_all(&pattern(batch_bytes(h.chunk_size) as usize * 3))
+        .unwrap();
+    let ino = ino_from_readdir(h.path(), "doomed.bin");
+    fs::remove_file(&path).unwrap();
+    drop(f);
+
+    assert!(
+        h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "chunks survived the unlink"
+    );
 }
 
 #[test]
@@ -678,5 +816,190 @@ fn buffered_data_survives_a_remount() {
     assert_same_bytes(
         &fs::read(h.path().join("durable.bin")).unwrap(),
         &pattern(3000),
+    );
+}
+
+// ------------------------------------------------------- multiple mounts
+
+/// A read cache only one mount can see must not outlive the bytes it
+/// holds: another mount's write is invisible here, so a hit has to be
+/// confirmed against the store's seq before it is served.
+#[test]
+fn another_mount_sees_an_overwrite_after_caching_the_old_bytes() {
+    let h = support::setup();
+    let other = h.second_mount();
+    let c = h.chunk_size as usize;
+
+    let mine = h.path().join("shared.bin");
+    let theirs = other.path.join("shared.bin");
+
+    let first = pattern(c * 2);
+    fs::write(&mine, &first).unwrap();
+
+    // The other mount reads the whole file, which caches every chunk.
+    assert_same_bytes(&fs::read(&theirs).unwrap(), &first);
+
+    // Same length, so nothing about the *size* it cached changes -- only
+    // the bytes, which is the part a stale cache would get wrong.
+    let second: Vec<u8> = first.iter().map(|b| !b).collect();
+    fs::write(&mine, &second).unwrap();
+
+    assert_same_bytes(&fs::read(&theirs).unwrap(), &second);
+}
+
+/// The same, for a chunk cached as a hole. Seq 0 is the store's
+/// "never written" sentinel, so this is the one version a cached chunk
+/// can hold that was never assigned to anything.
+#[test]
+fn another_mount_sees_a_write_into_a_chunk_it_cached_as_a_hole() {
+    let h = support::setup();
+    let other = h.second_mount();
+    let c = h.chunk_size;
+
+    let mine = h.path().join("sparse.bin");
+    let theirs = other.path.join("sparse.bin");
+
+    // Three chunks of size, none of them stored.
+    fs::File::create(&mine).unwrap().set_len(c * 3).unwrap();
+    assert_same_bytes(&fs::read(&theirs).unwrap(), &vec![0u8; c as usize * 3]);
+
+    // Filled in from the other side, inside the existing size.
+    let patch = pattern(c as usize);
+    let mut f = fs::OpenOptions::new().write(true).open(&mine).unwrap();
+    f.seek(SeekFrom::Start(c * 2)).unwrap();
+    f.write_all(&patch).unwrap();
+    drop(f);
+
+    let mut want = vec![0u8; c as usize * 3];
+    want[c as usize * 2..].copy_from_slice(&patch);
+    assert_same_bytes(&fs::read(&theirs).unwrap(), &want);
+}
+
+// ------------------------------------------------------- batched commits
+
+/// A single write covering more than one batch is split across
+/// transactions; the seams between them must not lose or duplicate bytes.
+#[test]
+fn a_write_spanning_more_than_one_batch_round_trips() {
+    let h = support::setup();
+    let batch = batch_bytes(h.chunk_size) as usize;
+    let path = h.path().join("multibatch.bin");
+
+    let data = pattern(batch * 2 + batch / 3);
+    fs::write(&path, &data).unwrap();
+
+    assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
+    assert_same_bytes(&fs::read(&path).unwrap(), &data);
+}
+
+/// The same, misaligned at both ends, so the first and last chunk of each
+/// batch take the read-modify-write path inside the transaction rather
+/// than the whole-chunk blind write.
+#[test]
+fn an_unaligned_write_spanning_batches_round_trips() {
+    let h = support::setup();
+    let c = h.chunk_size as usize;
+    let batch = batch_bytes(h.chunk_size) as usize;
+    let path = h.path().join("unaligned.bin");
+
+    let mut expected = pattern(batch * 3);
+    fs::write(&path, &expected).unwrap();
+
+    let at = (c + c / 2) as u64;
+    let patch: Vec<u8> = pattern(batch + c / 3).iter().map(|b| !b).collect();
+    let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start(at)).unwrap();
+    f.write_all(&patch).unwrap();
+    drop(f);
+
+    expected[at as usize..at as usize + patch.len()].copy_from_slice(&patch);
+    assert_same_bytes(&fs::read(&path).unwrap(), &expected);
+}
+
+/// At the smallest chunk size the chunk-count cap is what keeps a batch
+/// inside the server's transaction budget -- the byte budget alone would
+/// admit a thousand keys. A transaction over the limit is refused
+/// outright, so writing several batches' worth at all is the assertion.
+#[test]
+fn a_batch_never_exceeds_the_transaction_budget() {
+    let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
+    let path = h.path().join("tiny-chunks.bin");
+
+    let data = pattern(batch_bytes(MIN_CHUNK_SIZE) as usize * 6);
+    fs::write(&path, &data).expect("no batch should be refused for size");
+
+    assert_same_bytes(&fs::read(&path).unwrap(), &data);
+}
+
+/// Unmounting inside `AUTO_FLUSH_DELAY` must not lose buffered bytes: the
+/// timer has not fired yet, so `destroy` draining every buffer is the only
+/// thing that stores them. The file is deliberately left open, since
+/// closing it would flush by itself and prove nothing.
+#[test]
+fn unmounting_before_the_timer_fires_loses_nothing() {
+    let mut h = support::setup();
+    let path = h.path().join("racing-unmount.bin");
+
+    let mut f = fs::File::create(&path).unwrap();
+    // Everything slow happens before the write, so that what follows it
+    // stays well inside `AUTO_FLUSH_DELAY` -- otherwise the timer could
+    // store the bytes and this would pass without `destroy` doing a thing.
+    let ino = ino_from_readdir(h.path(), "racing-unmount.bin");
+    f.write_all(&pattern(4096)).unwrap();
+    assert!(
+        h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "the timer should not have run yet"
+    );
+
+    // Drops the old session, which unmounts and so runs `destroy`.
+    h.remount(h.chunk_size);
+
+    // Read from the store rather than through a mount: what is being
+    // tested is that the bytes were stored, not that anyone can see them.
+    assert!(
+        !h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "unmounting lost a buffered write the timer had not reached yet"
+    );
+    drop(f);
+}
+
+/// The whole point of batching: every chunk of one batch is written by one
+/// transaction, so they all land at the same sequence number, and the next
+/// batch lands at a different one.
+///
+/// This is the assertion that would catch a regression to a transaction
+/// per chunk -- which would still round-trip the bytes correctly, and so
+/// slip past every other test here.
+#[test]
+fn the_chunks_of_one_batch_share_a_commit() {
+    let h = support::setup();
+    let batch = batch_bytes(h.chunk_size) as usize;
+    let per_batch = batch / h.chunk_size as usize;
+    assert!(
+        per_batch > 1,
+        "this test is meaningless unless a batch spans several chunks"
+    );
+
+    let path = h.path().join("batched.bin");
+    fs::write(&path, pattern(batch * 2)).unwrap();
+    let ino = ino_from_readdir(h.path(), "batched.bin");
+
+    let seq_of = |index: u64| {
+        let mut key = chunk_prefix(ino);
+        key.extend_from_slice(&index.to_be_bytes());
+        h.key_version(&key)
+    };
+
+    let first = seq_of(0);
+    assert_ne!(first, 0, "chunk 0 should have been written");
+    assert_eq!(
+        seq_of(per_batch as u64 - 1),
+        first,
+        "the last chunk of a batch shares its commit with the first"
+    );
+    assert_ne!(
+        seq_of(per_batch as u64),
+        first,
+        "the next batch is a separate commit"
     );
 }
