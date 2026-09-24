@@ -368,7 +368,7 @@ impl Committer {
             return self
                 .write_batch(ino, offset, &[], &[])
                 .await
-                .map_err(|_| WriteError { written: 0 });
+                .map_err(|e| self.log_write_error(ino, offset, e, 0));
         }
 
         // One span per chunk the range touches, ascending, so grouping
@@ -386,7 +386,7 @@ impl Committer {
             let stored = self
                 .write_batch(ino, end, group, &data[cursor..cursor + bytes])
                 .await
-                .map_err(|_| WriteError { written: cursor })?;
+                .map_err(|e| self.log_write_error(ino, offset, e, cursor))?;
             cursor += bytes;
             match stored {
                 Some(a) => attr = Some(a),
@@ -394,6 +394,18 @@ impl Committer {
             }
         }
         Ok(attr)
+    }
+
+    /// Logs the real cause of a failed batch -- `write_batch` only ever
+    /// returns `KvError` on a genuine failure (a retried `Aborted` never
+    /// reaches here), and this is the one place every write path funnels
+    /// through, so it is the one place that needs to log it. `WriteError`
+    /// itself keeps only the byte count: the kernel gets `EIO` regardless
+    /// of cause, so there is nothing further to carry once this is
+    /// printed.
+    fn log_write_error(&self, ino: u64, offset: u64, e: KvError, written: usize) -> WriteError {
+        eprintln!("write to inode {ino} at offset {offset} failed after {written} bytes: {e}");
+        WriteError { written }
     }
 
     /// One transaction of `write_range`: stores every span in `spans` --
@@ -411,64 +423,17 @@ impl Committer {
         data: &[u8],
     ) -> Result<Option<FileAttr>, KvError> {
         loop {
-            let txn = self.client.transaction(TXN_TTL).await?;
-            // First, and load-bearing: the attributes are deleted last
-            // when a file goes away, so finding them absent here is what
-            // stops a batch from storing chunks nothing could ever reach
-            // again.
-            let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
-                return Ok(None);
-            };
-            let mut entry = decode_entry(ino, &bytes);
-
-            let mut cursor = 0usize;
-            for &(index, within, n) in spans {
-                let slice = &data[cursor..cursor + n];
-                cursor += n;
-                let key = chunk_key(ino, index);
-                // A write covering a whole chunk replaces it outright, so
-                // there is nothing to preserve and nothing to read first.
-                // Batches are aligned to the chunk grid, so this is the
-                // path every chunk of an aligned sequential write takes --
-                // such a batch reads no chunks at all.
-                if within == 0 && n as u64 == self.chunk_size {
-                    txn.write(&key, Some(slice)).await?;
-                } else {
-                    let mut buf = txn.read(&key).await?.value.unwrap_or_default();
-                    // Covers both a hole ahead of `within` and extending
-                    // the chunk to hold the new bytes.
-                    if buf.len() < within + n {
-                        buf.resize(within + n, 0);
-                    }
-                    buf[within..within + n].copy_from_slice(slice);
-                    txn.write(&key, Some(&buf)).await?;
-                }
-            }
-
-            if end > entry.attr.size {
-                entry.attr.size = end;
-                entry.attr.blocks = end.div_ceil(512);
-            }
-            let now = SystemTime::now();
-            entry.attr.mtime = now;
-            entry.attr.ctime = now;
-            txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
-                .await?;
-
-            match txn.commit().await {
-                Ok(_) => {
-                    // One call for the whole batch: `invalidate` bumps the
-                    // cache's generation each time, and a single bump
-                    // costs concurrent readers fewer failed confirmations
-                    // than one per chunk would.
-                    if let (Some(&(first, ..)), Some(&(last, ..))) = (spans.first(), spans.last()) {
-                        self.chunk_cache
-                            .lock()
-                            .unwrap()
-                            .invalidate(ino, first..=last);
-                    }
-                    return Ok(Some(entry.attr));
-                }
+            match self.write_batch_attempt(ino, end, spans, data).await {
+                Ok(outcome) => return Ok(outcome),
+                // Retried in full -- a fresh transaction, redoing every
+                // read and write -- because `Aborted` can come from *any*
+                // of them, not just `commit`: a contended key refuses the
+                // `read` or `write` that touches it outright (see the
+                // server's wound-wait `acquire`), it doesn't wait and let
+                // commit be the one to fail. `Transaction` deliberately
+                // does not retry this itself (see its doc comment): it
+                // doesn't know what the reads were, so only the caller
+                // that issued them can redo it.
                 Err(KvError::Aborted { .. }) => continue,
                 // The outcome is unknown, so the cache can't be trusted
                 // for these chunks either.
@@ -478,6 +443,75 @@ impl Committer {
                 }
             }
         }
+    }
+
+    /// One attempt at `write_batch`: opens a transaction, applies every
+    /// span, updates the attributes, and commits -- all of it, so that
+    /// `write_batch`'s retry can treat any failure the same way: throw
+    /// this attempt away and do the whole thing again from a fresh
+    /// transaction.
+    async fn write_batch_attempt(
+        &self,
+        ino: u64,
+        end: u64,
+        spans: &[(u64, usize, usize)],
+        data: &[u8],
+    ) -> Result<Option<FileAttr>, KvError> {
+        let txn = self.client.transaction(TXN_TTL).await?;
+        // First, and load-bearing: the attributes are deleted last
+        // when a file goes away, so finding them absent here is what
+        // stops a batch from storing chunks nothing could ever reach
+        // again.
+        let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
+            return Ok(None);
+        };
+        let mut entry = decode_entry(ino, &bytes);
+
+        let mut cursor = 0usize;
+        for &(index, within, n) in spans {
+            let slice = &data[cursor..cursor + n];
+            cursor += n;
+            let key = chunk_key(ino, index);
+            // A write covering a whole chunk replaces it outright, so
+            // there is nothing to preserve and nothing to read first.
+            // Batches are aligned to the chunk grid, so this is the
+            // path every chunk of an aligned sequential write takes --
+            // such a batch reads no chunks at all.
+            if within == 0 && n as u64 == self.chunk_size {
+                txn.write(&key, Some(slice)).await?;
+            } else {
+                let mut buf = txn.read(&key).await?.value.unwrap_or_default();
+                // Covers both a hole ahead of `within` and extending
+                // the chunk to hold the new bytes.
+                if buf.len() < within + n {
+                    buf.resize(within + n, 0);
+                }
+                buf[within..within + n].copy_from_slice(slice);
+                txn.write(&key, Some(&buf)).await?;
+            }
+        }
+
+        if end > entry.attr.size {
+            entry.attr.size = end;
+            entry.attr.blocks = end.div_ceil(512);
+        }
+        let now = SystemTime::now();
+        entry.attr.mtime = now;
+        entry.attr.ctime = now;
+        txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
+            .await?;
+        txn.commit().await?;
+
+        // One call for the whole batch: `invalidate` bumps the cache's
+        // generation each time, and a single bump costs concurrent
+        // readers fewer failed confirmations than one per chunk would.
+        if let (Some(&(first, ..)), Some(&(last, ..))) = (spans.first(), spans.last()) {
+            self.chunk_cache
+                .lock()
+                .unwrap()
+                .invalidate(ino, first..=last);
+        }
+        Ok(Some(entry.attr))
     }
 }
 
@@ -785,25 +819,35 @@ impl Raft5Fs {
     /// runtime cancels it rather than waiting.
     fn schedule_auto_flush(&self, ino: u64, slot: Arc<Mutex<WriteBuf>>) {
         let committer = self.committer();
-        self.rt.spawn(async move {
-            tokio::time::sleep(AUTO_FLUSH_DELAY).await;
-            // `try_lock`, not `lock`: this runs on an async worker, and a
-            // fuse thread may be holding this buffer's lock for an entire
-            // commit's round trip. Blocking the worker on that would be
-            // counter-productive at best; there's nothing to gain by
-            // waiting, since whoever holds the lock is already handling
-            // this file one way or another. `WouldBlock` and `Poisoned`
-            // both mean there's nothing useful for the timer to do.
-            let taken = match slot.try_lock() {
-                Ok(mut buf) => buf.take(),
-                Err(_) => return,
+        let rt = self.rt.clone();
+        // `spawn_blocking`, not `spawn`: the commit has to hold this
+        // buffer's lock for its whole duration, exactly like every other
+        // commit path (`commit_buf`'s callers all keep their `MutexGuard`
+        // held across it too) -- otherwise a fresh write on another fuse
+        // thread can acquire the lock the moment it's free, start its own
+        // commit, and race this one, both touching the same attributes.
+        // That used to be exactly what happened here: this task took the
+        // buffer's bytes and released the lock *before* committing them,
+        // leaving a window for that race.
+        //
+        // A plain async task can't hold a `std::sync::MutexGuard` across
+        // an `.await` (it isn't `Send`), which is why it was released
+        // early in the first place. `spawn_blocking` runs this on a
+        // thread outside the async worker pool, where blocking for the
+        // round trip -- via an ordinary `lock()` and `Handle::block_on`,
+        // the same combination every fuse thread already uses -- costs
+        // nothing else waiting on those workers.
+        self.rt.spawn_blocking(move || {
+            std::thread::sleep(AUTO_FLUSH_DELAY);
+            let mut buf = slot.lock().unwrap();
+            let Some((start, data)) = buf.take() else {
+                return;
             };
-            let Some((start, data)) = taken else { return };
-            if let Some(e) = commit_errno(committer.write_range(ino, start, &data).await) {
+            if let Some(e) = commit_errno(rt.block_on(committer.write_range(ino, start, &data))) {
                 // No one is synchronously waiting on this commit, so the
                 // failure has nowhere to go but back into the buffer, for
                 // the next flush/fsync/write to report.
-                slot.lock().unwrap().err.get_or_insert(e);
+                buf.err.get_or_insert(e);
             }
         });
     }
@@ -1362,7 +1406,10 @@ impl Filesystem for Raft5Fs {
         };
         match self.block(self.read_range(ino.0, offset, size as usize, entry.attr.size)) {
             Ok(data) => reply.data(&data),
-            Err(_) => reply.error(Errno::EIO),
+            Err(e) => {
+                eprintln!("read from inode {} at offset {offset} failed: {e}", ino.0);
+                reply.error(Errno::EIO)
+            }
         }
     }
 
