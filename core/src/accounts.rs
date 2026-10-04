@@ -23,7 +23,7 @@ use crate::fs::{TXN_TTL, retrying};
 use crate::layout::{ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX};
 use raft5fs_proto::types::{AccountKeys, FsError};
 
-fn keys_key(user: &str) -> Vec<u8> {
+pub(crate) fn keys_key(user: &str) -> Vec<u8> {
     let mut key = ACCOUNT_KEYS_PREFIX.to_vec();
     key.extend_from_slice(user.as_bytes());
     key

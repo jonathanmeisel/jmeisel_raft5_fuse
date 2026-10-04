@@ -8,7 +8,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
-use crate::types::{AccountKeys, Attr, DirItem, FsError, Kind, SetAttr, SetTime, WriteError};
+use crate::types::{
+    AccountKeys, Attr, DirItem, FsError, Grant, KeyPath, Kind, SetAttr, SetTime, WriteError,
+};
 
 fn malformed(what: &str) -> FsError {
     FsError::new(libc::EIO, format!("malformed response: no {what}"))
@@ -455,6 +457,111 @@ impl pb::WriteResponse {
                 written: 0,
                 error: malformed("write outcome"),
             }),
+        }
+    }
+}
+
+impl From<Grant> for pb::GrantInfo {
+    fn from(g: Grant) -> Self {
+        Self {
+            ino: g.ino,
+            writable: g.writable,
+            key_version: g.key_version,
+            sealed_key: g.sealed_key,
+            sealed_label: g.sealed_label,
+        }
+    }
+}
+
+impl From<pb::GrantInfo> for Grant {
+    fn from(g: pb::GrantInfo) -> Self {
+        Self {
+            ino: g.ino,
+            writable: g.writable,
+            key_version: g.key_version,
+            sealed_key: g.sealed_key,
+            sealed_label: g.sealed_label,
+        }
+    }
+}
+
+impl From<Result<KeyPath, FsError>> for pb::KeyPathResponse {
+    fn from(r: Result<KeyPath, FsError>) -> Self {
+        use pb::key_path_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(path) => R::Path(pb::KeyPath {
+                    grant: Some(path.grant.into()),
+                    nodes: path
+                        .nodes
+                        .into_iter()
+                        .map(|(ino, keys)| pb::NodeRecord { ino, keys })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::KeyPathResponse {
+    pub fn into_result(self) -> Result<KeyPath, FsError> {
+        use pb::key_path_response::Result as R;
+        match self.result {
+            Some(R::Path(p)) => Ok(KeyPath {
+                grant: p.grant.ok_or_else(|| malformed("grant"))?.into(),
+                nodes: p.nodes.into_iter().map(|n| (n.ino, n.keys)).collect(),
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("key path")),
+        }
+    }
+}
+
+impl From<Result<Vec<Grant>, FsError>> for pb::GrantListResponse {
+    fn from(r: Result<Vec<Grant>, FsError>) -> Self {
+        use pb::grant_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(grants) => R::List(pb::GrantList {
+                    grants: grants.into_iter().map(Into::into).collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::GrantListResponse {
+    pub fn into_result(self) -> Result<Vec<Grant>, FsError> {
+        use pb::grant_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l.grants.into_iter().map(Into::into).collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("grant list")),
+        }
+    }
+}
+
+impl From<Result<Vec<u8>, FsError>> for pb::PublicKeyResponse {
+    fn from(r: Result<Vec<u8>, FsError>) -> Self {
+        use pb::public_key_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(key) => R::Key(key),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::PublicKeyResponse {
+    pub fn into_result(self) -> Result<Vec<u8>, FsError> {
+        use pb::public_key_response::Result as R;
+        match self.result {
+            Some(R::Key(k)) => Ok(k),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("public key")),
         }
     }
 }

@@ -9,9 +9,13 @@ use std::time::{Duration, SystemTime};
 
 use raft5_client::{Client, Error as KvError, Transaction};
 
-use raft5fs_proto::types::{Attr, Caller, DirItem, FsError, Kind, SetAttr, WriteError};
+use raft5fs_crypto::node::NodeKeys;
+use raft5fs_proto::types::{
+    Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SetAttr, WriteError,
+};
 
 use crate::entry::{Entry, decode_entry, encode_entry};
+use crate::grants::{self, Reads, key_versions, node_keys_key, reservation_key};
 use crate::layout::{
     CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, TOMBSTONE_PREFIX, attr_key,
     chunk_key, chunk_prefix, chunk_spans, chunks_per_batch, dirent_key, dirent_prefix,
@@ -374,9 +378,55 @@ impl FsCore {
         self.read_entry(ino).await?.ok_or_else(enoent)
     }
 
+    /// On an encrypted filesystem, whether `caller` reaches `ino` through
+    /// a grant (a writable one, for `write`), checked with `r`'s reads --
+    /// an operation's own transaction, so that the check and the change
+    /// commit together (see `grants`). Elsewhere, always: the mode bits
+    /// decide there, in `perm`.
+    async fn guard(
+        &self,
+        r: &impl Reads,
+        caller: &Caller,
+        ino: u64,
+        write: bool,
+    ) -> Result<Result<(), FsError>, KvError> {
+        if !self.encrypted {
+            return Ok(Ok(()));
+        }
+        let Some(user) = caller.user.as_deref() else {
+            return Ok(Err(FsError::new(
+                libc::EACCES,
+                "no account to check grants of",
+            )));
+        };
+        Ok(grants::authorize(r, user, ino, write).await?.map(|_| ()))
+    }
+
+    /// `guard`, outside any transaction: for operations that only read.
+    async fn guard_now(&self, caller: &Caller, ino: u64, write: bool) -> Result<(), FsError> {
+        self.guard(&self.client, caller, ino, write).await?
+    }
+
+    /// The account an encrypted filesystem's operation is for, or
+    /// `EOPNOTSUPP` on a filesystem that isn't encrypted.
+    fn account<'a>(&self, caller: &'a Caller) -> Result<&'a str, FsError> {
+        if !self.encrypted {
+            return Err(FsError::new(
+                libc::EOPNOTSUPP,
+                "this filesystem isn't encrypted",
+            ));
+        }
+        caller
+            .user
+            .as_deref()
+            .ok_or_else(|| FsError::new(libc::EACCES, "no account"))
+    }
+
     /// Needs no permission on the inode itself: what guards it is search
-    /// permission on the path to it, which `lookup` checks.
-    pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
+    /// permission on the path to it, which `lookup` checks -- or on an
+    /// encrypted filesystem, a grant over it.
+    pub async fn getattr(&self, caller: &Caller, ino: u64) -> Result<Attr, FsError> {
+        self.guard_now(caller, ino, false).await?;
         Ok(self.resolve(ino).await?.attr)
     }
 
@@ -391,6 +441,7 @@ impl FsCore {
         parent: u64,
         name: &OsStr,
     ) -> Result<Attr, FsError> {
+        self.guard_now(caller, parent, false).await?;
         let dir = self.resolve(parent).await?;
         if dir.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
@@ -402,6 +453,7 @@ impl FsCore {
 
     /// Checks `caller` may open `ino` for `mask` (some of `R` and `W`).
     pub async fn open(&self, caller: &Caller, ino: u64, mask: u32) -> Result<(), FsError> {
+        self.guard_now(caller, ino, mask & W != 0).await?;
         let entry = self.resolve(ino).await?;
         if entry.attr.kind == Kind::Directory && mask & W != 0 {
             return Err(FsError::errno(libc::EISDIR));
@@ -412,11 +464,13 @@ impl FsCore {
     /// access(2): whether `caller` holds every right in `mask`, or with a
     /// `mask` of 0, whether `ino` exists.
     pub async fn access(&self, caller: &Caller, ino: u64, mask: u32) -> Result<(), FsError> {
+        self.guard_now(caller, ino, mask & W != 0).await?;
         let entry = self.resolve(ino).await?;
         perm::check(caller, &entry.attr, mask)
     }
 
     pub async fn readdir(&self, caller: &Caller, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        self.guard_now(caller, ino, false).await?;
         let entry = self.resolve(ino).await?;
         if entry.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
@@ -467,7 +521,17 @@ impl FsCore {
     /// `[offset, offset + len)` of `ino`, clamped to its size. End-of-file
     /// lives in the attributes, not in the chunks: an absent chunk is a
     /// hole, not the end, so the size has to come first.
-    pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+    ///
+    /// On an encrypted filesystem the grant is checked again on every
+    /// read, not just at open: a revoked grant stops even open files.
+    pub async fn read(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, FsError> {
+        self.guard_now(caller, ino, false).await?;
         let size = self.read_entry(ino).await?.ok_or_else(enoent)?.attr.size;
         Ok(self.read_range(ino, offset, len, size).await?)
     }
@@ -569,11 +633,23 @@ impl FsCore {
     /// That count is per batch: a batch that failed contributes nothing,
     /// since none of it can be assumed to have landed. A missing inode is
     /// always reported as `ENOENT` with nothing written.
-    pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
+    ///
+    /// On an encrypted filesystem the grant is checked again, once per
+    /// call, as for `read`.
+    pub async fn write(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Attr, WriteError> {
         let missing = || WriteError {
             written: 0,
             error: enoent(),
         };
+        if let Err(error) = self.guard_now(caller, ino, true).await {
+            return Err(WriteError { written: 0, error });
+        }
         if data.is_empty() {
             // Still a write as far as mtime is concerned.
             return self
@@ -726,6 +802,7 @@ impl FsCore {
             // Deleting chunks is destructive and happens outside the
             // transaction below, so the caller's right to truncate is
             // checked before it as well as in it.
+            self.guard_now(caller, ino, true).await?;
             let entry = self.resolve(ino).await?;
             perm::check_setattr(caller, &entry.attr, &changes, writable_handle)?;
             let last = new_size / self.chunk_size;
@@ -756,6 +833,7 @@ impl FsCore {
             if entry.is_deleted() {
                 return Ok(Err(enoent()));
             }
+            decide!(self.guard(&txn, caller, ino, true).await?);
             if let Err(e) = perm::check_setattr(caller, &entry.attr, &changes, writable_handle) {
                 return Ok(Err(e));
             }
@@ -807,26 +885,42 @@ impl FsCore {
         Ok(attr)
     }
 
+    /// `new` is what an encrypted filesystem's create brings (see
+    /// `NewNode`), and must be `None` on any other.
     pub async fn mkdir(
         &self,
         caller: &Caller,
         parent: u64,
         name: &OsStr,
         perm: u16,
+        new: Option<&NewNode>,
     ) -> Result<Attr, FsError> {
-        self.create_child(caller, parent, name, Kind::Directory, perm)
+        self.create_child(caller, parent, name, Kind::Directory, perm, new)
             .await
     }
 
+    /// As `mkdir`.
     pub async fn create(
         &self,
         caller: &Caller,
         parent: u64,
         name: &OsStr,
         perm: u16,
+        new: Option<&NewNode>,
     ) -> Result<Attr, FsError> {
-        self.create_child(caller, parent, name, Kind::File, perm)
+        self.create_child(caller, parent, name, Kind::File, perm, new)
             .await
+    }
+
+    /// The inode number an encrypted filesystem's create will use, held
+    /// for `caller` until it does.
+    pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
+        let user = self.account(caller)?;
+        let ino = allocate_inode(&self.client).await?;
+        self.client
+            .write(&reservation_key(ino), Some(user.as_bytes()))
+            .await?;
+        Ok(ino)
     }
 
     /// Allocates an inode and claims `name` in `parent` for it, writing
@@ -843,15 +937,36 @@ impl FsCore {
         name: &OsStr,
         kind: Kind,
         perm: u16,
+        new: Option<&NewNode>,
     ) -> Result<Attr, FsError> {
-        let ino = allocate_inode(&self.client).await?;
+        let ino = match (self.encrypted, new) {
+            (true, Some(new)) => new.ino,
+            (false, None) => allocate_inode(&self.client).await?,
+            (true, None) => {
+                return Err(FsError::new(
+                    libc::EINVAL,
+                    "a create here needs a key record",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(FsError::new(
+                    libc::EINVAL,
+                    "this filesystem isn't encrypted",
+                ));
+            }
+        };
         let dirent = &dirent_key(parent, name);
 
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, parent, true).await?);
             let mut dir = decide!(modifiable_dir(&txn, caller, parent).await?);
             if txn.read(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
+            }
+            if let Some(new) = new {
+                let (parent_version, _) = decide!(key_versions(&txn, parent).await?);
+                decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
             }
             let (uid, gid, perm) = perm::new_owner(caller, &dir.attr, kind, perm);
             let now = SystemTime::now();
@@ -868,7 +983,10 @@ impl FsCore {
                     mtime: now,
                     ctime: now,
                 },
-                parent: if kind == Kind::Directory { parent } else { 0 },
+                // Files too, though nothing but an encrypted filesystem's
+                // walk up to a grant needs it: a file's only parent is the
+                // one directory that names it.
+                parent,
             };
             write_entry(&txn, &entry).await?;
             txn.write(dirent, Some(&ino.to_be_bytes())).await?;
@@ -879,10 +997,48 @@ impl FsCore {
         .await?
     }
 
+    /// Takes up `new`'s reserved inode for `caller` and stores its key
+    /// record, which must have `versions` -- version 1, under the parent's
+    /// current key. Inside the creating transaction.
+    async fn claim(
+        &self,
+        txn: &Transaction,
+        caller: &Caller,
+        new: &NewNode,
+        versions: (u32, u32),
+    ) -> Result<Result<(), FsError>, KvError> {
+        let user = caller.user.as_deref().unwrap_or_default();
+        let reserved = txn.read(&reservation_key(new.ino)).await?.value;
+        if reserved.as_deref() != Some(user.as_bytes()) {
+            return Ok(Err(FsError::new(
+                libc::EACCES,
+                format!("inode {} isn't reserved for {user}", new.ino),
+            )));
+        }
+        if txn.read(&attr_key(new.ino)).await?.value.is_some() {
+            return Ok(Err(FsError::errno(libc::EEXIST)));
+        }
+        match NodeKeys::versions(&new.keys) {
+            Ok(found) if found == versions => {}
+            _ => {
+                return Ok(Err(FsError::new(
+                    libc::EINVAL,
+                    format!(
+                        "a new node's key record must be version {} under parent version {}",
+                        versions.0, versions.1
+                    ),
+                )));
+            }
+        }
+        txn.write(&reservation_key(new.ino), None).await?;
+        txn.write(&node_keys_key(new.ino), Some(&new.keys)).await?;
+        Ok(Ok(()))
+    }
+
     /// Removes a file, returning the inode it was.
     pub async fn unlink(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let child = self.child_ino(parent, name).await?;
-        self.remove_child(caller, parent, name, child, Kind::File)
+        self.remove_child(caller, parent, name, child, Kind::File, parent)
             .await?;
         Ok(child)
     }
@@ -890,7 +1046,7 @@ impl FsCore {
     /// Removes an empty directory, returning the inode it was.
     pub async fn rmdir(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let child = self.child_ino(parent, name).await?;
-        self.remove_child(caller, parent, name, child, Kind::Directory)
+        self.remove_child(caller, parent, name, child, Kind::Directory, parent)
             .await?;
         Ok(child)
     }
@@ -907,6 +1063,10 @@ impl FsCore {
     /// create add an entry to a removed directory. Then `finish_removal`
     /// deletes the chunks, the Entry and the tombstone. A crash between the
     /// two leaves the tombstone, which `reap_tombstones` finishes.
+    ///
+    /// On an encrypted filesystem the caller needs a writable grant over
+    /// `guarded`: the parent, except for a volume, which is guarded by
+    /// itself (its parent, the real root, being no one's).
     async fn remove_child(
         &self,
         caller: &Caller,
@@ -914,10 +1074,12 @@ impl FsCore {
         name: &OsStr,
         ino: u64,
         kind: Kind,
+        guarded: u64,
     ) -> Result<(), FsError> {
         let dirent = &dirent_key(parent, name);
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, guarded, true).await?);
             let mut dir = decide!(modifiable_dir(&txn, caller, parent).await?);
             if named(&txn, dirent).await? != Some(ino) {
                 return Ok(Err(enoent()));
@@ -953,6 +1115,7 @@ impl FsCore {
     /// so the size of the file makes no difference. A replaced inode is
     /// removed the way `unlink` removes one, starting with a tombstone in
     /// the same transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rename(
         &self,
         caller: &Caller,
@@ -961,11 +1124,16 @@ impl FsCore {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
+        node_keys: Option<(u64, &[u8])>,
     ) -> Result<Option<u64>, FsError> {
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
         let replaced = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, parent, true).await?);
+            if new_parent != parent {
+                decide!(self.guard(&txn, caller, new_parent, true).await?);
+            }
             let mut src_dir = decide!(modifiable_dir(&txn, caller, parent).await?);
             let mut dst_dir = if new_parent == parent {
                 None
@@ -1003,6 +1171,30 @@ impl FsCore {
                 txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
             }
 
+            if self.encrypted && new_parent != parent {
+                // Its key moves with it, re-wrapped under the new parent's.
+                let Some((keys_for, keys)) = node_keys else {
+                    return Ok(Err(FsError::new(
+                        libc::EINVAL,
+                        "a move to another directory here needs the re-wrapped key record",
+                    )));
+                };
+                if keys_for != ino {
+                    return Ok(Err(FsError::new(
+                        libc::ESTALE,
+                        "the name moved meanwhile names another inode now",
+                    )));
+                }
+                let (version, _) = decide!(key_versions(&txn, ino).await?);
+                let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
+                if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
+                    return Ok(Err(FsError::new(
+                        libc::EINVAL,
+                        "the moved node's key record must keep its version, under the new parent's",
+                    )));
+                }
+                txn.write(&node_keys_key(ino), Some(keys)).await?;
+            }
             if moved.attr.kind == Kind::Directory && new_parent != parent {
                 // Its `..` changes, which is a change to the directory.
                 decide!(perm::check(caller, &moved.attr, W));
@@ -1018,6 +1210,9 @@ impl FsCore {
                     }
                     cur = decide!(live_entry(&txn, cur).await?).parent;
                 }
+            }
+            if new_parent != parent {
+                // A file's parent too: see `create_child`.
                 moved.parent = new_parent;
             }
             moved.attr.ctime = now;
@@ -1043,6 +1238,149 @@ impl FsCore {
         Ok(replaced)
     }
 
+    /// `caller`'s grant over `ino` and the key records down to it (see
+    /// `grants::key_path`).
+    pub async fn key_path(&self, caller: &Caller, ino: u64) -> Result<KeyPath, FsError> {
+        let user = self.account(caller)?;
+        grants::key_path(&self.client, user, ino).await
+    }
+
+    /// Every grant made to `caller`.
+    pub async fn grants(&self, caller: &Caller) -> Result<Vec<Grant>, FsError> {
+        let user = self.account(caller)?;
+        grants::list(&self.client, user).await
+    }
+
+    /// `user`'s public key, for sealing grants to them. `ENOENT` for an
+    /// account that hasn't enrolled.
+    pub async fn public_key(&self, user: &str) -> Result<Vec<u8>, FsError> {
+        crate::accounts::get(&self.client, user)
+            .await?
+            .map(|keys| keys.public_key)
+            .ok_or_else(|| FsError::new(libc::ENOENT, format!("{user} hasn't enrolled")))
+    }
+
+    /// Grants directory `grant.ino` to `grantee`, replacing any grant of
+    /// it they had. `caller` needs a writable grant over it, and the grant
+    /// must hold its current key version.
+    pub async fn grant(
+        &self,
+        caller: &Caller,
+        grantee: &str,
+        grant: &Grant,
+    ) -> Result<(), FsError> {
+        self.account(caller)?;
+        grants::check_username(grantee)?;
+        let ino = grant.ino;
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, ino, true).await?);
+            let entry = decide!(live_entry(&txn, ino).await?);
+            decide!(check_kind(&entry, Kind::Directory));
+            if txn
+                .read(&crate::accounts::keys_key(grantee))
+                .await?
+                .value
+                .is_none()
+            {
+                return Ok(Err(FsError::new(
+                    libc::ENOENT,
+                    format!("{grantee} hasn't enrolled"),
+                )));
+            }
+            let (version, _) = decide!(key_versions(&txn, ino).await?);
+            if grant.key_version != version {
+                return Ok(Err(FsError::new(
+                    libc::EINVAL,
+                    format!("a grant must hold the current key version, {version}"),
+                )));
+            }
+            grants::put_grant(&txn, grantee, grant).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// A new volume: a directory under the real root, at `new`'s reserved
+    /// inode, granted read-write to `caller` with `sealed_key` (its key,
+    /// version 1) and `sealed_label`. Named after its inode -- what people
+    /// call it lives only in the grants, where the server can't read it.
+    pub async fn create_volume(
+        &self,
+        caller: &Caller,
+        new: &NewNode,
+        perm: u16,
+        sealed_key: &[u8],
+        sealed_label: &[u8],
+    ) -> Result<Attr, FsError> {
+        let user = self.account(caller)?;
+        let dirent = &dirent_key(ROOT_INO, OsStr::new(&new.ino.to_string()));
+        let grant = &Grant {
+            ino: new.ino,
+            writable: true,
+            key_version: 1,
+            sealed_key: sealed_key.to_vec(),
+            sealed_label: sealed_label.to_vec(),
+        };
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
+            if txn.read(dirent).await?.value.is_some() {
+                return Ok(Err(FsError::errno(libc::EEXIST)));
+            }
+            // No parent key: a volume's key only reaches people by grant.
+            decide!(self.claim(&txn, caller, new, (1, 0)).await?);
+            let (uid, gid, perm) = perm::new_owner(caller, &root.attr, Kind::Directory, perm);
+            let now = SystemTime::now();
+            let entry = Entry {
+                attr: Attr {
+                    ino: new.ino,
+                    kind: Kind::Directory,
+                    size: 0,
+                    perm,
+                    nlink: 2,
+                    uid,
+                    gid,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                },
+                parent: ROOT_INO,
+            };
+            write_entry(&txn, &entry).await?;
+            txn.write(dirent, Some(&new.ino.to_be_bytes())).await?;
+            grants::put_grant(&txn, user, grant).await?;
+            touch_dir(&txn, &mut root, now).await?;
+            txn.commit().await?;
+            Ok(Ok(entry.attr))
+        })
+        .await?
+    }
+
+    /// Removes volume `ino`, which must be empty, with every grant of it.
+    /// Needs a writable grant of the volume itself.
+    pub async fn delete_volume(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
+        self.account(caller)?;
+        self.guard_now(caller, ino, true).await?;
+        if self.resolve(ino).await?.parent != ROOT_INO {
+            return Err(FsError::new(
+                libc::EINVAL,
+                format!("inode {ino} isn't a volume"),
+            ));
+        }
+        let name = ino.to_string();
+        self.remove_child(
+            caller,
+            ROOT_INO,
+            OsStr::new(&name),
+            ino,
+            Kind::Directory,
+            ino,
+        )
+        .await
+    }
+
     /// Everything after the tombstone: the chunks, then the Entry and the
     /// tombstone together. Idempotent, so it is safe for several processes
     /// to finish the same deletion at once.
@@ -1054,6 +1392,9 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
+            // An encrypted filesystem's grants of it and key record; on
+            // another there are none, and this finds nothing.
+            grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;
             Ok(())
         })
@@ -1136,18 +1477,22 @@ fn log_write_error(ino: u64, offset: u64, e: KvError, written: usize) -> WriteEr
 #[allow(dead_code)]
 fn operations_are_send(core: &FsCore, caller: &Caller, name: &OsStr, data: &[u8]) {
     fn send<T: Send>(_: T) {}
-    send(core.getattr(1));
+    send(core.getattr(caller, 1));
     send(core.lookup(caller, 1, name));
     send(core.open(caller, 1, R));
     send(core.access(caller, 1, R));
     send(core.readdir(caller, 1));
-    send(core.read(1, 0, 1));
-    send(core.write(1, 0, data));
+    send(core.read(caller, 1, 0, 1));
+    send(core.write(caller, 1, 0, data));
     send(core.setattr(caller, 1, SetAttr::default(), false));
-    send(core.create(caller, 1, name, 0o644));
-    send(core.mkdir(caller, 1, name, 0o755));
+    send(core.create(caller, 1, name, 0o644, None));
+    send(core.mkdir(caller, 1, name, 0o755, None));
     send(core.unlink(caller, 1, name));
     send(core.rmdir(caller, 1, name));
-    send(core.rename(caller, 1, name, 1, name, false));
+    send(core.rename(caller, 1, name, 1, name, false, None));
+    send(core.reserve_inode(caller));
+    send(core.key_path(caller, 1));
+    send(core.grants(caller));
+    send(core.public_key("u"));
     send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0), false));
 }

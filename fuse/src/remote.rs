@@ -52,11 +52,11 @@ use zeroize::Zeroizing;
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
-    AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, EnrolRequest, HelloRequest,
-    InodeRequest, LoginRequest, NameRequest, PreloginRequest, ReadRequest, RenameRequest,
-    SetAttrRequest, WriteRequest,
+    AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
+    EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
+    PreloginRequest, PublicKeyRequest, ReadRequest, RenameRequest, SetAttrRequest, WriteRequest,
 };
-use raft5fs_proto::types::{Attr, DirItem, FsError, SetAttr, WriteError};
+use raft5fs_proto::types::{Attr, DirItem, FsError, Grant, KeyPath, NewNode, SetAttr, WriteError};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -605,16 +605,31 @@ impl Remote {
         .into_result()
     }
 
-    fn create_request(parent: u64, name: &OsStr, perm: u16) -> CreateRequest {
+    fn create_request(
+        parent: u64,
+        name: &OsStr,
+        perm: u16,
+        new: Option<&NewNode>,
+    ) -> CreateRequest {
         CreateRequest {
             parent,
             name: name_bytes(name),
             perm: perm.into(),
+            ino: new.map_or(0, |n| n.ino),
+            node_keys: new.map(|n| n.keys.clone()).unwrap_or_default(),
         }
     }
 
-    pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        let req = Self::create_request(parent, name, perm);
+    /// `new`: on an encrypted filesystem, the reserved inode and its key
+    /// record (see `vault`); `None` elsewhere.
+    pub async fn mkdir(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        perm: u16,
+        new: Option<&NewNode>,
+    ) -> Result<Attr, FsError> {
+        let req = Self::create_request(parent, name, perm, new);
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
             async move { c.mkdir(req).await }
@@ -630,8 +645,9 @@ impl Remote {
         parent: u64,
         name: &OsStr,
         perm: u16,
+        new: Option<&NewNode>,
     ) -> Result<(Attr, String), FsError> {
-        let req = Self::create_request(parent, name, perm);
+        let req = Self::create_request(parent, name, perm, new);
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
             async move { c.create(req).await }
@@ -654,7 +670,10 @@ impl Remote {
         .into_result()
     }
 
-    /// Moves a name, returning the inode it replaced, if any.
+    /// Moves a name, returning the inode it replaced, if any. `node_keys`:
+    /// on an encrypted filesystem, a move to another directory brings the
+    /// moved node's inode and key record, re-wrapped under the new
+    /// parent's key.
     pub async fn rename(
         &self,
         parent: u64,
@@ -662,6 +681,7 @@ impl Remote {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
+        node_keys: Option<(u64, &[u8])>,
     ) -> Result<Option<u64>, FsError> {
         let req = RenameRequest {
             parent,
@@ -669,6 +689,8 @@ impl Remote {
             new_parent,
             new_name: name_bytes(new_name),
             noreplace,
+            node_keys: node_keys.map(|(_, k)| k.to_vec()).unwrap_or_default(),
+            moved_ino: node_keys.map_or(0, |(ino, _)| ino),
         };
         let replaced = self
             .call(Retry::Once, |mut c| {
@@ -690,6 +712,99 @@ impl Remote {
             let req = req.clone();
             async move { c.rmdir(req).await }
         })
+        .await?
+        .into_result()
+    }
+
+    /// An inode number reserved for this account's next create. Resending
+    /// only reserves another, which nothing then uses.
+    pub async fn allocate_inode(&self) -> Result<u64, FsError> {
+        self.call(Retry::Idempotent, |mut c| async move {
+            c.allocate_inode(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// This account's grant over `ino`, and the key records from the
+    /// granted directory down to it.
+    pub async fn key_path(&self, ino: u64) -> Result<KeyPath, FsError> {
+        let req = InodeRequest { ino };
+        self.call(
+            Retry::ReadOnly,
+            |mut c| async move { c.get_key_path(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Every grant made to this account.
+    pub async fn list_grants(&self) -> Result<Vec<Grant>, FsError> {
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_grants(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// `user`'s public key, as the server has it.
+    pub async fn public_key(&self, user: &str) -> Result<Vec<u8>, FsError> {
+        let req = PublicKeyRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.public_key(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Grants `grant.ino` to `user`. Resending one that landed writes the
+    /// same grant again.
+    pub async fn grant(&self, user: &str, grant: Grant) -> Result<(), FsError> {
+        let req = GrantRequest {
+            username: user.to_string(),
+            grant: Some(grant.into()),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.grant(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Makes a volume at reserved inode `new.ino`, granted to this account.
+    pub async fn create_volume(
+        &self,
+        new: &NewNode,
+        perm: u16,
+        sealed_key: Vec<u8>,
+        sealed_label: Vec<u8>,
+    ) -> Result<Attr, FsError> {
+        let req = CreateVolumeRequest {
+            ino: new.ino,
+            perm: perm.into(),
+            node_keys: new.keys.clone(),
+            sealed_key,
+            sealed_label,
+        };
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.create_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Removes an empty volume.
+    pub async fn delete_volume(&self, ino: u64) -> Result<(), FsError> {
+        let req = InodeRequest { ino };
+        self.call(
+            Retry::Once,
+            |mut c| async move { c.delete_volume(req).await },
+        )
         .await?
         .into_result()
     }

@@ -20,17 +20,18 @@ use std::time::{Duration, Instant};
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
 use raft5fs_core::{
-    Caller, FsCore, FsError, MAX_CHUNK_SIZE, WriteError, accounts, batch_bytes, users,
+    Caller, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, WriteError, accounts, batch_bytes, users,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
     AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateResponse,
-    EmptyResponse, EnrolRequest, HelloRequest, HelloResponse, InoResponse, InodeRequest,
-    KdfSettings, LoginRequest, LoginResponse, NameRequest, OpenResponse, PreloginRequest,
-    PreloginResponse, ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, Session,
-    SetAttrRequest, WriteRequest, WriteResponse,
+    CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest,
+    HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
+    LoginRequest, LoginResponse, NameRequest, NoArgs, OpenResponse, PreloginRequest,
+    PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadDirResponse, ReadRequest,
+    ReadResponse, RenameRequest, Session, SetAttrRequest, WriteRequest, WriteResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -98,7 +99,10 @@ impl FsService {
         let token = session_from_metadata(request.metadata())
             .ok_or_else(|| Status::unauthenticated("the request carries no session"))?;
         let name = self.signer.verify_session(token)?;
-        let caller = self.identity(&name).await?;
+        let mut caller = self.identity(&name).await?;
+        if self.core.encrypted() {
+            caller = caller.with_user(name);
+        }
         Ok((caller, request.into_inner()))
     }
 
@@ -357,8 +361,10 @@ impl Fs for FsService {
     }
 
     async fn get_attr(&self, r: Request<InodeRequest>) -> Result<Response<AttrResponse>, Status> {
-        let (_, r) = self.caller(r).await?;
-        Ok(Response::new(self.core.getattr(r.ino).await.into()))
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.getattr(&caller, r.ino).await.into(),
+        ))
     }
 
     async fn lookup(&self, r: Request<NameRequest>) -> Result<Response<AttrResponse>, Status> {
@@ -396,7 +402,7 @@ impl Fs for FsService {
     async fn read(&self, r: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let data = match self.handle_ino(&caller, &r.handle, false) {
-            Ok(ino) => self.core.read(ino, r.offset, r.len as usize).await,
+            Ok(ino) => self.core.read(&caller, ino, r.offset, r.len as usize).await,
             Err(e) => Err(e),
         };
         Ok(Response::new(data.into()))
@@ -405,7 +411,7 @@ impl Fs for FsService {
     async fn write(&self, r: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let written = match self.handle_ino(&caller, &r.handle, true) {
-            Ok(ino) => self.core.write(ino, r.offset, &r.data).await,
+            Ok(ino) => self.core.write(&caller, ino, r.offset, &r.data).await,
             Err(error) => Err(WriteError { written: 0, error }),
         };
         Ok(Response::new(written.into()))
@@ -430,7 +436,13 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let made = self
             .core
-            .mkdir(&caller, r.parent, name(&r.name), r.perm as u16)
+            .mkdir(
+                &caller,
+                r.parent,
+                name(&r.name),
+                r.perm as u16,
+                new_node(&r).as_ref(),
+            )
             .await;
         Ok(Response::new(made.into()))
     }
@@ -442,7 +454,13 @@ impl Fs for FsService {
         // it is ordinary (it is how `cp` copies a read-only file).
         let made = self
             .core
-            .create(&caller, r.parent, name(&r.name), r.perm as u16)
+            .create(
+                &caller,
+                r.parent,
+                name(&r.name),
+                r.perm as u16,
+                new_node(&r).as_ref(),
+            )
             .await
             .map(|attr| (attr, self.signer.handle(&caller, attr.ino, true, true)));
         Ok(Response::new(made.into()))
@@ -469,6 +487,7 @@ impl Fs for FsService {
                 r.new_parent,
                 name(&r.new_name),
                 r.noreplace,
+                (!r.node_keys.is_empty()).then_some((r.moved_ino, r.node_keys.as_slice())),
             )
             .await
             .map(|replaced| replaced.unwrap_or(0));
@@ -484,4 +503,77 @@ impl Fs for FsService {
                 .into(),
         ))
     }
+
+    async fn allocate_inode(&self, r: Request<NoArgs>) -> Result<Response<InoResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.reserve_inode(&caller).await.into()))
+    }
+
+    async fn get_key_path(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<KeyPathResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.key_path(&caller, r.ino).await.into(),
+        ))
+    }
+
+    async fn list_grants(&self, r: Request<NoArgs>) -> Result<Response<GrantListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.grants(&caller).await.into()))
+    }
+
+    async fn public_key(
+        &self,
+        r: Request<PublicKeyRequest>,
+    ) -> Result<Response<PublicKeyResponse>, Status> {
+        let (_, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.public_key(&r.username).await.into(),
+        ))
+    }
+
+    async fn grant(&self, r: Request<GrantRequest>) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let granted = match r.grant {
+            Some(grant) => self.core.grant(&caller, &r.username, &grant.into()).await,
+            None => Err(FsError::new(libc::EINVAL, "a grant request needs a grant")),
+        };
+        Ok(Response::new(granted.into()))
+    }
+
+    async fn create_volume(
+        &self,
+        r: Request<CreateVolumeRequest>,
+    ) -> Result<Response<AttrResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let new = NewNode {
+            ino: r.ino,
+            keys: r.node_keys,
+        };
+        let made = self
+            .core
+            .create_volume(&caller, &new, r.perm as u16, &r.sealed_key, &r.sealed_label)
+            .await;
+        Ok(Response::new(made.into()))
+    }
+
+    async fn delete_volume(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.delete_volume(&caller, r.ino).await.into(),
+        ))
+    }
+}
+
+/// What an encrypted filesystem's create brings, if this one brought it.
+fn new_node(r: &CreateRequest) -> Option<NewNode> {
+    (r.ino != 0 || !r.node_keys.is_empty()).then(|| NewNode {
+        ino: r.ino,
+        keys: r.node_keys.clone(),
+    })
 }

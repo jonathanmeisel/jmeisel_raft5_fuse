@@ -15,11 +15,12 @@ use fuser::{
     INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use raft5fs_proto::types::{Attr, FsError, Kind, SetAttr, SetTime, WriteError};
+use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, SetAttr, SetTime, WriteError};
 use tokio::runtime::Handle;
 use tonic::transport::ClientTlsConfig;
 
 use crate::remote::{Credentials, Remote};
+use crate::vault::{VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -98,6 +99,11 @@ pub struct Raft5Fs {
     tls: Option<ClientTlsConfig>,
     /// Connected by `init`, before the kernel sends any other request.
     remote: OnceLock<Arc<Remote>>,
+    /// Set by `init` on an encrypted filesystem: its keys, and the virtual
+    /// root that stands in for the real one (see `vault`).
+    vault: OnceLock<Arc<Vault>>,
+    /// The virtual root's timestamps: when the mount was made.
+    mounted_at: SystemTime,
     /// Per-inode buffers of accepted-but-unstored writes. The map lock is
     /// only held to find or insert a slot, never across a network call;
     /// the slot's own lock is what serializes a file's writes and flushes.
@@ -117,6 +123,8 @@ impl Raft5Fs {
             credentials,
             tls: None,
             remote: OnceLock::new(),
+            vault: OnceLock::new(),
+            mounted_at: SystemTime::now(),
             write_bufs: Mutex::new(HashMap::new()),
             write_buffering: true,
             handles: Mutex::new(HashMap::new()),
@@ -140,6 +148,34 @@ impl Raft5Fs {
         self.remote
             .get()
             .expect("the kernel sends no request before init")
+    }
+
+    /// The vault, on an encrypted filesystem.
+    fn vault(&self) -> Option<&Arc<Vault>> {
+        self.vault.get()
+    }
+
+    /// Whether `ino` is the virtual root of an encrypted filesystem's
+    /// mount, which no request to a server may name.
+    fn is_virtual_root(&self, ino: u64) -> bool {
+        ino == VIRTUAL_ROOT && self.vault().is_some()
+    }
+
+    /// The virtual root's attributes: a directory owned by whoever mounted
+    /// it, as the real root of a local filesystem would seem to them.
+    fn root_attr(&self) -> Attr {
+        Attr {
+            ino: VIRTUAL_ROOT,
+            kind: Kind::Directory,
+            size: 0,
+            perm: 0o755,
+            nlink: 2,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            atime: self.mounted_at,
+            mtime: self.mounted_at,
+            ctime: self.mounted_at,
+        }
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -421,12 +457,27 @@ impl Filesystem for Raft5Fs {
                 eprintln!("cannot connect to the filesystem: {why}");
                 std::io::Error::from_raw_os_error(libc::EHOSTUNREACH)
             })?;
-        let _ = self.remote.set(Arc::new(remote));
+        let remote = Arc::new(remote);
+        if remote.encrypted() {
+            let vault = Vault::new(Arc::clone(&remote)).map_err(|e| {
+                eprintln!("cannot open the account's keys: {e}");
+                std::io::Error::from_raw_os_error(libc::EACCES)
+            })?;
+            let _ = self.vault.set(Arc::new(vault));
+        }
+        let _ = self.remote.set(remote);
         Ok(())
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let mut attr = match self.block(self.remote().lookup(parent.0, name)) {
+        let found = match self.vault() {
+            Some(vault) if parent.0 == VIRTUAL_ROOT => self.block(async {
+                let ino = vault.root_lookup(name).await?;
+                self.remote().getattr(ino).await
+            }),
+            _ => self.block(self.remote().lookup(parent.0, name)),
+        };
+        let mut attr = match found {
             Ok(attr) => attr,
             Err(e) => return reply.error(errno(&e)),
         };
@@ -445,6 +496,9 @@ impl Filesystem for Raft5Fs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if self.is_virtual_root(ino.0) {
+            return reply.attr(&TTL, &to_file_attr(&self.root_attr()));
+        }
         if let Err(e) = self.flush_ino(ino.0) {
             return reply.error(e);
         }
@@ -473,6 +527,9 @@ impl Filesystem for Raft5Fs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if self.is_virtual_root(ino.0) {
+            return reply.error(Errno::EPERM);
+        }
         // Buffered bytes predate this change, so they have to be stored
         // before it applies (a truncate must cut them, not be undone by
         // them landing afterwards).
@@ -506,20 +563,32 @@ impl Filesystem for Raft5Fs {
         reply: ReplyEntry,
     ) {
         let perm = (mode & !umask & 0o7777) as u16;
-        match self.block(self.remote().mkdir(parent.0, name, perm)) {
+        let made = match self.vault() {
+            Some(vault) if parent.0 == VIRTUAL_ROOT => self.block(vault.create_volume(name, perm)),
+            Some(vault) => self.block(vault.mkdir(parent.0, name, perm)),
+            None => self.block(self.remote().mkdir(parent.0, name, perm, None)),
+        };
+        match made {
             Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.block(self.remote().rmdir(parent.0, name)) {
-            Ok(_) => reply.ok(),
+        let removed = match self.vault() {
+            Some(vault) if parent.0 == VIRTUAL_ROOT => self.block(vault.delete_volume(name)),
+            _ => self.block(self.remote().rmdir(parent.0, name)).map(drop),
+        };
+        match removed {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.is_virtual_root(parent.0) {
+            return reply.error(Errno::EPERM);
+        }
         match self.block(self.remote().unlink(parent.0, name)) {
             Ok(ino) => {
                 // Anything still buffered for it can only fail now (the
@@ -548,10 +617,24 @@ impl Filesystem for Raft5Fs {
             return reply.error(Errno::EINVAL);
         }
         let noreplace = flags.contains(RenameFlags::RENAME_NOREPLACE);
-        match self.block(
-            self.remote()
-                .rename(parent.0, name, newparent.0, newname, noreplace),
-        ) {
+        // The virtual root's entries are grants, not names to move.
+        if self.is_virtual_root(parent.0) || self.is_virtual_root(newparent.0) {
+            return reply.error(Errno::EPERM);
+        }
+        let renamed = match self.vault() {
+            Some(vault) => {
+                self.block(vault.rename(parent.0, name, newparent.0, newname, noreplace))
+            }
+            None => self.block(self.remote().rename(
+                parent.0,
+                name,
+                newparent.0,
+                newname,
+                noreplace,
+                None,
+            )),
+        };
+        match renamed {
             Ok(replaced) => {
                 // As for `unlink`: what was buffered for a replaced file
                 // can only fail now.
@@ -575,7 +658,14 @@ impl Filesystem for Raft5Fs {
         reply: ReplyCreate,
     ) {
         let perm = (mode & !umask & 0o7777) as u16;
-        match self.block(self.remote().create(parent.0, name, perm)) {
+        if self.is_virtual_root(parent.0) {
+            return reply.error(Errno::EPERM);
+        }
+        let created = match self.vault() {
+            Some(vault) => self.block(vault.create(parent.0, name, perm)),
+            None => self.block(self.remote().create(parent.0, name, perm, None)),
+        };
+        match created {
             Ok((attr, handle)) => reply.created(
                 &TTL,
                 &to_file_attr(&attr),
@@ -588,6 +678,9 @@ impl Filesystem for Raft5Fs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if self.is_virtual_root(ino.0) {
+            return reply.error(Errno::EISDIR);
+        }
         match self.block(self.remote().open(ino.0, open_mask(flags))) {
             Ok(handle) => reply.opened(self.add_handle(handle), FopenFlags::empty()),
             Err(e) => reply.error(errno(&e)),
@@ -597,6 +690,9 @@ impl Filesystem for Raft5Fs {
     /// The listing itself is checked again by `readdir`; checking here
     /// too is what makes `opendir(3)` fail up front, as it does locally.
     fn opendir(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if self.is_virtual_root(ino.0) {
+            return reply.opened(FileHandle(0), FopenFlags::empty());
+        }
         // Listing needs no handle, so this one is dropped.
         match self.block(self.remote().open(ino.0, open_mask(flags))) {
             Ok(_) => reply.opened(FileHandle(0), FopenFlags::empty()),
@@ -609,6 +705,10 @@ impl Filesystem for Raft5Fs {
     /// and so `test -w`, and shells deciding what is executable -- agree
     /// with what the servers will actually allow.
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        // Anyone may list the virtual root, and make volumes in it.
+        if self.is_virtual_root(ino.0) {
+            return reply.ok();
+        }
         match self.block(self.remote().access(ino.0, mask.bits() as u32)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
@@ -758,9 +858,39 @@ impl Filesystem for Raft5Fs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let items = match self.block(self.remote().readdir(ino.0)) {
-            Ok(items) => items,
-            Err(e) => return reply.error(errno(&e)),
+        let items = match self.vault() {
+            Some(vault) if ino.0 == VIRTUAL_ROOT => match self.block(vault.root_entries()) {
+                Ok(entries) => {
+                    let dots = [".", ".."].map(|n| DirItem {
+                        ino: VIRTUAL_ROOT,
+                        kind: Kind::Directory,
+                        name: n.into(),
+                    });
+                    dots.into_iter()
+                        .chain(entries.into_iter().map(|(name, ino)| DirItem {
+                            ino,
+                            kind: Kind::Directory,
+                            name,
+                        }))
+                        .collect()
+                }
+                Err(e) => return reply.error(errno(&e)),
+            },
+            vault => match self.block(self.remote().readdir(ino.0)) {
+                Ok(mut items) => {
+                    // A grant's `..` is the virtual root: what is really
+                    // above it isn't this account's to see.
+                    if vault.is_some_and(|v| v.is_grant_root(ino.0)) {
+                        for item in &mut items {
+                            if item.name == ".." {
+                                item.ino = VIRTUAL_ROOT;
+                            }
+                        }
+                    }
+                    items
+                }
+                Err(e) => return reply.error(errno(&e)),
+            },
         };
         for (i, item) in items.into_iter().enumerate().skip(offset as usize) {
             if reply.add(

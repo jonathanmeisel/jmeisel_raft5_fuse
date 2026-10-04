@@ -98,6 +98,10 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x06 ++ "n/" ++ gid(BE4)            -> the name of that gid's group (`groups`)
 //   0x06 ++ "k/" ++ username            -> encrypted filesystems: the account's keys (`accounts`)
 //   0x06 ++ "e/" ++ username            -> a pending enrolment code's hash (`accounts`)
+//   0x07 ++ ino(BE8) ++ username        -> a grant of that directory to that user (`grants`)
+//   0x08 ++ ino(BE8)                    -> encrypted filesystems: the inode's key record
+//   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
+//   0x0A ++ ino(BE8)                    -> an inode number reserved for a create, by username
 //
 // Deleting an inode takes several transactions (its chunks can't all fit
 // in one), so it is announced first: one transaction removes the dirent,
@@ -139,6 +143,15 @@ pub(crate) const USERS_PREFIX: &[u8] = b"\x06u/";
 
 /// The prefix of every account key row; see `accounts`.
 pub(crate) const ACCOUNT_KEYS_PREFIX: &[u8] = b"\x06k/";
+
+/// The prefix of every grant row; see `grants`.
+pub(crate) const GRANTS_PREFIX: &[u8] = &[0x07];
+/// The prefix of every inode key record.
+pub(crate) const NODE_KEYS_PREFIX: &[u8] = &[0x08];
+/// The prefix of the per-user grant index; see `grants`.
+pub(crate) const GRANT_INDEX_PREFIX: &[u8] = &[0x09];
+/// The prefix of every inode reservation; see `grants`.
+pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
 
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";

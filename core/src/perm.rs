@@ -2,6 +2,10 @@
 //! attributes involved. The operations in `fs` call these on attributes
 //! read inside their own transaction, so a concurrent chmod can't slip in
 //! between the check and the change it guards.
+//!
+//! None of them binds a caller on an encrypted filesystem
+//! (`Caller::by_grant`): there, grants decide, and the mode bits are only
+//! kept and shown.
 
 use raft5fs_proto::types::{Attr, Caller, FsError, Kind, SetAttr, SetTime};
 
@@ -19,6 +23,9 @@ const S_ISVTX: u16 = 0o1000;
 /// right, except that executing a file still takes an execute bit
 /// somewhere.
 pub fn may(caller: &Caller, attr: &Attr, want: u32) -> bool {
+    if caller.by_grant() {
+        return true;
+    }
     if caller.is_root() {
         return want & X == 0 || attr.kind == Kind::Directory || attr.perm & 0o111 != 0;
     }
@@ -56,6 +63,7 @@ pub fn check_modify_dir(caller: &Caller, dir: &Attr) -> Result<(), FsError> {
 /// `check_modify_dir`, which applies regardless.
 pub fn check_sticky(caller: &Caller, dir: &Attr, child: &Attr) -> Result<(), FsError> {
     if dir.perm & S_ISVTX == 0
+        || caller.by_grant()
         || caller.is_root()
         || caller.uid == child.uid
         || caller.uid == dir.uid
@@ -95,6 +103,9 @@ pub fn check_setattr(
     changes: &SetAttr,
     writable_handle: bool,
 ) -> Result<(), FsError> {
+    if caller.by_grant() {
+        return Ok(());
+    }
     let eperm = || Err(FsError::errno(libc::EPERM));
     let root = caller.is_root();
     let owner = root || caller.uid == attr.uid;
@@ -210,6 +221,19 @@ mod tests {
 
     fn other() -> Caller {
         Caller::new(3000, 1, vec![])
+    }
+
+    #[test]
+    fn grants_not_mode_bits_bind_an_encrypted_filesystems_callers() {
+        let stranger = Caller::new(3000, 1, vec![]).with_user("eve");
+        let locked = file(0o000);
+        assert!(may(&stranger, &locked, R | W | X));
+        check_sticky(&stranger, &dir(0o1777), &locked).unwrap();
+        let chown = SetAttr {
+            uid: Some(0),
+            ..SetAttr::default()
+        };
+        check_setattr(&stranger, &locked, &chown, false).unwrap();
     }
 
     fn root() -> Caller {

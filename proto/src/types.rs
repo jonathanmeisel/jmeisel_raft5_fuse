@@ -34,11 +34,30 @@ pub struct Caller {
     /// Supplementary groups. Whether `gid` is repeated here doesn't
     /// matter.
     pub groups: Vec<u32>,
+    /// On an encrypted filesystem, the account: access there is by grant
+    /// to it, and the mode bits are left out of it. `None` elsewhere.
+    pub user: Option<String>,
 }
 
 impl Caller {
     pub fn new(uid: u32, gid: u32, groups: Vec<u32>) -> Self {
-        Self { uid, gid, groups }
+        Self {
+            uid,
+            gid,
+            groups,
+            user: None,
+        }
+    }
+
+    /// The same identity, as account `user` of an encrypted filesystem.
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
+    /// Whether grants, not mode bits, decide what this caller may do.
+    pub fn by_grant(&self) -> bool {
+        self.user.is_some()
     }
 
     /// uid 0 passes every permission check.
@@ -87,6 +106,34 @@ pub struct DirItem {
     pub ino: u64,
     pub kind: Kind,
     pub name: OsString,
+}
+
+/// A directory granted to a user on an encrypted filesystem: whether they
+/// may write under it, and its key at `key_version`, sealed to them, with
+/// the name it shows up as in their root, also sealed to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub ino: u64,
+    pub writable: bool,
+    pub key_version: u32,
+    pub sealed_key: Vec<u8>,
+    pub sealed_label: Vec<u8>,
+}
+
+/// A user's grant over an inode, and the key record of each node from the
+/// granted directory down to it, in that order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPath {
+    pub grant: Grant,
+    pub nodes: Vec<(u64, Vec<u8>)>,
+}
+
+/// What a create on an encrypted filesystem brings: the inode it reserved,
+/// and the new node's key record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNode {
+    pub ino: u64,
+    pub keys: Vec<u8>,
 }
 
 /// What an encrypted filesystem keeps for an account: enough to check a

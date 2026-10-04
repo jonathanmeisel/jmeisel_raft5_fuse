@@ -3,6 +3,7 @@
 pub mod accounts;
 mod entry;
 mod fs;
+pub mod grants;
 pub mod groups;
 mod layout;
 pub mod perm;
@@ -17,5 +18,6 @@ pub use layout::{
     chunk_prefix, dirent_prefix, tombstone_key, validate_chunk_size,
 };
 pub use raft5fs_proto::types::{
-    AccountKeys, Attr, Caller, DirItem, FsError, Kind, SetAttr, SetTime, WriteError,
+    AccountKeys, Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SetAttr, SetTime,
+    WriteError,
 };

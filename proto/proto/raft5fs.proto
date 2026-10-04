@@ -52,7 +52,34 @@ service Fs {
   rpc Rmdir(NameRequest) returns (InoResponse);
   // Returns the inode the move replaced, or 0 if it replaced nothing.
   rpc Rename(RenameRequest) returns (InoResponse);
+
+  // Encrypted filesystems only. There, access is by grant: a user reaches
+  // a directory, and everything under it, through a grant of it to them,
+  // and only what lies under their grants. Every inode has a key record
+  // (raft5fs-crypto's `NodeKeys`), opaque to the server but for its
+  // version numbers; a grant carries the granted directory's key sealed
+  // to the grantee.
+  //
+  // An inode number to create with: a node's key record is bound to its
+  // inode, so the client needs the number before it can make one.
+  rpc AllocateInode(NoArgs) returns (InoResponse);
+  // The caller's grant over `ino`, and the key record of every node from
+  // that grant's directory down to `ino`: what it takes to unwrap `ino`'s
+  // key from scratch.
+  rpc GetKeyPath(InodeRequest) returns (KeyPathResponse);
+  // Every grant made to the caller: the entries of their root.
+  rpc ListGrants(NoArgs) returns (GrantListResponse);
+  rpc PublicKey(PublicKeyRequest) returns (PublicKeyResponse);
+  // Grants a directory (and all under it) to a user, replacing any grant
+  // of it they had. Needs read-write access to it.
+  rpc Grant(GrantRequest) returns (EmptyResponse);
+  // A new top-level directory, granted read-write to its creator.
+  rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
+  // Removes an empty volume, and every grant of it.
+  rpc DeleteVolume(InodeRequest) returns (EmptyResponse);
 }
+
+message NoArgs {}
 
 message Error {
   int32 errno = 1;
@@ -181,6 +208,10 @@ message CreateRequest {
   uint64 parent = 1;
   bytes name = 2;
   uint32 perm = 3;
+  // Encrypted filesystems: the inode AllocateInode gave, and its key
+  // record, wrapped under the parent's current key.
+  uint64 ino = 4;
+  bytes node_keys = 5;
 }
 
 message RenameRequest {
@@ -190,6 +221,78 @@ message RenameRequest {
   bytes new_name = 4;
   // Fail with EEXIST rather than replace an existing `new_name`.
   bool noreplace = 5;
+  // Encrypted filesystems, when the parent changes: the moved node's key
+  // record, re-wrapped under the new parent's current key, and the inode
+  // it is for -- the move is refused if `name` no longer names it.
+  bytes node_keys = 6;
+  uint64 moved_ino = 7;
+}
+
+message GrantInfo {
+  uint64 ino = 1;
+  bool writable = 2;
+  // The version of the directory's key the grant holds.
+  uint32 key_version = 3;
+  // The key, sealed to the grantee.
+  bytes sealed_key = 4;
+  // What the grant shows up as in the grantee's root, sealed to them.
+  bytes sealed_label = 5;
+}
+
+message NodeRecord {
+  uint64 ino = 1;
+  bytes keys = 2;
+}
+
+message KeyPath {
+  GrantInfo grant = 1;
+  // From the granted directory down to the inode asked about.
+  repeated NodeRecord nodes = 2;
+}
+
+message KeyPathResponse {
+  oneof result {
+    KeyPath path = 1;
+    Error error = 2;
+  }
+}
+
+message GrantList {
+  repeated GrantInfo grants = 1;
+}
+
+message GrantListResponse {
+  oneof result {
+    GrantList list = 1;
+    Error error = 2;
+  }
+}
+
+message PublicKeyRequest {
+  string username = 1;
+}
+
+message PublicKeyResponse {
+  oneof result {
+    bytes key = 1;
+    Error error = 2;
+  }
+}
+
+message GrantRequest {
+  string username = 1;
+  GrantInfo grant = 2;
+}
+
+message CreateVolumeRequest {
+  // From AllocateInode.
+  uint64 ino = 1;
+  uint32 perm = 2;
+  // Version 1, with no parent key.
+  bytes node_keys = 3;
+  // The creator's grant: key version 1, sealed to them.
+  bytes sealed_key = 4;
+  bytes sealed_label = 5;
 }
 
 message ReadRequest {
