@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "fuse", "proto", "server", "utils"]
+members = ["core", "crypto", "fuse", "proto", "server", "utils"]
 resolver = "3"
 
 [workspace.package]
@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 raft5fs-core = { path = "core" }
+raft5fs-crypto = { path = "crypto" }
 raft5fs-proto = { path = "proto" }
 raft5fs-server = { path = "server" }
 raft5fs-fuse = { path = "fuse" }
