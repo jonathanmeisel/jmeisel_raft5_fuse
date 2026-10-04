@@ -9,17 +9,18 @@ use std::time::{Duration, SystemTime};
 
 use raft5_client::{Client, Error as KvError, Transaction};
 
+use raft5fs_crypto::data::TAG_LEN;
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SetAttr, WriteError,
+    Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SealedMove, SetAttr, WriteError,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
 use crate::grants::{self, Reads, key_versions, node_keys_key, reservation_key};
 use crate::layout::{
     CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, TOMBSTONE_PREFIX, attr_key,
-    chunk_key, chunk_prefix, chunk_spans, chunks_per_batch, dirent_key, dirent_prefix,
-    is_chunk_key, tombstone_key, validate_chunk_size,
+    chunk_key, chunk_prefix, chunk_spans, chunks_per_batch, dirent_ino, dirent_key, dirent_prefix,
+    dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key, validate_chunk_size,
 };
 use crate::perm::{self, R, W, X};
 use crate::read_cache::{ChunkCache, Lookup};
@@ -109,11 +110,7 @@ async fn modifiable_dir(
 
 /// The inode a directory entry names, if it exists.
 async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError> {
-    Ok(txn
-        .read(dirent)
-        .await?
-        .value
-        .map(|b| u64::from_be_bytes(b.try_into().unwrap())))
+    Ok(txn.read(dirent).await?.value.map(|b| dirent_ino(&b)))
 }
 
 /// Whether directory `ino` has no entries. The caller must already have
@@ -335,9 +332,7 @@ impl FsCore {
 
     async fn lookup_child(&self, parent: u64, name: &OsStr) -> Result<Option<u64>, FsError> {
         let result = self.client.read(&dirent_key(parent, name)).await?;
-        Ok(result
-            .value
-            .map(|b| u64::from_be_bytes(b.try_into().unwrap())))
+        Ok(result.value.map(|b| dirent_ino(&b)))
     }
 
     /// Creates the root directory unless it exists. Checking and creating
@@ -405,6 +400,31 @@ impl FsCore {
     /// `guard`, outside any transaction: for operations that only read.
     async fn guard_now(&self, caller: &Caller, ino: u64, write: bool) -> Result<(), FsError> {
         self.guard(&self.client, caller, ino, write).await?
+    }
+
+    /// Whether a new entry's `name` and `sealed_name` suit this filesystem:
+    /// on an encrypted one, a tag and a sealed name -- so no real name can
+    /// reach the store, even from a client that tried -- and elsewhere a
+    /// plain name with nothing sealed.
+    fn check_entry_name(&self, name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
+        let fits = if self.encrypted {
+            name.len() == TAG_LEN && !sealed_name.is_empty()
+        } else {
+            sealed_name.is_empty()
+        };
+        if fits {
+            Ok(())
+        } else if self.encrypted {
+            Err(FsError::new(
+                libc::EINVAL,
+                "a name here must be a tag, with the real name sealed",
+            ))
+        } else {
+            Err(FsError::new(
+                libc::EINVAL,
+                "this filesystem isn't encrypted",
+            ))
+        }
     }
 
     /// The account an encrypted filesystem's operation is for, or
@@ -482,11 +502,13 @@ impl FsCore {
                 ino,
                 kind: Kind::Directory,
                 name: OsString::from("."),
+                sealed_name: Vec::new(),
             },
             DirItem {
                 ino: entry.parent,
                 kind: Kind::Directory,
                 name: OsString::from(".."),
+                sealed_name: Vec::new(),
             },
         ];
 
@@ -503,7 +525,7 @@ impl FsCore {
             let Some(bytes) = self.client.read(&key).await?.value else {
                 continue;
             };
-            let child_ino = u64::from_be_bytes(bytes.try_into().unwrap());
+            let child_ino = dirent_ino(&bytes);
             let kind = self
                 .read_entry(child_ino)
                 .await?
@@ -513,6 +535,7 @@ impl FsCore {
                 ino: child_ino,
                 kind,
                 name,
+                sealed_name: dirent_sealed_name(&bytes).to_vec(),
             });
         }
         Ok(items)
@@ -955,7 +978,10 @@ impl FsCore {
                 ));
             }
         };
+        let sealed_name = new.map_or(&[][..], |n| &n.sealed_name);
+        self.check_entry_name(name, sealed_name)?;
         let dirent = &dirent_key(parent, name);
+        let value = &dirent_value(ino, sealed_name);
 
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
@@ -989,7 +1015,7 @@ impl FsCore {
                 parent,
             };
             write_entry(&txn, &entry).await?;
-            txn.write(dirent, Some(&ino.to_be_bytes())).await?;
+            txn.write(dirent, Some(value)).await?;
             touch_dir(&txn, &mut dir, now).await?;
             txn.commit().await?;
             Ok(Ok(entry.attr))
@@ -1124,8 +1150,9 @@ impl FsCore {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
-        node_keys: Option<(u64, &[u8])>,
+        sealed: Option<&SealedMove>,
     ) -> Result<Option<u64>, FsError> {
+        self.check_entry_name(new_name, sealed.map_or(&[][..], |m| &m.sealed_name))?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
         let replaced = retrying(move || async move {
@@ -1171,29 +1198,29 @@ impl FsCore {
                 txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
             }
 
-            if self.encrypted && new_parent != parent {
-                // Its key moves with it, re-wrapped under the new parent's.
-                let Some((keys_for, keys)) = node_keys else {
-                    return Ok(Err(FsError::new(
-                        libc::EINVAL,
-                        "a move to another directory here needs the re-wrapped key record",
-                    )));
-                };
-                if keys_for != ino {
+            if let Some(sealed) = sealed {
+                // The sealed name and key record are for one inode, which
+                // must be the one moving.
+                if sealed.ino != ino {
                     return Ok(Err(FsError::new(
                         libc::ESTALE,
                         "the name moved meanwhile names another inode now",
                     )));
                 }
-                let (version, _) = decide!(key_versions(&txn, ino).await?);
-                let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
-                if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
-                    return Ok(Err(FsError::new(
-                        libc::EINVAL,
-                        "the moved node's key record must keep its version, under the new parent's",
-                    )));
+                if new_parent != parent {
+                    // Its key moves with it, re-wrapped under the new
+                    // parent's.
+                    let keys = &sealed.node_keys;
+                    let (version, _) = decide!(key_versions(&txn, ino).await?);
+                    let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
+                    if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
+                        return Ok(Err(FsError::new(
+                            libc::EINVAL,
+                            "the moved node's key record must keep its version, under the new parent's",
+                        )));
+                    }
+                    txn.write(&node_keys_key(ino), Some(keys)).await?;
                 }
-                txn.write(&node_keys_key(ino), Some(keys)).await?;
             }
             if moved.attr.kind == Kind::Directory && new_parent != parent {
                 // Its `..` changes, which is a change to the directory.
@@ -1218,7 +1245,8 @@ impl FsCore {
             moved.attr.ctime = now;
             write_entry(&txn, &moved).await?;
             txn.write(from, None).await?;
-            txn.write(to, Some(&ino.to_be_bytes())).await?;
+            let sealed_name = sealed.map_or(&[][..], |m| &m.sealed_name);
+            txn.write(to, Some(&dirent_value(ino, sealed_name))).await?;
             touch_dir(&txn, &mut src_dir, now).await?;
             if let Some(dst_dir) = &mut dst_dir {
                 touch_dir(&txn, dst_dir, now).await?;
@@ -1349,7 +1377,7 @@ impl FsCore {
                 parent: ROOT_INO,
             };
             write_entry(&txn, &entry).await?;
-            txn.write(dirent, Some(&new.ino.to_be_bytes())).await?;
+            txn.write(dirent, Some(&dirent_value(new.ino, &[]))).await?;
             grants::put_grant(&txn, user, grant).await?;
             touch_dir(&txn, &mut root, now).await?;
             txn.commit().await?;

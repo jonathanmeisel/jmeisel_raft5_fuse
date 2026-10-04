@@ -170,6 +170,7 @@ impl From<DirItem> for pb::DirItem {
             ino: d.ino,
             kind: pb::Kind::from(d.kind).into(),
             name: d.name.into_vec(),
+            sealed_name: d.sealed_name,
         }
     }
 }
@@ -180,6 +181,7 @@ impl From<pb::DirItem> for DirItem {
             ino: d.ino,
             kind: kind(d.kind),
             name: OsString::from_vec(d.name),
+            sealed_name: d.sealed_name,
         }
     }
 }
@@ -623,6 +625,7 @@ mod tests {
             ino: 1,
             kind: Kind::File,
             name: name.clone(),
+            sealed_name: vec![1, 2],
         };
         assert_eq!(DirItem::from(pb::DirItem::from(item)).name, name);
     }

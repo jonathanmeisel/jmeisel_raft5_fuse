@@ -90,7 +90,7 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 // Key layout in the KV store:
 //   0x01 ++ ino(BE8)                    -> encoded Entry (attributes + parent)
 //   0x02 ++ ino(BE8) ++ index(BE8)      -> one chunk of a file's data
-//   0x03 ++ parent(BE8) ++ name         -> child ino(BE8), one per directory entry
+//   0x03 ++ parent(BE8) ++ name         -> child ino(BE8) [++ sealed name], one per directory entry
 //   0x04 ++ name                        -> filesystem-wide singletons
 //   0x05 ++ ino(BE8)                    -> marker: this inode's deletion is under way
 //   0x06 ++ "u/" ++ username            -> the account's uid, gid and groups (`users`)
@@ -199,6 +199,24 @@ pub fn dirent_prefix(parent: u64) -> Vec<u8> {
     let mut key = vec![0x03];
     key.extend_from_slice(&parent.to_be_bytes());
     key
+}
+
+/// A directory entry's value: the child's inode, then on an encrypted
+/// filesystem its real name, sealed (the key's name being only a tag).
+pub(crate) fn dirent_value(ino: u64, sealed_name: &[u8]) -> Vec<u8> {
+    let mut value = ino.to_be_bytes().to_vec();
+    value.extend_from_slice(sealed_name);
+    value
+}
+
+/// The inode a directory entry's value names.
+pub(crate) fn dirent_ino(value: &[u8]) -> u64 {
+    u64::from_be_bytes(value[..8].try_into().unwrap())
+}
+
+/// The sealed name a directory entry's value holds, if any.
+pub(crate) fn dirent_sealed_name(value: &[u8]) -> &[u8] {
+    &value[8..]
 }
 
 pub(crate) fn dirent_key(parent: u64, name: &OsStr) -> Vec<u8> {

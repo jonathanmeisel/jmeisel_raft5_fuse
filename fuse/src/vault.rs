@@ -9,6 +9,13 @@
 //! node's key here, wrapped under its parent's, and a move to another
 //! directory re-wraps the moved node's key under its new parent's.
 //!
+//! **Names.** The server never sees one. An entry is filed under a tag --
+//! an HMAC of its name under the directory's name key -- so the vault
+//! turns every name it is handed into a tag before asking for it, and
+//! seals the real name under the directory's key for listings to return.
+//! A listed name opens only if it matches its tag, so the server can't
+//! pass one entry off under another's name.
+//!
 //! **The root.** The server's real root is no one's to see. What a mount
 //! shows at its root instead is virtual: one entry per grant made to this
 //! account, named as the granter named it (a label sealed to this account,
@@ -22,9 +29,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::{Arc, Mutex};
 
 use raft5fs_crypto::Key;
+use raft5fs_crypto::data::{name_tag, open_name, seal_name, sealed_version};
 use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, seal_grant, seal_label};
 use raft5fs_crypto::node::NodeKeys;
-use raft5fs_proto::types::{Attr, FsError, Grant, KeyPath, NewNode};
+use raft5fs_proto::types::{Attr, DirItem, FsError, Grant, KeyPath, NewNode, SealedMove};
 
 use crate::remote::Remote;
 
@@ -32,13 +40,43 @@ use crate::remote::Remote;
 /// filesystem it is the virtual root, never the server's real one.
 pub const VIRTUAL_ROOT: u64 = 1;
 
-/// An inode's key record, and its current key.
+/// An inode's key record, its current key, and (for a directory) the key
+/// its entries' tags are made with.
 pub struct Node {
     pub record: NodeKeys,
     pub key: Key,
+    name_key: Key,
 }
 
 impl Node {
+    /// `ino`'s node with current key `key`, which this checks: a key that
+    /// doesn't open the record's name key isn't this node's.
+    fn new(ino: u64, record: NodeKeys, key: Key) -> Result<Self, FsError> {
+        let name_key = record.name_key(ino, &key).map_err(|e| corrupt(ino, e))?;
+        Ok(Self {
+            record,
+            key,
+            name_key,
+        })
+    }
+
+    /// The tag `name` is filed under in this directory.
+    pub fn tag(&self, name: &OsStr) -> OsString {
+        OsString::from_vec(name_tag(&self.name_key, name.as_bytes()).to_vec())
+    }
+
+    /// `name`, filed under `tag` in this directory `ino`, sealed under its
+    /// current key.
+    pub fn seal(&self, ino: u64, tag: &OsStr, name: &OsStr) -> Vec<u8> {
+        seal_name(
+            &self.key,
+            self.record.version,
+            ino,
+            tag.as_bytes(),
+            name.as_bytes(),
+        )
+    }
+
     /// This node's key at `version`: the current one, or an older one
     /// walked down to through the history.
     fn key_at(&self, ino: u64, version: u32) -> Result<Key, FsError> {
@@ -118,17 +156,15 @@ impl Vault {
                 format!("the grant of inode {root_ino} holds an out-of-date key"),
             ));
         }
-        // Proves the key: one that doesn't open the record isn't this
-        // node's, whatever the grant claims.
-        record
-            .name_key(root_ino, &key)
-            .map_err(|e| corrupt(root_ino, e))?;
-        let mut parent = (root_ino, self.keep(root_ino, Node { record, key }));
+        // `Node::new` proves the key: whatever the grant claims, one that
+        // doesn't open the record isn't this node's.
+        let root = Node::new(root_ino, record, key)?;
+        let mut parent = (root_ino, self.keep(root_ino, root));
         for (ino, bytes) in nodes {
             let record = NodeKeys::decode(&bytes).map_err(|e| corrupt(ino, e))?;
             let wrapping = parent.1.key_at(parent.0, record.parent_version)?;
             let key = record.open(ino, &wrapping).map_err(|e| corrupt(ino, e))?;
-            parent = (ino, self.keep(ino, Node { record, key }));
+            parent = (ino, self.keep(ino, Node::new(ino, record, key)?));
         }
         Ok(parent.1)
     }
@@ -191,22 +227,97 @@ impl Vault {
         self.roots.lock().unwrap().inos.contains(&ino)
     }
 
-    /// A reserved inode and key for a new child of `parent`.
-    async fn new_child(&self, parent: u64) -> Result<(NewNode, Node), FsError> {
+    /// A reserved inode and key for a new child `name` of `parent`, and
+    /// the tag it is filed under.
+    async fn new_child(
+        &self,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<(NewNode, Node, OsString), FsError> {
         let parent_node = self.node(parent).await?;
         let ino = self.remote.allocate_inode().await?;
         let (record, key) =
             NodeKeys::create(ino, Some((&parent_node.key, parent_node.record.version)));
+        let tag = parent_node.tag(name);
         let new = NewNode {
             ino,
             keys: record.encode(),
+            sealed_name: parent_node.seal(parent, &tag, name),
         };
-        Ok((new, Node { record, key }))
+        Ok((new, Node::new(ino, record, key)?, tag))
+    }
+
+    /// The tag `name` is filed under in directory `parent`.
+    async fn tag(&self, parent: u64, name: &OsStr) -> Result<OsString, FsError> {
+        Ok(self.node(parent).await?.tag(name))
+    }
+
+    pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
+        let tag = self.tag(parent, name).await?;
+        self.remote.lookup(parent, &tag).await
+    }
+
+    /// Removes a file, as `Remote::unlink`.
+    pub async fn unlink(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
+        let tag = self.tag(parent, name).await?;
+        let ino = self.remote.unlink(parent, &tag).await?;
+        self.nodes.lock().unwrap().remove(&ino);
+        Ok(ino)
+    }
+
+    /// Removes an empty directory, as `Remote::rmdir`.
+    pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
+        let tag = self.tag(parent, name).await?;
+        let ino = self.remote.rmdir(parent, &tag).await?;
+        self.nodes.lock().unwrap().remove(&ino);
+        Ok(ino)
+    }
+
+    /// Directory `ino`'s entries, with their real names. An entry whose
+    /// name doesn't open, or doesn't match its tag, isn't one this
+    /// directory's key holders made: it is left out, and said so.
+    pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        let items = self.remote.readdir(ino).await?;
+        let dir = self.node(ino).await?;
+        let mut named = Vec::with_capacity(items.len());
+        for mut item in items {
+            if item.sealed_name.is_empty() {
+                // `.` and `..`, which have no tag to hide behind.
+                if item.name == "." || item.name == ".." {
+                    named.push(item);
+                } else {
+                    eprintln!("inode {ino}: an entry with no sealed name; left out");
+                }
+                continue;
+            }
+            let opened = sealed_version(&item.sealed_name)
+                .map_err(|e| corrupt(ino, e))
+                .and_then(|version| dir.key_at(ino, version))
+                .and_then(|key| {
+                    open_name(
+                        &key,
+                        &dir.name_key,
+                        ino,
+                        item.name.as_bytes(),
+                        &item.sealed_name,
+                    )
+                    .map_err(|e| corrupt(ino, e))
+                });
+            match opened {
+                Ok(name) => {
+                    item.name = OsString::from_vec(name);
+                    item.sealed_name = Vec::new();
+                    named.push(item);
+                }
+                Err(e) => eprintln!("{e}; the entry for inode {} left out", item.ino),
+            }
+        }
+        Ok(named)
     }
 
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        let (new, node) = self.new_child(parent).await?;
-        let attr = self.remote.mkdir(parent, name, perm, Some(&new)).await?;
+        let (new, node, tag) = self.new_child(parent, name).await?;
+        let attr = self.remote.mkdir(parent, &tag, perm, Some(&new)).await?;
         self.keep(attr.ino, node);
         Ok(attr)
     }
@@ -218,14 +329,15 @@ impl Vault {
         name: &OsStr,
         perm: u16,
     ) -> Result<(Attr, String), FsError> {
-        let (new, node) = self.new_child(parent).await?;
-        let created = self.remote.create(parent, name, perm, Some(&new)).await?;
+        let (new, node, tag) = self.new_child(parent, name).await?;
+        let created = self.remote.create(parent, &tag, perm, Some(&new)).await?;
         self.keep(created.0.ino, node);
         Ok(created)
     }
 
-    /// Moves a name, as `Remote::rename`, re-wrapping the moved node's key
-    /// under its new parent's if the parent changes.
+    /// Moves a name, as `Remote::rename`: the new name sealed under the
+    /// new parent's key, and the moved node's key re-wrapped under it if
+    /// the parent changes.
     pub async fn rename(
         &self,
         parent: u64,
@@ -234,32 +346,40 @@ impl Vault {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<Option<u64>, FsError> {
-        if parent == new_parent {
-            return self
-                .remote
-                .rename(parent, name, new_parent, new_name, noreplace, None)
-                .await;
-        }
-        let ino = self.remote.lookup(parent, name).await?.ino;
-        let moved = self.node(ino).await?;
+        let from = self.node(parent).await?;
         let to = self.node(new_parent).await?;
-        let record = moved
-            .record
-            .rewrap(ino, &moved.key, (&to.key, to.record.version))
-            .map_err(|e| corrupt(ino, e))?;
+        let tag = from.tag(name);
+        let new_tag = to.tag(new_name);
+        let ino = self.remote.lookup(parent, &tag).await?.ino;
+        let mut sealed = SealedMove {
+            ino,
+            node_keys: Vec::new(),
+            sealed_name: to.seal(new_parent, &new_tag, new_name),
+        };
+        let mut rewrapped = None;
+        if parent != new_parent {
+            let moved = self.node(ino).await?;
+            let record = moved
+                .record
+                .rewrap(ino, &moved.key, (&to.key, to.record.version))
+                .map_err(|e| corrupt(ino, e))?;
+            sealed.node_keys = record.encode();
+            rewrapped = Some(Node {
+                record,
+                key: moved.key.clone(),
+                name_key: moved.name_key.clone(),
+            });
+        }
         let replaced = self
             .remote
-            .rename(
-                parent,
-                name,
-                new_parent,
-                new_name,
-                noreplace,
-                Some((ino, &record.encode())),
-            )
+            .rename(parent, &tag, new_parent, &new_tag, noreplace, Some(&sealed))
             .await?;
-        let key = moved.key.clone();
-        self.keep(ino, Node { record, key });
+        if let Some(node) = rewrapped {
+            self.keep(ino, node);
+        }
+        if let Some(victim) = replaced {
+            self.nodes.lock().unwrap().remove(&victim);
+        }
         Ok(replaced)
     }
 
@@ -276,12 +396,14 @@ impl Vault {
         let new = NewNode {
             ino,
             keys: record.encode(),
+            sealed_name: Vec::new(),
         };
+        let node = Node::new(ino, record, key)?;
         let attr = self
             .remote
             .create_volume(&new, perm, sealed_key, sealed_label)
             .await?;
-        self.keep(ino, Node { record, key });
+        self.keep(ino, node);
         let mut roots = self.roots.lock().unwrap();
         roots.by_name.insert(label.to_os_string(), ino);
         roots.inos.insert(ino);
@@ -337,7 +459,7 @@ impl Vault {
             .ok_or_else(|| FsError::new(libc::EINVAL, "an empty path"))?;
         let mut ino = self.root_lookup(OsStr::new(first)).await?;
         for part in parts {
-            ino = self.remote.lookup(ino, OsStr::new(part)).await?.ino;
+            ino = self.lookup(ino, OsStr::new(part)).await?.ino;
         }
         Ok(ino)
     }

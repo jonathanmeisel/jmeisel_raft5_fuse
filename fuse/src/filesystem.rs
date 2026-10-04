@@ -475,7 +475,8 @@ impl Filesystem for Raft5Fs {
                 let ino = vault.root_lookup(name).await?;
                 self.remote().getattr(ino).await
             }),
-            _ => self.block(self.remote().lookup(parent.0, name)),
+            Some(vault) => self.block(vault.lookup(parent.0, name)),
+            None => self.block(self.remote().lookup(parent.0, name)),
         };
         let mut attr = match found {
             Ok(attr) => attr,
@@ -577,7 +578,8 @@ impl Filesystem for Raft5Fs {
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let removed = match self.vault() {
             Some(vault) if parent.0 == VIRTUAL_ROOT => self.block(vault.delete_volume(name)),
-            _ => self.block(self.remote().rmdir(parent.0, name)).map(drop),
+            Some(vault) => self.block(vault.rmdir(parent.0, name)).map(drop),
+            None => self.block(self.remote().rmdir(parent.0, name)).map(drop),
         };
         match removed {
             Ok(()) => reply.ok(),
@@ -589,7 +591,11 @@ impl Filesystem for Raft5Fs {
         if self.is_virtual_root(parent.0) {
             return reply.error(Errno::EPERM);
         }
-        match self.block(self.remote().unlink(parent.0, name)) {
+        let removed = match self.vault() {
+            Some(vault) => self.block(vault.unlink(parent.0, name)),
+            None => self.block(self.remote().unlink(parent.0, name)),
+        };
+        match removed {
             Ok(ino) => {
                 // Anything still buffered for it can only fail now (the
                 // store refuses writes to a deleted inode); drop it rather
@@ -865,18 +871,25 @@ impl Filesystem for Raft5Fs {
                         ino: VIRTUAL_ROOT,
                         kind: Kind::Directory,
                         name: n.into(),
+                        sealed_name: Vec::new(),
                     });
                     dots.into_iter()
                         .chain(entries.into_iter().map(|(name, ino)| DirItem {
                             ino,
                             kind: Kind::Directory,
                             name,
+                            sealed_name: Vec::new(),
                         }))
                         .collect()
                 }
                 Err(e) => return reply.error(errno(&e)),
             },
-            vault => match self.block(self.remote().readdir(ino.0)) {
+            vault => match self.block(async {
+                match vault {
+                    Some(vault) => vault.readdir(ino.0).await,
+                    None => self.remote().readdir(ino.0).await,
+                }
+            }) {
                 Ok(mut items) => {
                     // A grant's `..` is the virtual root: what is really
                     // above it isn't this account's to see.

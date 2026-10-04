@@ -18,6 +18,6 @@ pub use layout::{
     chunk_prefix, dirent_prefix, tombstone_key, validate_chunk_size,
 };
 pub use raft5fs_proto::types::{
-    AccountKeys, Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SetAttr, SetTime,
-    WriteError,
+    AccountKeys, Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SealedMove,
+    SetAttr, SetTime, WriteError,
 };

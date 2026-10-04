@@ -6,6 +6,7 @@ mod support;
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -388,40 +389,37 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     let mine = vault(&h, support::TESTER);
     let remote = mine.remote();
     let parent = h.runtime.block_on(mine.node(v)).unwrap();
-    let create = |name: &str, new: Option<&NewNode>| {
+    // A create as an honest client would send it, but for `ino` and its
+    // key record claiming `parent_version`.
+    let create = |name: &str, ino: u64, parent_version: u32| {
+        let (record, _) = NodeKeys::create(ino, Some((&parent.key, parent_version)));
+        let tag = parent.tag(OsStr::new(name));
+        let new = NewNode {
+            ino,
+            keys: record.encode(),
+            sealed_name: parent.seal(v, &tag, OsStr::new(name)),
+        };
         h.runtime
-            .block_on(remote.create(v, OsStr::new(name), 0o644, new))
+            .block_on(remote.create(v, &tag, 0o644, Some(&new)))
     };
+    let version = parent.record.version;
 
-    assert_fs_errno(create("none", None), libc::EINVAL);
-
-    let unreserved = 1_000_000;
-    let (record, _) = NodeKeys::create(unreserved, Some((&parent.key, parent.record.version)));
-    let new = NewNode {
-        ino: unreserved,
-        keys: record.encode(),
-    };
-    assert_fs_errno(create("unreserved", Some(&new)), libc::EACCES);
+    let bare = h
+        .runtime
+        .block_on(remote.create(v, &parent.tag(OsStr::new("bare")), 0o644, None));
+    assert_fs_errno(bare, libc::EINVAL);
+    assert_fs_errno(create("unreserved", 1_000_000, version), libc::EACCES);
 
     // A reserved inode, but a record claiming the wrong parent version.
-    let ino = h.runtime.block_on(remote.allocate_inode()).unwrap();
-    let (record, _) = NodeKeys::create(ino, Some((&parent.key, parent.record.version + 1)));
-    let new = NewNode {
-        ino,
-        keys: record.encode(),
-    };
-    assert_fs_errno(create("wrong-version", Some(&new)), libc::EINVAL);
+    let reserved = h.runtime.block_on(remote.allocate_inode()).unwrap();
+    assert_fs_errno(create("wrong-version", reserved, version + 1), libc::EINVAL);
+    create("right", reserved, version).unwrap();
 
     // Someone else's reservation won't do either.
     h.add_user("alice", 50_001, 50_001, &[]);
     let alice = connect(&h, "alice", &support::password("alice")).unwrap();
     let hers = h.runtime.block_on(alice.allocate_inode()).unwrap();
-    let (record, _) = NodeKeys::create(hers, Some((&parent.key, parent.record.version)));
-    let new = NewNode {
-        ino: hers,
-        keys: record.encode(),
-    };
-    assert_fs_errno(create("hers", Some(&new)), libc::EACCES);
+    assert_fs_errno(create("hers", hers, version), libc::EACCES);
 }
 
 #[test]
@@ -461,4 +459,135 @@ fn every_inode_has_a_key_record() {
             .unwrap_or_else(|| panic!("no key record for {path:?}"));
         assert_eq!(NodeKeys::decode(&record).unwrap().version, 1);
     }
+}
+
+// ------------------------------------------------------------------ names
+
+/// Asserts `marker` appears in no key or value in the store.
+#[track_caller]
+fn assert_nowhere_in_store(h: &support::Harness, marker: &[u8]) {
+    for key in h.keys_with_prefix(&[]) {
+        let value = h.read_key(&key).unwrap_or_default();
+        for bytes in [&key, &value] {
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker),
+                "{:?} is stored under {key:?}",
+                String::from_utf8_lossy(marker)
+            );
+        }
+    }
+}
+
+#[test]
+fn no_name_reaches_the_store() {
+    let h = support::setup_encrypted();
+    let v = h.path().join("volume-zebra");
+    fs::create_dir_all(v.join("dir-zebra/deeper-zebra")).unwrap();
+    fs::write(v.join("dir-zebra/file-zebra"), b"x").unwrap();
+    fs::rename(v.join("dir-zebra/file-zebra"), v.join("moved-zebra")).unwrap();
+    h.add_user("alice", 50_001, 50_001, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(
+            ino(&v.join("dir-zebra")),
+            "alice",
+            false,
+            OsStr::new("label-zebra"),
+        ))
+        .unwrap();
+    assert_nowhere_in_store(&h, b"zebra");
+}
+
+#[test]
+fn names_survive_listing_moving_and_sharing() {
+    let h = support::setup_encrypted();
+    let v = h.path().join("v");
+    fs::create_dir_all(v.join("a")).unwrap();
+    fs::create_dir(v.join("b")).unwrap();
+    for name in ["one", "two", "naïve ☃"] {
+        fs::write(v.join("a").join(name), name).unwrap();
+    }
+    assert_eq!(names(&v.join("a")), ["naïve ☃", "one", "two"]);
+
+    fs::rename(v.join("a/one"), v.join("a/uno")).unwrap();
+    fs::rename(v.join("a/two"), v.join("b/dos")).unwrap();
+    assert_eq!(names(&v.join("a")), ["naïve ☃", "uno"]);
+    assert_eq!(names(&v.join("b")), ["dos"]);
+    assert_eq!(fs::read(v.join("b/dos")).unwrap(), b"two");
+    assert_errno(fs::read(v.join("a/one")), libc::ENOENT);
+
+    h.add_user("alice", 50_001, 50_001, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    let alice = h.mount_as("alice");
+    assert_eq!(names(&alice.path.join("v/a")), ["naïve ☃", "uno"]);
+    assert_eq!(
+        fs::read(alice.path.join("v/a/naïve ☃")).unwrap(),
+        "naïve ☃".as_bytes()
+    );
+}
+
+#[test]
+fn a_plain_name_is_refused() {
+    let h = support::setup_encrypted();
+    fs::create_dir(h.path().join("v")).unwrap();
+    fs::write(h.path().join("v/f"), b"x").unwrap();
+    let v = ino(&h.path().join("v"));
+    let mine = vault(&h, support::TESTER);
+    let remote = mine.remote();
+    let parent = h.runtime.block_on(mine.node(v)).unwrap();
+
+    // Everything right but the name, which goes as itself.
+    let reserved = h.runtime.block_on(remote.allocate_inode()).unwrap();
+    let (record, _) = NodeKeys::create(reserved, Some((&parent.key, parent.record.version)));
+    let name = OsStr::new("in-the-clear");
+    let new = NewNode {
+        ino: reserved,
+        keys: record.encode(),
+        sealed_name: parent.seal(v, name, name),
+    };
+    let created = h
+        .runtime
+        .block_on(remote.create(v, name, 0o644, Some(&new)));
+    assert_fs_errno(created, libc::EINVAL);
+
+    // A rename to a plain name, with or without anything sealed.
+    let tag = parent.tag(OsStr::new("f"));
+    let renamed = h
+        .runtime
+        .block_on(remote.rename(v, &tag, v, name, false, None));
+    assert_fs_errno(renamed, libc::EINVAL);
+}
+
+#[test]
+fn an_entry_filed_under_another_name_is_left_out() {
+    let h = support::setup_encrypted();
+    let v = h.path().join("v");
+    fs::create_dir(&v).unwrap();
+    fs::write(v.join("a"), b"a").unwrap();
+    fs::write(v.join("b"), b"b").unwrap();
+    let mine = vault(&h, support::TESTER);
+    let dir = h.runtime.block_on(mine.node(ino(&v))).unwrap();
+    let dirent = |name: &str| {
+        let mut key = vec![0x03];
+        key.extend_from_slice(&ino(&v).to_be_bytes());
+        key.extend_from_slice(dir.tag(OsStr::new(name)).as_bytes());
+        key
+    };
+    // What a server could do: file a's entry, sealed name and all, under
+    // b's tag too.
+    let a = h.read_key(&dirent("a")).unwrap();
+    h.write_key(&dirent("b"), Some(&a));
+
+    let fresh = vault(&h, support::TESTER);
+    let listed: Vec<String> = h
+        .runtime
+        .block_on(fresh.readdir(ino(&v)))
+        .unwrap()
+        .into_iter()
+        .map(|item| item.name.into_string().unwrap())
+        .collect();
+    assert_eq!(listed, [".", "..", "a"]);
 }

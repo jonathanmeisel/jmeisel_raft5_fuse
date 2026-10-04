@@ -56,7 +56,9 @@ use raft5fs_proto::pb::{
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
     PreloginRequest, PublicKeyRequest, ReadRequest, RenameRequest, SetAttrRequest, WriteRequest,
 };
-use raft5fs_proto::types::{Attr, DirItem, FsError, Grant, KeyPath, NewNode, SetAttr, WriteError};
+use raft5fs_proto::types::{
+    Attr, DirItem, FsError, Grant, KeyPath, NewNode, SealedMove, SetAttr, WriteError,
+};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -617,6 +619,7 @@ impl Remote {
             perm: perm.into(),
             ino: new.map_or(0, |n| n.ino),
             node_keys: new.map(|n| n.keys.clone()).unwrap_or_default(),
+            sealed_name: new.map(|n| n.sealed_name.clone()).unwrap_or_default(),
         }
     }
 
@@ -670,10 +673,10 @@ impl Remote {
         .into_result()
     }
 
-    /// Moves a name, returning the inode it replaced, if any. `node_keys`:
-    /// on an encrypted filesystem, a move to another directory brings the
-    /// moved node's inode and key record, re-wrapped under the new
-    /// parent's key.
+    /// Moves a name, returning the inode it replaced, if any. `sealed`: on
+    /// an encrypted filesystem, the moved inode, its new name sealed, and
+    /// on a move to another directory its key record re-wrapped (see
+    /// `SealedMove`).
     pub async fn rename(
         &self,
         parent: u64,
@@ -681,7 +684,7 @@ impl Remote {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
-        node_keys: Option<(u64, &[u8])>,
+        sealed: Option<&SealedMove>,
     ) -> Result<Option<u64>, FsError> {
         let req = RenameRequest {
             parent,
@@ -689,8 +692,9 @@ impl Remote {
             new_parent,
             new_name: name_bytes(new_name),
             noreplace,
-            node_keys: node_keys.map(|(_, k)| k.to_vec()).unwrap_or_default(),
-            moved_ino: node_keys.map_or(0, |(ino, _)| ino),
+            node_keys: sealed.map(|m| m.node_keys.clone()).unwrap_or_default(),
+            moved_ino: sealed.map_or(0, |m| m.ino),
+            sealed_new_name: sealed.map(|m| m.sealed_name.clone()).unwrap_or_default(),
         };
         let replaced = self
             .call(Retry::Once, |mut c| {

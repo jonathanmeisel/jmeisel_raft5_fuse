@@ -105,7 +105,12 @@ pub struct SetAttr {
 pub struct DirItem {
     pub ino: u64,
     pub kind: Kind,
+    /// On an encrypted filesystem, the entry's tag; see `sealed_name`.
     pub name: OsString,
+    /// On an encrypted filesystem, the real name, sealed under the
+    /// directory's key. Empty for `.` and `..`, and on any other
+    /// filesystem.
+    pub sealed_name: Vec<u8>,
 }
 
 /// A directory granted to a user on an encrypted filesystem: whether they
@@ -134,6 +139,20 @@ pub struct KeyPath {
 pub struct NewNode {
     pub ino: u64,
     pub keys: Vec<u8>,
+    /// Its real name, sealed under the parent's key. (The name the create
+    /// passes is the tag.)
+    pub sealed_name: Vec<u8>,
+}
+
+/// What a rename on an encrypted filesystem brings: the inode it moves --
+/// refused if the name no longer names it -- its key record re-wrapped
+/// under the new parent's key if the parent changes (empty if not), and
+/// the new name sealed under the new parent's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedMove {
+    pub ino: u64,
+    pub node_keys: Vec<u8>,
+    pub sealed_name: Vec<u8>,
 }
 
 /// What an encrypted filesystem keeps for an account: enough to check a

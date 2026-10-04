@@ -204,6 +204,9 @@ message NameRequest {
   bytes name = 2;
 }
 
+// On an encrypted filesystem, every `name` is a tag: an HMAC of the real
+// name under the directory's name key (raft5fs-crypto's `data`), which
+// lets the server find an entry without learning what it is called.
 message CreateRequest {
   uint64 parent = 1;
   bytes name = 2;
@@ -212,6 +215,9 @@ message CreateRequest {
   // record, wrapped under the parent's current key.
   uint64 ino = 4;
   bytes node_keys = 5;
+  // Encrypted filesystems: the real name, sealed under the parent's key,
+  // which listings hand back.
+  bytes sealed_name = 6;
 }
 
 message RenameRequest {
@@ -226,6 +232,9 @@ message RenameRequest {
   // it is for -- the move is refused if `name` no longer names it.
   bytes node_keys = 6;
   uint64 moved_ino = 7;
+  // Encrypted filesystems: `new_name`'s real name, sealed under the new
+  // parent's key.
+  bytes sealed_new_name = 8;
 }
 
 message GrantInfo {
@@ -370,7 +379,11 @@ message InoResponse {
 message DirItem {
   uint64 ino = 1;
   Kind kind = 2;
+  // On an encrypted filesystem, the entry's tag.
   bytes name = 3;
+  // On an encrypted filesystem, the real name, sealed; empty for `.` and
+  // `..`, and everywhere on any other filesystem.
+  bytes sealed_name = 4;
 }
 
 message DirList {

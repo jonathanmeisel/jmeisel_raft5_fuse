@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
 use raft5fs_core::{
-    Caller, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, WriteError, accounts, batch_bytes, users,
+    Caller, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, SealedMove, WriteError, accounts,
+    batch_bytes, users,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
@@ -487,7 +488,7 @@ impl Fs for FsService {
                 r.new_parent,
                 name(&r.new_name),
                 r.noreplace,
-                (!r.node_keys.is_empty()).then_some((r.moved_ino, r.node_keys.as_slice())),
+                sealed_move(&r).as_ref(),
             )
             .await
             .map(|replaced| replaced.unwrap_or(0));
@@ -551,6 +552,7 @@ impl Fs for FsService {
         let new = NewNode {
             ino: r.ino,
             keys: r.node_keys,
+            sealed_name: Vec::new(),
         };
         let made = self
             .core
@@ -572,8 +574,20 @@ impl Fs for FsService {
 
 /// What an encrypted filesystem's create brings, if this one brought it.
 fn new_node(r: &CreateRequest) -> Option<NewNode> {
-    (r.ino != 0 || !r.node_keys.is_empty()).then(|| NewNode {
+    (r.ino != 0 || !r.node_keys.is_empty() || !r.sealed_name.is_empty()).then(|| NewNode {
         ino: r.ino,
         keys: r.node_keys.clone(),
+        sealed_name: r.sealed_name.clone(),
+    })
+}
+
+/// What an encrypted filesystem's rename brings, if this one brought it.
+fn sealed_move(r: &RenameRequest) -> Option<SealedMove> {
+    (r.moved_ino != 0 || !r.node_keys.is_empty() || !r.sealed_new_name.is_empty()).then(|| {
+        SealedMove {
+            ino: r.moved_ino,
+            node_keys: r.node_keys.clone(),
+            sealed_name: r.sealed_new_name.clone(),
+        }
     })
 }
