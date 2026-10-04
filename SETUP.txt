@@ -1,0 +1,333 @@
+RAFT5FS: SETTING UP THE KV STORE, FILESYSTEM SERVERS AND MOUNTS
+===============================================================
+
+raft5fs has three tiers:
+
+  raft5 cluster      the key-value store everything lives in. Only the
+  (raft5-server)     filesystem servers may talk to it.
+
+  filesystem         stateless; hold the store credentials, check logins
+  servers            and enforce file permissions. Run as many as you
+  (raft5fs-server)   like against one store.
+
+  mounts             one per user per machine. Log in as a user, buffer
+  (raft5fs-fuse)     writes, and use whichever server answers.
+
+    user's mount --(TLS, user login)--> fs server --(mTLS, service login)--> raft5
+
+The steps below set up one store node, one filesystem server and one
+mount on a single machine, with TLS everywhere. Section 8 covers adding
+more of each.
+
+Commands are run from a scratch directory, here called $WORK. Ports used:
+
+  27051  raft5 client API      27052  raft5 peer API
+  27060  filesystem server
+
+
+-------------------------------------------------------------------------
+1. BUILD
+-------------------------------------------------------------------------
+
+The store (from the jmeisel_raft5 repository):
+
+  cd jmeisel_raft5
+  cargo build --release -p raft5-server -p raft5-client
+  # -> target/release/raft5-server  (a store node)
+  # -> target/release/raft          (the store's admin shell)
+
+The filesystem (from this repository):
+
+  cd jmeisel_raft5_fuse
+  cargo build --release
+  # -> target/release/raft5fs-server
+  # -> target/release/raft5fs-fuse
+
+Mounting needs FUSE 3 (`fusermount3`), e.g. the `fuse3` package.
+
+The examples below assume all four binaries are on your PATH.
+
+
+-------------------------------------------------------------------------
+2. CERTIFICATES AND SECRETS
+-------------------------------------------------------------------------
+
+One self-signed certificate, used by every tier: the store serves with it
+and requires it of clients (mTLS), the filesystem servers present it to
+the store and serve their own clients with it, and every client trusts
+it. (For separate certificates per tier, or your own CA, see TLS.txt in
+the jmeisel_raft5 repository; the requirements there apply here too.)
+
+  cd $WORK
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -days 365 -subj "/CN=raft5fs" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "extendedKeyUsage=serverAuth,clientAuth" \
+    -keyout key.pem -out cert.pem
+
+List every host name or IP that clients will dial in subjectAltName.
+
+Then two secrets and a password:
+
+  # The store's token-signing secret.
+  head -c 48 /dev/urandom | base64 > jwt.secret
+
+  # What the filesystem servers sign sessions and file handles with.
+  # Every filesystem server needs the same file. Anyone holding it can
+  # act as any filesystem user, so guard it like the store credentials.
+  head -c 48 /dev/urandom > token.key
+
+  # The store's first administrator's password.
+  echo 'choose-an-admin-password' > admin.pw
+
+  chmod 600 key.pem jwt.secret token.key admin.pw
+
+Only the users' machines need cert.pem; key.pem, jwt.secret and token.key
+stay on the servers.
+
+
+-------------------------------------------------------------------------
+3. START AND BOOTSTRAP THE STORE
+-------------------------------------------------------------------------
+
+Start a node:
+
+  raft5-server --id n1 --db $WORK/db \
+    --client-addr 127.0.0.1:27051 --peer-addr 127.0.0.1:27052 \
+    --jwt-secret-file jwt.secret \
+    --initial-admin-user admin --initial-admin-password-file admin.pw \
+    --client-tls-cert cert.pem --client-tls-key key.pem \
+    --client-tls-ca cert.pem
+
+--client-tls-ca is what makes the store require a client certificate.
+Users never get key.pem, so they can't even connect to the store.
+
+Open the admin shell in another terminal. It asks for admin's password:
+
+  raft --nodes https://127.0.0.1:27051 \
+    --ca-cert cert.pem --cert cert.pem --key key.pem --user admin
+
+In the shell, bootstrap the cluster, create the store accounts and lock
+the store down. Each create_user asks for that account's password.
+
+  raft> bootstrap n1
+  raft> create_user raft5fs
+  raft> create_user alice
+  raft> create_user bob
+  raft> acl_set "" user:raft5fs=write
+  raft> quit
+
+  - raft5fs  is the service account the filesystem servers work as.
+  - alice, bob  are filesystem users. They log in to their mounts with
+             these passwords, but can do nothing with the store directly.
+  - acl_set ""  puts an ACL on the empty prefix, which governs every
+             key: only raft5fs may read or write anything. Without it,
+             every key is open to any logged-in account.
+
+The --initial-admin-* flags only matter until the bootstrap. After that
+the stored admin account takes over, and they can be left off.
+
+
+-------------------------------------------------------------------------
+4. ADD FILESYSTEM USERS
+-------------------------------------------------------------------------
+
+Each store account that should use the filesystem needs an entry saying
+which uid, primary gid and supplementary groups it acts as. A store
+account with no entry is refused at login.
+
+The filesystem servers' store options, used here and in section 5:
+
+  export RAFT5FS_STORE_PASSWORD='<the raft5fs password>'
+  STORE="--store-user raft5fs --store-ca cert.pem \
+         --store-cert cert.pem --store-key key.pem"
+
+  raft5fs-server user add alice --uid 1001 --gid 1001 --groups 2000 \
+    $STORE https://127.0.0.1:27051
+  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups 2000 \
+    $STORE https://127.0.0.1:27051
+  raft5fs-server user list $STORE https://127.0.0.1:27051
+
+Here alice and bob share group 2000. The ids are the filesystem's own:
+they show up as file owners in `ls -l` on every machine, so match them to
+the local accounts if you want those listings to read naturally.
+
+uid 0 is root inside the filesystem and bypasses every permission
+check, so only map an account to 0 deliberately.
+
+Changes apply at the user's next login. `user del <name>` removes an
+entry. A removed user keeps access until their session expires (24 hours
+by default; see --session-ttl). To cut someone off at once, also delete
+their store account (`delete_user` in the admin shell).
+
+
+-------------------------------------------------------------------------
+5. START THE FILESYSTEM SERVER
+-------------------------------------------------------------------------
+
+  raft5fs-server --listen 127.0.0.1:27060 \
+    --token-key-file token.key \
+    --tls-cert cert.pem --tls-key key.pem \
+    --root-owner 1001:2000 \
+    $STORE https://127.0.0.1:27051
+
+  --root-owner  owner of the root directory. Only used when the
+                filesystem is first created, by whichever server gets
+                there first, so give every server the same value. It
+                defaults to 0:0 (root), in which case no ordinary user
+                can create anything at the top level until it is
+                chowned. Here alice owns it, and group 2000 can read it.
+  --chunk-size  how files are split into store keys (default 1M). Also
+                fixed when the filesystem is created.
+  --read-cache-size  memory for caching file data (default 64M).
+  --session-ttl  how long a login lasts, in seconds (default 86400).
+
+Leaving off --tls-cert/--tls-key serves in plaintext, and the server
+warns you: users' passwords and all file data then cross the network
+unencrypted.
+
+
+-------------------------------------------------------------------------
+6. MOUNT
+-------------------------------------------------------------------------
+
+As the local user who will use the mount (not root):
+
+  mkdir -p ~/raft5fs
+  raft5fs-fuse --user alice --ca cert.pem ~/raft5fs https://127.0.0.1:27060
+
+It asks for alice's password on the terminal, or reads it from the
+RAFT5FS_PASSWORD environment variable. It runs in the foreground; leave
+it running, and use ~/raft5fs from another shell:
+
+  echo hello > ~/raft5fs/greeting
+  ls -l ~/raft5fs
+
+Everything done through the mount is done as alice, whichever local user
+does it. That is why the mount is only usable by the local user who
+mounted it. Each person mounts with their own login.
+
+  --tls-server-name <NAME>  check the server certificate against NAME
+                     instead of the host in the address.
+  --no-write-buffer  store every write at once instead of buffering
+                     small writes (slower; mostly for debugging).
+
+Give several server addresses to fail over between them:
+
+  raft5fs-fuse --user alice --ca cert.pem ~/raft5fs \
+    https://fs1:27060 https://fs2:27060
+
+To unmount:
+
+  fusermount3 -u ~/raft5fs
+
+Buffered writes are stored before the unmount completes. A program
+that needs to know its data is stored should call fsync, or check the
+result of close.
+
+
+-------------------------------------------------------------------------
+7. PERMISSIONS IN SHORT
+-------------------------------------------------------------------------
+
+Ordinary POSIX permissions, enforced by the filesystem servers:
+
+  - Owner, group and other bits, using the uid, gid and groups from
+    the user table (section 4).
+  - chmod: owner only. chown: root only. chgrp: owner, to a group they
+    are in.
+  - The sticky bit (e.g. chmod 1777 on a shared tmp directory) and
+    setgid directories (chmod 2770 on a group directory; new files
+    inherit its group) both work.
+  - Access is checked when a file is opened. An already-open file
+    keeps working after a chmod, as on a local disk.
+
+Groups are just numbers. Nothing creates or names them: a group exists
+once some user's entry lists it. To share a file read-only with a new
+group 3000 holding alice and bob, first add 3000 to both entries (with
+the store options from section 4):
+
+  raft5fs-server user add alice --uid 1001 --gid 1001 --groups 2000,3000 \
+    $STORE https://127.0.0.1:27051
+  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups 2000,3000 \
+    $STORE https://127.0.0.1:27051
+
+`user add` replaces the whole entry, so repeat the uid and gid, and
+list every group the user should keep, not just the new one. Both users
+then unmount and mount again, since group changes apply at login.
+
+Then the file's owner, here alice, gives it the group and the group
+read bit:
+
+  chgrp 3000 ~/raft5fs/report.txt
+  chmod 640  ~/raft5fs/report.txt
+
+The owner can only chgrp to a group they are in, which is why alice is
+in 3000 too. Readers also need search permission (x) on every directory
+on the way to the file. For a shared directory whose new files get the
+group on their own, make it setgid:
+
+  chgrp 3000 ~/raft5fs/shared
+  chmod 2750 ~/raft5fs/shared
+
+Each file has exactly one group, and there are no POSIX ACLs (setfacl)
+to grant access to more. `ls -l` shows a group's number unless the
+local machine has a group with that gid.
+
+Not supported: hard links, symlinks, device files, and atomically
+swapping two names (renameat2 RENAME_EXCHANGE).
+
+
+-------------------------------------------------------------------------
+8. MORE THAN ONE OF EACH
+-------------------------------------------------------------------------
+
+More filesystem servers: start another raft5fs-server, the same way as
+in section 5, on any machine that can reach the store. Use the same
+token.key and --root-owner. Servers keep no state of their own, so a
+mount can use any of them, and an open file survives its server
+restarting.
+
+Changing token.key logs every mount out. Mounts log back in on their
+own, but files that were open at the time fail with EBADF.
+
+More store nodes: start each node with its own --id and --db, plus the
+peer TLS flags (--peer-tls-cert, --peer-tls-key, --peer-tls-ca; every
+node must agree), and use --advertise / --advertise-client when nodes
+dial each other by addresses other than the ones they bind. Then add it
+from the admin shell, connected to the existing cluster:
+
+  raft> add_server https://<new-node>:<peer-port>
+
+See TLS.txt in the jmeisel_raft5 repository for the peer certificate
+requirements. Give filesystem servers every store node's client address
+as seeds.
+
+
+-------------------------------------------------------------------------
+9. TROUBLESHOOTING
+-------------------------------------------------------------------------
+
+  "login refused: the username or password was wrong"
+      The user's store password, as created with create_user.
+
+  "<user> has no filesystem account"
+      The store login worked, but section 4 was skipped for this user.
+
+  Permission denied creating anything at the top level
+      The root directory belongs to whoever --root-owner named when
+      the filesystem was created (0:0 if no server passed it). Check
+      with `ls -ld` on the mountpoint. A user mapped to uid 0 in the
+      user table can chown it (local root can't: inside the filesystem
+      you are whoever you logged in as).
+
+  "cannot log in to the store as raft5fs" (filesystem server)
+      RAFT5FS_STORE_PASSWORD is wrong, or the store certificate options
+      don't match the store's (--store-ca, and --store-cert/--store-key
+      if the store requires client certificates).
+
+  A server that "did not answer"
+      Over TLS this is often a refused handshake, not a dead server: a
+      missing client certificate, or a certificate whose
+      subjectAltName doesn't cover the address dialed.
