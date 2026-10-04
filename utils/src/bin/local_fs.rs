@@ -38,7 +38,7 @@ use raft5fs_core::{DEFAULT_CHUNK_SIZE, DEFAULT_READ_CACHE_BYTES, FsCore};
 use raft5fs_fuse::filesystem::Raft5Fs;
 use raft5fs_fuse::remote::Credentials;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{FsService, Store};
+use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -641,7 +641,7 @@ async fn start_fs_server(
     let listener = tokio::net::TcpListener::bind(manifest.fs_addr())
         .await
         .map_err(|e| format!("could not listen on {}: {e}", manifest.fs_addr()))?;
-    let fs = FsService::new(Arc::new(core), signer, store);
+    let fs = FsService::new(Arc::new(core), signer, store, DEFAULT_IDENTITY_TTL);
     let server_tls = ServerTlsConfig::new().identity(tls.identity.clone());
     let cancel = stack.fs_cancel.clone();
     stack.tasks.spawn(async move {
@@ -818,15 +818,16 @@ fn print_connection_info(dir: &Path, manifest: &Manifest, mountpoint: &Path) {
         "  export RAFT5FS_STORE_PASSWORD=$(cat {})",
         path(SERVICE_PASSWORD)
     );
-    println!(
-        "  raft5fs-server user add <NAME> --uid <UID> --gid <GID> --store-user {SERVICE_USER} \\"
-    );
-    println!(
-        "    --store-ca {} --store-cert {} --store-key {} {seeds}",
+    let store_options = format!(
+        "--store-user {SERVICE_USER} --store-ca {} --store-cert {} --store-key {} {seeds}",
         path(CA_CERT),
         path(NODE_CERT),
         path(NODE_KEY)
     );
+    println!("  raft5fs-server user add <NAME> --uid <UID> --gid <GID> [--groups <GROUP>,...] \\");
+    println!("    {store_options}");
+    println!("  raft5fs-server user mod <NAME> --add-groups <GROUP>,... {store_options}");
+    println!("  raft5fs-server group add <NAME> [--gid <GID>] {store_options}");
     println!();
     println!("another mount (password in {}):", path(USER_PASSWORD));
     println!(

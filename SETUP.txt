@@ -143,23 +143,33 @@ The filesystem servers' store options, used here and in section 5:
   STORE="--store-user raft5fs --store-ca cert.pem \
          --store-cert cert.pem --store-key key.pem"
 
-  raft5fs-server user add alice --uid 1001 --gid 1001 --groups 2000 \
+  raft5fs-server group add staff --gid 2000 $STORE https://127.0.0.1:27051
+  raft5fs-server user add alice --uid 1001 --gid 1001 --groups staff \
     $STORE https://127.0.0.1:27051
-  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups 2000 \
+  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups staff \
     $STORE https://127.0.0.1:27051
   raft5fs-server user list $STORE https://127.0.0.1:27051
 
-Here alice and bob share group 2000. The ids are the filesystem's own:
-they show up as file owners in `ls -l` on every machine, so match them to
-the local accounts if you want those listings to read naturally.
+Here alice and bob share group 2000, named staff. The ids are the
+filesystem's own: they show up as file owners in `ls -l` on every
+machine, so match them to the local accounts if you want those listings
+to read naturally.
+
+Wherever a command takes a group, it takes a gid number or a group name.
+A number needn't have a name (1001 above has none); a name must have been
+created with `group add`. Leave off --gid and `group add` picks the
+lowest gid from 1000 up that no group or user uses, and prints it.
+`group list` shows them all, and `group del <name>` removes a name (users
+keep the gid; it is just unnamed again).
 
 uid 0 is root inside the filesystem and bypasses every permission
 check, so only map an account to 0 deliberately.
 
-Changes apply at the user's next login. `user del <name>` removes an
-entry. A removed user keeps access until their session expires (24 hours
-by default; see --session-ttl). To cut someone off at once, also delete
-their store account (`delete_user` in the admin shell).
+Changes reach users within a few seconds (--identity-ttl, section 5),
+including users who are already mounted: nobody needs to mount again.
+`user del <name>` removes an entry, and a mounted user who is removed is
+refused from then on. Also delete their store account (`delete_user` in
+the admin shell) so they can't log in to the store itself.
 
 
 -------------------------------------------------------------------------
@@ -181,7 +191,15 @@ their store account (`delete_user` in the admin shell).
   --chunk-size  how files are split into store keys (default 1M). Also
                 fixed when the filesystem is created.
   --read-cache-size  memory for caching file data (default 64M).
-  --session-ttl  how long a login lasts, in seconds (default 86400).
+  --session-ttl  how long a login lasts, in seconds (default 86400),
+                before the mount gives the password again.
+  --identity-ttl  how long, in seconds, a server trusts a user's entry
+                before reading it again (default 5): how long a change
+                to the user table takes to reach a mounted user.
+
+Every server of one filesystem should run the same version: sessions
+from this version don't carry the user's ids, and an older server can't
+use them.
 
 Leaving off --tls-cert/--tls-key serves in plaintext, and the server
 warns you: users' passwords and all file data then cross the network
@@ -243,19 +261,21 @@ Ordinary POSIX permissions, enforced by the filesystem servers:
   - Access is checked when a file is opened. An already-open file
     keeps working after a chmod, as on a local disk.
 
-Groups are just numbers. Nothing creates or names them: a group exists
-once some user's entry lists it. To share a file read-only with a new
-group 3000 holding alice and bob, first add 3000 to both entries (with
-the store options from section 4):
+A group is a gid on users' entries; a name for it is optional. To share
+a file read-only with a new group holding alice and bob, create the
+group and add both to it (with the store options from section 4):
 
-  raft5fs-server user add alice --uid 1001 --gid 1001 --groups 2000,3000 \
+  raft5fs-server group add reports $STORE https://127.0.0.1:27051
+  raft5fs-server user mod alice --add-groups reports \
     $STORE https://127.0.0.1:27051
-  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups 2000,3000 \
+  raft5fs-server user mod bob   --add-groups reports \
     $STORE https://127.0.0.1:27051
 
-`user add` replaces the whole entry, so repeat the uid and gid, and
-list every group the user should keep, not just the new one. Both users
-then unmount and mount again, since group changes apply at login.
+`group add` prints the gid it picked; say it was 3000. `user mod` changes
+only the groups it is given and leaves the rest of the entry alone;
+`--remove-groups` takes users out again. (`user add` instead replaces the
+whole entry.) Mounted users pick the change up within a few seconds,
+without mounting again.
 
 Then the file's owner, here alice, gives it the group and the group
 read bit:
@@ -264,7 +284,8 @@ read bit:
   chmod 640  ~/raft5fs/report.txt
 
 The owner can only chgrp to a group they are in, which is why alice is
-in 3000 too. Readers also need search permission (x) on every directory
+in reports too. chgrp takes the number: names live only in the user
+table, not on the machine you mount from. Readers also need search permission (x) on every directory
 on the way to the file. For a shared directory whose new files get the
 group on their own, make it setgid:
 

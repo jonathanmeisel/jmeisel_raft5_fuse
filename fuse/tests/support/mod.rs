@@ -459,7 +459,9 @@ pub fn serve_if_requested() {
             std::process::exit(2);
         };
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
-        let fs = FsService::new(Arc::new(core), signer, store);
+        // Read the user table on every request, so a test that changes
+        // it sees the change at once.
+        let fs = FsService::new(Arc::new(core), signer, store, Duration::ZERO);
         if let Err(e) = raft5fs_server::serve(
             fs,
             listener,

@@ -11,7 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use raft5fs_core::{
     CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, batch_bytes, chunk_prefix,
-    dirent_prefix, resolve_chunk_size, tombstone_key,
+    dirent_prefix, groups, resolve_chunk_size, tombstone_key, users,
 };
 
 /// Not really a test: the entry point that lets the harness run a
@@ -1430,6 +1430,129 @@ fn a_setgid_group_directory_is_shared_by_its_members() {
     assert_errno(
         fs::write(carol.path.join("pub/shared/x"), b"x"),
         libc::EACCES,
+    );
+}
+
+#[test]
+fn joining_or_leaving_a_group_applies_without_mounting_again() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let carol = h.mount_as("carol");
+    let report = alice.path.join("pub/report");
+    fs::write(&report, b"figures").unwrap();
+    chgrp(&report, STAFF).unwrap();
+    chmod(&report, 0o640).unwrap();
+    let carols_view = carol.path.join("pub/report");
+    assert_errno(fs::read(&carols_view), libc::EACCES);
+
+    let joined = h
+        .runtime
+        .block_on(users::modify(&h.client, "carol", &[STAFF], &[]))
+        .unwrap();
+    assert_eq!(joined.groups, [STAFF]);
+    assert_eq!(fs::read(&carols_view).unwrap(), b"figures");
+
+    h.runtime
+        .block_on(users::modify(&h.client, "carol", &[], &[STAFF]))
+        .unwrap();
+    assert_errno(fs::read(&carols_view), libc::EACCES);
+}
+
+#[test]
+fn a_removed_account_is_cut_off_without_waiting_for_its_session() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let bob = h.mount_as("bob");
+    fs::write(bob.path.join("pub/before"), b"x").unwrap();
+    assert!(h.runtime.block_on(users::remove(&h.client, "bob")).unwrap());
+    assert_errno(fs::write(bob.path.join("pub/after"), b"x"), libc::EACCES);
+}
+
+#[test]
+fn groups_are_named_and_given_free_gids() {
+    let h = support::setup();
+    add_people(&h);
+    let in_use: Vec<u32> = h
+        .runtime
+        .block_on(users::list(&h.client))
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, a)| std::iter::once(a.gid).chain(a.groups))
+        .collect();
+
+    let devs = h
+        .runtime
+        .block_on(groups::add(&h.client, "devs", None))
+        .unwrap();
+    assert!(devs >= groups::FIRST_ALLOCATED_GID && !in_use.contains(&devs));
+    let next = h
+        .runtime
+        .block_on(groups::add(&h.client, "ops", None))
+        .unwrap();
+    assert_ne!(next, devs);
+    assert_eq!(
+        h.runtime
+            .block_on(groups::add(&h.client, "devs", Some(60_000)))
+            .unwrap_err()
+            .errno,
+        libc::EEXIST
+    );
+    assert_eq!(
+        h.runtime
+            .block_on(groups::add(&h.client, "qa", Some(devs)))
+            .unwrap_err()
+            .errno,
+        libc::EEXIST
+    );
+    // A gid users already have can be named on purpose.
+    assert_eq!(
+        h.runtime
+            .block_on(groups::add(&h.client, "staff", Some(STAFF)))
+            .unwrap(),
+        STAFF
+    );
+
+    let resolve = |g: &str| h.runtime.block_on(groups::resolve(&h.client, g));
+    assert_eq!(resolve("devs").unwrap(), devs);
+    assert_eq!(resolve("123").unwrap(), 123);
+    assert_eq!(resolve("nobody").unwrap_err().errno, libc::ENOENT);
+    let names: Vec<String> = h
+        .runtime
+        .block_on(groups::list(&h.client))
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, ["devs", "ops", "staff"]);
+
+    // Removing a group leaves its gid on the users who have it.
+    assert_eq!(
+        h.runtime
+            .block_on(groups::remove(&h.client, "staff"))
+            .unwrap(),
+        Some(STAFF)
+    );
+    assert_eq!(
+        h.runtime
+            .block_on(groups::remove(&h.client, "staff"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(resolve("staff").unwrap_err().errno, libc::ENOENT);
+    let alice = h
+        .runtime
+        .block_on(users::get(&h.client, "alice"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(alice.groups, [STAFF]);
+
+    assert_eq!(
+        h.runtime
+            .block_on(users::modify(&h.client, "nobody", &[devs], &[]))
+            .unwrap_err()
+            .errno,
+        libc::ENOENT
     );
 }
 

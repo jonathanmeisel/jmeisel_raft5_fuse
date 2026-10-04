@@ -2,6 +2,7 @@
 
 mod entry;
 mod fs;
+pub mod groups;
 mod layout;
 pub mod perm;
 mod read_cache;

@@ -89,6 +89,8 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x04 ++ name                        -> filesystem-wide singletons
 //   0x05 ++ ino(BE8)                    -> marker: this inode's deletion is under way
 //   0x06 ++ "u/" ++ username            -> the account's uid, gid and groups (`users`)
+//   0x06 ++ "g/" ++ group name          -> the group's gid(BE4) (`groups`)
+//   0x06 ++ "n/" ++ gid(BE4)            -> the name of that gid's group (`groups`)
 //
 // Deleting an inode takes several transactions (its chunks can't all fit
 // in one), so it is announced first: one transaction removes the dirent,
@@ -127,6 +129,13 @@ pub(crate) fn attr_key(ino: u64) -> Vec<u8> {
 
 /// The prefix of every user table row; see `users`.
 pub(crate) const USERS_PREFIX: &[u8] = b"\x06u/";
+
+/// The prefix of every group name row; see `groups`.
+pub(crate) const GROUPS_PREFIX: &[u8] = b"\x06g/";
+
+/// The prefix of every gid row, the group table's reverse index; see
+/// `groups`.
+pub(crate) const GIDS_PREFIX: &[u8] = b"\x06n/";
 
 /// The prefix every deletion marker shares; see the layout notes above.
 pub(crate) const TOMBSTONE_PREFIX: &[u8] = &[0x05];

@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::env;
 use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
+use raft5fs_core::groups;
 use raft5fs_core::users::{self, Account};
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, DEFAULT_READ_CACHE_BYTES, FsCore, validate_chunk_size};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{FsService, Store};
+use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tonic::transport::ServerTlsConfig;
@@ -16,10 +18,15 @@ const USAGE: &str = "\
 usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       [--tls-cert <PEM> --tls-key <PEM>] [options]
                       <store options> <kv-seed-address>...
-       raft5fs-server user add <NAME> --uid <UID> --gid <GID> [--groups <GID>,...]
-                      <store options> <kv-seed-address>...
+       raft5fs-server user add <NAME> --uid <UID> --gid <GROUP>
+                      [--groups <GROUP>,...] <store options> <kv-seed-address>...
+       raft5fs-server user mod <NAME> [--add-groups <GROUP>,...]
+                      [--remove-groups <GROUP>,...] <store options> <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
+       raft5fs-server group add <NAME> [--gid <GID>] <store options> <kv-seed-address>...
+       raft5fs-server group del <NAME> <store options> <kv-seed-address>...
+       raft5fs-server group list <store options> <kv-seed-address>...
 
 Serving:
   --listen <ADDR>      address to serve clients on, e.g. 0.0.0.0:7700.
@@ -33,9 +40,13 @@ Serving:
                        Without them clients connect in plaintext, and
                        passwords and file data cross the network in the
                        clear.
-  --session-ttl <SECS> how long a login lasts (default 86400). Bounds how
-                       long a removed account or a changed group list
-                       takes to apply.
+  --session-ttl <SECS> how long a login lasts before the client must give
+                       the password again (default 86400).
+  --identity-ttl <SECS>
+                       how long a user table entry is trusted before it is
+                       read again (default 5): how long a changed group
+                       list or a removed account takes to reach a user who
+                       is already mounted.
   --chunk-size <SIZE>  size of each stored file chunk, as a byte count or
                        with a K/M suffix (default 1M). Only applies when
                        creating a new filesystem: an existing one keeps
@@ -50,7 +61,14 @@ Serving:
 
 Users: which uid, gid and supplementary groups a store account acts as in
 the filesystem. A store account with no entry can't log in to the
-filesystem. Changes apply at the account's next login.
+filesystem. Changes reach mounted users within --identity-ttl; nobody
+needs to mount again. `user add` replaces the whole entry; `user mod`
+changes only the groups it names.
+
+Groups: names for gids. A <GROUP> is a gid number, which needn't have a
+name, or the name of a group from `group add`. `group add` without --gid
+picks the lowest gid from 1000 up that no group or user uses. Removing a
+group removes only its name: entries listing its gid keep it.
 
 Store options:
   --store-user <NAME>  the store account to work as; it needs write access
@@ -118,9 +136,20 @@ struct Args {
     store_cert: Option<String>,
     store_key: Option<String>,
     store_server_name: Option<String>,
+    identity_ttl: Option<Duration>,
     uid: Option<u32>,
-    gid: Option<u32>,
-    groups: Vec<u32>,
+    gid: Option<String>,
+    groups: Vec<String>,
+    add_groups: Vec<String>,
+    remove_groups: Vec<String>,
+}
+
+/// The comma-separated items of a list flag, unresolved.
+fn split_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_args() -> Args {
@@ -163,15 +192,15 @@ fn parse_args() -> Args {
             "--store-cert" => a.store_cert = Some(value("--store-cert")),
             "--store-key" => a.store_key = Some(value("--store-key")),
             "--store-server-name" => a.store_server_name = Some(value("--store-server-name")),
-            "--uid" => a.uid = Some(parse_number("--uid", &value("--uid"))),
-            "--gid" => a.gid = Some(parse_number("--gid", &value("--gid"))),
-            "--groups" => {
-                a.groups = value("--groups")
-                    .split(',')
-                    .filter(|g| !g.is_empty())
-                    .map(|g| parse_number("--groups", g))
-                    .collect();
+            "--identity-ttl" => {
+                let secs = parse_number("--identity-ttl", &value("--identity-ttl"));
+                a.identity_ttl = Some(Duration::from_secs(secs.into()));
             }
+            "--uid" => a.uid = Some(parse_number("--uid", &value("--uid"))),
+            "--gid" => a.gid = Some(value("--gid")),
+            "--groups" => a.groups = split_list(&value("--groups")),
+            "--add-groups" => a.add_groups = split_list(&value("--add-groups")),
+            "--remove-groups" => a.remove_groups = split_list(&value("--remove-groups")),
             flag if flag.starts_with("--") => usage(&format!("unknown option {flag}")),
             _ => a.positional.push(arg),
         }
@@ -236,7 +265,111 @@ async fn store_client(a: &Args, seeds: Vec<String>) -> (Client, Store) {
     (client, store)
 }
 
+/// The gids `items` name, each a number or a group name; an unknown name
+/// ends the command.
+async fn resolve_groups(client: &Client, items: &[String]) -> Vec<u32> {
+    let mut gids = Vec::new();
+    for item in items {
+        gids.push(
+            groups::resolve(client, item)
+                .await
+                .unwrap_or_else(|e| fail(e)),
+        );
+    }
+    gids
+}
+
+/// `gid`, and its name in brackets if it has one: `3000(devs)`.
+fn show_gid(names: &HashMap<u32, String>, gid: u32) -> String {
+    match names.get(&gid) {
+        Some(name) => format!("{gid}({name})"),
+        None => gid.to_string(),
+    }
+}
+
+/// Every group's name, by gid.
+async fn group_names(client: &Client) -> HashMap<u32, String> {
+    groups::list(client)
+        .await
+        .unwrap_or_else(|e| fail(e))
+        .into_iter()
+        .map(|(name, gid)| (gid, name))
+        .collect()
+}
+
+fn show_account(names: &HashMap<u32, String>, name: &str, a: &Account) -> String {
+    let groups: Vec<String> = a.groups.iter().map(|&g| show_gid(names, g)).collect();
+    format!(
+        "{name}\tuid={} gid={} groups={}",
+        a.uid,
+        show_gid(names, a.gid),
+        groups.join(",")
+    )
+}
+
 async fn user_command(a: Args) {
+    let mut positional = a.positional.iter().skip(1);
+    let command = positional.next().map(String::as_str);
+    let name = match command {
+        Some("add" | "del" | "mod") => Some(
+            positional
+                .next()
+                .cloned()
+                .unwrap_or_else(|| usage("which user?")),
+        ),
+        Some("list") => None,
+        _ => usage("user takes add, mod, del or list"),
+    };
+    if command == Some("mod") && a.add_groups.is_empty() && a.remove_groups.is_empty() {
+        usage("user mod needs --add-groups or --remove-groups");
+    }
+    let seeds = positional.cloned().collect();
+    let (client, _) = store_client(&a, seeds).await;
+    let result = match (command, name) {
+        (Some("add"), Some(name)) => {
+            let gid = a
+                .gid
+                .as_deref()
+                .unwrap_or_else(|| usage("--gid is required"));
+            let account = Account {
+                uid: a.uid.unwrap_or_else(|| usage("--uid is required")),
+                gid: resolve_groups(&client, &[gid.to_string()]).await[0],
+                groups: resolve_groups(&client, &a.groups).await,
+            };
+            users::set(&client, &name, &account).await
+        }
+        (Some("mod"), Some(name)) => {
+            let add = resolve_groups(&client, &a.add_groups).await;
+            let remove = resolve_groups(&client, &a.remove_groups).await;
+            match users::modify(&client, &name, &add, &remove).await {
+                Ok(account) => {
+                    let names = group_names(&client).await;
+                    println!("{}", show_account(&names, &name, &account));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+        (Some("del"), Some(name)) => users::remove(&client, &name).await.map(|existed| {
+            if !existed {
+                eprintln!("{name} had no entry");
+            }
+        }),
+        _ => match users::list(&client).await {
+            Ok(rows) => {
+                let names = group_names(&client).await;
+                for (name, a) in rows {
+                    println!("{}", show_account(&names, &name, &a));
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+    };
+    result.unwrap_or_else(|e| fail(e));
+}
+
+async fn group_command(a: Args) {
     let mut positional = a.positional.iter().skip(1);
     let command = positional.next().map(String::as_str);
     let name = match command {
@@ -244,36 +377,42 @@ async fn user_command(a: Args) {
             positional
                 .next()
                 .cloned()
-                .unwrap_or_else(|| usage("which user?")),
+                .unwrap_or_else(|| usage("which group?")),
         ),
         Some("list") => None,
-        _ => usage("user takes add, del or list"),
+        _ => usage("group takes add, del or list"),
     };
+    let gid = a.gid.as_deref().map(|g| parse_number("--gid", g));
     let seeds = positional.cloned().collect();
     let (client, _) = store_client(&a, seeds).await;
     let result = match (command, name) {
-        (Some("add"), Some(name)) => {
-            let account = Account {
-                uid: a.uid.unwrap_or_else(|| usage("--uid is required")),
-                gid: a.gid.unwrap_or_else(|| usage("--gid is required")),
-                groups: a.groups.clone(),
-            };
-            users::set(&client, &name, &account).await
-        }
-        (Some("del"), Some(name)) => users::remove(&client, &name).await.map(|existed| {
-            if !existed {
-                eprintln!("{name} had no entry");
+        (Some("add"), Some(name)) => groups::add(&client, &name, gid)
+            .await
+            .map(|gid| println!("{name}\tgid={gid}")),
+        (Some("del"), Some(name)) => match groups::remove(&client, &name).await {
+            Ok(None) => {
+                eprintln!("there was no group {name}");
+                Ok(())
             }
-        }),
-        _ => users::list(&client).await.map(|rows| {
-            for (name, a) in rows {
-                let groups: Vec<String> = a.groups.iter().map(u32::to_string).collect();
-                println!(
-                    "{name}\tuid={} gid={} groups={}",
-                    a.uid,
-                    a.gid,
-                    groups.join(",")
-                );
+            Ok(Some(gid)) => users::list(&client).await.map(|rows| {
+                let members: Vec<String> = rows
+                    .into_iter()
+                    .filter(|(_, a)| a.gid == gid || a.groups.contains(&gid))
+                    .map(|(user, _)| user)
+                    .collect();
+                if !members.is_empty() {
+                    eprintln!(
+                        "note: gid {gid} is still in the entries of {}; \
+                         it is now just unnamed",
+                        members.join(", ")
+                    );
+                }
+            }),
+            Err(e) => Err(e),
+        },
+        _ => groups::list(&client).await.map(|rows| {
+            for (name, gid) in rows {
+                println!("{name}\tgid={gid}");
             }
         }),
     };
@@ -328,7 +467,12 @@ async fn serve_command(a: Args) {
         .await
         .unwrap_or_else(|e| usage(&format!("cannot listen on {listen}: {e}")));
     eprintln!("serving on {}", listener.local_addr().unwrap());
-    let fs = FsService::new(Arc::new(core), signer, store);
+    let fs = FsService::new(
+        Arc::new(core),
+        signer,
+        store,
+        a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL),
+    );
     if let Err(e) = raft5fs_server::serve(fs, listener, tls, pending()).await {
         fail(format!("server stopped: {e}"));
     }
@@ -337,9 +481,9 @@ async fn serve_command(a: Args) {
 fn main() {
     let args = parse_args();
     let runtime = Runtime::new().expect("failed to start tokio runtime");
-    if args.positional.first().map(String::as_str) == Some("user") {
-        runtime.block_on(user_command(args));
-    } else {
-        runtime.block_on(serve_command(args));
+    match args.positional.first().map(String::as_str) {
+        Some("user") => runtime.block_on(user_command(args)),
+        Some("group") => runtime.block_on(group_command(args)),
+        _ => runtime.block_on(serve_command(args)),
     }
 }

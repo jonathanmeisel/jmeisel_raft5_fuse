@@ -5,10 +5,12 @@
 //! instance can check what any other issued, and a server restart loses
 //! nothing. That is the whole of the servers' shared state.
 //!
-//! - A **session** says which account a client logged in as and the
-//!   identity that account acts as, and expires. Every request but Hello
-//!   and Login carries one; it is what revocation rests on, since a
-//!   deleted account can't log in again.
+//! - A **session** says which account a client logged in as, and
+//!   expires. Every request but Hello and Login carries one. It doesn't
+//!   say what the account acts as: the server looks that up in the user
+//!   table (through a short-lived cache), so a changed group list or a
+//!   removed account applies to a mounted user within seconds, without
+//!   their logging in again.
 //! - A **handle** says that one inode was opened for reading and/or
 //!   writing, and by which uid. It doesn't expire by itself -- it is only
 //!   honoured alongside a live session of the same uid -- so an open file
@@ -24,8 +26,9 @@ use tonic::Status;
 
 const ALGORITHM: Algorithm = Algorithm::HS256;
 
-/// How long a session lasts unless the server is told otherwise. Bounds
-/// how long a removed account, or a changed group list, takes to apply.
+/// How long a session lasts unless the server is told otherwise: how
+/// often a client proves again that it knows the password. Changes to the
+/// user table don't wait for it (see the server's identity cache).
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Tells the two kinds of token apart, since one key signs both: a handle
@@ -42,9 +45,6 @@ struct SessionClaims {
     kind: Kind,
     /// The account name.
     sub: String,
-    uid: u32,
-    gid: u32,
-    groups: Vec<u32>,
     exp: u64,
 }
 
@@ -85,25 +85,26 @@ impl Signer {
             .expect("HMAC signing of plain claims can't fail")
     }
 
-    /// A session for account `name` acting as `caller`, and when it
-    /// expires (seconds since the epoch).
-    pub fn session(&self, name: &str, caller: &Caller) -> (String, u64) {
+    /// A session for account `name`, and when it expires (seconds since
+    /// the epoch).
+    pub fn session(&self, name: &str) -> (String, u64) {
         let exp = jsonwebtoken::get_current_timestamp() + self.session_ttl.as_secs();
         let token = self.sign(&SessionClaims {
             kind: Kind::Session,
             sub: name.to_string(),
-            uid: caller.uid,
-            gid: caller.gid,
-            groups: caller.groups.clone(),
             exp,
         });
         (token, exp)
     }
 
-    /// Who a session token is for. Anything wrong with it -- forged,
-    /// expired, not a session at all -- is `UNAUTHENTICATED`, which tells
-    /// the client to log in again.
-    pub fn verify_session(&self, token: &str) -> Result<Caller, Status> {
+    /// The account a session token is for. Anything wrong with it --
+    /// forged, expired, not a session at all -- is `UNAUTHENTICATED`, which
+    /// tells the client to log in again.
+    ///
+    /// A token from before sessions stopped carrying the identity still
+    /// verifies (its extra claims are ignored), but the reverse doesn't:
+    /// an older server can't read these, so upgrade every server at once.
+    pub fn verify_session(&self, token: &str) -> Result<String, Status> {
         let refused = |why: String| Status::unauthenticated(format!("session refused: {why}"));
         // `Validation::new` pins the algorithm and requires `exp`.
         let claims = decode::<SessionClaims>(token, &self.decoding, &Validation::new(ALGORITHM))
@@ -112,7 +113,7 @@ impl Signer {
         if claims.kind != Kind::Session {
             return Err(refused("not a session token".into()));
         }
-        Ok(Caller::new(claims.uid, claims.gid, claims.groups))
+        Ok(claims.sub)
     }
 
     /// A handle recording that `caller` opened `ino` as `read`/`write`.
@@ -166,13 +167,13 @@ mod tests {
     #[test]
     fn a_session_names_who_it_was_issued_to() {
         let s = signer();
-        let (token, _) = s.session("alice", &alice());
-        assert_eq!(s.verify_session(&token).unwrap(), alice());
+        let (token, _) = s.session("alice");
+        assert_eq!(s.verify_session(&token).unwrap(), "alice");
     }
 
     #[test]
     fn another_key_or_a_tampered_token_is_refused() {
-        let (token, _) = signer().session("alice", &alice());
+        let (token, _) = signer().session("alice");
         let other = Signer::new(b"other key", DEFAULT_SESSION_TTL);
         assert!(other.verify_session(&token).is_err());
         let mut tampered = token.into_bytes();
@@ -192,9 +193,6 @@ mod tests {
         let token = s.sign(&SessionClaims {
             kind: Kind::Session,
             sub: "alice".into(),
-            uid: 1000,
-            gid: 100,
-            groups: vec![],
             exp: jsonwebtoken::get_current_timestamp() - 3600,
         });
         let status = s.verify_session(&token).unwrap_err();
@@ -202,11 +200,34 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_still_carries_an_identity_verifies() {
+        #[derive(Serialize)]
+        struct Old {
+            kind: Kind,
+            sub: String,
+            uid: u32,
+            gid: u32,
+            groups: Vec<u32>,
+            exp: u64,
+        }
+        let s = signer();
+        let token = s.sign(&Old {
+            kind: Kind::Session,
+            sub: "alice".into(),
+            uid: 1000,
+            gid: 100,
+            groups: vec![4],
+            exp: jsonwebtoken::get_current_timestamp() + 60,
+        });
+        assert_eq!(s.verify_session(&token).unwrap(), "alice");
+    }
+
+    #[test]
     fn a_handle_is_not_a_session_and_a_session_is_not_a_handle() {
         let s = signer();
         let handle = s.handle(&alice(), 7, true, false);
         assert!(s.verify_session(&handle).is_err());
-        let (session, _) = s.session("alice", &alice());
+        let (session, _) = s.session("alice");
         assert_eq!(
             s.verify_handle(&alice(), &session).unwrap_err().errno,
             libc::EBADF

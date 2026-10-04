@@ -1,17 +1,21 @@
 //! The filesystem server: the raft5fs protocol over `FsCore`.
 //!
 //! Stateless by design, so any number can run against one store and a
-//! client can use any of them: nothing here outlives a request except the
-//! read cache inside `FsCore`, which revalidates every hit against the
-//! store. Write buffering lives in the client; sessions and open files
-//! live in signed tokens the client holds (see `auth`).
+//! client can use any of them: nothing here outlives a request except two
+//! caches -- the read cache inside `FsCore`, which revalidates every hit
+//! against the store, and the identity cache here, which holds a user
+//! table row for at most `identity_ttl`. Write buffering lives in the
+//! client; sessions and open files live in signed tokens the client holds
+//! (see `auth`).
 
 pub mod auth;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
@@ -36,6 +40,12 @@ use crate::auth::Signer;
 /// default, which a batch of large chunks would exceed.
 const MAX_MESSAGE_BYTES: usize = MAX_CHUNK_SIZE as usize + (1 << 20);
 
+/// How long a server may act on a user table row it has read before
+/// reading it again, unless told otherwise: how long a changed group list
+/// or a removed account takes to reach a mounted user. Costs at most one
+/// store read per active user per this long.
+pub const DEFAULT_IDENTITY_TTL: Duration = Duration::from_secs(5);
+
 /// How to reach the store: what the server's own client was built from,
 /// so that logins can be checked on clients of their own.
 #[derive(Clone)]
@@ -59,23 +69,68 @@ pub struct FsService {
     core: Arc<FsCore>,
     signer: Signer,
     store: Store,
+    /// What each account acted as when its row was last read, and when
+    /// that was.
+    identities: Mutex<HashMap<String, (Instant, Caller)>>,
+    identity_ttl: Duration,
 }
 
 impl FsService {
-    pub fn new(core: Arc<FsCore>, signer: Signer, store: Store) -> Self {
+    /// `identity_ttl` is how long a user table row is trusted before being
+    /// read again (`DEFAULT_IDENTITY_TTL`; zero reads it every request).
+    pub fn new(core: Arc<FsCore>, signer: Signer, store: Store, identity_ttl: Duration) -> Self {
         Self {
             core,
             signer,
             store,
+            identities: Mutex::new(HashMap::new()),
+            identity_ttl,
         }
     }
 
-    /// Who `request` is from, per its session, and its message.
-    fn caller<T>(&self, request: Request<T>) -> Result<(Caller, T), Status> {
+    /// Who `request` is from, per its session and the user table, and
+    /// its message.
+    async fn caller<T>(&self, request: Request<T>) -> Result<(Caller, T), Status> {
         let token = session_from_metadata(request.metadata())
             .ok_or_else(|| Status::unauthenticated("the request carries no session"))?;
-        let caller = self.signer.verify_session(token)?;
+        let name = self.signer.verify_session(token)?;
+        let caller = self.identity(&name).await?;
         Ok((caller, request.into_inner()))
+    }
+
+    /// What account `name` acts as now, give or take `identity_ttl`. An
+    /// account whose row is gone is `UNAUTHENTICATED`: the client then
+    /// logs in again, which is refused, so removing a row cuts a mounted
+    /// user off without waiting for their session to expire.
+    async fn identity(&self, name: &str) -> Result<Caller, Status> {
+        if let Some((read_at, caller)) = self.identities.lock().unwrap().get(name)
+            && read_at.elapsed() < self.identity_ttl
+        {
+            return Ok(caller.clone());
+        }
+        match users::get(self.core.client(), name).await {
+            Ok(Some(a)) => {
+                let caller = Caller::new(a.uid, a.gid, a.groups);
+                self.remember(name, &caller);
+                Ok(caller)
+            }
+            Ok(None) => {
+                self.identities.lock().unwrap().remove(name);
+                Err(Status::unauthenticated(format!(
+                    "{name} no longer has a filesystem account"
+                )))
+            }
+            Err(e) => Err(Status::unavailable(format!(
+                "cannot read the user table: {e}"
+            ))),
+        }
+    }
+
+    fn remember(&self, name: &str, caller: &Caller) {
+        self.identities
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (Instant::now(), caller.clone()));
     }
 
     /// The inode `handle` opened, if `caller` may use it for writing (or
@@ -123,7 +178,11 @@ impl FsService {
         }
         drop(store);
         match users::get(self.core.client(), username).await {
-            Ok(Some(a)) => Ok(Ok(Caller::new(a.uid, a.gid, a.groups))),
+            Ok(Some(a)) => {
+                let caller = Caller::new(a.uid, a.gid, a.groups);
+                self.remember(username, &caller);
+                Ok(Ok(caller))
+            }
             Ok(None) => Ok(Err(FsError::new(
                 libc::EACCES,
                 format!("{username} has no filesystem account"),
@@ -177,23 +236,23 @@ impl Fs for FsService {
         let session = self
             .authenticate(&r.username, &r.password)
             .await?
-            .map(|caller| self.signer.session(&r.username, &caller));
+            .map(|_| self.signer.session(&r.username));
         Ok(Response::new(session.into()))
     }
 
     async fn get_attr(&self, r: Request<InodeRequest>) -> Result<Response<AttrResponse>, Status> {
-        let (_, r) = self.caller(r)?;
+        let (_, r) = self.caller(r).await?;
         Ok(Response::new(self.core.getattr(r.ino).await.into()))
     }
 
     async fn lookup(&self, r: Request<NameRequest>) -> Result<Response<AttrResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let found = self.core.lookup(&caller, r.parent, name(&r.name)).await;
         Ok(Response::new(found.into()))
     }
 
     async fn open(&self, r: Request<AccessRequest>) -> Result<Response<OpenResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let opened = self.core.open(&caller, r.ino, r.mask).await.map(|()| {
             self.signer
                 .handle(&caller, r.ino, r.mask & R != 0, r.mask & W != 0)
@@ -202,7 +261,7 @@ impl Fs for FsService {
     }
 
     async fn access(&self, r: Request<AccessRequest>) -> Result<Response<EmptyResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
             self.core.access(&caller, r.ino, r.mask).await.into(),
         ))
@@ -212,14 +271,14 @@ impl Fs for FsService {
         &self,
         r: Request<InodeRequest>,
     ) -> Result<Response<ReadDirResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
             self.core.readdir(&caller, r.ino).await.into(),
         ))
     }
 
     async fn read(&self, r: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let data = match self.handle_ino(&caller, &r.handle, false) {
             Ok(ino) => self.core.read(ino, r.offset, r.len as usize).await,
             Err(e) => Err(e),
@@ -228,7 +287,7 @@ impl Fs for FsService {
     }
 
     async fn write(&self, r: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let written = match self.handle_ino(&caller, &r.handle, true) {
             Ok(ino) => self.core.write(ino, r.offset, &r.data).await,
             Err(error) => Err(WriteError { written: 0, error }),
@@ -237,7 +296,7 @@ impl Fs for FsService {
     }
 
     async fn set_attr(&self, r: Request<SetAttrRequest>) -> Result<Response<AttrResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         // A handle that doesn't check out just doesn't help: the change
         // is then judged on the caller's permissions alone.
         let writable_handle = r
@@ -252,7 +311,7 @@ impl Fs for FsService {
     }
 
     async fn mkdir(&self, r: Request<CreateRequest>) -> Result<Response<AttrResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let made = self
             .core
             .mkdir(&caller, r.parent, name(&r.name), r.perm as u16)
@@ -261,7 +320,7 @@ impl Fs for FsService {
     }
 
     async fn create(&self, r: Request<CreateRequest>) -> Result<Response<CreateResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         // Open for both whatever the new mode says: creating a file
         // read-only and writing it through the descriptor that created
         // it is ordinary (it is how `cp` copies a read-only file).
@@ -274,7 +333,7 @@ impl Fs for FsService {
     }
 
     async fn unlink(&self, r: Request<NameRequest>) -> Result<Response<InoResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
             self.core
                 .unlink(&caller, r.parent, name(&r.name))
@@ -284,7 +343,7 @@ impl Fs for FsService {
     }
 
     async fn rename(&self, r: Request<RenameRequest>) -> Result<Response<InoResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         let moved = self
             .core
             .rename(
@@ -301,7 +360,7 @@ impl Fs for FsService {
     }
 
     async fn rmdir(&self, r: Request<NameRequest>) -> Result<Response<InoResponse>, Status> {
-        let (caller, r) = self.caller(r)?;
+        let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
             self.core
                 .rmdir(&caller, r.parent, name(&r.name))

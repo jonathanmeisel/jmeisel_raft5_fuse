@@ -8,6 +8,7 @@
 
 use raft5_client::Client;
 
+use crate::fs::{TXN_TTL, retrying};
 use crate::layout::USERS_PREFIX;
 use raft5fs_proto::types::FsError;
 
@@ -59,7 +60,8 @@ pub async fn get(client: &Client, name: &str) -> Result<Option<Account>, FsError
 }
 
 /// Adds `name`'s row, or replaces it. Takes effect at that account's next
-/// login: a session already issued keeps the identity it was issued with.
+/// request, once each server's identity cache has let go of the old row:
+/// a mounted user needn't log in again.
 pub async fn set(client: &Client, name: &str, account: &Account) -> Result<(), FsError> {
     if name.is_empty() {
         return Err(FsError::new(libc::EINVAL, "a username can't be empty"));
@@ -68,6 +70,52 @@ pub async fn set(client: &Client, name: &str, account: &Account) -> Result<(), F
         .write(&user_key(name), Some(&encode(account)))
         .await?;
     Ok(())
+}
+
+/// Adds the gids in `add` to `name`'s supplementary groups and takes out
+/// those in `remove`, returning the row as it now is. Read and written in
+/// one transaction, so two changes at once can't undo each other. A user
+/// with no row is `ENOENT`. Like `set`, applies at the account's next
+/// request (see the server's identity cache), not just its next login.
+pub async fn modify(
+    client: &Client,
+    name: &str,
+    add: &[u32],
+    remove: &[u32],
+) -> Result<Account, FsError> {
+    let key = user_key(name);
+    retrying(|| {
+        let key = &key;
+        async move {
+            let txn = client.transaction(TXN_TTL).await?;
+            let Some(bytes) = txn.read(key).await?.value else {
+                return Ok(Err(FsError::new(
+                    libc::ENOENT,
+                    format!("{name} has no filesystem account"),
+                )));
+            };
+            let mut account = match decode(name, &bytes) {
+                Ok(account) => account,
+                Err(e) => return Ok(Err(e)),
+            };
+            apply(&mut account.groups, add, remove);
+            txn.write(key, Some(&encode(&account))).await?;
+            txn.commit().await?;
+            Ok(Ok(account))
+        }
+    })
+    .await?
+}
+
+/// `groups` with `add` appended (skipping any already there) and `remove`
+/// taken out, keeping the order the rest were in.
+fn apply(groups: &mut Vec<u32>, add: &[u32], remove: &[u32]) {
+    for &gid in add {
+        if !groups.contains(&gid) {
+            groups.push(gid);
+        }
+    }
+    groups.retain(|gid| !remove.contains(gid));
 }
 
 /// Removes `name`'s row, reporting whether there was one.
@@ -114,6 +162,15 @@ mod tests {
         ] {
             assert_eq!(decode("u", &encode(&account)).unwrap(), account);
         }
+    }
+
+    #[test]
+    fn modifying_groups_keeps_order_and_skips_duplicates() {
+        let mut groups = vec![4, 27, 50];
+        apply(&mut groups, &[27, 100, 100], &[4]);
+        assert_eq!(groups, [27, 50, 100]);
+        apply(&mut groups, &[], &[999]);
+        assert_eq!(groups, [27, 50, 100]);
     }
 
     #[test]

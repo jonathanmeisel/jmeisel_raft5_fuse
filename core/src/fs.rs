@@ -20,7 +20,7 @@ use crate::layout::{
 use crate::perm::{self, R, W, X};
 use crate::read_cache::{ChunkCache, Lookup};
 
-const TXN_TTL: Duration = Duration::from_secs(10);
+pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
 /// Default byte budget of the chunk read cache.
 pub const DEFAULT_READ_CACHE_BYTES: usize = 64 << 20;
@@ -52,7 +52,7 @@ const READ_CACHE_TTL: Duration = Duration::from_secs(60);
 /// async closure: an async closure's future can't be shown `Send` for
 /// every lifetime, which the server's runtime needs. So callers capture
 /// only references (which copy) and `move` them into each attempt.
-async fn retrying<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, KvError>
+pub(crate) async fn retrying<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, KvError>
 where
     Fut: std::future::Future<Output = Result<T, KvError>>,
 {
