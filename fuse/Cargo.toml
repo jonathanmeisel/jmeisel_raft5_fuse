@@ -1,0 +1,27 @@
+[package]
+name = "raft5fs-fuse"
+description = "FUSE client: kernel requests over gRPC to any of several servers, with client-side write buffering."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "raft5fs-fuse"
+path = "src/main.rs"
+
+[dependencies]
+fuser = { workspace = true }
+libc = { workspace = true }
+raft5fs-proto = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+
+# The end-to-end tests run the whole stack in-process: a raft5 cluster,
+# filesystem servers over it, and mounts over those.
+[dev-dependencies]
+raft5-client = { workspace = true }
+raft5-server = { workspace = true }
+raft5fs-core = { workspace = true }
+raft5fs-server = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+rcgen = "0.14"

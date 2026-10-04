@@ -1,0 +1,10 @@
+[package]
+name = "raft5fs-core"
+description = "The filesystem's store logic: key layout, inode records, batched writes, the read cache. No FUSE."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+raft5-client = { workspace = true }
+raft5fs-proto = { workspace = true, features = ["raft5"] }

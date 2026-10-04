@@ -1,0 +1,20 @@
+[package]
+name = "raft5fs-proto"
+description = "The client/server protocol, and the plain types both ends (and core) share."
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Converts raft5 store errors into `FsError`. Only the server side needs it,
+# which is what keeps the FUSE client free of the store client.
+raft5 = ["dep:raft5-client"]
+
+[dependencies]
+libc = { workspace = true }
+prost = { workspace = true }
+raft5-client = { workspace = true, optional = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

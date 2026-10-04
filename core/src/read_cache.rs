@@ -38,6 +38,7 @@ pub enum Lookup {
 }
 
 impl Lookup {
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         match *self {
             Self::Miss { generation } | Self::Unconfirmed { generation, .. } => generation,
@@ -91,6 +92,7 @@ impl ChunkCache {
         }
     }
 
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         self.capacity > 0
     }

@@ -1,0 +1,244 @@
+// The filesystem protocol between FUSE clients and filesystem servers.
+//
+// Filesystem errors travel in-band, as `Error { errno, message }` inside
+// each response, so the client can hand the kernel the exact errno. A
+// gRPC status, by contrast, always means the request didn't get a
+// filesystem answer at all -- the server was unreachable or failed --
+// which is what tells the client it may try another server.
+//
+// Every request but Hello and Login carries a session token from Login,
+// as `authorization: Bearer <token>` metadata; who the request is from is
+// whoever that session belongs to. A missing, forged or expired session
+// is refused with UNAUTHENTICATED -- the one status that is about the
+// request rather than the server, and the client's cue to log in again.
+//
+// Reading and writing file data takes a handle from Open or Create
+// instead of an inode: the handle records what that open was allowed,
+// so access is checked once, at open, as POSIX has it.
+syntax = "proto3";
+
+package raft5fs;
+
+service Fs {
+  // What the client needs to know before buffering writes.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  rpc GetAttr(InodeRequest) returns (AttrResponse);
+  rpc Lookup(NameRequest) returns (AttrResponse);
+  // Both check the caller may access the inode as `mask` asks; Open then
+  // hands back a handle carrying that access.
+  rpc Open(AccessRequest) returns (OpenResponse);
+  rpc Access(AccessRequest) returns (EmptyResponse);
+  rpc ReadDir(InodeRequest) returns (ReadDirResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc SetAttr(SetAttrRequest) returns (AttrResponse);
+  rpc Mkdir(CreateRequest) returns (AttrResponse);
+  // Also opens the new file for reading and writing, whatever its mode.
+  rpc Create(CreateRequest) returns (CreateResponse);
+  // Both return the inode removed.
+  rpc Unlink(NameRequest) returns (InoResponse);
+  rpc Rmdir(NameRequest) returns (InoResponse);
+  // Returns the inode the move replaced, or 0 if it replaced nothing.
+  rpc Rename(RenameRequest) returns (InoResponse);
+}
+
+message Error {
+  int32 errno = 1;
+  string message = 2;
+}
+
+// Time since the Unix epoch.
+message Timestamp {
+  uint64 secs = 1;
+  uint32 nanos = 2;
+}
+
+enum Kind {
+  KIND_FILE = 0;
+  KIND_DIRECTORY = 1;
+}
+
+message Attr {
+  uint64 ino = 1;
+  Kind kind = 2;
+  uint64 size = 3;
+  uint32 perm = 4;
+  uint32 nlink = 5;
+  uint32 uid = 6;
+  uint32 gid = 7;
+  Timestamp atime = 8;
+  Timestamp mtime = 9;
+  Timestamp ctime = 10;
+}
+
+message HelloRequest {}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message Session {
+  string token = 1;
+  // When the token stops being accepted, in seconds since the Unix epoch.
+  uint64 expires_at = 2;
+}
+
+message LoginResponse {
+  oneof result {
+    Session session = 1;
+    Error error = 2;
+  }
+}
+
+message HelloResponse {
+  // Fixed for the filesystem's lifetime.
+  uint64 chunk_size = 1;
+  // How much contiguous data one write transaction stores: the client
+  // buffers up to this much and aligns its batches to multiples of it.
+  uint64 batch_bytes = 2;
+}
+
+message InodeRequest {
+  uint64 ino = 1;
+}
+
+// `mask` is access(2)'s: R_OK (4), W_OK (2) and X_OK (1) ORed, or 0 to
+// ask only whether the inode exists.
+message AccessRequest {
+  uint64 ino = 1;
+  uint32 mask = 2;
+}
+
+message NameRequest {
+  uint64 parent = 1;
+  // Bytes, not string: a file name needn't be UTF-8.
+  bytes name = 2;
+}
+
+message CreateRequest {
+  uint64 parent = 1;
+  bytes name = 2;
+  uint32 perm = 3;
+}
+
+message RenameRequest {
+  uint64 parent = 1;
+  bytes name = 2;
+  uint64 new_parent = 3;
+  bytes new_name = 4;
+  // Fail with EEXIST rather than replace an existing `new_name`.
+  bool noreplace = 5;
+}
+
+message ReadRequest {
+  // From Open or Create, opened for reading.
+  string handle = 1;
+  uint64 offset = 2;
+  uint32 len = 3;
+}
+
+message WriteRequest {
+  // From Open or Create, opened for writing.
+  string handle = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message SetTime {
+  oneof time {
+    bool now = 1;
+    Timestamp at = 2;
+  }
+}
+
+message SetAttrRequest {
+  uint64 ino = 1;
+  optional uint32 mode = 2;
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  optional uint64 size = 5;
+  SetTime atime = 6;
+  SetTime mtime = 7;
+  // A handle to `ino` opened for writing, which permits a size change
+  // whatever the mode now says (ftruncate).
+  optional string handle = 8;
+}
+
+message AttrResponse {
+  oneof result {
+    Attr attr = 1;
+    Error error = 2;
+  }
+}
+
+// Success unless `error` is set.
+message EmptyResponse {
+  Error error = 1;
+}
+
+message OpenResponse {
+  oneof result {
+    string handle = 1;
+    Error error = 2;
+  }
+}
+
+message Created {
+  Attr attr = 1;
+  string handle = 2;
+}
+
+message CreateResponse {
+  oneof result {
+    Created created = 1;
+    Error error = 2;
+  }
+}
+
+message InoResponse {
+  oneof result {
+    uint64 ino = 1;
+    Error error = 2;
+  }
+}
+
+message DirItem {
+  uint64 ino = 1;
+  Kind kind = 2;
+  bytes name = 3;
+}
+
+message DirList {
+  repeated DirItem items = 1;
+}
+
+message ReadDirResponse {
+  oneof result {
+    DirList list = 1;
+    Error error = 2;
+  }
+}
+
+message ReadResponse {
+  oneof result {
+    bytes data = 1;
+    Error error = 2;
+  }
+}
+
+// A write that failed part-way: `written` leading bytes were stored
+// before `error`.
+message WriteFailure {
+  uint64 written = 1;
+  Error error = 2;
+}
+
+message WriteResponse {
+  oneof result {
+    Attr attr = 1;
+    WriteFailure failure = 2;
+  }
+}

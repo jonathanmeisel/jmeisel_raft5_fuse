@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use fuser::Errno;
 
 /// Bytes accepted by `write` but not yet committed: one contiguous run,
@@ -11,12 +13,17 @@ use fuser::Errno;
 pub struct WriteBuf {
     start: u64,
     data: Vec<u8>,
-    /// An error from a commit nothing was synchronously waiting on --
-    /// only the auto-flush timer's commit produces one of these, since
-    /// every other commit reports directly to whichever `write`, `flush`
-    /// or `fsync` call triggered it. Surfaced and cleared by the next one
-    /// of those.
+    /// A failed commit's error, kept because the bytes it lost had already
+    /// been reported written. Every `write`, `flush` and `fsync` reports
+    /// it; only `fsync`, or the release of the file's last descriptor,
+    /// clears it.
     pub err: Option<Errno>,
+    /// The handle the run is committed with: the one the latest write
+    /// came through. Any writable handle this mount holds for the inode
+    /// would do -- the server only checks it permits writing that inode --
+    /// and a handle stays valid after its descriptor is closed, so a run
+    /// outliving the descriptor that wrote it can still be committed.
+    pub handle: Option<Arc<str>>,
 }
 
 impl WriteBuf {

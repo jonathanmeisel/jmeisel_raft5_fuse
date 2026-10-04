@@ -9,9 +9,18 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use jmeisel_raft5_fuse::filesystem::{
+use raft5fs_core::{
     CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, batch_bytes, chunk_prefix,
+    dirent_prefix, resolve_chunk_size, tombstone_key,
 };
+
+/// Not really a test: the entry point that lets the harness run a
+/// filesystem server as a separate process (see `support::TestServer`).
+/// Returns at once in a normal run.
+#[test]
+fn server_process_mode() {
+    support::serve_if_requested();
+}
 
 /// Position-dependent bytes, so a chunk landing at the wrong offset (or
 /// in the wrong order) fails loudly instead of matching by luck. 251 is
@@ -436,9 +445,9 @@ fn an_out_of_range_stored_chunk_size_is_refused() {
     // adopting it would produce chunks nothing could store or fetch.
     h.write_key(CHUNK_SIZE_KEY, Some(&(MAX_CHUNK_SIZE * 2).to_be_bytes()));
 
-    let fs_over_same_store = h.unmounted_fs(h.chunk_size);
-    let err = fs_over_same_store
-        .resolve_chunk_size(h.chunk_size)
+    let err = h
+        .runtime
+        .block_on(resolve_chunk_size(&h.client, h.chunk_size))
         .expect_err("an unusable recorded chunk size should be refused");
     assert!(err.contains("unusable"), "unexpected message: {err}");
 }
@@ -1005,4 +1014,873 @@ fn the_chunks_of_one_batch_share_a_commit() {
         first,
         "the next batch is a separate commit"
     );
+}
+
+// ------------------------------------------------------------- deletion
+
+/// One mount unlinks a file while another keeps committing writes to it.
+/// Deleting the chunks takes several transactions, so without the
+/// deletion mark a commit landing between them stores a chunk the
+/// deletion has already scanned past -- leaked, with nothing left that
+/// could find it -- and a writer that keeps landing commits can stop the
+/// deletion's rescans from ever finishing. The two mounts share no process
+/// state, so nothing but the store can order them.
+///
+/// The writer has a deadline so that a regression fails rather than hangs:
+/// with the mark working, its writes are refused as soon as the unlink's
+/// first step commits, long before then.
+#[test]
+fn unlinking_from_one_mount_while_another_writes_leaks_no_chunks() {
+    let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
+    let other = h.second_mount();
+    let batch = batch_bytes(MIN_CHUNK_SIZE) as usize;
+    // Enough chunks that the deletion's scan spans several transactions.
+    let span = batch * 32;
+
+    for round in 0..3 {
+        let name = format!("contested-{round}.bin");
+        let path = h.path().join(&name);
+        fs::write(&path, pattern(span)).unwrap();
+        let ino = ino_from_readdir(h.path(), &name);
+
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            // A batch-sized write commits immediately, so commits keep
+            // landing until one is refused because the file is gone.
+            let mut offset = 0u64;
+            while std::time::Instant::now() < deadline {
+                if f.seek(SeekFrom::Start(offset)).is_err() || f.write_all(&pattern(batch)).is_err()
+                {
+                    return true;
+                }
+                offset = (offset + batch as u64) % span as u64;
+            }
+            false
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::remove_file(other.path.join(&name)).unwrap();
+        let refused = writer.join().unwrap();
+
+        assert!(
+            refused,
+            "round {round}: writes kept succeeding after the file was unlinked"
+        );
+        assert!(
+            h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+            "round {round}: chunks outlived the unlink"
+        );
+        assert!(h.read_key(&tombstone_key(ino)).is_none());
+    }
+}
+
+/// A deletion that stops after its first step -- dirent gone, Entry
+/// marked, tombstone written -- as a crash would leave it. The inode is
+/// unreachable by name, so only the tombstone says it exists; the next
+/// mount to start must find it and finish the job.
+#[test]
+fn an_interrupted_deletion_is_finished_by_the_next_mount() {
+    let mut h = support::setup();
+    let name = "half-deleted.bin";
+    let path = h.path().join(name);
+    fs::write(&path, pattern(h.chunk_size as usize * 3)).unwrap();
+    let ino = ino_from_readdir(h.path(), name);
+
+    // The first step of an unlink, by hand. The link count is bytes 19..23
+    // of the Entry record (after kind, perm, uid, gid and size).
+    let mut attr_key = vec![0x01];
+    attr_key.extend_from_slice(&ino.to_be_bytes());
+    let mut entry = h.read_key(&attr_key).unwrap();
+    entry[19..23].copy_from_slice(&0u32.to_be_bytes());
+    h.write_key(&attr_key, Some(&entry));
+    let mut dirent = vec![0x03];
+    dirent.extend_from_slice(&1u64.to_be_bytes());
+    dirent.extend_from_slice(name.as_bytes());
+    h.write_key(&dirent, None);
+    h.write_key(&tombstone_key(ino), Some(&[1u8][..]));
+    assert!(!h.keys_with_prefix(&chunk_prefix(ino)).is_empty());
+
+    h.remount(h.chunk_size);
+    // Any request waits for the mount's `init`, which is where it reaps.
+    let _ = fs::read_dir(h.path()).unwrap().count();
+
+    assert!(
+        h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
+        "the interrupted deletion's chunks were never removed"
+    );
+    assert!(h.read_key(&attr_key).is_none());
+    assert!(h.read_key(&tombstone_key(ino)).is_none());
+}
+
+// ------------------------------------------------------- server failover
+
+/// The mount's server goes away part-way through a write. Servers hold no
+/// write state -- unstored bytes are in the client's buffer -- so the
+/// client resends to the other server and nothing is lost. Writes are
+/// safe to resend: a batch commits whole or not at all, and the same
+/// bytes at the same offset store the same thing twice.
+#[test]
+fn a_mount_fails_over_when_its_server_goes_away() {
+    let mut h = support::setup();
+    let batch = batch_bytes(h.chunk_size) as usize;
+    let path = h.path().join("failover.bin");
+    let data = pattern(batch * 6 + 123);
+    let (before, after) = data.split_at(batch * 3 + 17);
+
+    let mut f = fs::File::create(&path).unwrap();
+    f.write_all(before).unwrap();
+
+    // The mount starts on the first server. Take it away, and make sure
+    // it is really gone rather than still answering an open connection.
+    let server = h.servers.remove(0);
+    let gone = server.address.trim_start_matches("http://").to_string();
+    drop(server);
+    assert!(
+        std::net::TcpStream::connect(&gone).is_err(),
+        "the stopped server is still accepting connections"
+    );
+
+    f.write_all(after).unwrap();
+    f.sync_all()
+        .expect("fsync should succeed through the surviving server");
+    drop(f);
+
+    assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
+    assert_same_bytes(&fs::read(&path).unwrap(), &data);
+}
+
+/// Bytes a `write` was told are written, lost when a later commit carrying
+/// them fails, must surface at `fsync` -- even though by then the buffer
+/// is empty and there is nothing left to commit. The commit that failed
+/// took them out of the buffer, so without the stashed error `fsync`
+/// would find nothing wrong and report success over lost data.
+///
+/// A mount with a single server, so stopping it makes the commit fail
+/// rather than fail over.
+#[test]
+fn a_lost_acknowledged_write_is_reported_by_fsync() {
+    let mut h = support::setup();
+    let batch = batch_bytes(h.chunk_size) as usize;
+    let lone = support::MountedFs::mount(&h.runtime, vec![h.servers[0].address.clone()]);
+    let path = lone.path.join("acknowledged.bin");
+    let mut f = fs::File::create(&path).unwrap();
+
+    // Gone before the writes, so they run back to back with nothing slow
+    // between them: the auto-flush timer (500 ms) can't store the first
+    // one on its own before the second makes it fail.
+    drop(h.servers.remove(0));
+
+    // Only buffered, so it is acknowledged without reaching any server.
+    f.write_all(&pattern(4096)).unwrap();
+    // Crosses a batch boundary, so this commits the bytes above too --
+    // and fails, with nowhere to fail over to.
+    assert!(
+        f.write_all(&pattern(batch)).is_err(),
+        "the commit should have failed with the server gone"
+    );
+    assert!(
+        f.sync_all().is_err(),
+        "fsync reported success over acknowledged bytes that were lost"
+    );
+    drop(f);
+}
+
+// ------------------------------------------------------------ permissions
+
+/// The uids of the users `add_people` adds. None of them is the user
+/// running the tests, who owns the root directory.
+const ALICE: u32 = 50_001;
+const BOB: u32 = 50_002;
+const CAROL: u32 = 50_003;
+/// A group Alice and Bob are in, and Carol isn't.
+const STAFF: u32 = 50_100;
+
+/// Adds users "alice", "bob" and "carol", each with a primary group of
+/// their own; alice and bob are also in `STAFF`.
+fn add_people(h: &support::Harness) {
+    h.add_user("alice", ALICE, ALICE, &[STAFF]);
+    h.add_user("bob", BOB, BOB, &[STAFF]);
+    h.add_user("carol", CAROL, CAROL, &[]);
+}
+
+fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+fn chgrp(path: &std::path::Path, gid: u32) -> std::io::Result<()> {
+    std::os::unix::fs::chown(path, None, Some(gid))
+}
+
+#[track_caller]
+fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
+    match result {
+        Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
+        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
+    }
+}
+
+/// access(2) on `path`.
+fn access(path: &std::path::Path, mask: i32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    if unsafe { libc::access(path.as_ptr(), mask) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// A directory at the root that anyone may create in, for tests whose
+/// users don't own the root.
+/// Also adds the users (see `add_people`), since every such test needs
+/// both.
+fn open_dir(h: &support::Harness, name: &str) {
+    add_people(h);
+    let dir = h.path().join(name);
+    fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o777).unwrap();
+}
+
+#[test]
+fn files_are_created_as_the_mounts_user() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+
+    fs::write(alice.path.join("pub/a"), b"x").unwrap();
+    fs::create_dir(alice.path.join("pub/d")).unwrap();
+
+    for name in ["pub/a", "pub/d"] {
+        let meta = fs::metadata(h.path().join(name)).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (ALICE, ALICE), "{name}");
+    }
+}
+
+#[test]
+fn another_user_cannot_open_a_private_file() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    let private = alice.path.join("pub/private");
+    fs::write(&private, b"secret").unwrap();
+    chmod(&private, 0o600).unwrap();
+
+    assert_errno(fs::read(bob.path.join("pub/private")), libc::EACCES);
+    assert_errno(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(bob.path.join("pub/private")),
+        libc::EACCES,
+    );
+    assert_eq!(fs::read(&private).unwrap(), b"secret");
+}
+
+#[test]
+fn read_permission_does_not_imply_write_permission() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::write(alice.path.join("pub/f"), b"alice's").unwrap();
+    chmod(&alice.path.join("pub/f"), 0o644).unwrap();
+
+    let theirs = bob.path.join("pub/f");
+    assert_eq!(fs::read(&theirs).unwrap(), b"alice's");
+    assert_errno(fs::write(&theirs, b"bob's"), libc::EACCES);
+    // Truncating is writing too.
+    assert_errno(fs::File::create(&theirs), libc::EACCES);
+    assert_eq!(fs::read(&theirs).unwrap(), b"alice's");
+}
+
+#[test]
+fn access_reports_what_the_server_would_allow() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let carol = h.mount_as("carol");
+    fs::write(alice.path.join("pub/f"), b"x").unwrap();
+    chmod(&alice.path.join("pub/f"), 0o640).unwrap();
+    chgrp(&alice.path.join("pub/f"), STAFF).unwrap();
+    let bob = h.mount_as("bob");
+
+    assert!(access(&alice.path.join("pub/f"), libc::R_OK | libc::W_OK).is_ok());
+    assert!(access(&bob.path.join("pub/f"), libc::R_OK).is_ok());
+    assert_errno(access(&bob.path.join("pub/f"), libc::W_OK), libc::EACCES);
+    assert_errno(access(&carol.path.join("pub/f"), libc::R_OK), libc::EACCES);
+    assert!(access(&carol.path.join("pub/f"), libc::F_OK).is_ok());
+}
+
+#[test]
+fn a_directory_without_search_permission_hides_its_contents() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::create_dir(alice.path.join("pub/private")).unwrap();
+    fs::write(alice.path.join("pub/private/f"), b"x").unwrap();
+    chmod(&alice.path.join("pub/private/f"), 0o666).unwrap();
+    chmod(&alice.path.join("pub/private"), 0o700).unwrap();
+
+    // Even a world-readable file is out of reach behind it.
+    assert_errno(fs::read(bob.path.join("pub/private/f")), libc::EACCES);
+    assert_errno(fs::read_dir(bob.path.join("pub/private")), libc::EACCES);
+    assert_eq!(fs::read(alice.path.join("pub/private/f")).unwrap(), b"x");
+}
+
+#[test]
+fn listing_a_directory_takes_read_permission() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::create_dir(alice.path.join("pub/dropbox")).unwrap();
+    fs::write(alice.path.join("pub/dropbox/known"), b"x").unwrap();
+    chmod(&alice.path.join("pub/dropbox/known"), 0o644).unwrap();
+    chmod(&alice.path.join("pub/dropbox"), 0o711).unwrap();
+
+    // Bob can't list it, but can reach a name he already knows.
+    assert_errno(fs::read_dir(bob.path.join("pub/dropbox")), libc::EACCES);
+    assert_eq!(fs::read(bob.path.join("pub/dropbox/known")).unwrap(), b"x");
+}
+
+#[test]
+fn creating_and_removing_take_write_permission_on_the_directory() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::create_dir(alice.path.join("pub/mine")).unwrap();
+    fs::write(alice.path.join("pub/mine/f"), b"x").unwrap();
+    fs::create_dir(alice.path.join("pub/mine/d")).unwrap();
+    chmod(&alice.path.join("pub/mine"), 0o755).unwrap();
+
+    let mine = bob.path.join("pub/mine");
+    assert_errno(fs::write(mine.join("new"), b"x"), libc::EACCES);
+    assert_errno(fs::create_dir(mine.join("newdir")), libc::EACCES);
+    assert_errno(fs::remove_file(mine.join("f")), libc::EACCES);
+    assert_errno(fs::remove_dir(mine.join("d")), libc::EACCES);
+    assert!(alice.path.join("pub/mine/f").exists());
+    assert!(alice.path.join("pub/mine/d").exists());
+    // And the root, which neither owns.
+    assert_errno(fs::write(alice.path.join("top"), b"x"), libc::EACCES);
+}
+
+#[test]
+fn the_sticky_bit_stops_users_removing_each_others_files() {
+    let h = support::setup();
+    add_people(&h);
+    let tmp = h.path().join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    chmod(&tmp, 0o1777).unwrap();
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::write(alice.path.join("tmp/alices"), b"x").unwrap();
+    fs::write(bob.path.join("tmp/bobs"), b"x").unwrap();
+
+    assert_errno(fs::remove_file(bob.path.join("tmp/alices")), libc::EPERM);
+    fs::remove_file(bob.path.join("tmp/bobs")).unwrap();
+    // The directory's owner may still clean up.
+    fs::remove_file(tmp.join("alices")).unwrap();
+}
+
+#[test]
+fn only_the_owner_may_chmod_and_only_to_their_own_groups_chgrp() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    let f = alice.path.join("pub/f");
+    fs::write(&f, b"x").unwrap();
+    chmod(&f, 0o666).unwrap();
+
+    assert_errno(chmod(&bob.path.join("pub/f"), 0o777), libc::EPERM);
+    assert_errno(chgrp(&bob.path.join("pub/f"), STAFF), libc::EPERM);
+    chgrp(&f, STAFF).unwrap();
+    assert_errno(chgrp(&f, CAROL), libc::EPERM);
+    assert_errno(std::os::unix::fs::chown(&f, Some(BOB), None), libc::EPERM);
+    let meta = fs::metadata(&f).unwrap();
+    assert_eq!(
+        (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+        (ALICE, STAFF, 0o666)
+    );
+}
+
+#[test]
+fn a_setgid_group_directory_is_shared_by_its_members() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    let carol = h.mount_as("carol");
+    let shared = alice.path.join("pub/shared");
+    fs::create_dir(&shared).unwrap();
+    chgrp(&shared, STAFF).unwrap();
+    chmod(&shared, 0o2770).unwrap();
+
+    fs::write(bob.path.join("pub/shared/bobs"), b"from bob").unwrap();
+    fs::create_dir(bob.path.join("pub/shared/sub")).unwrap();
+    let file = fs::metadata(alice.path.join("pub/shared/bobs")).unwrap();
+    assert_eq!((file.uid(), file.gid()), (BOB, STAFF));
+    let sub = fs::metadata(alice.path.join("pub/shared/sub")).unwrap();
+    assert_eq!(sub.gid(), STAFF);
+    assert_eq!(sub.mode() & 0o2000, 0o2000, "subdirectories inherit setgid");
+
+    assert_errno(fs::read_dir(carol.path.join("pub/shared")), libc::EACCES);
+    assert_errno(
+        fs::write(carol.path.join("pub/shared/x"), b"x"),
+        libc::EACCES,
+    );
+}
+
+// ------------------------------------------------------- identity, tokens
+
+fn connect_as(h: &support::Harness, user: &str, password: &str) -> Result<(), String> {
+    let addresses: Vec<String> = h.servers.iter().map(|s| s.address.clone()).collect();
+    let credentials = raft5fs_fuse::remote::Credentials {
+        username: user.to_string(),
+        password: password.to_string(),
+    };
+    h.runtime
+        .block_on(raft5fs_fuse::remote::Remote::connect(
+            &addresses,
+            credentials,
+            Some(support::fs_tls()),
+        ))
+        .map(drop)
+}
+
+#[test]
+fn a_wrong_password_is_refused() {
+    let h = support::setup();
+    add_people(&h);
+    let refused = connect_as(&h, "alice", "alice").unwrap_err();
+    assert!(refused.contains("login refused"), "{refused}");
+    connect_as(&h, "alice", &support::password("alice")).unwrap();
+}
+
+#[test]
+fn a_store_account_without_a_filesystem_identity_is_refused() {
+    let h = support::setup();
+    h.runtime
+        .block_on(
+            h.cluster
+                .admin
+                .create_user("dave", &support::password("dave"), false),
+        )
+        .unwrap();
+    let refused = connect_as(&h, "dave", &support::password("dave")).unwrap_err();
+    assert!(refused.contains("no filesystem account"), "{refused}");
+}
+
+/// Users get at the filesystem only through the servers. The store talks
+/// only to holders of a client certificate, which users don't have...
+#[test]
+fn users_cannot_connect_to_the_store_at_all() {
+    let h = support::setup();
+    add_people(&h);
+    h.runtime.block_on(async {
+        let alice = raft5_client::Client::with_tls(
+            [&h.cluster.client_address],
+            support::store_tls_without_identity(),
+        )
+        .unwrap();
+        let refused = alice
+            .login("alice", &support::password("alice"))
+            .await
+            .unwrap_err();
+        // Refused at the handshake, before any RPC: to the client that
+        // looks like a store that never answers.
+        assert!(
+            matches!(refused, raft5_client::Error::Unavailable(_)),
+            "{refused}"
+        );
+    });
+}
+
+/// ...and even holding one, a user's own store account can't read the
+/// filesystem's keys, let alone write them.
+#[test]
+fn users_cannot_reach_the_filesystems_keys_directly() {
+    let h = support::setup();
+    add_people(&h);
+    h.runtime.block_on(async {
+        let alice =
+            raft5_client::Client::with_tls([&h.cluster.client_address], support::store_tls())
+                .unwrap();
+        alice
+            .login("alice", &support::password("alice"))
+            .await
+            .unwrap();
+        assert!(alice.read(CHUNK_SIZE_KEY).await.is_err());
+        assert!(alice.write(CHUNK_SIZE_KEY, Some(b"x")).await.is_err());
+    });
+    // Still there and unchanged, as the service account sees it.
+    assert_eq!(h.read_key(CHUNK_SIZE_KEY).unwrap().len(), 8);
+}
+
+/// A mount whose session stops being accepted -- here because the servers
+/// now sign with another key, as after a rotation; an expiry looks the
+/// same -- logs in again by itself and carries on.
+#[test]
+fn a_refused_session_is_renewed_by_logging_in_again() {
+    let mut h = support::setup();
+    let path = h.path().join("f");
+    fs::write(&path, b"before").unwrap();
+
+    h.restart_servers_with_key("another key, also at least 32 bytes");
+
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+    fs::write(h.path().join("g"), b"after").unwrap();
+    assert_eq!(fs::read(h.path().join("g")).unwrap(), b"after");
+}
+
+/// Servers keep nothing about open files, so a descriptor survives every
+/// server being restarted under it.
+#[test]
+fn an_open_file_survives_its_servers_restarting() {
+    let mut h = support::setup();
+    let path = h.path().join("f");
+    fs::write(&path, b"0123456789").unwrap();
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+
+    h.restart_servers_with_key(support::TOKEN_KEY);
+
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(b"abc").unwrap();
+    f.sync_all().unwrap();
+    let mut got = String::new();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    std::io::Read::read_to_string(&mut f, &mut got).unwrap();
+    assert_eq!(got, "abc3456789");
+}
+
+/// Access is decided at open, as POSIX has it: taking permissions away
+/// afterwards doesn't break a descriptor already open.
+#[test]
+fn an_open_file_keeps_the_access_it_was_opened_with() {
+    let h = support::setup();
+    let path = h.path().join("f");
+    fs::write(&path, b"data").unwrap();
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    chmod(&path, 0o000).unwrap();
+
+    assert_errno(fs::read(&path), libc::EACCES);
+    f.write_all(b"more").unwrap();
+    f.sync_all().unwrap();
+    let mut got = String::new();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    std::io::Read::read_to_string(&mut f, &mut got).unwrap();
+    assert_eq!(got, "more");
+}
+
+/// Creating a file read-only and filling it through the descriptor that
+/// created it is ordinary -- `cp` does it for every read-only file.
+#[test]
+fn a_file_created_read_only_can_be_written_through_its_creating_descriptor() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let h = support::setup();
+    let path = h.path().join("ro");
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .open(&path)
+        .unwrap();
+    f.write_all(b"contents").unwrap();
+    f.set_len(4).unwrap();
+    drop(f);
+
+    assert_eq!(fs::read(&path).unwrap(), b"cont");
+    assert_errno(fs::OpenOptions::new().write(true).open(&path), libc::EACCES);
+}
+
+// ----------------------------------------------------------------- rename
+
+#[test]
+fn rename_within_a_directory() {
+    let h = support::setup();
+    let (a, b) = (h.path().join("a"), h.path().join("b"));
+    fs::write(&a, b"contents").unwrap();
+    let ino = ino_of(&a);
+
+    fs::rename(&a, &b).unwrap();
+
+    assert!(!a.exists());
+    assert_eq!(fs::read(&b).unwrap(), b"contents");
+    assert_eq!(ino_of(&b), ino, "a rename keeps the inode");
+    let names: Vec<_> = fs::read_dir(h.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["b"]);
+}
+
+#[test]
+fn rename_across_directories_moves_files_and_whole_trees() {
+    let h = support::setup();
+    let p = h.path();
+    fs::create_dir_all(p.join("src/tree/deep")).unwrap();
+    fs::write(p.join("src/tree/deep/f"), b"deep").unwrap();
+    fs::write(p.join("src/file"), b"file").unwrap();
+    fs::create_dir(p.join("dst")).unwrap();
+
+    fs::rename(p.join("src/file"), p.join("dst/file")).unwrap();
+    fs::rename(p.join("src/tree"), p.join("dst/tree")).unwrap();
+
+    assert_eq!(fs::read(p.join("dst/file")).unwrap(), b"file");
+    assert_eq!(fs::read(p.join("dst/tree/deep/f")).unwrap(), b"deep");
+    assert_eq!(fs::read_dir(p.join("src")).unwrap().count(), 0);
+    // A fresh mount resolves the new paths from the store alone.
+    let other = h.second_mount();
+    assert_eq!(
+        fs::read(other.path.join("dst/tree/deep/f")).unwrap(),
+        b"deep"
+    );
+    assert!(!other.path.join("src/tree").exists());
+}
+
+#[test]
+fn rename_over_a_file_replaces_it_and_frees_its_data() {
+    let h = support::setup();
+    let (a, b) = (h.path().join("a"), h.path().join("b"));
+    fs::write(&a, b"new").unwrap();
+    fs::write(&b, pattern(3 * h.chunk_size as usize)).unwrap();
+    let old = ino_of(&b);
+    assert!(!h.keys_with_prefix(&chunk_prefix(old)).is_empty());
+
+    fs::rename(&a, &b).unwrap();
+
+    assert_eq!(fs::read(&b).unwrap(), b"new");
+    assert!(h.keys_with_prefix(&chunk_prefix(old)).is_empty());
+    assert!(h.read_key(&tombstone_key(old)).is_none());
+}
+
+/// The data stays where it is: chunks are keyed by inode, so moving a
+/// large file rewrites none of them.
+#[test]
+fn rename_copies_no_data() {
+    let h = support::setup();
+    let a = h.path().join("big");
+    fs::write(&a, pattern(8 * h.chunk_size as usize)).unwrap();
+    let ino = ino_of(&a);
+    let chunks = h.keys_with_prefix(&chunk_prefix(ino));
+    let before: Vec<u64> = chunks.iter().map(|k| h.key_version(k)).collect();
+    fs::create_dir(h.path().join("d")).unwrap();
+
+    fs::rename(&a, h.path().join("d/big")).unwrap();
+
+    let after: Vec<u64> = chunks.iter().map(|k| h.key_version(k)).collect();
+    assert_eq!(before, after);
+    assert_same_bytes(
+        &fs::read(h.path().join("d/big")).unwrap(),
+        &pattern(8 * h.chunk_size as usize),
+    );
+}
+
+#[test]
+fn rename_over_a_directory_needs_it_empty_and_of_the_same_kind() {
+    let h = support::setup();
+    let p = h.path();
+    fs::create_dir(p.join("d1")).unwrap();
+    fs::write(p.join("d1/f"), b"x").unwrap();
+    fs::create_dir(p.join("full")).unwrap();
+    fs::write(p.join("full/f"), b"x").unwrap();
+    fs::create_dir(p.join("empty")).unwrap();
+    fs::write(p.join("file"), b"x").unwrap();
+
+    assert_errno(fs::rename(p.join("d1"), p.join("full")), libc::ENOTEMPTY);
+    assert_errno(fs::rename(p.join("d1"), p.join("file")), libc::ENOTDIR);
+    assert_errno(fs::rename(p.join("file"), p.join("empty")), libc::EISDIR);
+    let empty = ino_of(&p.join("empty"));
+    fs::rename(p.join("d1"), p.join("empty")).unwrap();
+    assert_eq!(fs::read(p.join("empty/f")).unwrap(), b"x");
+    assert!(!p.join("d1").exists());
+    assert!(h.read_key(&tombstone_key(empty)).is_none());
+}
+
+#[test]
+fn a_directory_cannot_be_moved_into_itself() {
+    let h = support::setup();
+    let p = h.path();
+    fs::create_dir_all(p.join("a/b/c")).unwrap();
+
+    assert_errno(fs::rename(p.join("a"), p.join("a/b/c/a")), libc::EINVAL);
+    assert_errno(fs::rename(p.join("a"), p.join("a/a")), libc::EINVAL);
+    assert!(p.join("a/b/c").is_dir());
+    // Moving one level up out of itself is fine.
+    fs::rename(p.join("a/b/c"), p.join("c")).unwrap();
+    assert!(p.join("c").is_dir());
+}
+
+fn renameat2(from: &std::path::Path, to: &std::path::Path, flags: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes()).unwrap();
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).unwrap();
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[test]
+fn rename_noreplace_refuses_an_existing_name_and_exchange_is_unsupported() {
+    let h = support::setup();
+    let (a, b, c) = (h.path().join("a"), h.path().join("b"), h.path().join("c"));
+    fs::write(&a, b"a").unwrap();
+    fs::write(&b, b"b").unwrap();
+
+    assert_errno(renameat2(&a, &b, libc::RENAME_NOREPLACE), libc::EEXIST);
+    assert_eq!(fs::read(&b).unwrap(), b"b");
+    renameat2(&a, &c, libc::RENAME_NOREPLACE).unwrap();
+    assert_errno(renameat2(&b, &c, libc::RENAME_EXCHANGE), libc::EINVAL);
+}
+
+#[test]
+fn renaming_takes_write_permission_on_both_directories_and_respects_sticky() {
+    let h = support::setup();
+    open_dir(&h, "pub");
+    let tmp = h.path().join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    chmod(&tmp, 0o1777).unwrap();
+    let alice = h.mount_as("alice");
+    let bob = h.mount_as("bob");
+    fs::create_dir(alice.path.join("pub/mine")).unwrap();
+    chmod(&alice.path.join("pub/mine"), 0o755).unwrap();
+    fs::write(alice.path.join("pub/mine/f"), b"x").unwrap();
+    fs::write(alice.path.join("tmp/alices"), b"x").unwrap();
+    fs::create_dir(bob.path.join("pub/bobs")).unwrap();
+
+    // Out of a directory bob can't write, and into one.
+    assert_errno(
+        fs::rename(bob.path.join("pub/mine/f"), bob.path.join("pub/bobs/f")),
+        libc::EACCES,
+    );
+    fs::write(bob.path.join("pub/bobs/g"), b"x").unwrap();
+    assert_errno(
+        fs::rename(bob.path.join("pub/bobs/g"), bob.path.join("pub/mine/g")),
+        libc::EACCES,
+    );
+    // Someone else's file in a sticky directory.
+    assert_errno(
+        fs::rename(bob.path.join("tmp/alices"), bob.path.join("tmp/bobs-now")),
+        libc::EPERM,
+    );
+    assert!(alice.path.join("pub/mine/f").exists());
+    assert!(alice.path.join("tmp/alices").exists());
+}
+
+/// rmdir's emptiness check and a create in the same directory can't both
+/// win: either the directory goes and nothing was created in it, or the
+/// create lands and the directory stays. A create that slipped in after
+/// the check would leave an entry nothing can reach.
+///
+/// A smoke test, not proof: the window it probes is a single round trip
+/// wide, too narrow to hit reliably. What closes it is the locking
+/// argument on `is_empty_dir`.
+#[test]
+fn rmdir_and_a_concurrent_create_cannot_both_succeed() {
+    let h = support::setup();
+    let other = h.second_mount();
+    for round in 0..20 {
+        let dir = format!("d{round}");
+        fs::create_dir(h.path().join(&dir)).unwrap();
+        let ino = ino_of(&h.path().join(&dir));
+        let barrier = std::sync::Barrier::new(2);
+        let (removed, created) = std::thread::scope(|s| {
+            let rm = s.spawn(|| {
+                barrier.wait();
+                fs::remove_dir(h.path().join(&dir)).is_ok()
+            });
+            let mk = s.spawn(|| {
+                barrier.wait();
+                fs::write(other.path.join(&dir).join("f"), b"x").is_ok()
+            });
+            (rm.join().unwrap(), mk.join().unwrap())
+        });
+        assert!(!(removed && created), "round {round}: both succeeded");
+        if removed {
+            assert!(
+                h.keys_with_prefix(&dirent_prefix(ino)).is_empty(),
+                "round {round}: a removed directory kept entries"
+            );
+        }
+    }
+}
+
+/// Two renames that would each be fine alone, but together would make a
+/// loop -- `a` into `b` and `b` into `a` -- that nothing could reach.
+/// Exactly one must win.
+#[test]
+fn opposite_renames_cannot_make_a_loop() {
+    let h = support::setup();
+    let other = h.second_mount();
+    for round in 0..20 {
+        let x = format!("x{round}");
+        fs::create_dir_all(h.path().join(&x).join("a")).unwrap();
+        fs::create_dir(h.path().join(&x).join("b")).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (ab, ba) = std::thread::scope(|s| {
+            let ab = s.spawn(|| {
+                barrier.wait();
+                fs::rename(h.path().join(&x).join("a"), h.path().join(&x).join("b/a")).is_ok()
+            });
+            let ba = s.spawn(|| {
+                barrier.wait();
+                fs::rename(
+                    other.path.join(&x).join("b"),
+                    other.path.join(&x).join("a/b"),
+                )
+                .is_ok()
+            });
+            (ab.join().unwrap(), ba.join().unwrap())
+        });
+        assert!(ab != ba, "round {round}: a->b/a {ab}, b->a/b {ba}");
+        // Whichever won, both are still reachable from the root.
+        let fresh = h.second_mount();
+        let base = fresh.path.join(&x);
+        let reachable = if ab {
+            base.join("b/a").is_dir()
+        } else {
+            base.join("a/b").is_dir()
+        };
+        assert!(
+            reachable,
+            "round {round}: the moved directory is unreachable"
+        );
+    }
+}
+
+#[test]
+fn creating_and_removing_update_the_directorys_mtime() {
+    let h = support::setup();
+    let dir = h.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    let mtime = |p: &std::path::Path| fs::metadata(p).unwrap().modified().unwrap();
+    let t0 = mtime(&dir);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(dir.join("f"), b"x").unwrap();
+    let t1 = mtime(&dir);
+    assert!(t1 > t0);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::remove_file(dir.join("f")).unwrap();
+    assert!(mtime(&dir) > t1);
 }
