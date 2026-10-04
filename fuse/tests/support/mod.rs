@@ -28,9 +28,10 @@ use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
 use raft5fs_core::users::{self, Account};
-use raft5fs_core::{DEFAULT_READ_CACHE_BYTES, FsCore};
+use raft5fs_core::{DEFAULT_READ_CACHE_BYTES, FsCore, accounts};
+use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
-use raft5fs_fuse::remote::Credentials;
+use raft5fs_fuse::remote::{Credentials, Remote};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{FsService, Store};
 use tokio::runtime::Runtime;
@@ -325,6 +326,7 @@ const SERVER_CLUSTER_ENV: &str = "RAFT5FS_TEST_SERVER_CLUSTER";
 const SERVER_CHUNK_ENV: &str = "RAFT5FS_TEST_SERVER_CHUNK_SIZE";
 const SERVER_LISTEN_ENV: &str = "RAFT5FS_TEST_SERVER_LISTEN";
 const SERVER_TOKEN_KEY_ENV: &str = "RAFT5FS_TEST_SERVER_TOKEN_KEY";
+const SERVER_ENCRYPTED_ENV: &str = "RAFT5FS_TEST_SERVER_ENCRYPTED";
 /// The test that is really the server-mode entry point; see
 /// `serve_if_requested`.
 const SERVER_MODE_TEST: &str = "server_process_mode";
@@ -333,11 +335,15 @@ impl TestServer {
     /// Starts a server process over the cluster at `cluster_address` and
     /// waits until it is accepting connections. It opens the filesystem on
     /// the way (settling the chunk size, finishing interrupted deletions).
-    pub fn start(cluster_address: &str, chunk_size: u64) -> Self {
+    pub fn start(cluster_address: &str, chunk_size: u64, encrypted: bool) -> Self {
         for _ in 0..20 {
-            if let Some(server) =
-                Self::try_start(cluster_address, chunk_size, free_local_addr(), TOKEN_KEY)
-            {
+            if let Some(server) = Self::try_start(
+                cluster_address,
+                chunk_size,
+                free_local_addr(),
+                TOKEN_KEY,
+                encrypted,
+            ) {
                 return server;
             }
         }
@@ -351,6 +357,7 @@ impl TestServer {
         chunk_size: u64,
         listen: SocketAddr,
         token_key: &str,
+        encrypted: bool,
     ) -> Option<Self> {
         let exe = std::env::current_exe().expect("the test binary's own path");
         {
@@ -365,6 +372,7 @@ impl TestServer {
                 .env(SERVER_CHUNK_ENV, chunk_size.to_string())
                 .env(SERVER_LISTEN_ENV, listen.to_string())
                 .env(SERVER_TOKEN_KEY_ENV, token_key)
+                .env(SERVER_ENCRYPTED_ENV, if encrypted { "1" } else { "0" })
                 .env(CERT_ENV, &cert().cert)
                 .env(KEY_ENV, &cert().key)
                 .stdout(std::process::Stdio::null())
@@ -420,6 +428,7 @@ pub fn serve_if_requested() {
     let chunk_size: u64 = std::env::var(SERVER_CHUNK_ENV).unwrap().parse().unwrap();
     let listen: SocketAddr = std::env::var(SERVER_LISTEN_ENV).unwrap().parse().unwrap();
     let token_key = std::env::var(SERVER_TOKEN_KEY_ENV).unwrap();
+    let encrypted = std::env::var(SERVER_ENCRYPTED_ENV).as_deref() == Ok("1");
 
     // Die with the test that started us, even if it never gets to kill us:
     // a panicking test unwinds past `Drop`s only so far.
@@ -448,12 +457,18 @@ pub fn serve_if_requested() {
         // can work in it the way a user works in their home directory.
         let (uid, gid, _) = own_ids();
         let root_owner = (uid, gid);
-        let core = FsCore::connect(client, chunk_size, DEFAULT_READ_CACHE_BYTES, root_owner)
-            .await
-            .unwrap_or_else(|why| {
-                eprintln!("test server could not open the filesystem: {why}");
-                std::process::exit(1);
-            });
+        let core = FsCore::connect(
+            client,
+            chunk_size,
+            DEFAULT_READ_CACHE_BYTES,
+            root_owner,
+            encrypted,
+        )
+        .await
+        .unwrap_or_else(|why| {
+            eprintln!("test server could not open the filesystem: {why}");
+            std::process::exit(1);
+        });
         let Ok(listener) = tokio::net::TcpListener::bind(listen).await else {
             // Taken since the parent chose it; the parent will pick another.
             std::process::exit(2);
@@ -476,9 +491,9 @@ pub fn serve_if_requested() {
     });
 }
 
-fn start_servers(cluster: &TestCluster, chunk_size: u64) -> Vec<TestServer> {
+fn start_servers(cluster: &TestCluster, chunk_size: u64, encrypted: bool) -> Vec<TestServer> {
     (0..SERVERS)
-        .map(|_| TestServer::start(&cluster.client_address, chunk_size))
+        .map(|_| TestServer::start(&cluster.client_address, chunk_size, encrypted))
         .collect()
 }
 
@@ -541,6 +556,9 @@ pub struct Harness {
     pub cluster: TestCluster,
     pub runtime: Runtime,
     pub chunk_size: u64,
+    /// Whether the servers were asked to make the filesystem encrypted;
+    /// if so, `add_user` also enrols the user.
+    pub encrypted: bool,
 }
 
 impl Harness {
@@ -556,7 +574,7 @@ impl Harness {
     /// The old mount comes down while its servers are still up, so what it
     /// buffered is stored on the way out.
     pub fn remount(&mut self, chunk_size: u64) {
-        let servers = start_servers(&self.cluster, chunk_size);
+        let servers = start_servers(&self.cluster, chunk_size, self.encrypted);
         let addresses = servers.iter().map(|s| s.address.clone()).collect();
         self.mount = MountedFs::mount(&self.runtime, addresses);
         self.servers = servers;
@@ -632,6 +650,21 @@ impl Harness {
     pub fn add_user(&self, name: &str, uid: u32, gid: u32, groups: &[u32]) {
         self.cluster
             .add_user(&self.runtime, &self.client, name, uid, gid, groups);
+        if self.encrypted {
+            self.enrol(name);
+        }
+    }
+
+    /// The servers' addresses, in order.
+    pub fn addresses(&self) -> Vec<String> {
+        self.addresses_from(0)
+    }
+
+    /// Enrols `name` on this encrypted filesystem with password
+    /// `password(name)`, through the real enrolment RPC, and returns their
+    /// public key.
+    pub fn enrol(&self, name: &str) -> [u8; 32] {
+        enrol(&self.runtime, &self.client, &self.addresses(), name)
     }
 
     /// Restarts every server in place -- same addresses, so the mounts
@@ -652,6 +685,7 @@ impl Harness {
                     self.chunk_size,
                     listen,
                     token_key,
+                    self.encrypted,
                 ) {
                     break s;
                 }
@@ -670,10 +704,23 @@ pub fn setup() -> Harness {
 }
 
 pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
+    setup_with(chunk_size, false)
+}
+
+/// Like `setup`, but the filesystem is encrypted, and `TESTER` enrolled
+/// before mounting.
+pub fn setup_encrypted() -> Harness {
+    setup_with(TEST_CHUNK_SIZE, true)
+}
+
+fn setup_with(chunk_size: u64, encrypted: bool) -> Harness {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let (cluster, client) = TestCluster::start(&runtime);
-    let servers = start_servers(&cluster, chunk_size);
-    let addresses = servers.iter().map(|s| s.address.clone()).collect();
+    let servers = start_servers(&cluster, chunk_size, encrypted);
+    let addresses: Vec<String> = servers.iter().map(|s| s.address.clone()).collect();
+    if encrypted {
+        enrol(&runtime, &client, &addresses, TESTER);
+    }
     let mount = MountedFs::mount(&runtime, addresses);
     Harness {
         mount,
@@ -682,7 +729,28 @@ pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
         cluster,
         runtime,
         chunk_size,
+        encrypted,
     }
+}
+
+/// Issues `name` an enrolment code and enrols them with it, with
+/// password `password(name)` and cheap key-stretching settings.
+fn enrol(runtime: &Runtime, client: &Client, addresses: &[String], name: &str) -> [u8; 32] {
+    runtime.block_on(async {
+        let code = accounts::issue_code(client, name)
+            .await
+            .unwrap_or_else(|e| panic!("issue {name} an enrolment code: {e}"));
+        Remote::enrol(
+            addresses,
+            Some(fs_tls()),
+            name,
+            &code,
+            &password(name),
+            KdfParams::TESTING,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("enrol {name}: {e}"))
+    })
 }
 
 /// An address for a test cluster to listen on, such that no two tests in

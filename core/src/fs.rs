@@ -13,9 +13,9 @@ use raft5fs_proto::types::{Attr, Caller, DirItem, FsError, Kind, SetAttr, WriteE
 
 use crate::entry::{Entry, decode_entry, encode_entry};
 use crate::layout::{
-    CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ROOT_INO, TOMBSTONE_PREFIX, attr_key, chunk_key,
-    chunk_prefix, chunk_spans, chunks_per_batch, dirent_key, dirent_prefix, is_chunk_key,
-    tombstone_key, validate_chunk_size,
+    CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, TOMBSTONE_PREFIX, attr_key,
+    chunk_key, chunk_prefix, chunk_spans, chunks_per_batch, dirent_key, dirent_prefix,
+    is_chunk_key, tombstone_key, validate_chunk_size,
 };
 use crate::perm::{self, R, W, X};
 use crate::read_cache::{ChunkCache, Lookup};
@@ -163,6 +163,57 @@ pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, 
     .map_err(|e| e.to_string())?
 }
 
+/// Whether the filesystem in `client`'s store is encrypted: what the store
+/// records, or for a new filesystem, `requested`, which it then records.
+/// Like the chunk size, settled in one transaction so that servers
+/// starting a new filesystem together agree.
+///
+/// Asking for encryption of a filesystem that already exists unencrypted
+/// is an error rather than a note: carrying on would leave its owner
+/// believing their data is encrypted when it isn't. The reverse -- an
+/// encrypted filesystem opened without asking -- just stays encrypted.
+pub async fn resolve_encryption(client: &Client, requested: bool) -> Result<bool, String> {
+    retrying(move || async move {
+        let refused = || {
+            Ok(Err(
+                "this filesystem was created unencrypted, and can't be made encrypted".to_string(),
+            ))
+        };
+        let txn = client.transaction(TXN_TTL).await?;
+        if let Some(bytes) = txn.read(ENCRYPTED_KEY).await?.value {
+            let encrypted = bytes.as_slice() == [1];
+            if requested && !encrypted {
+                return refused();
+            }
+            return Ok(Ok(encrypted));
+        }
+        // No record, but a root: a filesystem from before encryption was
+        // recorded, which makes it unencrypted.
+        let existing = txn.read(&attr_key(ROOT_INO)).await?.value.is_some();
+        if existing && requested {
+            return refused();
+        }
+        let encrypted = requested && !existing;
+        txn.write(ENCRYPTED_KEY, Some(&[u8::from(encrypted)]))
+            .await?;
+        txn.commit().await?;
+        Ok(Ok(encrypted))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Whether the filesystem in `client`'s store is encrypted, without
+/// settling it: `None` if no server has opened it yet.
+pub async fn stored_encryption(client: &Client) -> Result<Option<bool>, FsError> {
+    let recorded = client.read(ENCRYPTED_KEY).await?.value;
+    if let Some(bytes) = recorded {
+        return Ok(Some(bytes.as_slice() == [1]));
+    }
+    let existing = client.read(&attr_key(ROOT_INO)).await?.value.is_some();
+    Ok(existing.then_some(false))
+}
+
 fn decode_chunk_size(bytes: &[u8]) -> Result<u64, String> {
     let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
         format!(
@@ -214,6 +265,7 @@ fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
 pub struct FsCore {
     client: Client,
     chunk_size: u64,
+    encrypted: bool,
     chunk_cache: Mutex<ChunkCache>,
 }
 
@@ -223,16 +275,22 @@ impl FsCore {
     /// filesystem is new -- owned by `root_owner` (uid, gid), mode 0755 --
     /// and finishing any deletion an earlier process left half done (see
     /// `reap_tombstones`). `read_cache_bytes` of 0 disables the read cache.
+    /// `encrypted` only matters to a new filesystem (see
+    /// `resolve_encryption`).
     pub async fn connect(
         client: Client,
         preferred_chunk_size: u64,
         read_cache_bytes: usize,
         root_owner: (u32, u32),
+        encrypted: bool,
     ) -> Result<Self, String> {
+        // Before the root exists, which is how it tells a new filesystem.
+        let encrypted = resolve_encryption(&client, encrypted).await?;
         let chunk_size = resolve_chunk_size(&client, preferred_chunk_size).await?;
         let core = Self {
             client,
             chunk_size,
+            encrypted,
             chunk_cache: Mutex::new(ChunkCache::new(read_cache_bytes, READ_CACHE_TTL)),
         };
         core.ensure_root(root_owner)
@@ -248,6 +306,11 @@ impl FsCore {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    /// Whether this filesystem is encrypted: fixed when it was created.
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// The store client this filesystem works through.
@@ -1086,5 +1149,5 @@ fn operations_are_send(core: &FsCore, caller: &Caller, name: &OsStr, data: &[u8]
     send(core.unlink(caller, 1, name));
     send(core.rmdir(caller, 1, name));
     send(core.rename(caller, 1, name, 1, name, false));
-    send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0)));
+    send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0), false));
 }

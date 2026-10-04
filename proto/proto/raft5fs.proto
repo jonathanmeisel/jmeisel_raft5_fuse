@@ -6,7 +6,8 @@
 // filesystem answer at all -- the server was unreachable or failed --
 // which is what tells the client it may try another server.
 //
-// Every request but Hello and Login carries a session token from Login,
+// Every request but Hello, Prelogin, Login, Enrol and ChangePassword
+// carries a session token from Login,
 // as `authorization: Bearer <token>` metadata; who the request is from is
 // whoever that session belongs to. A missing, forged or expired session
 // is refused with UNAUTHENTICATED -- the one status that is about the
@@ -23,6 +24,15 @@ service Fs {
   // What the client needs to know before buffering writes.
   rpc Hello(HelloRequest) returns (HelloResponse);
   rpc Login(LoginRequest) returns (LoginResponse);
+
+  // Encrypted filesystems only. The password never reaches the server:
+  // the client stretches it with the salt and parameters from Prelogin
+  // and logs in with the `auth` half (see raft5fs-crypto's `password`).
+  rpc Prelogin(PreloginRequest) returns (PreloginResponse);
+  // Sets up an account's keys, once, with a code an administrator issued.
+  rpc Enrol(EnrolRequest) returns (EmptyResponse);
+  // Replaces an account's password-derived material; the key pair stays.
+  rpc ChangePassword(ChangePasswordRequest) returns (EmptyResponse);
 
   rpc GetAttr(InodeRequest) returns (AttrResponse);
   rpc Lookup(NameRequest) returns (AttrResponse);
@@ -77,13 +87,60 @@ message HelloRequest {}
 
 message LoginRequest {
   string username = 1;
+  // An unencrypted filesystem's login: checked against the store account.
   string password = 2;
+  // An encrypted filesystem's login, in place of the password.
+  bytes auth = 3;
 }
 
 message Session {
   string token = 1;
   // When the token stops being accepted, in seconds since the Unix epoch.
   uint64 expires_at = 2;
+  // Encrypted filesystems: the account's private key, wrapped under the
+  // key only the password opens. Empty otherwise.
+  bytes wrapped_private_key = 3;
+}
+
+message PreloginRequest {
+  string username = 1;
+}
+
+// How to stretch a password. An account that doesn't exist gets made-up
+// settings, the same every time, so this doesn't say which accounts do.
+message KdfSettings {
+  bytes salt = 1;
+  bytes params = 2;
+}
+
+message PreloginResponse {
+  oneof result {
+    KdfSettings settings = 1;
+    Error error = 2;
+  }
+}
+
+// What an encrypted filesystem keeps for an account. The server can check
+// a login against `verifier`, and opens nothing.
+message AccountKeys {
+  bytes salt = 1;
+  bytes kdf_params = 2;
+  bytes verifier = 3;
+  bytes public_key = 4;
+  bytes wrapped_private_key = 5;
+}
+
+message EnrolRequest {
+  string username = 1;
+  string code = 2;
+  AccountKeys keys = 3;
+}
+
+// `keys` must keep the account's public key: only the wrapping changes.
+message ChangePasswordRequest {
+  string username = 1;
+  bytes old_auth = 2;
+  AccountKeys keys = 3;
 }
 
 message LoginResponse {
@@ -99,6 +156,8 @@ message HelloResponse {
   // How much contiguous data one write transaction stores: the client
   // buffers up to this much and aligns its batches to multiples of it.
   uint64 batch_bytes = 2;
+  // Whether the filesystem is encrypted, which changes how to log in.
+  bool encrypted = 3;
 }
 
 message InodeRequest {

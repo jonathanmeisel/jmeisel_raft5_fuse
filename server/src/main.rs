@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
-use raft5fs_core::groups;
 use raft5fs_core::users::{self, Account};
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, DEFAULT_READ_CACHE_BYTES, FsCore, validate_chunk_size};
+use raft5fs_core::{accounts, groups, stored_encryption};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use tokio::net::TcpListener;
@@ -19,7 +19,8 @@ usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       [--tls-cert <PEM> --tls-key <PEM>] [options]
                       <store options> <kv-seed-address>...
        raft5fs-server user add <NAME> --uid <UID> --gid <GROUP>
-                      [--groups <GROUP>,...] <store options> <kv-seed-address>...
+                      [--groups <GROUP>,...] [--enrol] <store options> <kv-seed-address>...
+       raft5fs-server user enrol <NAME> <store options> <kv-seed-address>...
        raft5fs-server user mod <NAME> [--add-groups <GROUP>,...]
                       [--remove-groups <GROUP>,...] <store options> <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
@@ -58,12 +59,24 @@ Serving:
   --root-owner <UID>:<GID>
                        owner of the root directory (default 0:0). Like
                        --chunk-size, only applies to a new filesystem.
+  --encrypted          create the filesystem encrypted: clients encrypt
+                       every name and every byte before it leaves them,
+                       and log in without their password ever reaching a
+                       server. Only applies to a new filesystem; an
+                       existing one stays as it was created, and asking
+                       to encrypt an unencrypted one is an error.
 
 Users: which uid, gid and supplementary groups a store account acts as in
 the filesystem. A store account with no entry can't log in to the
 filesystem. Changes reach mounted users within --identity-ttl; nobody
 needs to mount again. `user add` replaces the whole entry; `user mod`
 changes only the groups it names.
+
+On an encrypted filesystem a user also needs keys, which only their own
+client can make. `user enrol` (or `user add --enrol`) prints a one-time
+code; the user runs `raft5fs-share enrol` with it to choose a password.
+A new code lets someone who forgot their password enrol again, losing
+access to whatever was shared with them until it is shared again.
 
 Groups: names for gids. A <GROUP> is a gid number, which needn't have a
 name, or the name of a group from `group add`. `group add` without --gid
@@ -137,6 +150,8 @@ struct Args {
     store_key: Option<String>,
     store_server_name: Option<String>,
     identity_ttl: Option<Duration>,
+    encrypted: bool,
+    enrol: bool,
     uid: Option<u32>,
     gid: Option<String>,
     groups: Vec<String>,
@@ -192,6 +207,8 @@ fn parse_args() -> Args {
             "--store-cert" => a.store_cert = Some(value("--store-cert")),
             "--store-key" => a.store_key = Some(value("--store-key")),
             "--store-server-name" => a.store_server_name = Some(value("--store-server-name")),
+            "--encrypted" => a.encrypted = true,
+            "--enrol" => a.enrol = true,
             "--identity-ttl" => {
                 let secs = parse_number("--identity-ttl", &value("--identity-ttl"));
                 a.identity_ttl = Some(Duration::from_secs(secs.into()));
@@ -311,14 +328,14 @@ async fn user_command(a: Args) {
     let mut positional = a.positional.iter().skip(1);
     let command = positional.next().map(String::as_str);
     let name = match command {
-        Some("add" | "del" | "mod") => Some(
+        Some("add" | "del" | "mod" | "enrol") => Some(
             positional
                 .next()
                 .cloned()
                 .unwrap_or_else(|| usage("which user?")),
         ),
         Some("list") => None,
-        _ => usage("user takes add, mod, del or list"),
+        _ => usage("user takes add, mod, enrol, del or list"),
     };
     if command == Some("mod") && a.add_groups.is_empty() && a.remove_groups.is_empty() {
         usage("user mod needs --add-groups or --remove-groups");
@@ -336,8 +353,19 @@ async fn user_command(a: Args) {
                 gid: resolve_groups(&client, &[gid.to_string()]).await[0],
                 groups: resolve_groups(&client, &a.groups).await,
             };
-            users::set(&client, &name, &account).await
+            match users::set(&client, &name, &account).await {
+                Ok(()) if a.enrol => issue_enrolment_code(&client, &name).await,
+                other => other,
+            }
         }
+        (Some("enrol"), Some(name)) => match users::get(&client, &name).await {
+            Ok(Some(_)) => issue_enrolment_code(&client, &name).await,
+            Ok(None) => Err(raft5fs_core::FsError::new(
+                libc::ENOENT,
+                format!("{name} has no entry; add them first"),
+            )),
+            Err(e) => Err(e),
+        },
         (Some("mod"), Some(name)) => {
             let add = resolve_groups(&client, &a.add_groups).await;
             let remove = resolve_groups(&client, &a.remove_groups).await;
@@ -367,6 +395,24 @@ async fn user_command(a: Args) {
         },
     };
     result.unwrap_or_else(|e| fail(e));
+}
+
+/// Prints a fresh enrolment code for `name`, if the filesystem is
+/// encrypted.
+async fn issue_enrolment_code(client: &Client, name: &str) -> Result<(), raft5fs_core::FsError> {
+    match stored_encryption(client).await? {
+        Some(true) => {}
+        Some(false) => {
+            fail("this filesystem isn't encrypted; its users log in with store passwords")
+        }
+        None => fail(
+            "no filesystem server has created this filesystem yet; start one with --encrypted first",
+        ),
+    }
+    let code = accounts::issue_code(client, name).await?;
+    println!("enrolment code for {name}: {code}");
+    println!("(they run `raft5fs-share --user {name} enrol {code} <server-address>...`)");
+    Ok(())
 }
 
 async fn group_command(a: Args) {
@@ -447,9 +493,13 @@ async fn serve_command(a: Args) {
         chunk_size,
         a.read_cache_bytes.unwrap_or(DEFAULT_READ_CACHE_BYTES),
         a.root_owner.unwrap_or((0, 0)),
+        a.encrypted,
     )
     .await
     .unwrap_or_else(|why| fail(format!("cannot open the filesystem: {why}")));
+    if core.encrypted() && !a.encrypted {
+        eprintln!("note: this filesystem is encrypted");
+    }
     if core.chunk_size() != chunk_size {
         eprintln!(
             "note: this filesystem was created with a {}-byte chunk size; \

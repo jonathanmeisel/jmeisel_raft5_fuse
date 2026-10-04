@@ -121,9 +121,60 @@ pub fn check_verifier(auth: &[u8], stored: &[u8]) -> bool {
     stored.len() == 32 && bool::from(verifier(auth).ct_eq(stored))
 }
 
+/// The salt Prelogin hands out for an account that doesn't exist: made up
+/// from a server secret and the name, so it is the same on every server
+/// and every ask, like a real one -- a stranger can't tell the two apart.
+pub fn decoy_salt(server_secret: &[u8], user: &str) -> [u8; SALT_LEN] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(server_secret).expect("HMAC takes any key length");
+    mac.update(b"raft5fs/decoy-salt/");
+    mac.update(user.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    digest[..SALT_LEN].try_into().unwrap()
+}
+
+/// A one-time enrolment code: 128 random bits, as 32 hex digits.
+pub fn new_enrolment_code() -> String {
+    let mut bytes = [0; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the server keeps of an enrolment code. A plain hash is enough:
+/// the code is random, not something a person chose.
+pub fn enrolment_code_hash(code: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"raft5fs/enrolment-code");
+    hash.update(code.trim().to_ascii_lowercase().as_bytes());
+    hash.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoy_salts_are_stable_per_user_and_secret() {
+        assert_eq!(decoy_salt(b"s", "eve"), decoy_salt(b"s", "eve"));
+        assert_ne!(decoy_salt(b"s", "eve"), decoy_salt(b"s", "mallory"));
+        assert_ne!(decoy_salt(b"s", "eve"), decoy_salt(b"t", "eve"));
+    }
+
+    #[test]
+    fn enrolment_codes_are_fresh_and_hash_forgivingly() {
+        let code = new_enrolment_code();
+        assert_eq!(code.len(), 32);
+        assert_ne!(code, new_enrolment_code());
+        assert_eq!(
+            enrolment_code_hash(&code),
+            enrolment_code_hash(&format!(" {} \n", code.to_uppercase()))
+        );
+        assert_ne!(
+            enrolment_code_hash(&code),
+            enrolment_code_hash(&new_enrolment_code())
+        );
+    }
 
     #[test]
     fn one_password_and_salt_always_give_the_same_keys() {

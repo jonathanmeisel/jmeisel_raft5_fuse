@@ -2006,6 +2006,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "raft5-client",
+ "raft5fs-crypto",
  "raft5fs-proto",
 ]
 
@@ -2033,12 +2034,14 @@ dependencies = [
  "raft5-client",
  "raft5-server",
  "raft5fs-core",
+ "raft5fs-crypto",
  "raft5fs-proto",
  "raft5fs-server",
  "rcgen",
  "tokio",
  "tokio-util",
  "tonic",
+ "zeroize",
 ]
 
 [[package]]
@@ -2061,6 +2064,7 @@ dependencies = [
  "libc",
  "raft5-client",
  "raft5fs-core",
+ "raft5fs-crypto",
  "raft5fs-proto",
  "serde",
  "tokio",

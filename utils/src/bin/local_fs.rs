@@ -633,6 +633,7 @@ async fn start_fs_server(
         DEFAULT_CHUNK_SIZE,
         DEFAULT_READ_CACHE_BYTES,
         (manifest.uid, manifest.gid),
+        false,
     )
     .await
     .map_err(|e| format!("could not open the filesystem: {e}"))?;

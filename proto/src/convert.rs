@@ -8,7 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
-use crate::types::{Attr, DirItem, FsError, Kind, SetAttr, SetTime, WriteError};
+use crate::types::{AccountKeys, Attr, DirItem, FsError, Kind, SetAttr, SetTime, WriteError};
 
 fn malformed(what: &str) -> FsError {
     FsError::new(libc::EIO, format!("malformed response: no {what}"))
@@ -230,12 +230,12 @@ impl pb::EmptyResponse {
     }
 }
 
-impl From<Result<(String, u64), FsError>> for pb::LoginResponse {
-    fn from(r: Result<(String, u64), FsError>) -> Self {
+impl From<Result<pb::Session, FsError>> for pb::LoginResponse {
+    fn from(r: Result<pb::Session, FsError>) -> Self {
         use pb::login_response::Result as R;
         Self {
             result: Some(match r {
-                Ok((token, expires_at)) => R::Session(pb::Session { token, expires_at }),
+                Ok(session) => R::Session(session),
                 Err(e) => R::Error(e.into()),
             }),
         }
@@ -243,13 +243,61 @@ impl From<Result<(String, u64), FsError>> for pb::LoginResponse {
 }
 
 impl pb::LoginResponse {
-    /// The session token, and when it expires.
-    pub fn into_result(self) -> Result<(String, u64), FsError> {
+    /// The session: its token, when it expires, and (on an encrypted
+    /// filesystem) the wrapped private key.
+    pub fn into_result(self) -> Result<pb::Session, FsError> {
         use pb::login_response::Result as R;
         match self.result {
-            Some(R::Session(s)) => Ok((s.token, s.expires_at)),
+            Some(R::Session(s)) => Ok(s),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("session")),
+        }
+    }
+}
+
+impl From<Result<pb::KdfSettings, FsError>> for pb::PreloginResponse {
+    fn from(r: Result<pb::KdfSettings, FsError>) -> Self {
+        use pb::prelogin_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(settings) => R::Settings(settings),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::PreloginResponse {
+    pub fn into_result(self) -> Result<pb::KdfSettings, FsError> {
+        use pb::prelogin_response::Result as R;
+        match self.result {
+            Some(R::Settings(s)) => Ok(s),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("KDF settings")),
+        }
+    }
+}
+
+impl From<AccountKeys> for pb::AccountKeys {
+    fn from(k: AccountKeys) -> Self {
+        Self {
+            salt: k.salt,
+            kdf_params: k.kdf_params,
+            verifier: k.verifier,
+            public_key: k.public_key,
+            wrapped_private_key: k.wrapped_private_key,
+        }
+    }
+}
+
+impl From<pb::AccountKeys> for AccountKeys {
+    fn from(k: pb::AccountKeys) -> Self {
+        Self {
+            salt: k.salt,
+            kdf_params: k.kdf_params,
+            verifier: k.verifier,
+            public_key: k.public_key,
+            wrapped_private_key: k.wrapped_private_key,
         }
     }
 }

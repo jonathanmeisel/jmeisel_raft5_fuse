@@ -69,6 +69,9 @@ pub struct Signer {
     encoding: EncodingKey,
     decoding: DecodingKey,
     session_ttl: Duration,
+    /// The key itself, for the one other thing every server must agree on
+    /// without talking: the decoy salts of accounts that don't exist.
+    secret: Vec<u8>,
 }
 
 impl Signer {
@@ -77,7 +80,14 @@ impl Signer {
             encoding: EncodingKey::from_secret(key),
             decoding: DecodingKey::from_secret(key),
             session_ttl,
+            secret: key.to_vec(),
         }
+    }
+
+    /// The salt to hand out for an account that has none, the same on
+    /// every server (see `raft5fs_crypto::password::decoy_salt`).
+    pub fn decoy_salt(&self, user: &str) -> [u8; raft5fs_crypto::password::SALT_LEN] {
+        raft5fs_crypto::password::decoy_salt(&self.secret, user)
     }
 
     fn sign(&self, claims: &impl Serialize) -> String {

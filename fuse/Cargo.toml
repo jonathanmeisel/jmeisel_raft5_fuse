@@ -8,11 +8,17 @@ edition.workspace = true
 name = "raft5fs-fuse"
 path = "src/main.rs"
 
+[[bin]]
+name = "raft5fs-share"
+path = "src/bin/share.rs"
+
 [dependencies]
 fuser = { workspace = true }
 libc = { workspace = true }
+raft5fs-crypto = { workspace = true }
 raft5fs-proto = { workspace = true }
 tokio = { workspace = true }
+zeroize = "1"
 tonic = { workspace = true }
 
 # The end-to-end tests run the whole stack in-process: a raft5 cluster,

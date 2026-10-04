@@ -31,6 +31,12 @@
 //! otherwise refuses) is renewed by logging in again with the same
 //! credentials, and the request then retried -- which is why they are
 //! kept for the life of the mount.
+//!
+//! On an encrypted filesystem the password itself never goes to a server.
+//! The first login stretches it (with the salt Prelogin hands out) into
+//! `auth`, which is what logs in, and a key that opens the account's
+//! private key from the login's reply. From then on only `auth` is kept,
+//! for renewals; the password is dropped.
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -39,11 +45,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN};
+use raft5fs_crypto::password::{self, AUTH_LEN, KdfParams, PasswordKeys, new_salt, verifier};
+use zeroize::Zeroizing;
+
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
-    AccessRequest, CreateRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest,
-    ReadRequest, RenameRequest, SetAttrRequest, WriteRequest,
+    AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, EnrolRequest, HelloRequest,
+    InodeRequest, LoginRequest, NameRequest, PreloginRequest, ReadRequest, RenameRequest,
+    SetAttrRequest, WriteRequest,
 };
 use raft5fs_proto::types::{Attr, DirItem, FsError, SetAttr, WriteError};
 use tonic::Code;
@@ -94,14 +105,55 @@ impl Interceptor for Authorize {
 
 type Client = FsClient<InterceptedService<Channel, Authorize>>;
 
+/// What a login presents: the password, until an encrypted filesystem's
+/// first login has turned it into `auth`.
+enum Secret {
+    Password(Zeroizing<String>),
+    Auth(Zeroizing<[u8; AUTH_LEN]>),
+}
+
 pub struct Remote {
     servers: Vec<(String, Client)>,
-    credentials: Credentials,
+    username: String,
+    secret: RwLock<Secret>,
+    /// Whether the filesystem is encrypted, from Hello.
+    encrypted: bool,
+    /// The account's key pair, once an encrypted login has opened it.
+    identity: RwLock<Option<Arc<Identity>>>,
     session: Session,
     /// Where to start: the last server that answered.
     current: AtomicUsize,
     chunk_size: u64,
     batch_bytes: u64,
+}
+
+/// Stretches `password` off the async threads: Argon2 is slow on purpose.
+async fn derive(password: &str, salt: Vec<u8>, params: KdfParams) -> Result<PasswordKeys, FsError> {
+    let password = Zeroizing::new(password.to_string());
+    tokio::task::spawn_blocking(move || password::derive(password.as_bytes(), &salt, params))
+        .await
+        .expect("key derivation panicked")
+        .map_err(|e| FsError::new(libc::EIO, e.to_string()))
+}
+
+/// What the server keeps for an account whose password is `password` and
+/// key pair `identity`, under a fresh salt; and the `auth` it will take.
+async fn account_keys(
+    username: &str,
+    password: &str,
+    params: KdfParams,
+    identity: &Identity,
+) -> Result<(AccountKeys, Zeroizing<[u8; AUTH_LEN]>), FsError> {
+    let salt = new_salt();
+    let keys = derive(password, salt.to_vec(), params).await?;
+    let account = AccountKeys {
+        salt: salt.to_vec(),
+        kdf_params: params.encode().to_vec(),
+        verifier: verifier(&keys.auth).to_vec(),
+        public_key: identity.public_key().to_vec(),
+        wrapped_private_key: identity.wrap(&keys.kek, username),
+    };
+    Ok((account, Zeroizing::new(keys.auth)))
 }
 
 /// When a request may be resent to another server; see the module doc.
@@ -134,6 +186,17 @@ impl Remote {
         credentials: Credentials,
         tls: Option<ClientTlsConfig>,
     ) -> Result<Self, String> {
+        let remote = Self::dial(addresses, credentials, tls).await?;
+        remote.login().await.map_err(|e| e.message)?;
+        Ok(remote)
+    }
+
+    /// Connects and says hello, without logging in.
+    async fn dial(
+        addresses: &[String],
+        credentials: Credentials,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<Self, String> {
         if addresses.is_empty() {
             return Err("no server addresses".to_string());
         }
@@ -161,7 +224,10 @@ impl Remote {
         }
         let mut remote = Self {
             servers,
-            credentials,
+            username: credentials.username,
+            secret: RwLock::new(Secret::Password(Zeroizing::new(credentials.password))),
+            encrypted: false,
+            identity: RwLock::new(None),
             session,
             current: AtomicUsize::new(0),
             chunk_size: 0,
@@ -175,8 +241,103 @@ impl Remote {
             .map_err(|e| e.message)?;
         remote.chunk_size = hello.chunk_size;
         remote.batch_bytes = hello.batch_bytes;
-        remote.login().await.map_err(|e| e.message)?;
+        remote.encrypted = hello.encrypted;
         Ok(remote)
+    }
+
+    /// Enrols `username` on the encrypted filesystem at `addresses`, with
+    /// the one-time `code` an administrator issued: makes the account a
+    /// key pair, and stores it wrapped under what `password` yields.
+    /// Returns the new public key, for the user to note its fingerprint.
+    pub async fn enrol(
+        addresses: &[String],
+        tls: Option<ClientTlsConfig>,
+        username: &str,
+        code: &str,
+        password: &str,
+        params: KdfParams,
+    ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        let credentials = Credentials {
+            username: username.to_string(),
+            password: String::new(),
+        };
+        let remote = Self::dial(addresses, credentials, tls)
+            .await
+            .map_err(|e| FsError::new(libc::EIO, e))?;
+        remote.require_encrypted()?;
+        let identity = Identity::generate();
+        let (keys, _) = account_keys(username, password, params, &identity).await?;
+        let req = EnrolRequest {
+            username: username.to_string(),
+            code: code.to_string(),
+            keys: Some(keys),
+        };
+        // Never resent: a code is used up by the first enrolment, so a
+        // resend of one that landed would report a false refusal.
+        remote
+            .call(Retry::Once, |mut c| {
+                let req = req.clone();
+                async move { c.enrol(req).await }
+            })
+            .await?
+            .into_result()?;
+        Ok(identity.public_key())
+    }
+
+    /// Changes this account's password to `new_password`. The key pair
+    /// stays -- only its wrapping changes -- so everything shared with it
+    /// stays readable. Needs an encrypted login, which proves the old one.
+    pub async fn change_password(
+        &self,
+        new_password: &str,
+        params: KdfParams,
+    ) -> Result<(), FsError> {
+        self.require_encrypted()?;
+        let identity = self
+            .identity()
+            .ok_or_else(|| FsError::new(libc::EACCES, "not logged in: no key pair to re-wrap"))?;
+        let old_auth = match &*self.secret.read().unwrap() {
+            Secret::Auth(auth) => auth.to_vec(),
+            Secret::Password(_) => {
+                return Err(FsError::new(libc::EACCES, "not logged in"));
+            }
+        };
+        let (keys, new_auth) =
+            account_keys(&self.username, new_password, params, &identity).await?;
+        let req = ChangePasswordRequest {
+            username: self.username.clone(),
+            old_auth,
+            keys: Some(keys),
+        };
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.change_password(req).await }
+        })
+        .await?
+        .into_result()?;
+        *self.secret.write().unwrap() = Secret::Auth(new_auth);
+        Ok(())
+    }
+
+    /// Whether the filesystem is encrypted.
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// The account's key pair: there after an encrypted filesystem's login.
+    pub fn identity(&self) -> Option<Arc<Identity>> {
+        self.identity.read().unwrap().clone()
+    }
+
+    fn require_encrypted(&self) -> Result<(), FsError> {
+        if self.encrypted {
+            Ok(())
+        } else {
+            Err(FsError::new(
+                libc::EOPNOTSUPP,
+                "this filesystem isn't encrypted",
+            ))
+        }
     }
 
     /// Logs in, on whichever server answers, and keeps the session for
@@ -186,29 +347,90 @@ impl Remote {
     /// Not through `call`, which logs in itself when a session is
     /// refused: this has to work with no session, and must not recurse.
     async fn login(&self) -> Result<(), FsError> {
-        let req = LoginRequest {
-            username: self.credentials.username.clone(),
-            password: self.credentials.password.clone(),
+        let mut req = LoginRequest {
+            username: self.username.clone(),
+            password: String::new(),
+            auth: Vec::new(),
         };
+        // An encrypted filesystem's first login: the keys the password
+        // yields, kept until the server has accepted them.
+        let mut derived = None;
+        let password = match &*self.secret.read().unwrap() {
+            Secret::Auth(auth) => {
+                req.auth = auth.to_vec();
+                None
+            }
+            Secret::Password(password) => Some(password.clone()),
+        };
+        if let Some(password) = password {
+            if self.encrypted {
+                let settings = self
+                    .first_answer("a prelogin", |mut c| {
+                        let req = PreloginRequest {
+                            username: self.username.clone(),
+                        };
+                        async move { c.prelogin(req).await }
+                    })
+                    .await?
+                    .into_result()?;
+                let params = KdfParams::decode(&settings.params)
+                    .map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
+                let keys = derive(&password, settings.salt, params).await?;
+                req.auth = keys.auth.to_vec();
+                derived = Some(keys);
+            } else {
+                req.password = password.to_string();
+            }
+        }
+        let session = self
+            .first_answer("a login", |mut c| {
+                let req = req.clone();
+                async move { c.login(req).await }
+            })
+            .await?
+            .into_result()?;
+        if let Some(keys) = derived {
+            // The server took `auth`, so the password was right: what
+            // fails to open now was tampered with, not mistyped.
+            let identity =
+                Identity::unwrap(&keys.kek, &self.username, &session.wrapped_private_key)
+                    .map_err(|e| FsError::new(libc::EIO, format!("login: {e}")))?;
+            *self.identity.write().unwrap() = Some(Arc::new(identity));
+            *self.secret.write().unwrap() = Secret::Auth(Zeroizing::new(keys.auth));
+        }
+        *self.session.write().unwrap() = session.token;
+        Ok(())
+    }
+
+    /// The first answer any server gives `request`, trying each in turn
+    /// from the current one. For the requests that come before a session
+    /// -- not through `call`, which logs in itself when a session is
+    /// refused, and so must never be what a login goes through.
+    async fn first_answer<T, Fut>(
+        &self,
+        what: &str,
+        request: impl Fn(Client) -> Fut,
+    ) -> Result<T, FsError>
+    where
+        Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
         let n = self.servers.len();
         let start = self.current.load(Ordering::Relaxed);
         let mut failures = Vec::new();
         for attempt in 0..n {
             let i = (start + attempt) % n;
             let (address, client) = &self.servers[i];
-            match client.clone().login(req.clone()).await {
+            match request(client.clone()).await {
                 Ok(response) => {
                     self.current.store(i, Ordering::Relaxed);
-                    let (token, _) = response.into_inner().into_result()?;
-                    *self.session.write().unwrap() = token;
-                    return Ok(());
+                    return Ok(response.into_inner());
                 }
                 Err(status) => failures.push(format!("{address}: {}", status.message())),
             }
         }
         Err(FsError::new(
             libc::EIO,
-            format!("no server answered a login: {}", failures.join("; ")),
+            format!("no server answered {what}: {}", failures.join("; ")),
         ))
     }
 

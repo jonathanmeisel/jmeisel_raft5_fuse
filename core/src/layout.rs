@@ -17,6 +17,11 @@ pub(crate) const DELETE_BATCH: usize = 256;
 /// adopt it rather than reinterpreting every chunk boundary.
 pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
+/// Records whether a filesystem is encrypted (one byte, 1 or 0), fixed
+/// when it is created. A store from before this was recorded has a root
+/// but no such key, and is unencrypted.
+pub const ENCRYPTED_KEY: &[u8] = b"\x04encrypted";
+
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
 pub const MIN_CHUNK_SIZE: u64 = 4096;
 /// The largest chunk we will create. A chunk has to fit in one
@@ -91,6 +96,8 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x06 ++ "u/" ++ username            -> the account's uid, gid and groups (`users`)
 //   0x06 ++ "g/" ++ group name          -> the group's gid(BE4) (`groups`)
 //   0x06 ++ "n/" ++ gid(BE4)            -> the name of that gid's group (`groups`)
+//   0x06 ++ "k/" ++ username            -> encrypted filesystems: the account's keys (`accounts`)
+//   0x06 ++ "e/" ++ username            -> a pending enrolment code's hash (`accounts`)
 //
 // Deleting an inode takes several transactions (its chunks can't all fit
 // in one), so it is announced first: one transaction removes the dirent,
@@ -129,6 +136,12 @@ pub(crate) fn attr_key(ino: u64) -> Vec<u8> {
 
 /// The prefix of every user table row; see `users`.
 pub(crate) const USERS_PREFIX: &[u8] = b"\x06u/";
+
+/// The prefix of every account key row; see `accounts`.
+pub(crate) const ACCOUNT_KEYS_PREFIX: &[u8] = b"\x06k/";
+
+/// The prefix of every pending enrolment code; see `accounts`.
+pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";
 
 /// The prefix of every group name row; see `groups`.
 pub(crate) const GROUPS_PREFIX: &[u8] = b"\x06g/";

@@ -19,14 +19,18 @@ use std::time::{Duration, Instant};
 
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
-use raft5fs_core::{Caller, FsCore, FsError, MAX_CHUNK_SIZE, WriteError, batch_bytes, users};
+use raft5fs_core::{
+    Caller, FsCore, FsError, MAX_CHUNK_SIZE, WriteError, accounts, batch_bytes, users,
+};
+use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
-    AccessRequest, AttrResponse, CreateRequest, CreateResponse, EmptyResponse, HelloRequest,
-    HelloResponse, InoResponse, InodeRequest, LoginRequest, LoginResponse, NameRequest,
-    OpenResponse, ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, SetAttrRequest,
-    WriteRequest, WriteResponse,
+    AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateResponse,
+    EmptyResponse, EnrolRequest, HelloRequest, HelloResponse, InoResponse, InodeRequest,
+    KdfSettings, LoginRequest, LoginResponse, NameRequest, OpenResponse, PreloginRequest,
+    PreloginResponse, ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, Session,
+    SetAttrRequest, WriteRequest, WriteResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -149,15 +153,57 @@ impl FsService {
         Ok(h.ino)
     }
 
-    /// Checks `username`'s password against the store, and looks up what
-    /// the account acts as. `Ok(Err)` is a refusal; `Err` means the store
-    /// couldn't be asked, which is this server's failure, not the
-    /// caller's.
+    /// Checks a login -- the password against the store account, or on an
+    /// encrypted filesystem `auth` against the account's verifier -- and
+    /// looks up what the account acts as. Returns that, and the wrapped
+    /// private key an encrypted login hands back. `Ok(Err)` is a refusal;
+    /// `Err` means the store couldn't be asked, which is this server's
+    /// failure, not the caller's.
     async fn authenticate(
+        &self,
+        r: &LoginRequest,
+    ) -> Result<Result<(Caller, Vec<u8>), FsError>, Status> {
+        let username = r.username.as_str();
+        let wrapped_private_key = if self.core.encrypted() {
+            match accounts::check_login(self.core.client(), username, &r.auth).await {
+                Ok(Some(keys)) => keys.wrapped_private_key,
+                Ok(None) => {
+                    return Ok(Err(FsError::new(
+                        libc::EACCES,
+                        "login refused: the username or password was wrong",
+                    )));
+                }
+                Err(e) => return Err(store_unavailable(e)),
+            }
+        } else {
+            if let Err(refused) = self.check_store_password(username, &r.password).await? {
+                return Ok(Err(refused));
+            }
+            Vec::new()
+        };
+        match users::get(self.core.client(), username).await {
+            Ok(Some(a)) => {
+                let caller = Caller::new(a.uid, a.gid, a.groups);
+                self.remember(username, &caller);
+                Ok(Ok((caller, wrapped_private_key)))
+            }
+            Ok(None) => Ok(Err(FsError::new(
+                libc::EACCES,
+                format!("{username} has no filesystem account"),
+            ))),
+            Err(e) => Err(Status::unavailable(format!(
+                "cannot read the user table: {e}"
+            ))),
+        }
+    }
+
+    /// An unencrypted filesystem's login check: whether the store takes
+    /// `password` for its account `username`.
+    async fn check_store_password(
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Result<Caller, FsError>, Status> {
+    ) -> Result<Result<(), FsError>, Status> {
         let unavailable = |e: KvError| Status::unavailable(format!("cannot reach the store: {e}"));
         // A client of its own: logging in on a clone of the server's
         // client would replace the server's own login.
@@ -176,22 +222,27 @@ impl FsService {
             }
             Err(e) => return Err(unavailable(e)),
         }
-        drop(store);
-        match users::get(self.core.client(), username).await {
-            Ok(Some(a)) => {
-                let caller = Caller::new(a.uid, a.gid, a.groups);
-                self.remember(username, &caller);
-                Ok(Ok(caller))
-            }
-            Ok(None) => Ok(Err(FsError::new(
-                libc::EACCES,
-                format!("{username} has no filesystem account"),
-            ))),
-            Err(e) => Err(Status::unavailable(format!(
-                "cannot read the user table: {e}"
-            ))),
+        Ok(Ok(()))
+    }
+
+    /// An encrypted filesystem's operation, or `EOPNOTSUPP` on one that
+    /// isn't.
+    fn require_encrypted(&self) -> Result<(), FsError> {
+        if self.core.encrypted() {
+            Ok(())
+        } else {
+            Err(FsError::new(
+                libc::EOPNOTSUPP,
+                "this filesystem isn't encrypted",
+            ))
         }
     }
+}
+
+/// A store failure while checking credentials: the server's problem, so a
+/// status, which sends the client to another server.
+fn store_unavailable(e: FsError) -> Status {
+    Status::unavailable(format!("cannot reach the store: {e}"))
 }
 
 /// The service, ready to add to a tonic `Server`.
@@ -228,16 +279,81 @@ impl Fs for FsService {
         Ok(Response::new(HelloResponse {
             chunk_size,
             batch_bytes: batch_bytes(chunk_size),
+            encrypted: self.core.encrypted(),
         }))
     }
 
     async fn login(&self, r: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
         let r = r.into_inner();
         let session = self
-            .authenticate(&r.username, &r.password)
+            .authenticate(&r)
             .await?
-            .map(|_| self.signer.session(&r.username));
+            .map(|(_, wrapped_private_key)| {
+                let (token, expires_at) = self.signer.session(&r.username);
+                Session {
+                    token,
+                    expires_at,
+                    wrapped_private_key,
+                }
+            });
         Ok(Response::new(session.into()))
+    }
+
+    async fn prelogin(
+        &self,
+        r: Request<PreloginRequest>,
+    ) -> Result<Response<PreloginResponse>, Status> {
+        let username = r.into_inner().username;
+        if let Err(e) = self.require_encrypted() {
+            return Ok(Response::new(Err(e).into()));
+        }
+        let settings = match accounts::get(self.core.client(), &username).await {
+            Ok(Some(keys)) => KdfSettings {
+                salt: keys.salt,
+                params: keys.kdf_params,
+            },
+            // Indistinguishable from a real account's: the same made-up
+            // salt every time, and the parameters new accounts get.
+            Ok(None) => KdfSettings {
+                salt: self.signer.decoy_salt(&username).to_vec(),
+                params: KdfParams::DEFAULT.encode().to_vec(),
+            },
+            Err(e) => return Err(store_unavailable(e)),
+        };
+        Ok(Response::new(Ok(settings).into()))
+    }
+
+    async fn enrol(&self, r: Request<EnrolRequest>) -> Result<Response<EmptyResponse>, Status> {
+        let r = r.into_inner();
+        let enrolled = match (self.require_encrypted(), r.keys) {
+            (Err(e), _) => Err(e),
+            (Ok(()), None) => Err(FsError::new(libc::EINVAL, "an enrolment needs keys")),
+            (Ok(()), Some(keys)) => {
+                accounts::enrol(self.core.client(), &r.username, &r.code, &keys.into()).await
+            }
+        };
+        Ok(Response::new(enrolled.into()))
+    }
+
+    async fn change_password(
+        &self,
+        r: Request<ChangePasswordRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let r = r.into_inner();
+        let changed = match (self.require_encrypted(), r.keys) {
+            (Err(e), _) => Err(e),
+            (Ok(()), None) => Err(FsError::new(libc::EINVAL, "a password change needs keys")),
+            (Ok(()), Some(keys)) => {
+                accounts::change_password(
+                    self.core.client(),
+                    &r.username,
+                    &r.old_auth,
+                    &keys.into(),
+                )
+                .await
+            }
+        };
+        Ok(Response::new(changed.into()))
     }
 
     async fn get_attr(&self, r: Request<InodeRequest>) -> Result<Response<AttrResponse>, Status> {

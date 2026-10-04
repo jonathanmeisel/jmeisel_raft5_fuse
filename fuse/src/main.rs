@@ -1,11 +1,10 @@
 use std::env;
-use std::io::{BufRead, Write};
 
 use fuser::{Config, MountOption};
+use raft5fs_fuse::cli;
 use raft5fs_fuse::filesystem::Raft5Fs;
 use raft5fs_fuse::remote::Credentials;
 use tokio::runtime::Runtime;
-use tonic::transport::{Certificate, ClientTlsConfig};
 
 const USAGE: &str = "\
 usage: raft5fs-fuse --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
@@ -31,31 +30,6 @@ usage: raft5fs-fuse --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
 fn usage(why: &str) -> ! {
     eprintln!("{why}\n\n{USAGE}");
     std::process::exit(1);
-}
-
-/// Reads a password from the terminal without echoing it.
-fn prompt_password(username: &str) -> std::io::Result<String> {
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")?;
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&tty);
-    write!(&tty, "password for {username}: ")?;
-    // SAFETY: `termios` is plain data, filled in by `tcgetattr` before use.
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    let echo_off = unsafe { libc::tcgetattr(fd, &mut saved) } == 0 && {
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) == 0 }
-    };
-    let mut line = String::new();
-    let read = std::io::BufReader::new(&tty).read_line(&mut line);
-    if echo_off {
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
-    }
-    writeln!(&tty)?;
-    read?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 fn main() {
@@ -86,24 +60,17 @@ fn main() {
     }
     let mountpoint = positional.remove(0);
     let username = username.unwrap_or_else(|| usage("--user is required"));
-    let password = match env::var("RAFT5FS_PASSWORD") {
-        Ok(p) => p,
-        Err(_) => prompt_password(&username).unwrap_or_else(|e| {
+    let password = cli::password_from("RAFT5FS_PASSWORD", &format!("password for {username}: "))
+        .unwrap_or_else(|e| {
             eprintln!("cannot read a password: {e}");
             std::process::exit(1);
-        }),
-    };
+        });
     let credentials = Credentials { username, password };
     let tls = ca.map(|path| {
-        let pem = std::fs::read(&path).unwrap_or_else(|e| {
-            eprintln!("cannot read {path}: {e}");
+        cli::tls(&path, server_name.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
             std::process::exit(1);
-        });
-        let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem));
-        if let Some(name) = &server_name {
-            tls = tls.domain_name(name);
-        }
-        tls
+        })
     });
     if tls.is_none() && server_name.is_some() {
         usage("--tls-server-name needs --ca");

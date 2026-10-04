@@ -89,6 +89,18 @@ pub struct DirItem {
     pub name: OsString,
 }
 
+/// What an encrypted filesystem keeps for an account: enough to check a
+/// login and to hand the client back its wrapped private key, and nothing
+/// that opens anything. The fields are raft5fs-crypto's encodings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountKeys {
+    pub salt: Vec<u8>,
+    pub kdf_params: Vec<u8>,
+    pub verifier: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub wrapped_private_key: Vec<u8>,
+}
+
 /// An errno plus a message. The errno is what a caller hands the kernel;
 /// the message carries the real cause (usually the store's own error
 /// text) so it can be logged.

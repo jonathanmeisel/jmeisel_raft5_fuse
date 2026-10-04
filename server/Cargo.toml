@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 raft5fs-core = { workspace = true }
+raft5fs-crypto = { workspace = true }
 raft5fs-proto = { workspace = true }
 raft5-client = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
