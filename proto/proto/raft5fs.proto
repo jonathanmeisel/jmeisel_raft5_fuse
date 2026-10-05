@@ -77,9 +77,65 @@ service Fs {
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume, and every grant of it.
   rpc DeleteVolume(InodeRequest) returns (EmptyResponse);
+  // File data, which the client seals chunk by chunk (raft5fs-crypto's
+  // `data`), so the server can neither read it nor patch it: Read and
+  // Write are refused here, and the client reads, changes and re-seals
+  // whole chunks instead. Checked against the caller's grant every time,
+  // so these take an inode, not a handle.
+  rpc ReadChunks(ReadChunksRequest) returns (ReadChunksResponse);
+  // Stores whole sealed chunks, each sealed under the file's current key
+  // version. A chunk with an `expected_seq` is stored only if it is still
+  // as the client read it -- otherwise nothing is, and the answer is
+  // EAGAIN, for the client to read again and redo its change.
+  rpc WriteChunks(WriteChunksRequest) returns (AttrResponse);
 }
 
 message NoArgs {}
+
+message ReadChunksRequest {
+  uint64 ino = 1;
+  uint64 first = 2;
+  // At most what one write batch holds; more is cut short, and the client
+  // asks again from where the answer stopped.
+  uint32 count = 3;
+}
+
+message SealedChunk {
+  uint64 index = 1;
+  // The store's sequence number for the chunk as read: what a write of it
+  // expects, to be sure nothing changed it meanwhile.
+  uint64 seq = 2;
+  // Empty for a chunk that was never written: a hole, all zeros.
+  bytes blob = 3;
+}
+
+message ChunkList {
+  // The file's attributes, for its size.
+  Attr attr = 1;
+  repeated SealedChunk chunks = 2;
+}
+
+message ReadChunksResponse {
+  oneof result {
+    ChunkList list = 1;
+    Error error = 2;
+  }
+}
+
+message ChunkWrite {
+  uint64 index = 1;
+  // Absent for a chunk being replaced whole, whatever it held.
+  optional uint64 expected_seq = 2;
+  bytes blob = 3;
+}
+
+message WriteChunksRequest {
+  uint64 ino = 1;
+  repeated ChunkWrite chunks = 2;
+  // The file grows to at least this, the end of what was written; 0 to
+  // leave its size alone.
+  uint64 end = 3;
+}
 
 message Error {
   int32 errno = 1;

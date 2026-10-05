@@ -133,6 +133,24 @@ pub struct KeyPath {
     pub nodes: Vec<(u64, Vec<u8>)>,
 }
 
+/// A file chunk as stored on an encrypted filesystem: sealed, with the
+/// store's sequence number for it. `blob` is `None` for a hole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedChunk {
+    pub index: u64,
+    pub seq: u64,
+    pub blob: Option<Vec<u8>>,
+}
+
+/// A sealed chunk to store, if it is still at `expected_seq` (or whatever
+/// it holds, without one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkWrite {
+    pub index: u64,
+    pub expected_seq: Option<u64>,
+    pub blob: Vec<u8>,
+}
+
 /// What a create on an encrypted filesystem brings: the inode it reserved,
 /// and the new node's key record.
 #[derive(Debug, Clone, PartialEq, Eq)]

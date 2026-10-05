@@ -9,10 +9,11 @@ use std::time::{Duration, SystemTime};
 
 use raft5_client::{Client, Error as KvError, Transaction};
 
-use raft5fs_crypto::data::TAG_LEN;
+use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, Caller, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SealedMove, SetAttr, WriteError,
+    Attr, Caller, ChunkWrite, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SealedChunk,
+    SealedMove, SetAttr, WriteError,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -554,6 +555,7 @@ impl FsCore {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, FsError> {
+        self.refuse_plain_data()?;
         self.guard_now(caller, ino, false).await?;
         let size = self.read_entry(ino).await?.ok_or_else(enoent)?.attr.size;
         Ok(self.read_range(ino, offset, len, size).await?)
@@ -670,6 +672,9 @@ impl FsCore {
             written: 0,
             error: enoent(),
         };
+        if let Err(error) = self.refuse_plain_data() {
+            return Err(WriteError { written: 0, error });
+        }
         if let Err(error) = self.guard_now(caller, ino, true).await {
             return Err(WriteError { written: 0, error });
         }
@@ -868,7 +873,11 @@ impl FsCore {
                 // The chunk EOF now falls inside still holds bytes past
                 // it. Cutting it back is what makes a later grow read
                 // zeros rather than what used to be there.
+                // Not on an encrypted filesystem, whose chunks this can't
+                // cut: there the client re-sealed the boundary chunk
+                // already (see `write_chunks`).
                 if rem > 0
+                    && !self.encrypted
                     && let Some(mut buf) = txn.read(&chunk_key(ino, last)).await?.value
                     && buf.len() > rem
                 {
@@ -1266,6 +1275,114 @@ impl FsCore {
         Ok(replaced)
     }
 
+    /// Refuses `read` and `write` on an encrypted filesystem, whose data
+    /// moves only sealed, by whole chunks (`read_chunks`, `write_chunks`):
+    /// nothing in the clear may reach the store, even from a client that
+    /// tried.
+    fn refuse_plain_data(&self) -> Result<(), FsError> {
+        if self.encrypted {
+            Err(FsError::new(
+                libc::EOPNOTSUPP,
+                "file data here is read and written sealed, by the chunk",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Up to a write batch's worth of `ino`'s sealed chunks from `first`
+    /// on -- fewer than `count` if that is more -- each with the store's
+    /// sequence number for it, and the file's attributes. Encrypted
+    /// filesystems only.
+    pub async fn read_chunks(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        first: u64,
+        count: u32,
+    ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+        self.account(caller)?;
+        self.guard_now(caller, ino, false).await?;
+        let attr = self.resolve(ino).await?.attr;
+        let count = (count as usize).min(chunks_per_batch(self.chunk_size)) as u64;
+        let mut chunks = Vec::with_capacity(count as usize);
+        for index in first..first.saturating_add(count) {
+            let read = self.client.read(&chunk_key(ino, index)).await?;
+            chunks.push(SealedChunk {
+                index,
+                seq: read.seq,
+                blob: read.value,
+            });
+        }
+        Ok((attr, chunks))
+    }
+
+    /// Stores sealed chunks of `ino` -- all of them, or with any not as
+    /// its `expected_seq` says, none (`EAGAIN`) -- and grows the file to
+    /// `end`. Each must be sealed under the file's current key version
+    /// (`EKEYEXPIRED` if not, for the client to fetch the key again).
+    /// Encrypted filesystems only.
+    pub async fn write_chunks(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        writes: &[ChunkWrite],
+        end: u64,
+    ) -> Result<Attr, FsError> {
+        self.account(caller)?;
+        if writes.len() > chunks_per_batch(self.chunk_size) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "more chunks than one write takes",
+            ));
+        }
+        let largest = self.chunk_size as usize + CHUNK_OVERHEAD;
+        if writes.iter().any(|w| w.blob.len() > largest) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "a sealed chunk larger than a chunk",
+            ));
+        }
+        let attr = retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, ino, true).await?);
+            // As in `write_batch_attempt`: no chunk for an inode whose
+            // deletion has begun.
+            let mut entry = decide!(live_entry(&txn, ino).await?);
+            decide!(check_kind(&entry, Kind::File));
+            let (version, _) = decide!(key_versions(&txn, ino).await?);
+            for w in writes {
+                if sealed_version(&w.blob).ok() != Some(version) {
+                    return Ok(Err(FsError::new(
+                        libc::EKEYEXPIRED,
+                        format!("chunks of inode {ino} must be sealed under key version {version}"),
+                    )));
+                }
+                let key = chunk_key(ino, w.index);
+                if let Some(expected) = w.expected_seq
+                    && txn.read(&key).await?.seq != expected
+                {
+                    return Ok(Err(FsError::new(
+                        libc::EAGAIN,
+                        format!("chunk {} of inode {ino} changed meanwhile", w.index),
+                    )));
+                }
+                txn.write(&key, Some(&w.blob)).await?;
+            }
+            if end > entry.attr.size {
+                entry.attr.size = end;
+            }
+            let now = SystemTime::now();
+            entry.attr.mtime = now;
+            entry.attr.ctime = now;
+            write_entry(&txn, &entry).await?;
+            txn.commit().await?;
+            Ok(Ok(entry.attr))
+        })
+        .await??;
+        Ok(attr)
+    }
+
     /// `caller`'s grant over `ino` and the key records down to it (see
     /// `grants::key_path`).
     pub async fn key_path(&self, caller: &Caller, ino: u64) -> Result<KeyPath, FsError> {
@@ -1522,5 +1639,7 @@ fn operations_are_send(core: &FsCore, caller: &Caller, name: &OsStr, data: &[u8]
     send(core.key_path(caller, 1));
     send(core.grants(caller));
     send(core.public_key("u"));
+    send(core.read_chunks(caller, 1, 0, 1));
+    send(core.write_chunks(caller, 1, &[], 0));
     send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0), false));
 }

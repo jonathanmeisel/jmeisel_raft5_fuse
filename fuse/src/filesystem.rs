@@ -82,6 +82,22 @@ fn set_time(t: TimeOrNow) -> SetTime {
     }
 }
 
+/// Stores `data` at `offset` in `ino`: sealed by the chunk through the
+/// vault on an encrypted filesystem, or else straight through `handle`.
+async fn store(
+    remote: &Remote,
+    vault: Option<&Arc<Vault>>,
+    ino: u64,
+    handle: &str,
+    offset: u64,
+    data: &[u8],
+) -> Result<Attr, WriteError> {
+    match vault {
+        Some(vault) => vault.write(ino, offset, data).await,
+        None => remote.write(handle, offset, data).await,
+    }
+}
+
 /// What a committed run means for its caller: success, or the errno to
 /// report. A short write counts as failure here -- a buffered run is
 /// either stored or not, from the point of view of whoever is waiting.
@@ -233,7 +249,14 @@ impl Raft5Fs {
             .handle
             .clone()
             .expect("a run is only ever appended with a handle");
-        let committed = commit_result(self.block(self.remote().write(&handle, start, &data)));
+        let committed = commit_result(self.block(store(
+            self.remote(),
+            self.vault(),
+            buf.ino,
+            &handle,
+            start,
+            &data,
+        )));
         if let Err(e) = committed {
             buf.err.get_or_insert(e);
         }
@@ -254,6 +277,7 @@ impl Raft5Fs {
     /// unmount completes, so correctness never rests on this firing.
     fn schedule_auto_flush(&self, slot: Arc<Mutex<WriteBuf>>) {
         let remote = Arc::clone(self.remote());
+        let vault = self.vault().cloned();
         let rt = self.rt.clone();
         // `spawn_blocking`, not `spawn`: the commit has to hold this
         // buffer's lock for its whole duration, exactly like every other
@@ -278,7 +302,15 @@ impl Raft5Fs {
                 .handle
                 .clone()
                 .expect("a run is only ever appended with a handle");
-            if let Err(e) = commit_result(rt.block_on(remote.write(&handle, start, &data))) {
+            let stored = rt.block_on(store(
+                &remote,
+                vault.as_ref(),
+                buf.ino,
+                &handle,
+                start,
+                &data,
+            ));
+            if let Err(e) = commit_result(stored) {
                 // No one is synchronously waiting on this commit, so the
                 // failure has nowhere to go but back into the buffer, for
                 // the next flush/fsync/write to report.
@@ -379,7 +411,14 @@ impl Raft5Fs {
             // to land first.
             self.commit_buf(&mut buf)?;
             return direct_write_result(
-                self.block(self.remote().write(&handle, offset, data)),
+                self.block(store(
+                    self.remote(),
+                    self.vault(),
+                    ino,
+                    &handle,
+                    offset,
+                    data,
+                )),
                 data.len(),
             );
         }
@@ -406,6 +445,7 @@ impl Raft5Fs {
             let idle = buf.is_empty();
             buf.append(offset, &data[..n]);
             buf.handle = Some(Arc::clone(&handle));
+            buf.ino = ino;
             if idle {
                 self.schedule_auto_flush(Arc::clone(&slot));
             }
@@ -548,6 +588,13 @@ impl Filesystem for Raft5Fs {
         // Through an open file (ftruncate), its handle may permit what
         // the mode no longer does.
         let handle = fh.and_then(|fh| self.handle(fh).ok());
+        // An encrypted file's last chunk is cut here first; the server
+        // can't cut what it can't open.
+        if let (Some(vault), Some(size)) = (self.vault(), size)
+            && let Err(e) = self.block(vault.truncate(ino.0, size))
+        {
+            return reply.error(errno(&e));
+        }
         match self.block(self.remote().setattr(ino.0, changes, handle.as_deref())) {
             Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
             Err(e) => reply.error(errno(&e)),
@@ -740,7 +787,11 @@ impl Filesystem for Raft5Fs {
         if let Err(e) = self.flush_ino(ino.0) {
             return reply.error(e);
         }
-        match self.block(self.remote().read(&handle, offset, size as usize)) {
+        let read = match self.vault() {
+            Some(vault) => self.block(vault.read(ino.0, offset, size as usize)),
+            None => self.block(self.remote().read(&handle, offset, size as usize)),
+        };
+        match read {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 if e.errno != libc::ENOENT {
@@ -772,7 +823,14 @@ impl Filesystem for Raft5Fs {
             self.buffered_write(ino.0, handle, offset, data)
         } else {
             direct_write_result(
-                self.block(self.remote().write(&handle, offset, data)),
+                self.block(store(
+                    self.remote(),
+                    self.vault(),
+                    ino.0,
+                    &handle,
+                    offset,
+                    data,
+                )),
                 data.len(),
             )
         };

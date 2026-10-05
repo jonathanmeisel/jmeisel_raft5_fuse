@@ -54,10 +54,12 @@ use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
-    PreloginRequest, PublicKeyRequest, ReadRequest, RenameRequest, SetAttrRequest, WriteRequest,
+    PreloginRequest, PublicKeyRequest, ReadChunksRequest, ReadRequest, RenameRequest,
+    SetAttrRequest, WriteChunksRequest, WriteRequest,
 };
 use raft5fs_proto::types::{
-    Attr, DirItem, FsError, Grant, KeyPath, NewNode, SealedMove, SetAttr, WriteError,
+    Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, NewNode, SealedChunk, SealedMove, SetAttr,
+    WriteError,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -809,6 +811,46 @@ impl Remote {
             Retry::Once,
             |mut c| async move { c.delete_volume(req).await },
         )
+        .await?
+        .into_result()
+    }
+
+    /// Up to a batch's worth of `ino`'s sealed chunks from `first` on,
+    /// and its attributes. May return fewer than `count`.
+    pub async fn read_chunks(
+        &self,
+        ino: u64,
+        first: u64,
+        count: u32,
+    ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+        let req = ReadChunksRequest { ino, first, count };
+        self.call(
+            Retry::ReadOnly,
+            |mut c| async move { c.read_chunks(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Stores sealed chunks of `ino`, if each is as its `expected_seq`
+    /// says, and grows the file to `end`. Resent like `write`: every
+    /// chunk replaced whole, or guarded by its seq, lands the same way
+    /// twice.
+    pub async fn write_chunks(
+        &self,
+        ino: u64,
+        chunks: &[ChunkWrite],
+        end: u64,
+    ) -> Result<Attr, FsError> {
+        let req = WriteChunksRequest {
+            ino,
+            chunks: chunks.iter().cloned().map(Into::into).collect(),
+            end,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.write_chunks(req).await }
+        })
         .await?
         .into_result()
     }

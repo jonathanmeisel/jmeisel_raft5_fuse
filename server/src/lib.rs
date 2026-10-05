@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
 use raft5fs_core::{
-    Caller, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, SealedMove, WriteError, accounts,
+    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, SealedMove, WriteError, accounts,
     batch_bytes, users,
 };
 use raft5fs_crypto::password::KdfParams;
@@ -31,8 +31,9 @@ use raft5fs_proto::pb::{
     CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest,
     HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
     LoginRequest, LoginResponse, NameRequest, NoArgs, OpenResponse, PreloginRequest,
-    PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadDirResponse, ReadRequest,
-    ReadResponse, RenameRequest, Session, SetAttrRequest, WriteRequest, WriteResponse,
+    PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
+    ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, Session, SetAttrRequest,
+    WriteChunksRequest, WriteRequest, WriteResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -569,6 +570,28 @@ impl Fs for FsService {
         Ok(Response::new(
             self.core.delete_volume(&caller, r.ino).await.into(),
         ))
+    }
+
+    async fn read_chunks(
+        &self,
+        r: Request<ReadChunksRequest>,
+    ) -> Result<Response<ReadChunksResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let read = self
+            .core
+            .read_chunks(&caller, r.ino, r.first, r.count)
+            .await;
+        Ok(Response::new(read.into()))
+    }
+
+    async fn write_chunks(
+        &self,
+        r: Request<WriteChunksRequest>,
+    ) -> Result<Response<AttrResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
+        let written = self.core.write_chunks(&caller, r.ino, &writes, r.end).await;
+        Ok(Response::new(written.into()))
     }
 }
 

@@ -591,3 +591,155 @@ fn an_entry_filed_under_another_name_is_left_out() {
         .collect();
     assert_eq!(listed, [".", "..", "a"]);
 }
+
+// ------------------------------------------------------------------- data
+
+const CHUNK: usize = support::TEST_CHUNK_SIZE as usize;
+
+/// Position-dependent bytes, as in `fuse_fs`, so data landing at the wrong
+/// offset fails loudly.
+fn pattern(len: usize, salt: u8) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8 ^ salt).collect()
+}
+
+#[test]
+fn no_data_reaches_the_store() {
+    let h = support::setup_encrypted();
+    fs::create_dir(h.path().join("v")).unwrap();
+    let f = h.path().join("v/f");
+    let marker = b"zebra-stripes-";
+    // Whole chunks, a partial one, and a patch in the middle of one.
+    let mut data: Vec<u8> = marker
+        .iter()
+        .copied()
+        .cycle()
+        .take(2 * CHUNK + 1000)
+        .collect();
+    fs::write(&f, &data).unwrap();
+    let mut file = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(CHUNK as u64 + 7)).unwrap();
+    file.write_all(marker).unwrap();
+    drop(file);
+    data[CHUNK + 7..CHUNK + 7 + marker.len()].copy_from_slice(marker);
+    assert!(fs::read(&f).unwrap() == data, "the file reads back changed");
+    assert_nowhere_in_store(&h, marker);
+}
+
+#[test]
+fn data_reads_back_through_overwrites_holes_and_truncation() {
+    use std::io::{Seek, SeekFrom, Write};
+    let h = support::setup_encrypted();
+    fs::create_dir(h.path().join("v")).unwrap();
+    let f = h.path().join("v/f");
+    let mut model = pattern(3 * CHUNK + 500, 0);
+    fs::write(&f, &model).unwrap();
+
+    let mut file = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    // A patch straddling a chunk boundary.
+    let patch = pattern(300, 0x55);
+    let at = CHUNK - 100;
+    file.seek(SeekFrom::Start(at as u64)).unwrap();
+    file.write_all(&patch).unwrap();
+    model[at..at + 300].copy_from_slice(&patch);
+    // A write past the end leaves a hole of zeros.
+    let far = 5 * CHUNK + 3;
+    file.seek(SeekFrom::Start(far as u64)).unwrap();
+    file.write_all(b"tail").unwrap();
+    model.resize(far, 0);
+    model.extend_from_slice(b"tail");
+    file.sync_all().unwrap();
+    assert_eq!(fs::read(&f).unwrap(), model);
+
+    // Cut mid-chunk, then grow again: what was cut reads as zeros.
+    let cut = 2 * CHUNK + 10;
+    file.set_len(cut as u64).unwrap();
+    model.truncate(cut);
+    assert_eq!(fs::read(&f).unwrap(), model);
+    file.set_len((3 * CHUNK) as u64).unwrap();
+    model.resize(3 * CHUNK, 0);
+    assert_eq!(fs::read(&f).unwrap(), model);
+    // And by path, with no handle: truncate(2).
+    drop(file);
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&f)
+        .unwrap();
+    assert_eq!(fs::read(&f).unwrap(), b"");
+}
+
+#[test]
+fn concurrent_writes_to_one_chunk_lose_nothing() {
+    let h = support::setup_encrypted();
+    fs::create_dir(h.path().join("v")).unwrap();
+    let f = h.path().join("v/f");
+    fs::write(&f, vec![0u8; 1000]).unwrap();
+    let file = ino(&f);
+    let a = vault(&h, support::TESTER);
+    let b = vault(&h, support::TESTER);
+    // Each writes its own bytes of the same chunk, over and over; every
+    // write is a read-modify-write of the whole chunk.
+    h.runtime.block_on(async {
+        let left = async {
+            for i in 0..20u8 {
+                a.write(file, 0, &[i + 1; 10]).await.unwrap();
+            }
+        };
+        let right = async {
+            for i in 0..20u8 {
+                b.write(file, 500, &[i + 101; 10]).await.unwrap();
+            }
+        };
+        tokio::join!(left, right);
+    });
+    let data = fs::read(&f).unwrap();
+    assert_eq!(&data[0..10], &[20; 10]);
+    assert_eq!(&data[500..510], &[120; 10]);
+    assert!(data[10..500].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn the_server_takes_no_unsealed_or_mis_sealed_data() {
+    let h = support::setup_encrypted();
+    fs::create_dir(h.path().join("v")).unwrap();
+    let f = h.path().join("v/f");
+    fs::write(&f, b"sealed").unwrap();
+    let file = ino(&f);
+    let mine = vault(&h, support::TESTER);
+    let remote = mine.remote();
+
+    // The unencrypted data path is closed.
+    let handle = h.runtime.block_on(remote.open(file, 6)).unwrap();
+    let plain = h.runtime.block_on(remote.write(&handle, 0, b"plain"));
+    assert_eq!(plain.unwrap_err().error.errno, libc::EOPNOTSUPP);
+    assert_fs_errno(
+        h.runtime.block_on(remote.read(&handle, 0, 6)),
+        libc::EOPNOTSUPP,
+    );
+
+    // A chunk sealed under a key version the file doesn't have.
+    let node = h.runtime.block_on(mine.node(file)).unwrap();
+    let blob = raft5fs_crypto::data::seal_chunk(&node.key, node.record.version + 1, file, 0, b"x");
+    let wrong = raft5fs_core::ChunkWrite {
+        index: 0,
+        expected_seq: None,
+        blob,
+    };
+    assert_fs_errno(
+        h.runtime.block_on(remote.write_chunks(file, &[wrong], 1)),
+        libc::EKEYEXPIRED,
+    );
+    // A stale expected seq.
+    let blob = raft5fs_crypto::data::seal_chunk(&node.key, node.record.version, file, 0, b"x");
+    let stale = raft5fs_core::ChunkWrite {
+        index: 0,
+        expected_seq: Some(1),
+        blob,
+    };
+    assert_fs_errno(
+        h.runtime.block_on(remote.write_chunks(file, &[stale], 1)),
+        libc::EAGAIN,
+    );
+    assert_eq!(fs::read(&f).unwrap(), b"sealed");
+}

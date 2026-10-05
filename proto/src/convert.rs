@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
 use crate::types::{
-    AccountKeys, Attr, DirItem, FsError, Grant, KeyPath, Kind, SetAttr, SetTime, WriteError,
+    AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, Kind, SealedChunk, SetAttr,
+    SetTime, WriteError,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -564,6 +565,72 @@ impl pb::PublicKeyResponse {
             Some(R::Key(k)) => Ok(k),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("public key")),
+        }
+    }
+}
+
+impl From<Result<(Attr, Vec<SealedChunk>), FsError>> for pb::ReadChunksResponse {
+    fn from(r: Result<(Attr, Vec<SealedChunk>), FsError>) -> Self {
+        use pb::read_chunks_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok((attr, chunks)) => R::List(pb::ChunkList {
+                    attr: Some(attr.into()),
+                    chunks: chunks
+                        .into_iter()
+                        .map(|c| pb::SealedChunk {
+                            index: c.index,
+                            seq: c.seq,
+                            blob: c.blob.unwrap_or_default(),
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::ReadChunksResponse {
+    /// The file's attributes and the chunks read.
+    pub fn into_result(self) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+        use pb::read_chunks_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => {
+                let attr = l.attr.ok_or_else(|| malformed("attributes"))?.into();
+                let chunks = l
+                    .chunks
+                    .into_iter()
+                    .map(|c| SealedChunk {
+                        index: c.index,
+                        seq: c.seq,
+                        blob: (!c.blob.is_empty()).then_some(c.blob),
+                    })
+                    .collect();
+                Ok((attr, chunks))
+            }
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("chunk list")),
+        }
+    }
+}
+
+impl From<ChunkWrite> for pb::ChunkWrite {
+    fn from(c: ChunkWrite) -> Self {
+        Self {
+            index: c.index,
+            expected_seq: c.expected_seq,
+            blob: c.blob,
+        }
+    }
+}
+
+impl From<pb::ChunkWrite> for ChunkWrite {
+    fn from(c: pb::ChunkWrite) -> Self {
+        Self {
+            index: c.index,
+            expected_seq: c.expected_seq,
+            blob: c.blob,
         }
     }
 }

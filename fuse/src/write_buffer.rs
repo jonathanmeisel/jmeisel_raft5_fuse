@@ -24,6 +24,9 @@ pub struct WriteBuf {
     /// and a handle stays valid after its descriptor is closed, so a run
     /// outliving the descriptor that wrote it can still be committed.
     pub handle: Option<Arc<str>>,
+    /// The inode the run belongs to: what an encrypted filesystem's
+    /// commit goes by, rather than the handle.
+    pub ino: u64,
 }
 
 impl WriteBuf {

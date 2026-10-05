@@ -9,6 +9,15 @@
 //! node's key here, wrapped under its parent's, and a move to another
 //! directory re-wraps the moved node's key under its new parent's.
 //!
+//! **Data.** Nor any file's contents: each chunk is sealed under the
+//! file's key here (raft5fs-crypto's `data`), so the server can't patch a
+//! byte range the way it does for an unencrypted filesystem. A write that
+//! covers a chunk whole just seals it; one that covers part of a chunk
+//! reads the chunk, opens it, changes it and seals it again -- stored only
+//! if no one changed the chunk in between (the store's sequence number
+//! says), and otherwise done over. Truncating re-seals the chunk the new
+//! end falls in, cut short, before the server drops the chunks past it.
+//!
 //! **Names.** The server never sees one. An entry is filed under a tag --
 //! an HMAC of its name under the directory's name key -- so the vault
 //! turns every name it is handed into a tag before asking for it, and
@@ -29,10 +38,15 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::{Arc, Mutex};
 
 use raft5fs_crypto::Key;
-use raft5fs_crypto::data::{name_tag, open_name, seal_name, sealed_version};
+use raft5fs_crypto::data::{
+    name_tag, open_chunk, open_name, seal_chunk, seal_name, sealed_version,
+};
 use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, seal_grant, seal_label};
 use raft5fs_crypto::node::NodeKeys;
-use raft5fs_proto::types::{Attr, DirItem, FsError, Grant, KeyPath, NewNode, SealedMove};
+use raft5fs_proto::types::{
+    Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, NewNode, SealedChunk, SealedMove,
+    WriteError,
+};
 
 use crate::remote::Remote;
 
@@ -88,6 +102,25 @@ impl Node {
                 .map_err(|e| corrupt(ino, e))
         }
     }
+}
+
+/// How many times a read-modify-write of a chunk is redone when someone
+/// else changed the chunk under it, before giving up with `EAGAIN`.
+const CHANGE_RETRIES: usize = 32;
+
+/// The pieces of `[offset, offset + len)` by chunk: each chunk's index,
+/// where in the chunk the piece starts, and how long it is.
+fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
+    let mut spans = Vec::new();
+    let mut pos = offset;
+    let end = offset + len as u64;
+    while pos < end {
+        let within = pos % chunk_size;
+        let n = (chunk_size - within).min(end - pos);
+        spans.push((pos / chunk_size, within as usize, n as usize));
+        pos += n;
+    }
+    spans
 }
 
 fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
@@ -462,5 +495,209 @@ impl Vault {
             ino = self.lookup(ino, OsStr::new(part)).await?.ino;
         }
         Ok(ino)
+    }
+
+    /// File `ino`'s bytes `[offset, offset + len)`, as far as its size,
+    /// with holes reading as zeros.
+    pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let chunk_size = self.remote.chunk_size();
+        let first = offset / chunk_size;
+        let last = (offset + len as u64 - 1) / chunk_size;
+        let (size, chunks) = self.fetch(ino, first, last).await?;
+        if offset >= size {
+            return Ok(Vec::new());
+        }
+        let end = (offset + len as u64).min(size);
+        let mut out = vec![0; (end - offset) as usize];
+        let node = self.node(ino).await?;
+        for chunk in chunks {
+            let Some(blob) = &chunk.blob else {
+                continue;
+            };
+            let plain = self.open(&node, ino, chunk.index, blob)?;
+            let start = chunk.index * chunk_size;
+            let lo = start.max(offset);
+            let hi = (start + plain.len() as u64).min(end);
+            if lo < hi {
+                out[(lo - offset) as usize..(hi - offset) as usize]
+                    .copy_from_slice(&plain[(lo - start) as usize..(hi - start) as usize]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Chunks `first..=last` of `ino`, in as many asks as the server's cap
+    /// takes, and the file's size as of the last.
+    async fn fetch(
+        &self,
+        ino: u64,
+        first: u64,
+        last: u64,
+    ) -> Result<(u64, Vec<SealedChunk>), FsError> {
+        let mut chunks = Vec::new();
+        let mut size = 0;
+        let mut next = first;
+        while next <= last {
+            let count = (last - next + 1).min(u64::from(u32::MAX)) as u32;
+            let (attr, got) = self.remote.read_chunks(ino, next, count).await?;
+            size = attr.size;
+            let Some(after) = got.last().map(|c| c.index + 1) else {
+                return Err(FsError::new(libc::EIO, "the server returned no chunks"));
+            };
+            next = after;
+            chunks.extend(got);
+        }
+        Ok((size, chunks))
+    }
+
+    /// One chunk of `ino`, and the store's sequence number for it.
+    async fn fetch_one(&self, ino: u64, index: u64) -> Result<SealedChunk, FsError> {
+        let (_, mut got) = self.remote.read_chunks(ino, index, 1).await?;
+        got.pop()
+            .filter(|c| c.index == index)
+            .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
+    }
+
+    /// Opens a sealed chunk of `ino`, with whichever of its key versions
+    /// it was sealed under.
+    fn open(&self, node: &Node, ino: u64, index: u64, blob: &[u8]) -> Result<Vec<u8>, FsError> {
+        let version = sealed_version(blob).map_err(|e| corrupt(ino, e))?;
+        let key = node.key_at(ino, version)?;
+        open_chunk(&key, ino, index, blob).map_err(|e| corrupt(ino, e))
+    }
+
+    /// Writes `data` at `offset` in file `ino`, a batch at a time, growing
+    /// it as needed. As `Remote::write`, a failure says how many leading
+    /// bytes were stored, by whole batches.
+    pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
+        let failed = |written, error| WriteError { written, error };
+        let node = self.node(ino).await.map_err(|e| failed(0, e))?;
+        if data.is_empty() {
+            // Still a write, as far as mtime is concerned.
+            return self
+                .remote
+                .write_chunks(ino, &[], offset)
+                .await
+                .map_err(|e| failed(0, e));
+        }
+        let chunk_size = self.remote.chunk_size();
+        let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as usize;
+        let spans = spans(chunk_size, offset, data.len());
+        let mut attr = None;
+        let mut cursor = 0;
+        for group in spans.chunks(per_batch) {
+            let bytes: usize = group.iter().map(|&(_, _, n)| n).sum();
+            let end = offset + (cursor + bytes) as u64;
+            let stored = self
+                .write_batch(&node, ino, group, &data[cursor..cursor + bytes], end)
+                .await
+                .map_err(|e| failed(cursor, e))?;
+            attr = Some(stored);
+            cursor += bytes;
+        }
+        Ok(attr.expect("a non-empty write has at least one batch"))
+    }
+
+    /// One batch of `write`: seals each span's chunk -- whole, or read,
+    /// changed and re-sealed -- and stores them all, or does it over if a
+    /// chunk read changed before they could be.
+    async fn write_batch(
+        &self,
+        node: &Node,
+        ino: u64,
+        spans: &[(u64, usize, usize)],
+        data: &[u8],
+        end: u64,
+    ) -> Result<Attr, FsError> {
+        let chunk_size = self.remote.chunk_size();
+        for _ in 0..CHANGE_RETRIES {
+            let mut writes = Vec::with_capacity(spans.len());
+            let mut cursor = 0;
+            for &(index, within, n) in spans {
+                let piece = &data[cursor..cursor + n];
+                cursor += n;
+                let (plain, expected_seq) = if within == 0 && n as u64 == chunk_size {
+                    (piece.to_vec(), None)
+                } else {
+                    let chunk = self.fetch_one(ino, index).await?;
+                    let mut plain = match &chunk.blob {
+                        Some(blob) => self.open(node, ino, index, blob)?,
+                        None => Vec::new(),
+                    };
+                    if plain.len() < within + n {
+                        plain.resize(within + n, 0);
+                    }
+                    plain[within..within + n].copy_from_slice(piece);
+                    (plain, Some(chunk.seq))
+                };
+                writes.push(ChunkWrite {
+                    index,
+                    expected_seq,
+                    blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
+                });
+            }
+            match self.remote.write_chunks(ino, &writes, end).await {
+                Err(e) if e.errno == libc::EAGAIN => continue,
+                other => return other,
+            }
+        }
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("inode {ino}'s chunks kept changing under this write"),
+        ))
+    }
+
+    /// Readies file `ino` to be cut to `new_size`: re-seals the chunk the
+    /// new end falls in without what lies past it, which the server can't
+    /// cut itself. The truncation proper -- the size, and dropping the
+    /// chunks past it -- is the setattr that follows.
+    pub async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
+        let chunk_size = self.remote.chunk_size();
+        let keep = (new_size % chunk_size) as usize;
+        if keep == 0 {
+            return Ok(());
+        }
+        let index = new_size / chunk_size;
+        let node = self.node(ino).await?;
+        for _ in 0..CHANGE_RETRIES {
+            let chunk = self.fetch_one(ino, index).await?;
+            let Some(blob) = &chunk.blob else {
+                return Ok(());
+            };
+            let mut plain = self.open(&node, ino, index, blob)?;
+            if plain.len() <= keep {
+                return Ok(());
+            }
+            plain.truncate(keep);
+            let write = ChunkWrite {
+                index,
+                expected_seq: Some(chunk.seq),
+                blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
+            };
+            match self.remote.write_chunks(ino, &[write], 0).await {
+                Err(e) if e.errno == libc::EAGAIN => continue,
+                other => return other.map(drop),
+            }
+        }
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("inode {ino}'s last chunk kept changing under this truncate"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spans_cover_a_range_chunk_by_chunk() {
+        assert_eq!(spans(10, 0, 0), []);
+        assert_eq!(spans(10, 3, 4), [(0, 3, 4)]);
+        assert_eq!(spans(10, 0, 10), [(0, 0, 10)]);
+        assert_eq!(spans(10, 8, 15), [(0, 8, 2), (1, 0, 10), (2, 0, 3)]);
     }
 }
