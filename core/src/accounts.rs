@@ -1,4 +1,4 @@
-//! Encrypted filesystems' accounts: what checks a login, and the user's
+//! Accounts: what checks a login, and the user's
 //! wrapped private key.
 //!
 //! The server never sees a password here. Each account holds what the
@@ -7,8 +7,9 @@
 //! `auth` against, and the user's key pair -- the public half, and the
 //! private half wrapped under a key only the password yields.
 //!
-//! An account gets its keys once, by enrolling with a one-time code an
-//! administrator issued (`issue_code`). Only the code's hash is stored,
+//! An account is its keys. It gets them by enrolling with a one-time code
+//! an administrator issued (`issue_code`), which is all there is to adding
+//! a user. Only the code's hash is stored,
 //! and enrolling consumes it. Issuing a new code lets a user who lost
 //! their password enrol again -- with a new key pair, so whatever was
 //! granted to the old one is out of reach until granted again.
@@ -135,9 +136,7 @@ pub async fn check_login(
 /// A fresh one-time code `user` can enrol with, replacing any code issued
 /// before. Only its hash is stored.
 pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> {
-    if user.is_empty() {
-        return Err(FsError::new(libc::EINVAL, "a username can't be empty"));
-    }
+    crate::grants::check_username(user)?;
     let code = new_enrolment_code();
     client
         .write(&code_key(user), Some(&enrolment_code_hash(&code)))
@@ -216,6 +215,57 @@ pub async fn change_password(
         }
     })
     .await?
+}
+
+/// Removes `user`: their keys, any code issued them, and every grant made
+/// to them. Returns whether there was anything to remove. A session
+/// already issued to them stops working once servers notice the keys are
+/// gone (their identity cache).
+pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
+    let prefix = crate::grants::index_prefix(user);
+    let mut granted = Vec::new();
+    let mut iter = client.key_iterator(&prefix);
+    while let Some(key) = iter.next().await? {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        if let Ok(ino) = <[u8; 8]>::try_from(&key[prefix.len()..]) {
+            granted.push(u64::from_be_bytes(ino));
+        }
+    }
+    let granted = &granted;
+    retrying(|| async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        let existed = txn.read(&keys_key(user)).await?.value.is_some()
+            || txn.read(&code_key(user)).await?.value.is_some()
+            || !granted.is_empty();
+        txn.write(&keys_key(user), None).await?;
+        txn.write(&code_key(user), None).await?;
+        for &ino in granted {
+            crate::grants::remove_grant(&txn, user, ino).await?;
+        }
+        txn.commit().await?;
+        Ok(Ok(existed))
+    })
+    .await?
+}
+
+/// Every account with keys, and every one with a code it hasn't used yet,
+/// in name order: `(name, enrolled)`.
+pub async fn list(client: &Client) -> Result<Vec<(String, bool)>, FsError> {
+    let mut accounts = std::collections::BTreeMap::new();
+    for (prefix, enrolled) in [(ACCOUNT_KEYS_PREFIX, true), (ENROLMENT_PREFIX, false)] {
+        let mut iter = client.key_iterator(prefix);
+        while let Some(key) = iter.next().await? {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let name = String::from_utf8_lossy(&key[prefix.len()..]).into_owned();
+            let entry = accounts.entry(name).or_insert(false);
+            *entry |= enrolled;
+        }
+    }
+    Ok(accounts.into_iter().collect())
 }
 
 #[cfg(test)]

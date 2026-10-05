@@ -14,9 +14,9 @@ const USAGE: &str = "\
 usage: raft5fs-share --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
                      <command> <server-address>...
 
-Account commands, for encrypted filesystems:
+Account commands:
   enrol <CODE>         set up this account with the one-time code an
-                       administrator issued (`raft5fs-server user enrol`),
+                       administrator issued (`raft5fs-server user add`),
                        choosing its password. Makes the account's key
                        pair and prints its fingerprint.
   passwd               change this account's password. Everything shared
@@ -95,7 +95,7 @@ fn default_known_keys() -> PathBuf {
     config.join("raft5fs").join("known_keys")
 }
 
-/// Logs in to an encrypted filesystem and opens the account's keys,
+/// Logs in and opens the account's keys,
 /// pinning keys in `known_keys`.
 fn log_in(
     runtime: &Runtime,

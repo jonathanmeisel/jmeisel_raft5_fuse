@@ -2084,6 +2084,7 @@ dependencies = [
  "raft5-client",
  "raft5-server",
  "raft5fs-core",
+ "raft5fs-crypto",
  "raft5fs-fuse",
  "raft5fs-server",
  "rcgen",

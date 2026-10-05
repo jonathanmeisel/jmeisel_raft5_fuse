@@ -1,4 +1,4 @@
-//! Encrypted filesystems, end to end: enrolment, logins whose password
+//! Encryption and access by grant, end to end: enrolment, logins whose password
 //! never reaches a server, password changes, and access by grant -- the
 //! virtual root, volumes, and what each user can and can't reach.
 
@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use raft5fs_core::{NewNode, accounts, resolve_encryption, stored_encryption};
+use raft5fs_core::{ENCRYPTED_KEY, NewNode, SealedMove, accounts, check_store};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::remote::{Credentials, Remote};
@@ -73,12 +73,6 @@ fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, raft5fs_core::FsError>,
     }
 }
 
-/// Gives `name` a user table entry and a store account, but no keys.
-fn add_unenrolled(h: &support::Harness, name: &str) {
-    h.cluster
-        .add_user(&h.runtime, &h.client, name, 50_001, 50_001, &[]);
-}
-
 fn enrol_with(
     h: &support::Harness,
     name: &str,
@@ -97,19 +91,18 @@ fn enrol_with(
 
 #[test]
 fn an_enrolled_user_mounts_and_uses_the_filesystem() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("vol")).unwrap();
     let f = h.path().join("vol/hello");
     fs::write(&f, b"world").unwrap();
     assert_eq!(fs::read(&f).unwrap(), b"world");
     let remote = connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
-    assert!(remote.encrypted());
     assert!(remote.identity().is_some(), "the login opened the key pair");
 }
 
 #[test]
 fn a_wrong_password_and_an_unknown_user_are_refused_alike() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let wrong = connect(&h, support::TESTER, "not it").err().unwrap();
     let unknown = connect(&h, "nobody", "anything").err().unwrap();
     assert!(wrong.contains("login refused"), "{wrong}");
@@ -118,9 +111,7 @@ fn a_wrong_password_and_an_unknown_user_are_refused_alike() {
 
 #[test]
 fn an_enrolment_code_works_once_and_only_for_its_user() {
-    let h = support::setup_encrypted();
-    add_unenrolled(&h, "alice");
-    add_unenrolled(&h, "bob");
+    let h = support::setup_root();
     let code = h
         .runtime
         .block_on(accounts::issue_code(&h.client, "alice"))
@@ -145,8 +136,8 @@ fn an_enrolment_code_works_once_and_only_for_its_user() {
 
 #[test]
 fn a_password_change_keeps_the_key_pair() {
-    let h = support::setup_encrypted();
-    h.add_user("alice", 50_001, 50_001, &[]);
+    let h = support::setup_root();
+    h.add_user("alice");
     let old = support::password("alice");
     let remote = connect(&h, "alice", &old).unwrap();
     let key = remote.identity().unwrap().public_key();
@@ -161,8 +152,7 @@ fn a_password_change_keeps_the_key_pair() {
 
 #[test]
 fn no_password_reaches_the_store() {
-    let h = support::setup_encrypted();
-    add_unenrolled(&h, "alice");
+    let h = support::setup_root();
     let password = "correct horse battery staple";
     let code = h
         .runtime
@@ -186,7 +176,7 @@ fn no_password_reaches_the_store() {
 
 #[test]
 fn a_mount_logs_in_again_without_its_password() {
-    let mut h = support::setup_encrypted();
+    let mut h = support::setup_root();
     fs::create_dir(h.path().join("vol")).unwrap();
     fs::write(h.path().join("vol/before"), b"x").unwrap();
     // Every session the mount holds is now refused, so its next request
@@ -197,41 +187,48 @@ fn a_mount_logs_in_again_without_its_password() {
 }
 
 #[test]
-fn enrolment_needs_an_encrypted_filesystem() {
-    let h = support::setup();
-    let refused = enrol_with(&h, support::TESTER, "code", "pw").unwrap_err();
-    assert_eq!(refused.errno, libc::EOPNOTSUPP);
+fn a_store_from_an_unencrypted_raft5fs_is_refused() {
+    let h = support::setup_root();
+    let check = || h.runtime.block_on(check_store(&h.client));
+    check().unwrap();
+    // Recorded unencrypted, or from before anything was recorded.
+    h.write_key(ENCRYPTED_KEY, Some(&[0]));
+    assert!(check().unwrap_err().contains("older, unencrypted raft5fs"));
+    h.write_key(ENCRYPTED_KEY, None);
+    assert!(check().unwrap_err().contains("older, unencrypted raft5fs"));
 }
 
 #[test]
-fn encryption_is_fixed_when_a_filesystem_is_created() {
-    let plain = support::setup();
-    let run = |f| plain.runtime.block_on(f);
-    assert_eq!(run(stored_encryption(&plain.client)).unwrap(), Some(false));
-    let refused = plain
-        .runtime
-        .block_on(resolve_encryption(&plain.client, true));
-    assert!(refused.unwrap_err().contains("created unencrypted"));
+fn removing_a_user_cuts_them_off_and_drops_their_grants() {
+    let h = support::setup_root();
+    fs::create_dir(h.root().join("v")).unwrap();
+    fs::write(h.root().join("v/f"), b"x").unwrap();
+    h.add_user("alice");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&h.root().join("v")), "alice", false, OsStr::new("v")))
+        .unwrap();
+    let alice = h.mount_as("alice");
+    assert_eq!(fs::read(alice.path.join("v/f")).unwrap(), b"x");
 
-    let encrypted = support::setup_encrypted();
-    assert_eq!(
-        encrypted
-            .runtime
-            .block_on(stored_encryption(&encrypted.client))
-            .unwrap(),
-        Some(true)
+    assert!(
+        h.runtime
+            .block_on(accounts::remove(&h.client, "alice"))
+            .unwrap()
     );
-    let kept = encrypted
-        .runtime
-        .block_on(resolve_encryption(&encrypted.client, false));
-    assert_eq!(kept, Ok(true));
+    // Her mount's next request is refused, and so is logging in again.
+    assert!(fs::read(alice.path.join("v/f")).is_err());
+    assert!(connect(&h, "alice", &support::password("alice")).is_err());
+    let mut index = vec![0x09];
+    index.extend_from_slice(b"alice\0");
+    assert!(h.keys_with_prefix(&index).is_empty(), "her grants are gone");
 }
 
 // ----------------------------------------------------------------- grants
 
 #[test]
 fn the_root_lists_grants_and_mkdir_there_makes_a_volume() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let root = h.path();
     assert!(names(root).is_empty(), "a new account has nothing granted");
 
@@ -253,13 +250,13 @@ fn the_root_lists_grants_and_mkdir_there_makes_a_volume() {
 
 #[test]
 fn nothing_ungranted_is_reachable() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("mine")).unwrap();
     fs::write(h.path().join("mine/secret"), b"x").unwrap();
     let volume = ino(&h.path().join("mine"));
     let file = ino(&h.path().join("mine/secret"));
 
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let alice = h.mount_as("alice");
     assert!(names(&alice.path).is_empty());
 
@@ -274,7 +271,7 @@ fn nothing_ungranted_is_reachable() {
             .block_on(remote.lookup(volume, OsStr::new("secret"))),
         libc::EACCES,
     );
-    assert_fs_errno(h.runtime.block_on(remote.open(file, 4)), libc::EACCES);
+    assert_fs_errno(h.runtime.block_on(remote.access(file, 4)), libc::EACCES);
     assert_fs_errno(h.runtime.block_on(remote.key_path(file)), libc::EACCES);
     // The real root is no one's, not even the volumes' owners'.
     assert_fs_errno(run(remote.getattr(1)), libc::EACCES);
@@ -293,12 +290,12 @@ fn nothing_ungranted_is_reachable() {
 
 #[test]
 fn a_read_only_grant_shows_its_directory_and_nothing_above() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let team = h.path().join("team");
     fs::create_dir_all(team.join("shared/deeper")).unwrap();
     fs::write(team.join("shared/notes"), b"agenda").unwrap();
     fs::write(team.join("private"), b"x").unwrap();
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
 
     let mine = vault(&h, support::TESTER);
     let shared = ino(&team.join("shared"));
@@ -329,10 +326,10 @@ fn a_read_only_grant_shows_its_directory_and_nothing_above() {
 
 #[test]
 fn a_writable_grant_shares_both_ways() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let team = h.path().join("team");
     fs::create_dir(&team).unwrap();
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&team), "alice", true, OsStr::new("team")))
@@ -354,7 +351,7 @@ fn a_writable_grant_shares_both_ways() {
 
 #[test]
 fn a_moved_node_keeps_its_key_under_its_new_parent() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = h.path().join("v");
     fs::create_dir_all(v.join("a/sub")).unwrap();
     fs::create_dir(v.join("b")).unwrap();
@@ -370,7 +367,7 @@ fn a_moved_node_keeps_its_key_under_its_new_parent() {
 
     // Only b is shared, so alice reaches them only through their new
     // parent's key -- which works only if the move re-wrapped them.
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     h.runtime
         .block_on(before.grant(ino(&v.join("b")), "alice", false, OsStr::new("b")))
         .unwrap();
@@ -383,7 +380,7 @@ fn a_moved_node_keeps_its_key_under_its_new_parent() {
 
 #[test]
 fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let v = ino(&h.path().join("v"));
     let mine = vault(&h, support::TESTER);
@@ -399,15 +396,19 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
             keys: record.encode(),
             sealed_name: parent.seal(v, &tag, OsStr::new(name)),
         };
-        h.runtime
-            .block_on(remote.create(v, &tag, 0o644, Some(&new)))
+        h.runtime.block_on(remote.create(v, &tag, 0o644, &new))
     };
     let version = parent.record.version;
 
-    let bare = h
-        .runtime
-        .block_on(remote.create(v, &parent.tag(OsStr::new("bare")), 0o644, None));
-    assert_fs_errno(bare, libc::EINVAL);
+    // No inode reserved, no key record.
+    let tag = parent.tag(OsStr::new("bare"));
+    let bare = NewNode {
+        ino: 0,
+        keys: Vec::new(),
+        sealed_name: parent.seal(v, &tag, OsStr::new("bare")),
+    };
+    let bare = h.runtime.block_on(remote.create(v, &tag, 0o644, &bare));
+    assert_fs_errno(bare, libc::EACCES);
     assert_fs_errno(create("unreserved", 1_000_000, version), libc::EACCES);
 
     // A reserved inode, but a record claiming the wrong parent version:
@@ -420,7 +421,7 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     create("right", reserved, version).unwrap();
 
     // Someone else's reservation won't do either.
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let alice = connect(&h, "alice", &support::password("alice")).unwrap();
     let hers = h.runtime.block_on(alice.allocate_inode()).unwrap();
     assert_fs_errno(create("hers", hers, version), libc::EACCES);
@@ -428,10 +429,10 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
 
 #[test]
 fn removing_a_volume_removes_its_grants_and_keys() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("gone")).unwrap();
     let volume = ino(&h.path().join("gone"));
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(volume, "alice", false, OsStr::new("gone")))
@@ -451,7 +452,7 @@ fn removing_a_volume_removes_its_grants_and_keys() {
 
 #[test]
 fn every_inode_has_a_key_record() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = h.path().join("v");
     fs::create_dir_all(v.join("d")).unwrap();
     fs::write(v.join("d/f"), b"x").unwrap();
@@ -484,12 +485,12 @@ fn assert_nowhere_in_store(h: &support::Harness, marker: &[u8]) {
 
 #[test]
 fn no_name_reaches_the_store() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = h.path().join("volume-zebra");
     fs::create_dir_all(v.join("dir-zebra/deeper-zebra")).unwrap();
     fs::write(v.join("dir-zebra/file-zebra"), b"x").unwrap();
     fs::rename(v.join("dir-zebra/file-zebra"), v.join("moved-zebra")).unwrap();
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(
@@ -504,7 +505,7 @@ fn no_name_reaches_the_store() {
 
 #[test]
 fn names_survive_listing_moving_and_sharing() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = h.path().join("v");
     fs::create_dir_all(v.join("a")).unwrap();
     fs::create_dir(v.join("b")).unwrap();
@@ -520,7 +521,7 @@ fn names_survive_listing_moving_and_sharing() {
     assert_eq!(fs::read(v.join("b/dos")).unwrap(), b"two");
     assert_errno(fs::read(v.join("a/one")), libc::ENOENT);
 
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
@@ -535,7 +536,7 @@ fn names_survive_listing_moving_and_sharing() {
 
 #[test]
 fn a_plain_name_is_refused() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     fs::write(h.path().join("v/f"), b"x").unwrap();
     let v = ino(&h.path().join("v"));
@@ -552,22 +553,25 @@ fn a_plain_name_is_refused() {
         keys: record.encode(),
         sealed_name: parent.seal(v, name, name),
     };
-    let created = h
-        .runtime
-        .block_on(remote.create(v, name, 0o644, Some(&new)));
+    let created = h.runtime.block_on(remote.create(v, name, 0o644, &new));
     assert_fs_errno(created, libc::EINVAL);
 
-    // A rename to a plain name, with or without anything sealed.
+    // A rename to a plain name, with nothing sealed.
     let tag = parent.tag(OsStr::new("f"));
+    let sealed = SealedMove {
+        ino: ino(&h.path().join("v/f")),
+        node_keys: Vec::new(),
+        sealed_name: Vec::new(),
+    };
     let renamed = h
         .runtime
-        .block_on(remote.rename(v, &tag, v, name, false, None));
+        .block_on(remote.rename(v, &tag, v, name, false, &sealed));
     assert_fs_errno(renamed, libc::EINVAL);
 }
 
 #[test]
 fn an_entry_filed_under_another_name_is_left_out() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = h.path().join("v");
     fs::create_dir(&v).unwrap();
     fs::write(v.join("a"), b"a").unwrap();
@@ -608,7 +612,7 @@ fn pattern(len: usize, salt: u8) -> Vec<u8> {
 
 #[test]
 fn no_data_reaches_the_store() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let f = h.path().join("v/f");
     let marker = b"zebra-stripes-";
@@ -633,7 +637,7 @@ fn no_data_reaches_the_store() {
 #[test]
 fn data_reads_back_through_overwrites_holes_and_truncation() {
     use std::io::{Seek, SeekFrom, Write};
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let f = h.path().join("v/f");
     let mut model = pattern(3 * CHUNK + 500, 0);
@@ -675,7 +679,7 @@ fn data_reads_back_through_overwrites_holes_and_truncation() {
 
 #[test]
 fn concurrent_writes_to_one_chunk_lose_nothing() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let f = h.path().join("v/f");
     fs::write(&f, vec![0u8; 1000]).unwrap();
@@ -704,23 +708,14 @@ fn concurrent_writes_to_one_chunk_lose_nothing() {
 }
 
 #[test]
-fn the_server_takes_no_unsealed_or_mis_sealed_data() {
-    let h = support::setup_encrypted();
+fn the_server_takes_no_mis_sealed_or_stale_data() {
+    let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let f = h.path().join("v/f");
     fs::write(&f, b"sealed").unwrap();
     let file = ino(&f);
     let mine = vault(&h, support::TESTER);
     let remote = mine.remote();
-
-    // The unencrypted data path is closed.
-    let handle = h.runtime.block_on(remote.open(file, 6)).unwrap();
-    let plain = h.runtime.block_on(remote.write(&handle, 0, b"plain"));
-    assert_eq!(plain.unwrap_err().error.errno, libc::EOPNOTSUPP);
-    assert_fs_errno(
-        h.runtime.block_on(remote.read(&handle, 0, 6)),
-        libc::EOPNOTSUPP,
-    );
 
     // A chunk sealed under a key version the file doesn't have.
     let node = h.runtime.block_on(mine.node(file)).unwrap();
@@ -777,14 +772,14 @@ fn shared_tree(h: &support::Harness) -> std::path::PathBuf {
 
 #[test]
 fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = shared_tree(&h);
     let (sub, f, g) = (
         ino(&v.join("shared/sub")),
         ino(&v.join("shared/sub/f")),
         ino(&v.join("shared/sub/g")),
     );
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
@@ -806,7 +801,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     let remote = hers.remote();
     assert_fs_errno(h.runtime.block_on(remote.getattr(f)), libc::EACCES);
     assert_fs_errno(
-        h.runtime.block_on(remote.read_chunks(f, 0, 1)),
+        h.runtime.block_on(remote.read_chunks(f, 0, 1, &[])),
         libc::EACCES,
     );
 
@@ -852,11 +847,11 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
 
 #[test]
 fn a_revocation_keeps_the_grants_below_it_usable() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = shared_tree(&h);
     let sub = ino(&v.join("shared/sub"));
-    h.add_user("alice", 50_001, 50_001, &[]);
-    h.add_user("bob", 50_002, 50_002, &[]);
+    h.add_user("alice");
+    h.add_user("bob");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
@@ -882,11 +877,11 @@ fn a_revocation_keeps_the_grants_below_it_usable() {
 
 #[test]
 fn revoking_takes_the_key_above_unless_it_is_a_volume() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = shared_tree(&h);
     let shared = ino(&v.join("shared"));
-    h.add_user("alice", 50_001, 50_001, &[]);
-    h.add_user("bob", 50_002, 50_002, &[]);
+    h.add_user("alice");
+    h.add_user("bob");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(shared, "alice", true, OsStr::new("shared")))
@@ -920,10 +915,10 @@ fn revoking_takes_the_key_above_unless_it_is_a_volume() {
 
 #[test]
 fn concurrent_writers_rotate_a_stale_path_once() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = shared_tree(&h);
     let f = ino(&v.join("shared/sub/f"));
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
@@ -947,9 +942,9 @@ fn concurrent_writers_rotate_a_stale_path_once() {
 
 #[test]
 fn a_changed_public_key_is_refused_until_forgotten() {
-    let h = support::setup_encrypted();
+    let h = support::setup_root();
     let v = shared_tree(&h);
-    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     let first = h
         .runtime
@@ -965,7 +960,7 @@ fn a_changed_public_key_is_refused_until_forgotten() {
         .block_on(mine.grant(shared, "alice", false, OsStr::new("shared")));
     assert_fs_errno(refused, libc::EPERM);
     // Nor does a rotation re-seal her grant to the new key.
-    h.add_user("bob", 50_002, 50_002, &[]);
+    h.add_user("bob");
     h.runtime
         .block_on(mine.grant(ino(&v), "bob", false, OsStr::new("v")))
         .unwrap();
@@ -978,4 +973,57 @@ fn a_changed_public_key_is_refused_until_forgotten() {
             .unwrap(),
         second
     );
+}
+
+// ------------------------------------------------------------------ cache
+
+#[test]
+fn a_small_write_into_a_cached_chunk_fetches_nothing() {
+    let h = support::setup();
+    let f = h.path().join("f");
+    fs::write(&f, b"").unwrap();
+    let file = ino(&f);
+    let mine = vault(&h, support::TESTER);
+    let remote = mine.remote();
+    let run = |offset, data: &[u8]| h.runtime.block_on(mine.write(file, offset, data)).unwrap();
+
+    run(0, &[1; 100]);
+    let after_first = remote.chunk_reads();
+    // What it wrote it cached, so changing a few bytes of it -- a
+    // read-modify-write of the whole chunk -- needs nothing from the
+    // server, and neither does reading it back.
+    run(10, &[2; 5]);
+    run(50, &[3; 5]);
+    let read = h.runtime.block_on(mine.read(file, 0, 100)).unwrap();
+    assert_eq!(remote.chunk_reads(), after_first);
+    let mut expected = vec![1; 100];
+    expected[10..15].fill(2);
+    expected[50..55].fill(3);
+    assert_eq!(read, expected);
+}
+
+#[test]
+fn a_cached_chunk_is_never_served_stale() {
+    let h = support::setup();
+    let f = h.path().join("f");
+    fs::write(&f, vec![1; 1000]).unwrap();
+    let file = ino(&f);
+    let reader = vault(&h, support::TESTER);
+    let writer = vault(&h, support::TESTER);
+    assert_eq!(h.runtime.block_on(reader.read(file, 0, 4)).unwrap(), [1; 4]);
+
+    h.runtime.block_on(writer.write(file, 0, &[9; 4])).unwrap();
+    assert_eq!(h.runtime.block_on(reader.read(file, 0, 4)).unwrap(), [9; 4]);
+
+    // And a write based on a stale cached copy is refused by its seq, and
+    // redone on fresh bytes: the other writer's change survives.
+    h.runtime
+        .block_on(writer.write(file, 100, &[8; 4]))
+        .unwrap();
+    h.runtime
+        .block_on(reader.write(file, 200, &[7; 4]))
+        .unwrap();
+    let data = h.runtime.block_on(writer.read(file, 0, 1000)).unwrap();
+    assert_eq!(&data[100..104], &[8; 4]);
+    assert_eq!(&data[200..204], &[7; 4]);
 }

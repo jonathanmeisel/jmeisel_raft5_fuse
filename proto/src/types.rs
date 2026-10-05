@@ -10,7 +10,8 @@ pub enum Kind {
     Directory,
 }
 
-/// An inode's attributes, as stored.
+/// An inode's attributes, as stored. There are no owners: access goes by
+/// grants, and a mount shows its own user as the owner of everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attr {
     pub ino: u64,
@@ -18,61 +19,26 @@ pub struct Attr {
     pub size: u64,
     pub perm: u16,
     pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
     pub atime: SystemTime,
     pub mtime: SystemTime,
     pub ctime: SystemTime,
 }
 
-/// Who an operation is on behalf of: the identity permission checks use.
+/// Who an operation is on behalf of: the account whose grants decide what
+/// it may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
-    pub uid: u32,
-    /// The primary group, which new files are created with.
-    pub gid: u32,
-    /// Supplementary groups. Whether `gid` is repeated here doesn't
-    /// matter.
-    pub groups: Vec<u32>,
-    /// On an encrypted filesystem, the account: access there is by grant
-    /// to it, and the mode bits are left out of it. `None` elsewhere.
-    pub user: Option<String>,
+    pub user: String,
 }
 
 impl Caller {
-    pub fn new(uid: u32, gid: u32, groups: Vec<u32>) -> Self {
-        Self {
-            uid,
-            gid,
-            groups,
-            user: None,
-        }
-    }
-
-    /// The same identity, as account `user` of an encrypted filesystem.
-    pub fn with_user(mut self, user: impl Into<String>) -> Self {
-        self.user = Some(user.into());
-        self
-    }
-
-    /// Whether grants, not mode bits, decide what this caller may do.
-    pub fn by_grant(&self) -> bool {
-        self.user.is_some()
-    }
-
-    /// uid 0 passes every permission check.
-    pub fn is_root(&self) -> bool {
-        self.uid == 0
-    }
-
-    pub fn in_group(&self, gid: u32) -> bool {
-        self.gid == gid || self.groups.contains(&gid)
+    pub fn new(user: impl Into<String>) -> Self {
+        Self { user: user.into() }
     }
 }
 
-/// A time to set, keeping "now" distinct from an explicit time: POSIX
-/// lets anyone who can write a file set its times to now, but only the
-/// owner set them to anything else.
+/// A time to set, keeping "now" -- the server's clock -- distinct from an
+/// explicit time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetTime {
     Now,
@@ -93,8 +59,6 @@ impl SetTime {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SetAttr {
     pub mode: Option<u32>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
     pub size: Option<u64>,
     pub atime: Option<SetTime>,
     pub mtime: Option<SetTime>,
@@ -105,15 +69,14 @@ pub struct SetAttr {
 pub struct DirItem {
     pub ino: u64,
     pub kind: Kind,
-    /// On an encrypted filesystem, the entry's tag; see `sealed_name`.
+    /// The entry's tag; see `sealed_name`.
     pub name: OsString,
-    /// On an encrypted filesystem, the real name, sealed under the
-    /// directory's key. Empty for `.` and `..`, and on any other
-    /// filesystem.
+    /// The real name, sealed under the directory's key. Empty for `.`
+    /// and `..`.
     pub sealed_name: Vec<u8>,
 }
 
-/// A directory granted to a user on an encrypted filesystem: whether they
+/// A directory granted to a user: whether they
 /// may write under it, and its key at `key_version`, sealed to them, with
 /// the name it shows up as in their root, also sealed to them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,13 +124,15 @@ pub struct Rotation {
     pub grants: Vec<(String, Vec<u8>)>,
 }
 
-/// A file chunk as stored on an encrypted filesystem: sealed, with the
-/// store's sequence number for it. `blob` is `None` for a hole.
+/// A file chunk as stored: sealed, with the store's sequence number for
+/// it. `blob` is `None` for a hole, or for a chunk `unchanged`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedChunk {
     pub index: u64,
     pub seq: u64,
     pub blob: Option<Vec<u8>>,
+    /// Still at the seq the client said it held, so `blob` wasn't sent.
+    pub unchanged: bool,
 }
 
 /// A sealed chunk to store, if it is still at `expected_seq` (or whatever
@@ -179,7 +144,7 @@ pub struct ChunkWrite {
     pub blob: Vec<u8>,
 }
 
-/// What a create on an encrypted filesystem brings: the inode it reserved,
+/// What a create brings: the inode it reserved,
 /// and the new node's key record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNode {
@@ -190,7 +155,7 @@ pub struct NewNode {
     pub sealed_name: Vec<u8>,
 }
 
-/// What a rename on an encrypted filesystem brings: the inode it moves --
+/// What a rename brings: the inode it moves --
 /// refused if the name no longer names it -- its key record re-wrapped
 /// under the new parent's key if the parent changes (empty if not), and
 /// the new name sealed under the new parent's key.
@@ -201,7 +166,7 @@ pub struct SealedMove {
     pub sealed_name: Vec<u8>,
 }
 
-/// What an encrypted filesystem keeps for an account: enough to check a
+/// What the filesystem keeps for an account: enough to check a
 /// login and to hand the client back its wrapped private key, and nothing
 /// that opens anything. The fields are raft5fs-crypto's encodings.
 #[derive(Debug, Clone, PartialEq, Eq)]

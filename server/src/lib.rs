@@ -1,12 +1,10 @@
 //! The filesystem server: the raft5fs protocol over `FsCore`.
 //!
 //! Stateless by design, so any number can run against one store and a
-//! client can use any of them: nothing here outlives a request except two
-//! caches -- the read cache inside `FsCore`, which revalidates every hit
-//! against the store, and the identity cache here, which holds a user
-//! table row for at most `identity_ttl`. Write buffering lives in the
-//! client; sessions and open files live in signed tokens the client holds
-//! (see `auth`).
+//! client can use any of them: nothing here outlives a request except the
+//! account cache, which remembers that an account is still enrolled for at
+//! most `identity_ttl`. Write buffering and the chunk cache live in the
+//! client; sessions live in signed tokens the client holds (see `auth`).
 
 pub mod auth;
 
@@ -18,22 +16,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use raft5_client::{Client, ClientTls, Error as KvError};
-use raft5fs_core::perm::{R, W};
 use raft5fs_core::{
-    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, Rotation, SealedMove, WriteError,
-    accounts, batch_bytes, users,
+    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, Rotation, SealedMove, accounts,
+    batch_bytes,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
-    AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateResponse,
-    CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest,
-    GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings,
-    KeyPathResponse, LoginRequest, LoginResponse, NameRequest, NoArgs, OpenResponse,
-    PreloginRequest, PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest,
-    ReadChunksResponse, ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, RotateRequest,
-    Session, SetAttrRequest, WriteChunksRequest, WriteRequest, WriteResponse,
+    AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
+    EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
+    HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
+    LoginRequest, LoginResponse, NameRequest, NoArgs, PreloginRequest, PreloginResponse,
+    PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse, ReadDirResponse,
+    RenameRequest, RotateRequest, Session, SetAttrRequest, WriteChunksRequest, WriteChunksResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -47,14 +43,14 @@ use crate::auth::Signer;
 /// default, which a batch of large chunks would exceed.
 const MAX_MESSAGE_BYTES: usize = MAX_CHUNK_SIZE as usize + (1 << 20);
 
-/// How long a server may act on a user table row it has read before
-/// reading it again, unless told otherwise: how long a changed group list
-/// or a removed account takes to reach a mounted user. Costs at most one
-/// store read per active user per this long.
+/// How long a server may go on trusting that an account is enrolled before
+/// looking again, unless told otherwise: how long removing an account
+/// takes to reach a user who is already mounted. Costs at most one store
+/// read per active user per this long.
 pub const DEFAULT_IDENTITY_TTL: Duration = Duration::from_secs(5);
 
-/// How to reach the store: what the server's own client was built from,
-/// so that logins can be checked on clients of their own.
+/// How to reach the store: the seeds and TLS settings a server's client is
+/// built from.
 #[derive(Clone)]
 pub struct Store {
     pub seeds: Vec<String>,
@@ -62,8 +58,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// A fresh client, sharing nothing with any other -- in particular
-    /// not its login, which a clone would.
+    /// A fresh client, sharing nothing with any other.
     pub fn client(&self) -> Result<Client, KvError> {
         match &self.tls {
             Some(tls) => Client::with_tls(&self.seeds, tls.clone()),
@@ -75,178 +70,68 @@ impl Store {
 pub struct FsService {
     core: Arc<FsCore>,
     signer: Signer,
-    store: Store,
-    /// What each account acted as when its row was last read, and when
-    /// that was.
-    identities: Mutex<HashMap<String, (Instant, Caller)>>,
+    /// When each account was last seen enrolled.
+    enrolled: Mutex<HashMap<String, Instant>>,
     identity_ttl: Duration,
 }
 
 impl FsService {
-    /// `identity_ttl` is how long a user table row is trusted before being
-    /// read again (`DEFAULT_IDENTITY_TTL`; zero reads it every request).
-    pub fn new(core: Arc<FsCore>, signer: Signer, store: Store, identity_ttl: Duration) -> Self {
+    /// `identity_ttl` is how long an account is trusted to still be
+    /// enrolled before looking again (`DEFAULT_IDENTITY_TTL`; zero looks
+    /// on every request).
+    pub fn new(core: Arc<FsCore>, signer: Signer, identity_ttl: Duration) -> Self {
         Self {
             core,
             signer,
-            store,
-            identities: Mutex::new(HashMap::new()),
+            enrolled: Mutex::new(HashMap::new()),
             identity_ttl,
         }
     }
 
-    /// Who `request` is from, per its session and the user table, and
-    /// its message.
+    /// Who `request` is from, per its session, and its message.
     async fn caller<T>(&self, request: Request<T>) -> Result<(Caller, T), Status> {
         let token = session_from_metadata(request.metadata())
             .ok_or_else(|| Status::unauthenticated("the request carries no session"))?;
         let name = self.signer.verify_session(token)?;
-        let mut caller = self.identity(&name).await?;
-        if self.core.encrypted() {
-            caller = caller.with_user(name);
-        }
-        Ok((caller, request.into_inner()))
+        self.check_enrolled(&name).await?;
+        Ok((Caller::new(name), request.into_inner()))
     }
 
-    /// What account `name` acts as now, give or take `identity_ttl`. An
-    /// account whose row is gone is `UNAUTHENTICATED`: the client then
-    /// logs in again, which is refused, so removing a row cuts a mounted
-    /// user off without waiting for their session to expire.
-    async fn identity(&self, name: &str) -> Result<Caller, Status> {
-        if let Some((read_at, caller)) = self.identities.lock().unwrap().get(name)
-            && read_at.elapsed() < self.identity_ttl
+    /// That account `name` is still enrolled, give or take
+    /// `identity_ttl`. One removed is `UNAUTHENTICATED`: the client then
+    /// logs in again, which is refused, so removing an account cuts a
+    /// mounted user off without waiting for their session to expire.
+    async fn check_enrolled(&self, name: &str) -> Result<(), Status> {
+        if let Some(seen) = self.enrolled.lock().unwrap().get(name)
+            && seen.elapsed() < self.identity_ttl
         {
-            return Ok(caller.clone());
+            return Ok(());
         }
-        match users::get(self.core.client(), name).await {
-            Ok(Some(a)) => {
-                let caller = Caller::new(a.uid, a.gid, a.groups);
-                self.remember(name, &caller);
-                Ok(caller)
+        match accounts::get(self.core.client(), name).await {
+            Ok(Some(_)) => {
+                self.remember(name);
+                Ok(())
             }
             Ok(None) => {
-                self.identities.lock().unwrap().remove(name);
+                self.enrolled.lock().unwrap().remove(name);
                 Err(Status::unauthenticated(format!(
-                    "{name} no longer has a filesystem account"
+                    "{name} no longer has an account"
                 )))
             }
-            Err(e) => Err(Status::unavailable(format!(
-                "cannot read the user table: {e}"
-            ))),
+            Err(e) => Err(store_unavailable(e)),
         }
     }
 
-    fn remember(&self, name: &str, caller: &Caller) {
-        self.identities
+    fn remember(&self, name: &str) {
+        self.enrolled
             .lock()
             .unwrap()
-            .insert(name.to_string(), (Instant::now(), caller.clone()));
-    }
-
-    /// The inode `handle` opened, if `caller` may use it for writing (or
-    /// with `write` false, reading).
-    fn handle_ino(&self, caller: &Caller, handle: &str, write: bool) -> Result<u64, FsError> {
-        let h = self.signer.verify_handle(caller, handle)?;
-        if (write && !h.write) || (!write && !h.read) {
-            return Err(FsError::new(
-                libc::EBADF,
-                format!(
-                    "handle not open for {}",
-                    if write { "writing" } else { "reading" }
-                ),
-            ));
-        }
-        Ok(h.ino)
-    }
-
-    /// Checks a login -- the password against the store account, or on an
-    /// encrypted filesystem `auth` against the account's verifier -- and
-    /// looks up what the account acts as. Returns that, and the wrapped
-    /// private key an encrypted login hands back. `Ok(Err)` is a refusal;
-    /// `Err` means the store couldn't be asked, which is this server's
-    /// failure, not the caller's.
-    async fn authenticate(
-        &self,
-        r: &LoginRequest,
-    ) -> Result<Result<(Caller, Vec<u8>), FsError>, Status> {
-        let username = r.username.as_str();
-        let wrapped_private_key = if self.core.encrypted() {
-            match accounts::check_login(self.core.client(), username, &r.auth).await {
-                Ok(Some(keys)) => keys.wrapped_private_key,
-                Ok(None) => {
-                    return Ok(Err(FsError::new(
-                        libc::EACCES,
-                        "login refused: the username or password was wrong",
-                    )));
-                }
-                Err(e) => return Err(store_unavailable(e)),
-            }
-        } else {
-            if let Err(refused) = self.check_store_password(username, &r.password).await? {
-                return Ok(Err(refused));
-            }
-            Vec::new()
-        };
-        match users::get(self.core.client(), username).await {
-            Ok(Some(a)) => {
-                let caller = Caller::new(a.uid, a.gid, a.groups);
-                self.remember(username, &caller);
-                Ok(Ok((caller, wrapped_private_key)))
-            }
-            Ok(None) => Ok(Err(FsError::new(
-                libc::EACCES,
-                format!("{username} has no filesystem account"),
-            ))),
-            Err(e) => Err(Status::unavailable(format!(
-                "cannot read the user table: {e}"
-            ))),
-        }
-    }
-
-    /// An unencrypted filesystem's login check: whether the store takes
-    /// `password` for its account `username`.
-    async fn check_store_password(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<Result<(), FsError>, Status> {
-        let unavailable = |e: KvError| Status::unavailable(format!("cannot reach the store: {e}"));
-        // A client of its own: logging in on a clone of the server's
-        // client would replace the server's own login.
-        let store = self.store.client().map_err(unavailable)?;
-        match store.login(username, password).await {
-            Ok(()) => {}
-            Err(
-                e @ (KvError::Denied { .. }
-                | KvError::Unauthenticated(_)
-                | KvError::PermissionDenied(_)),
-            ) => {
-                return Ok(Err(FsError::new(
-                    libc::EACCES,
-                    format!("login refused: {e}"),
-                )));
-            }
-            Err(e) => return Err(unavailable(e)),
-        }
-        Ok(Ok(()))
-    }
-
-    /// An encrypted filesystem's operation, or `EOPNOTSUPP` on one that
-    /// isn't.
-    fn require_encrypted(&self) -> Result<(), FsError> {
-        if self.core.encrypted() {
-            Ok(())
-        } else {
-            Err(FsError::new(
-                libc::EOPNOTSUPP,
-                "this filesystem isn't encrypted",
-            ))
-        }
+            .insert(name.to_string(), Instant::now());
     }
 }
 
-/// A store failure while checking credentials: the server's problem, so a
-/// status, which sends the client to another server.
+/// A store failure: the server's problem, so a status, which sends the
+/// client to another server.
 fn store_unavailable(e: FsError) -> Status {
     Status::unavailable(format!("cannot reach the store: {e}"))
 }
@@ -285,24 +170,7 @@ impl Fs for FsService {
         Ok(Response::new(HelloResponse {
             chunk_size,
             batch_bytes: batch_bytes(chunk_size),
-            encrypted: self.core.encrypted(),
         }))
-    }
-
-    async fn login(&self, r: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
-        let r = r.into_inner();
-        let session = self
-            .authenticate(&r)
-            .await?
-            .map(|(_, wrapped_private_key)| {
-                let (token, expires_at) = self.signer.session(&r.username);
-                Session {
-                    token,
-                    expires_at,
-                    wrapped_private_key,
-                }
-            });
-        Ok(Response::new(session.into()))
     }
 
     async fn prelogin(
@@ -310,9 +178,6 @@ impl Fs for FsService {
         r: Request<PreloginRequest>,
     ) -> Result<Response<PreloginResponse>, Status> {
         let username = r.into_inner().username;
-        if let Err(e) = self.require_encrypted() {
-            return Ok(Response::new(Err(e).into()));
-        }
         let settings = match accounts::get(self.core.client(), &username).await {
             Ok(Some(keys)) => KdfSettings {
                 salt: keys.salt,
@@ -329,12 +194,35 @@ impl Fs for FsService {
         Ok(Response::new(Ok(settings).into()))
     }
 
+    /// Checks `auth` against the account's verifier, and hands back the
+    /// wrapped private key. A wrong `auth` and an unknown account are
+    /// refused alike.
+    async fn login(&self, r: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
+        let r = r.into_inner();
+        let session = match accounts::check_login(self.core.client(), &r.username, &r.auth).await {
+            Ok(Some(keys)) => {
+                self.remember(&r.username);
+                let (token, expires_at) = self.signer.session(&r.username);
+                Ok(Session {
+                    token,
+                    expires_at,
+                    wrapped_private_key: keys.wrapped_private_key,
+                })
+            }
+            Ok(None) => Err(FsError::new(
+                libc::EACCES,
+                "login refused: the username or password was wrong",
+            )),
+            Err(e) => return Err(store_unavailable(e)),
+        };
+        Ok(Response::new(session.into()))
+    }
+
     async fn enrol(&self, r: Request<EnrolRequest>) -> Result<Response<EmptyResponse>, Status> {
         let r = r.into_inner();
-        let enrolled = match (self.require_encrypted(), r.keys) {
-            (Err(e), _) => Err(e),
-            (Ok(()), None) => Err(FsError::new(libc::EINVAL, "an enrolment needs keys")),
-            (Ok(()), Some(keys)) => {
+        let enrolled = match r.keys {
+            None => Err(FsError::new(libc::EINVAL, "an enrolment needs keys")),
+            Some(keys) => {
                 accounts::enrol(self.core.client(), &r.username, &r.code, &keys.into()).await
             }
         };
@@ -346,10 +234,9 @@ impl Fs for FsService {
         r: Request<ChangePasswordRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
         let r = r.into_inner();
-        let changed = match (self.require_encrypted(), r.keys) {
-            (Err(e), _) => Err(e),
-            (Ok(()), None) => Err(FsError::new(libc::EINVAL, "a password change needs keys")),
-            (Ok(()), Some(keys)) => {
+        let changed = match r.keys {
+            None => Err(FsError::new(libc::EINVAL, "a password change needs keys")),
+            Some(keys) => {
                 accounts::change_password(
                     self.core.client(),
                     &r.username,
@@ -375,15 +262,6 @@ impl Fs for FsService {
         Ok(Response::new(found.into()))
     }
 
-    async fn open(&self, r: Request<AccessRequest>) -> Result<Response<OpenResponse>, Status> {
-        let (caller, r) = self.caller(r).await?;
-        let opened = self.core.open(&caller, r.ino, r.mask).await.map(|()| {
-            self.signer
-                .handle(&caller, r.ino, r.mask & R != 0, r.mask & W != 0)
-        });
-        Ok(Response::new(opened.into()))
-    }
-
     async fn access(&self, r: Request<AccessRequest>) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
@@ -401,36 +279,9 @@ impl Fs for FsService {
         ))
     }
 
-    async fn read(&self, r: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
-        let (caller, r) = self.caller(r).await?;
-        let data = match self.handle_ino(&caller, &r.handle, false) {
-            Ok(ino) => self.core.read(&caller, ino, r.offset, r.len as usize).await,
-            Err(e) => Err(e),
-        };
-        Ok(Response::new(data.into()))
-    }
-
-    async fn write(&self, r: Request<WriteRequest>) -> Result<Response<WriteResponse>, Status> {
-        let (caller, r) = self.caller(r).await?;
-        let written = match self.handle_ino(&caller, &r.handle, true) {
-            Ok(ino) => self.core.write(&caller, ino, r.offset, &r.data).await,
-            Err(error) => Err(WriteError { written: 0, error }),
-        };
-        Ok(Response::new(written.into()))
-    }
-
     async fn set_attr(&self, r: Request<SetAttrRequest>) -> Result<Response<AttrResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        // A handle that doesn't check out just doesn't help: the change
-        // is then judged on the caller's permissions alone.
-        let writable_handle = r
-            .handle
-            .as_deref()
-            .is_some_and(|h| self.handle_ino(&caller, h, true).ok() == Some(r.ino));
-        let changed = self
-            .core
-            .setattr(&caller, r.ino, r.changes(), writable_handle)
-            .await;
+        let changed = self.core.setattr(&caller, r.ino, r.changes()).await;
         Ok(Response::new(changed.into()))
     }
 
@@ -443,17 +294,14 @@ impl Fs for FsService {
                 r.parent,
                 name(&r.name),
                 r.perm as u16,
-                new_node(&r).as_ref(),
+                &new_node(&r),
             )
             .await;
         Ok(Response::new(made.into()))
     }
 
-    async fn create(&self, r: Request<CreateRequest>) -> Result<Response<CreateResponse>, Status> {
+    async fn create(&self, r: Request<CreateRequest>) -> Result<Response<AttrResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        // Open for both whatever the new mode says: creating a file
-        // read-only and writing it through the descriptor that created
-        // it is ordinary (it is how `cp` copies a read-only file).
         let made = self
             .core
             .create(
@@ -461,10 +309,9 @@ impl Fs for FsService {
                 r.parent,
                 name(&r.name),
                 r.perm as u16,
-                new_node(&r).as_ref(),
+                &new_node(&r),
             )
-            .await
-            .map(|attr| (attr, self.signer.handle(&caller, attr.ino, true, true)));
+            .await;
         Ok(Response::new(made.into()))
     }
 
@@ -480,6 +327,11 @@ impl Fs for FsService {
 
     async fn rename(&self, r: Request<RenameRequest>) -> Result<Response<InoResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
+        let sealed = SealedMove {
+            ino: r.moved_ino,
+            node_keys: r.node_keys.clone(),
+            sealed_name: r.sealed_new_name.clone(),
+        };
         let moved = self
             .core
             .rename(
@@ -489,7 +341,7 @@ impl Fs for FsService {
                 r.new_parent,
                 name(&r.new_name),
                 r.noreplace,
-                sealed_move(&r).as_ref(),
+                &sealed,
             )
             .await
             .map(|replaced| replaced.unwrap_or(0));
@@ -579,7 +431,7 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let read = self
             .core
-            .read_chunks(&caller, r.ino, r.first, r.count)
+            .read_chunks(&caller, r.ino, r.first, r.count, &r.known_seqs)
             .await;
         Ok(Response::new(read.into()))
     }
@@ -587,7 +439,7 @@ impl Fs for FsService {
     async fn write_chunks(
         &self,
         r: Request<WriteChunksRequest>,
-    ) -> Result<Response<AttrResponse>, Status> {
+    ) -> Result<Response<WriteChunksResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
         let written = self.core.write_chunks(&caller, r.ino, &writes, r.end).await;
@@ -613,22 +465,11 @@ impl Fs for FsService {
     }
 }
 
-/// What an encrypted filesystem's create brings, if this one brought it.
-fn new_node(r: &CreateRequest) -> Option<NewNode> {
-    (r.ino != 0 || !r.node_keys.is_empty() || !r.sealed_name.is_empty()).then(|| NewNode {
+/// What a create brings besides the parent, tag and mode.
+fn new_node(r: &CreateRequest) -> NewNode {
+    NewNode {
         ino: r.ino,
         keys: r.node_keys.clone(),
         sealed_name: r.sealed_name.clone(),
-    })
-}
-
-/// What an encrypted filesystem's rename brings, if this one brought it.
-fn sealed_move(r: &RenameRequest) -> Option<SealedMove> {
-    (r.moved_ino != 0 || !r.node_keys.is_empty() || !r.sealed_new_name.is_empty()).then(|| {
-        SealedMove {
-            ino: r.moved_ino,
-            node_keys: r.node_keys.clone(),
-            sealed_name: r.sealed_new_name.clone(),
-        }
-    })
+    }
 }

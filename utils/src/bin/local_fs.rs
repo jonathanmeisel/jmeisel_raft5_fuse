@@ -18,6 +18,9 @@
 //! the node key -- the filesystem server -- can reach the store at all),
 //! and TLS from the mount to the filesystem server.
 //!
+//! The mount's account is enrolled at bootstrap, and the mount starts at
+//! an empty root, where `mkdir` makes a volume (see SETUP.txt).
+//!
 //! Ctrl-C (or SIGTERM, or SIGHUP) unmounts the filesystem, storing what
 //! the mount buffered, before the server and the cluster stop.
 
@@ -33,10 +36,11 @@ use fuser::{BackgroundSession, Config, MountOption};
 use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, PeerTls, ServerConfig, serve_config};
-use raft5fs_core::users::{self, Account};
-use raft5fs_core::{DEFAULT_CHUNK_SIZE, DEFAULT_READ_CACHE_BYTES, FsCore};
+use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts};
+use raft5fs_crypto::identity::fingerprint;
+use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
-use raft5fs_fuse::remote::Credentials;
+use raft5fs_fuse::remote::{Credentials, Remote};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use rcgen::{
@@ -115,12 +119,13 @@ struct Manifest {
     admin_user: String,
     nodes: Vec<NodeSpec>,
     fs_port: u16,
-    /// The store account the mount logs in as.
+    /// The account the mount logs in as.
     user: String,
-    /// What that account acts as in the filesystem: whoever ran the
-    /// bootstrap. Also the root directory's owner.
-    uid: u32,
-    gid: u32,
+    /// Whether the filesystem is encrypted: always, now. Absent from the
+    /// manifests of installations from before every one was, which this
+    /// can no longer start.
+    #[serde(default)]
+    encrypted: bool,
 }
 
 impl Manifest {
@@ -277,7 +282,16 @@ async fn start(dir: &Path) -> Result<(Stack, Manifest), Error> {
         );
         create_files(dir)?
     } else {
-        read_manifest(dir)?
+        let manifest = read_manifest(dir)?;
+        if !manifest.encrypted {
+            return Err(format!(
+                "{} holds an installation made by an older local-fs, which this one \
+                 can't start; delete it to make a new one",
+                dir.display()
+            )
+            .into());
+        }
+        manifest
     };
     let tls = Tls::load(dir)?;
     let auth = auth_config(dir, &manifest.admin_user).await?;
@@ -332,14 +346,56 @@ async fn start(dir: &Path) -> Result<(Stack, Manifest), Error> {
             )
             .into());
         }
-        write_manifest(dir, &manifest)?;
     }
 
     if let Err(e) = start_fs_server(dir, &manifest, &tls, &mut stack).await {
         let _ = stack.stop().await;
         return Err(e);
     }
+    if fresh {
+        // The account needs keys before it can log in, and only a
+        // running filesystem server can enrol it.
+        if let Err(e) = enrol(dir, &manifest, &tls).await {
+            let _ = stack.stop().await;
+            return Err(format!(
+                "enrolling {} failed: {e}\n{} is left half-made; delete it before trying again",
+                manifest.user,
+                dir.display()
+            )
+            .into());
+        }
+        write_manifest(dir, &manifest)?;
+    }
     Ok((stack, manifest))
+}
+
+/// Enrols the mount's account on the new filesystem: issues it a code, as
+/// `raft5fs-server user add` would, and enrols with it, as
+/// `raft5fs-share enrol` would, so its password is the one on file.
+async fn enrol(dir: &Path, manifest: &Manifest, tls: &Tls) -> Result<(), Error> {
+    let service = Client::with_tls(manifest.seeds(), tls.store_client())?;
+    service
+        .login(SERVICE_USER, &read_trimmed(&dir.join(SERVICE_PASSWORD))?)
+        .await
+        .map_err(|e| format!("could not log in as {SERVICE_USER}: {e}"))?;
+    let code = accounts::issue_code(&service, &manifest.user).await?;
+    let fs_tls =
+        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(read(&dir.join(CA_CERT))?));
+    let public_key = Remote::enrol(
+        &[manifest.fs_url()],
+        Some(fs_tls),
+        &manifest.user,
+        &code,
+        &read_trimmed(&dir.join(USER_PASSWORD))?,
+        KdfParams::DEFAULT,
+    )
+    .await?;
+    info!(
+        "enrolled {}, key fingerprint {}",
+        manifest.user,
+        fingerprint(&public_key)
+    );
+    Ok(())
 }
 
 fn is_empty_or_missing(dir: &Path) -> Result<bool, Error> {
@@ -401,18 +457,16 @@ fn create_files(dir: &Path) -> Result<Manifest, Error> {
         write_private(&dir.join(secret), random_string()?.as_bytes())?;
     }
 
-    let (uid, gid, _) = own_ids();
     Ok(Manifest {
         admin_user: ADMIN_USER.to_string(),
         nodes,
         fs_port: ports[NODES * 2],
         user: mount_user_name(),
-        uid,
-        gid,
+        encrypted: true,
     })
 }
 
-/// The local user's name, if it can be a store account of its own.
+/// The local user's name, if it isn't one of the store's own accounts.
 fn mount_user_name() -> String {
     match std::env::var("USER") {
         Ok(name) if !name.is_empty() && name != ADMIN_USER && name != SERVICE_USER => name,
@@ -420,25 +474,6 @@ fn mount_user_name() -> String {
     }
 }
 
-/// Whoever runs this: the mount's identity in the filesystem.
-fn own_ids() -> (u32, u32, Vec<u32>) {
-    // SAFETY: plain libc calls; `getgroups` writes at most `n` entries
-    // into a buffer of that many.
-    unsafe {
-        let n = libc::getgroups(0, std::ptr::null_mut());
-        let mut groups = vec![0; n.max(0) as usize];
-        let n = libc::getgroups(groups.len() as i32, groups.as_mut_ptr());
-        groups.truncate(n.max(0) as usize);
-        (libc::getuid(), libc::getgid(), groups)
-    }
-}
-
-/// `count` distinct ports the OS considers free right now.
-///
-/// Every listener is held until all have been picked, so the OS can't
-/// hand the same port out twice. They are released before the nodes and
-/// server bind them, so something else could still take one in between
-/// -- in which case that node fails to start and bootstrapping reports it.
 fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
     let listeners = (0..count)
         .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
@@ -580,34 +615,6 @@ async fn bootstrap(
         .set_acl(b"", &[(Principal::user(SERVICE_USER), Right::Write)])
         .await
         .map_err(|e| format!("could not lock the store down: {e}"))?;
-    admin
-        .create_user(
-            &manifest.user,
-            &read_trimmed(&dir.join(USER_PASSWORD))?,
-            false,
-        )
-        .await
-        .map_err(|e| format!("could not create {}: {e}", manifest.user))?;
-
-    // The user table is the service account's to write.
-    let service = Client::with_tls(manifest.seeds(), tls.store_client())?;
-    service
-        .login(SERVICE_USER, &service_password)
-        .await
-        .map_err(|e| format!("could not log in as {SERVICE_USER}: {e}"))?;
-    let (_, _, groups) = own_ids();
-    let account = Account {
-        uid: manifest.uid,
-        gid: manifest.gid,
-        groups,
-    };
-    users::set(&service, &manifest.user, &account)
-        .await
-        .map_err(|e| format!("could not add {} to the user table: {e}", manifest.user))?;
-    info!(
-        "created {} as uid {} gid {}",
-        manifest.user, manifest.uid, manifest.gid
-    );
     Ok(())
 }
 
@@ -628,21 +635,15 @@ async fn start_fs_server(
         .login(SERVICE_USER, &read_trimmed(&dir.join(SERVICE_PASSWORD))?)
         .await
         .map_err(|e| format!("could not log in to the store as {SERVICE_USER}: {e}"))?;
-    let core = FsCore::connect(
-        client,
-        DEFAULT_CHUNK_SIZE,
-        DEFAULT_READ_CACHE_BYTES,
-        (manifest.uid, manifest.gid),
-        false,
-    )
-    .await
-    .map_err(|e| format!("could not open the filesystem: {e}"))?;
+    let core = FsCore::connect(client, DEFAULT_CHUNK_SIZE)
+        .await
+        .map_err(|e| format!("could not open the filesystem: {e}"))?;
 
     let signer = Signer::new(&read(&dir.join(TOKEN_KEY))?, DEFAULT_SESSION_TTL);
     let listener = tokio::net::TcpListener::bind(manifest.fs_addr())
         .await
         .map_err(|e| format!("could not listen on {}: {e}", manifest.fs_addr()))?;
-    let fs = FsService::new(Arc::new(core), signer, store, DEFAULT_IDENTITY_TTL);
+    let fs = FsService::new(Arc::new(core), signer, DEFAULT_IDENTITY_TTL);
     let server_tls = ServerTlsConfig::new().identity(tls.identity.clone());
     let cancel = stack.fs_cancel.clone();
     stack.tasks.spawn(async move {
@@ -797,13 +798,7 @@ fn print_connection_info(dir: &Path, manifest: &Manifest, mountpoint: &Path) {
         );
     }
     println!("  filesystem server: {}", manifest.fs_url());
-    println!(
-        "  mounted at {} as {} (uid {} gid {})",
-        mountpoint.display(),
-        manifest.user,
-        manifest.uid,
-        manifest.gid
-    );
+    println!("  mounted at {} as {}", mountpoint.display(), manifest.user);
     println!();
     println!("store admin shell (password in {}):", path(ADMIN_PASSWORD));
     println!(
@@ -814,21 +809,42 @@ fn print_connection_info(dir: &Path, manifest: &Manifest, mountpoint: &Path) {
         manifest.admin_user
     );
     println!();
-    println!("filesystem users (after create_user in the admin shell):");
+    println!("your root lists what is shared with you; mkdir there makes a new");
+    println!("top-level directory, shared with no one.");
+    println!();
+    println!("more users (each gets a code to enrol with, choosing their password):");
     println!(
         "  export RAFT5FS_STORE_PASSWORD=$(cat {})",
         path(SERVICE_PASSWORD)
     );
-    let store_options = format!(
-        "--store-user {SERVICE_USER} --store-ca {} --store-cert {} --store-key {} {seeds}",
-        path(CA_CERT),
+    println!(
+        "  raft5fs-server user add <NAME> --store-user {SERVICE_USER} --store-ca {} \\",
+        path(CA_CERT)
+    );
+    println!(
+        "    --store-cert {} --store-key {} {seeds}",
         path(NODE_CERT),
         path(NODE_KEY)
     );
-    println!("  raft5fs-server user add <NAME> --uid <UID> --gid <GID> [--groups <GROUP>,...] \\");
-    println!("    {store_options}");
-    println!("  raft5fs-server user mod <NAME> --add-groups <GROUP>,... {store_options}");
-    println!("  raft5fs-server group add <NAME> [--gid <GID>] {store_options}");
+    println!(
+        "  raft5fs-share --user <NAME> --ca {} enrol <CODE> {}",
+        path(CA_CERT),
+        manifest.fs_url()
+    );
+    println!();
+    println!("sharing (password in {}):", path(USER_PASSWORD));
+    println!(
+        "  raft5fs-share --user {} --ca {} grant <PATH> <USER> [--ro] {}",
+        manifest.user,
+        path(CA_CERT),
+        manifest.fs_url()
+    );
+    println!(
+        "  raft5fs-share --user {} --ca {} revoke <PATH> <USER> {}",
+        manifest.user,
+        path(CA_CERT),
+        manifest.fs_url()
+    );
     println!();
     println!("another mount (password in {}):", path(USER_PASSWORD));
     println!(

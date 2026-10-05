@@ -7,16 +7,24 @@ raft5fs has three tiers:
   (raft5-server)     filesystem servers may talk to it.
 
   filesystem         stateless; hold the store credentials, check logins
-  servers            and enforce file permissions. Run as many as you
-  (raft5fs-server)   like against one store.
+  servers            and grants. Run as many as you like against one
+  (raft5fs-server)   store.
 
-  mounts             one per user per machine. Log in as a user, buffer
-  (raft5fs-fuse)     writes, and use whichever server answers.
+  mounts             one per user per machine. Log in as a user, encrypt
+  (raft5fs-fuse)     and decrypt, buffer and cache, and use whichever
+                     server answers.
 
     user's mount --(TLS, user login)--> fs server --(mTLS, service login)--> raft5
 
+Everything is encrypted on the users' machines: file contents and names
+are sealed by the mount before they leave it, and users' passwords never
+reach a server. Neither the store nor the filesystem servers -- nor
+whoever runs them -- can read what is in the filesystem (section 8 says
+exactly what they can see). Access is by grants of directories to users
+(section 7).
+
 The steps below set up one store node, one filesystem server and one
-mount on a single machine, with TLS everywhere. Section 8 covers adding
+mount on a single machine, with TLS everywhere. Section 9 covers adding
 more of each.
 
 Commands are run from a scratch directory, here called $WORK. Ports used:
@@ -42,10 +50,11 @@ The filesystem (from this repository):
   cargo build --release
   # -> target/release/raft5fs-server
   # -> target/release/raft5fs-fuse
+  # -> target/release/raft5fs-share  (accounts and sharing)
 
 Mounting needs FUSE 3 (`fusermount3`), e.g. the `fuse3` package.
 
-The examples below assume all four binaries are on your PATH.
+The examples below assume these binaries are on your PATH.
 
 
 -------------------------------------------------------------------------
@@ -73,9 +82,10 @@ Then two secrets and a password:
   # The store's token-signing secret.
   head -c 48 /dev/urandom | base64 > jwt.secret
 
-  # What the filesystem servers sign sessions and file handles with.
-  # Every filesystem server needs the same file. Anyone holding it can
-  # act as any filesystem user, so guard it like the store credentials.
+  # What the filesystem servers sign sessions with. Every filesystem
+  # server needs the same file. Anyone holding it can act as any user --
+  # though, everything being encrypted, still not read anything they
+  # couldn't before -- so keep it secret.
   head -c 48 /dev/urandom > token.key
 
   # The store's first administrator's password.
@@ -108,19 +118,17 @@ Open the admin shell in another terminal. It asks for admin's password:
   raft --nodes https://127.0.0.1:27051 \
     --ca-cert cert.pem --cert cert.pem --key key.pem --user admin
 
-In the shell, bootstrap the cluster, create the store accounts and lock
-the store down. Each create_user asks for that account's password.
+In the shell, bootstrap the cluster, create the filesystem servers'
+account and lock the store down. create_user asks for its password.
 
   raft> bootstrap n1
   raft> create_user raft5fs
-  raft> create_user alice
-  raft> create_user bob
   raft> acl_set "" user:raft5fs=write
   raft> quit
 
   - raft5fs  is the service account the filesystem servers work as.
-  - alice, bob  are filesystem users. They log in to their mounts with
-             these passwords, but can do nothing with the store directly.
+             Filesystem users don't get store accounts: they log in to
+             the filesystem servers, with keys of their own (section 5).
   - acl_set ""  puts an ACL on the empty prefix, which governs every
              key: only raft5fs may read or write anything. Without it,
              every key is open to any logged-in account.
@@ -130,12 +138,8 @@ the stored admin account takes over, and they can be left off.
 
 
 -------------------------------------------------------------------------
-4. ADD FILESYSTEM USERS
+4. START THE FILESYSTEM SERVER
 -------------------------------------------------------------------------
-
-Each store account that should use the filesystem needs an entry saying
-which uid, primary gid and supplementary groups it acts as. A store
-account with no entry is refused at login.
 
 The filesystem servers' store options, used here and in section 5:
 
@@ -143,67 +147,64 @@ The filesystem servers' store options, used here and in section 5:
   STORE="--store-user raft5fs --store-ca cert.pem \
          --store-cert cert.pem --store-key key.pem"
 
-  raft5fs-server group add staff --gid 2000 $STORE https://127.0.0.1:27051
-  raft5fs-server user add alice --uid 1001 --gid 1001 --groups staff \
-    $STORE https://127.0.0.1:27051
-  raft5fs-server user add bob   --uid 1002 --gid 1002 --groups staff \
-    $STORE https://127.0.0.1:27051
-  raft5fs-server user list $STORE https://127.0.0.1:27051
-
-Here alice and bob share group 2000, named staff. The ids are the
-filesystem's own: they show up as file owners in `ls -l` on every
-machine, so match them to the local accounts if you want those listings
-to read naturally.
-
-Wherever a command takes a group, it takes a gid number or a group name.
-A number needn't have a name (1001 above has none); a name must have been
-created with `group add`. Leave off --gid and `group add` picks the
-lowest gid from 1000 up that no group or user uses, and prints it.
-`group list` shows them all, and `group del <name>` removes a name (users
-keep the gid; it is just unnamed again).
-
-uid 0 is root inside the filesystem and bypasses every permission
-check, so only map an account to 0 deliberately.
-
-Changes reach users within a few seconds (--identity-ttl, section 5),
-including users who are already mounted: nobody needs to mount again.
-`user del <name>` removes an entry, and a mounted user who is removed is
-refused from then on. Also delete their store account (`delete_user` in
-the admin shell) so they can't log in to the store itself.
-
-
--------------------------------------------------------------------------
-5. START THE FILESYSTEM SERVER
--------------------------------------------------------------------------
-
   raft5fs-server --listen 127.0.0.1:27060 \
     --token-key-file token.key \
     --tls-cert cert.pem --tls-key key.pem \
-    --root-owner 1001:2000 \
     $STORE https://127.0.0.1:27051
 
-  --root-owner  owner of the root directory. Only used when the
-                filesystem is first created, by whichever server gets
-                there first, so give every server the same value. It
-                defaults to 0:0 (root), in which case no ordinary user
-                can create anything at the top level until it is
-                chowned. Here alice owns it, and group 2000 can read it.
-  --chunk-size  how files are split into store keys (default 1M). Also
-                fixed when the filesystem is created.
-  --read-cache-size  memory for caching file data (default 64M).
-  --session-ttl  how long a login lasts, in seconds (default 86400),
-                before the mount gives the password again.
-  --identity-ttl  how long, in seconds, a server trusts a user's entry
-                before reading it again (default 5): how long a change
-                to the user table takes to reach a mounted user.
+The first server to start on an empty store creates the filesystem.
 
-Every server of one filesystem should run the same version: sessions
-from this version don't carry the user's ids, and an older server can't
-use them.
+  --chunk-size  how files are split into store keys (default 1M). Fixed
+                when the filesystem is created.
+  --session-ttl  how long a login lasts, in seconds (default 86400),
+                before the mount logs in again on its own.
+  --identity-ttl  how long, in seconds, a server trusts an account to
+                still exist before looking again (default 5): how long
+                removing a user takes to reach one who is mounted.
+
+A store made by an older raft5fs, which could make unencrypted
+filesystems, is refused: there is no migrating one.
 
 Leaving off --tls-cert/--tls-key serves in plaintext, and the server
-warns you: users' passwords and all file data then cross the network
-unencrypted.
+warns you: what is stored stays encrypted, but sessions cross the
+network in the clear, for anyone watching to reuse.
+
+
+-------------------------------------------------------------------------
+5. ADD USERS
+-------------------------------------------------------------------------
+
+Adding a user issues a one-time code (with the store options from
+section 4):
+
+  raft5fs-server user add alice $STORE https://127.0.0.1:27051
+
+Hand the code to alice, who runs, on her own machine:
+
+  raft5fs-share --user alice --ca cert.pem enrol <CODE> https://127.0.0.1:27060
+
+She chooses her password there. Her machine makes her key pair, stores
+the private key on the server sealed under a key only her password
+yields, and prints the key's fingerprint. She should note it: it is how
+others can check, when sharing with her, that the server handed them her
+real key (7.3).
+
+Her password is stretched on her machine into a login secret, which is
+all a server ever gets. To change it -- everything shared with her stays
+readable:
+
+  raft5fs-share --user alice --ca cert.pem passwd https://127.0.0.1:27060
+
+A forgotten password can't be recovered: nothing on the servers opens
+her private key without it. `user add alice` again issues a new code; she
+enrols again with a new key pair, and whatever was shared with her has
+to be shared again. Others will be told her key changed (7.3).
+
+  raft5fs-server user list $STORE https://127.0.0.1:27051
+  raft5fs-server user del alice $STORE https://127.0.0.1:27051
+
+`user del` removes the account and every grant made to it. A mounted user
+who is removed is refused within --identity-ttl.
 
 
 -------------------------------------------------------------------------
@@ -217,15 +218,33 @@ As the local user who will use the mount (not root):
 
 It asks for alice's password on the terminal, or reads it from the
 RAFT5FS_PASSWORD environment variable. It runs in the foreground; leave
-it running, and use ~/raft5fs from another shell:
+it running, and use ~/raft5fs from another shell.
 
-  echo hello > ~/raft5fs/greeting
-  ls -l ~/raft5fs
+The root of the mount isn't the filesystem's real root. It lists only
+what has been shared with alice, each under the name it was shared as,
+and nothing above those directories is reachable at all. A new user's
+root is empty. `mkdir` there makes a volume: a new top-level directory,
+shared with its maker alone. `rmdir` there removes an empty volume (and
+every grant of it). Nothing else can be made, moved or removed in the
+root.
+
+  mkdir ~/raft5fs/photos
+  cp -r ~/Pictures/2024 ~/raft5fs/photos/
+  ls -l ~/raft5fs/photos
+
+There are no owners in the filesystem: everything shows the local user
+who mounted it as its owner, and chown to anyone else is refused.
+Permission bits are kept and shown (so `chmod +x` works), but grants
+decide who may read and write (section 7).
 
 Everything done through the mount is done as alice, whichever local user
 does it. That is why the mount is only usable by the local user who
 mounted it. Each person mounts with their own login.
 
+  --cache-size <SIZE>  memory for caching file data, decrypted (default
+                     64M, 0 disables). A cached chunk is checked with a
+                     server on every read -- a few bytes, not the chunk --
+                     so it is never stale.
   --tls-server-name <NAME>  check the server certificate against NAME
                      instead of the host in the address.
   --no-write-buffer  store every write at once instead of buffering
@@ -244,74 +263,113 @@ Buffered writes are stored before the unmount completes. A program
 that needs to know its data is stored should call fsync, or check the
 result of close.
 
-
--------------------------------------------------------------------------
-7. PERMISSIONS IN SHORT
--------------------------------------------------------------------------
-
-Ordinary POSIX permissions, enforced by the filesystem servers:
-
-  - Owner, group and other bits, using the uid, gid and groups from
-    the user table (section 4).
-  - chmod: owner only. chown: root only. chgrp: owner, to a group they
-    are in.
-  - The sticky bit (e.g. chmod 1777 on a shared tmp directory) and
-    setgid directories (chmod 2770 on a group directory; new files
-    inherit its group) both work.
-  - Access is checked when a file is opened. An already-open file
-    keeps working after a chmod, as on a local disk.
-
-A group is a gid on users' entries; a name for it is optional. To share
-a file read-only with a new group holding alice and bob, create the
-group and add both to it (with the store options from section 4):
-
-  raft5fs-server group add reports $STORE https://127.0.0.1:27051
-  raft5fs-server user mod alice --add-groups reports \
-    $STORE https://127.0.0.1:27051
-  raft5fs-server user mod bob   --add-groups reports \
-    $STORE https://127.0.0.1:27051
-
-`group add` prints the gid it picked; say it was 3000. `user mod` changes
-only the groups it is given and leaves the rest of the entry alone;
-`--remove-groups` takes users out again. (`user add` instead replaces the
-whole entry.) Mounted users pick the change up within a few seconds,
-without mounting again.
-
-Then the file's owner, here alice, gives it the group and the group
-read bit:
-
-  chgrp 3000 ~/raft5fs/report.txt
-  chmod 640  ~/raft5fs/report.txt
-
-The owner can only chgrp to a group they are in, which is why alice is
-in reports too. chgrp takes the number: names live only in the user
-table, not on the machine you mount from. Readers also need search permission (x) on every directory
-on the way to the file. For a shared directory whose new files get the
-group on their own, make it setgid:
-
-  chgrp 3000 ~/raft5fs/shared
-  chmod 2750 ~/raft5fs/shared
-
-Each file has exactly one group, and there are no POSIX ACLs (setfacl)
-to grant access to more. `ls -l` shows a group's number unless the
-local machine has a group with that gid.
-
 Not supported: hard links, symlinks, device files, and atomically
 swapping two names (renameat2 RENAME_EXCHANGE).
 
 
 -------------------------------------------------------------------------
-8. MORE THAN ONE OF EACH
+7. SHARING
+-------------------------------------------------------------------------
+
+7.1 Grants
+
+Grants are of directories, and cover everything under them. With
+raft5fs-share, a path starts at an entry of the root, as the mount shows
+it:
+
+  raft5fs-share --user alice --ca cert.pem \
+    grant photos/2024 bob --ro --name from-alice https://127.0.0.1:27060
+
+bob's root now shows from-alice. --ro makes the grant read-only, and
+writes under it then fail with "Read-only file system"; without it bob
+may change anything under it, and share it on. To share, alice needs a
+read-write grant of the directory -- which she has of every volume she
+made.
+
+  raft5fs-share ... grants photos/2024 <server>     who holds it, and how
+
+Grants alone decide access, and are checked on every request, so a grant
+taken back stops even files bob has open, at once.
+
+7.2 Revoking
+
+  raft5fs-share ... revoke photos/2024 bob <server>
+
+A revocation gives the directory a new key, and new keys for everything
+under it before anything new is written there: what is written after it
+is sealed under keys bob never had. What bob could read before, he may
+have kept a copy of; revoking can't take that back. Revoking a grant of
+a directory needs a grant of the directory above it (its new key is
+sealed under that one's), except for a volume.
+
+7.3 Whose key?
+
+Sharing with bob seals the directory's key to bob's public key, and only
+the server can say what that is. raft5fs-share pins each user's key the
+first time it seals to them, in ~/.config/raft5fs/known_keys (or
+--known-keys), and refuses a different one after that. Check the
+fingerprint `grant` prints against the one bob saw when he enrolled. If
+he really did enrol again, check his new fingerprint with him, then:
+
+  raft5fs-share --user alice forget-key bob
+
+Pins are kept per user name, so keep a known-keys file per filesystem.
+
+
+-------------------------------------------------------------------------
+8. WHAT THE SERVERS CAN AND CAN'T DO
+-------------------------------------------------------------------------
+
+They can't read file contents, names (of files, directories, or what a
+grant is called), or passwords; nor forge or alter data without the
+change being detected when it is read.
+
+They can see:
+
+  - the shape of the tree, inode numbers, sizes, permission bits and
+    times;
+  - who is granted what, read-only or not, and who reads and writes
+    which inodes, and when;
+  - the tag each name is filed under. The tag of a name doesn't change
+    when the directory's key does, so someone revoked who also got hold
+    of the raw store could test guesses at the names of new files in a
+    directory they used to have.
+
+And as the ones holding the data, they can always lose it, withhold
+it, change what isn't sealed (sizes, times, permission bits, the tree's
+shape), or hand back an older version of a chunk that was really written
+once (sealing proves where data came from, not that it is the latest).
+A malicious server could also show a user a directory it made up
+itself, or answer a lookup with the wrong inode (listings are checked;
+single lookups aren't). The fingerprints in 7.3 are what stop it reading
+what users share with each other.
+
+What it costs:
+
+  - The server can't patch an encrypted chunk, so a write smaller than
+    a chunk changes the whole chunk: from the mount's cache if it has
+    it, or else read, changed and re-sealed. Small, scattered writes to
+    files the mount hasn't touched cost more; a smaller --chunk-size,
+    chosen when the filesystem is created, helps.
+  - Each chunk is stored 44 bytes larger.
+  - A revocation scans every grant in the filesystem. Fine for
+    hundreds; slow for very many.
+
+local-fs (in utils) runs a whole installation on one machine, for
+trying all this out.
+
+
+-------------------------------------------------------------------------
+9. MORE THAN ONE OF EACH
 -------------------------------------------------------------------------
 
 More filesystem servers: start another raft5fs-server, the same way as
-in section 5, on any machine that can reach the store. Use the same
-token.key and --root-owner. Servers keep no state of their own, so a
-mount can use any of them, and an open file survives its server
-restarting.
+in section 4, on any machine that can reach the store, with the same
+token.key. Servers keep no state of their own, so a mount can use any of
+them, and an open file survives its server restarting.
 
 Changing token.key logs every mount out. Mounts log back in on their
-own, but files that were open at the time fail with EBADF.
+own, from the login secret they kept.
 
 More store nodes: start each node with its own --id and --db, plus the
 peer TLS flags (--peer-tls-cert, --peer-tls-key, --peer-tls-ca; every
@@ -327,21 +385,29 @@ as seeds.
 
 
 -------------------------------------------------------------------------
-9. TROUBLESHOOTING
+10. TROUBLESHOOTING
 -------------------------------------------------------------------------
 
   "login refused: the username or password was wrong"
-      The user's store password, as created with create_user.
+      Also what a user who hasn't enrolled yet gets (section 5).
 
-  "<user> has no filesystem account"
-      The store login worked, but section 4 was skipped for this user.
+  "no such enrolment code"
+      The code is wrong, was issued to someone else, or was used: codes
+      work once. `user add` issues another.
 
-  Permission denied creating anything at the top level
-      The root directory belongs to whoever --root-owner named when
-      the filesystem was created (0:0 if no server passed it). Check
-      with `ls -ld` on the mountpoint. A user mapped to uid 0 in the
-      user table can chown it (local root can't: inside the filesystem
-      you are whoever you logged in as).
+  "Operation not permitted" making a file at the top of a mount
+      Only volumes go there: `mkdir` one, and put files in it.
+
+  "the server gave a different key for <user> than before"
+      Either they enrolled again or the server is lying. Check their
+      fingerprint with them before `raft5fs-share forget-key <user>`.
+
+  "... can't reach" (revoke)
+      Revoking a grant of a directory takes a grant of the one above it;
+      ask someone who has one, or revoke at the volume.
+
+  "this store holds a filesystem made by an older, unencrypted raft5fs"
+      There is no migrating it; start from an empty store.
 
   "cannot log in to the store as raft5fs" (filesystem server)
       RAFT5FS_STORE_PASSWORD is wrong, or the store certificate options

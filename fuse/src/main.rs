@@ -8,21 +8,29 @@ use tokio::runtime::Runtime;
 
 const USAGE: &str = "\
 usage: raft5fs-fuse --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
-                    [--no-write-buffer] <mountpoint> <server-address>...
+                    [--cache-size <SIZE>] [--no-write-buffer]
+                    <mountpoint> <server-address>...
 
   --user <NAME>        the account to use the filesystem as. Its password
                        is read from the RAFT5FS_PASSWORD environment
                        variable, or asked for on the terminal.
   --ca <PEM>           reach the servers over TLS, trusting certificates
                        that chain to this (and nothing else). Without it
-                       the password and all file data cross the network
-                       in the clear.
+                       sessions cross the network in the clear (though
+                       the password never does, and file data and names
+                       are encrypted either way).
   --tls-server-name <NAME>
                        check the servers' certificates against this name
                        instead of the host in each address.
   <server-address>     a filesystem server, e.g. https://fs1:7700. Give
                        several: requests go to whichever answers, and move
                        on to the next if one goes away.
+  --cache-size <SIZE>  memory for caching file data this machine has read
+                       or written, decrypted, as a byte count or with a
+                       K/M suffix (default 64M, 0 disables). A cached
+                       chunk is still checked with a server on every
+                       read, at the cost of a few bytes, so it is never
+                       stale.
   --no-write-buffer    store every write immediately instead of buffering
                        small sequential writes until a batch fills, the
                        file is closed, or fsync is called.";
@@ -32,8 +40,23 @@ fn usage(why: &str) -> ! {
     std::process::exit(1);
 }
 
+/// A byte count, or a number with a K or M suffix.
+fn parse_size(s: &str) -> Result<usize, String> {
+    let (digits, unit) = match s.chars().last() {
+        Some('K' | 'k') => (&s[..s.len() - 1], 1024),
+        Some('M' | 'm') => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1),
+    };
+    digits
+        .parse::<usize>()
+        .map_err(|_| format!("not a size: {s}"))?
+        .checked_mul(unit)
+        .ok_or_else(|| format!("size too large: {s}"))
+}
+
 fn main() {
     let mut write_buffering = true;
+    let mut cache_bytes = None;
     let mut username = None;
     let mut ca = None;
     let mut server_name = None;
@@ -42,6 +65,12 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-write-buffer" => write_buffering = false,
+            "--cache-size" => {
+                let size = args
+                    .next()
+                    .unwrap_or_else(|| usage("--cache-size needs a value"));
+                cache_bytes = Some(parse_size(&size).unwrap_or_else(|why| usage(&why)));
+            }
             "--ca" => ca = Some(args.next().unwrap_or_else(|| usage("--ca needs a value"))),
             "--tls-server-name" => {
                 server_name = Some(
@@ -79,6 +108,9 @@ fn main() {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let mut fs = Raft5Fs::new(positional, credentials, runtime.handle().clone())
         .with_write_buffering(write_buffering);
+    if let Some(bytes) = cache_bytes {
+        fs = fs.with_cache_size(bytes);
+    }
     if let Some(tls) = tls {
         fs = fs.with_tls(tls);
     }

@@ -11,7 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use raft5fs_core::{
     CHUNK_SIZE_KEY, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, batch_bytes, chunk_prefix,
-    dirent_prefix, groups, resolve_chunk_size, tombstone_key, users,
+    dirent_prefix, resolve_chunk_size, tombstone_key,
 };
 
 /// Not really a test: the entry point that lets the harness run a
@@ -61,13 +61,24 @@ fn root_directory_starts_empty() {
     assert!(entries.is_empty(), "expected no entries, got {entries:?}");
 }
 
+/// There are no owners -- grants decide access -- so a mount shows the
+/// local user who made it as the owner of everything, and won't give
+/// anything to anyone else.
 #[test]
-fn root_directory_is_owned_by_the_calling_user() {
+fn everything_seems_to_belong_to_the_mounting_user() {
     let h = support::setup();
-
-    let meta = fs::metadata(h.path()).expect("stat mountpoint");
-    assert_eq!(meta.uid(), unsafe { libc::getuid() });
-    assert_eq!(meta.gid(), unsafe { libc::getgid() });
+    let f = h.path().join("f");
+    fs::write(&f, b"x").unwrap();
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    for path in [h.root(), h.path(), f.as_path()] {
+        let meta = fs::metadata(path).expect("stat");
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid), "{path:?}");
+    }
+    std::os::unix::fs::chown(&f, Some(uid), Some(gid)).unwrap();
+    assert_errno(
+        std::os::unix::fs::chown(&f, Some(uid + 1), None),
+        libc::EPERM,
+    );
 }
 
 #[test]
@@ -1161,7 +1172,8 @@ fn a_mount_fails_over_when_its_server_goes_away() {
 fn a_lost_acknowledged_write_is_reported_by_fsync() {
     let mut h = support::setup();
     let batch = batch_bytes(h.chunk_size) as usize;
-    let lone = support::MountedFs::mount(&h.runtime, vec![h.servers[0].address.clone()]);
+    let lone =
+        support::MountedFs::mount(&h.runtime, vec![h.servers[0].address.clone()]).in_volume();
     let path = lone.path.join("acknowledged.bin");
     let mut f = fs::File::create(&path).unwrap();
 
@@ -1185,31 +1197,7 @@ fn a_lost_acknowledged_write_is_reported_by_fsync() {
     drop(f);
 }
 
-// ------------------------------------------------------------ permissions
-
-/// The uids of the users `add_people` adds. None of them is the user
-/// running the tests, who owns the root directory.
-const ALICE: u32 = 50_001;
-const BOB: u32 = 50_002;
-const CAROL: u32 = 50_003;
-/// A group Alice and Bob are in, and Carol isn't.
-const STAFF: u32 = 50_100;
-
-/// Adds users "alice", "bob" and "carol", each with a primary group of
-/// their own; alice and bob are also in `STAFF`.
-fn add_people(h: &support::Harness) {
-    h.add_user("alice", ALICE, ALICE, &[STAFF]);
-    h.add_user("bob", BOB, BOB, &[STAFF]);
-    h.add_user("carol", CAROL, CAROL, &[]);
-}
-
-fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-}
-
-fn chgrp(path: &std::path::Path, gid: u32) -> std::io::Result<()> {
-    std::os::unix::fs::chown(path, None, Some(gid))
-}
+// ---------------------------------------------------------------- helpers
 
 #[track_caller]
 fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
@@ -1217,343 +1205,6 @@ fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
         Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
         Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
     }
-}
-
-/// access(2) on `path`.
-fn access(path: &std::path::Path, mask: i32) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-    if unsafe { libc::access(path.as_ptr(), mask) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// A directory at the root that anyone may create in, for tests whose
-/// users don't own the root.
-/// Also adds the users (see `add_people`), since every such test needs
-/// both.
-fn open_dir(h: &support::Harness, name: &str) {
-    add_people(h);
-    let dir = h.path().join(name);
-    fs::create_dir(&dir).unwrap();
-    chmod(&dir, 0o777).unwrap();
-}
-
-#[test]
-fn files_are_created_as_the_mounts_user() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-
-    fs::write(alice.path.join("pub/a"), b"x").unwrap();
-    fs::create_dir(alice.path.join("pub/d")).unwrap();
-
-    for name in ["pub/a", "pub/d"] {
-        let meta = fs::metadata(h.path().join(name)).unwrap();
-        assert_eq!((meta.uid(), meta.gid()), (ALICE, ALICE), "{name}");
-    }
-}
-
-#[test]
-fn another_user_cannot_open_a_private_file() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    let private = alice.path.join("pub/private");
-    fs::write(&private, b"secret").unwrap();
-    chmod(&private, 0o600).unwrap();
-
-    assert_errno(fs::read(bob.path.join("pub/private")), libc::EACCES);
-    assert_errno(
-        fs::OpenOptions::new()
-            .write(true)
-            .open(bob.path.join("pub/private")),
-        libc::EACCES,
-    );
-    assert_eq!(fs::read(&private).unwrap(), b"secret");
-}
-
-#[test]
-fn read_permission_does_not_imply_write_permission() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::write(alice.path.join("pub/f"), b"alice's").unwrap();
-    chmod(&alice.path.join("pub/f"), 0o644).unwrap();
-
-    let theirs = bob.path.join("pub/f");
-    assert_eq!(fs::read(&theirs).unwrap(), b"alice's");
-    assert_errno(fs::write(&theirs, b"bob's"), libc::EACCES);
-    // Truncating is writing too.
-    assert_errno(fs::File::create(&theirs), libc::EACCES);
-    assert_eq!(fs::read(&theirs).unwrap(), b"alice's");
-}
-
-#[test]
-fn access_reports_what_the_server_would_allow() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let carol = h.mount_as("carol");
-    fs::write(alice.path.join("pub/f"), b"x").unwrap();
-    chmod(&alice.path.join("pub/f"), 0o640).unwrap();
-    chgrp(&alice.path.join("pub/f"), STAFF).unwrap();
-    let bob = h.mount_as("bob");
-
-    assert!(access(&alice.path.join("pub/f"), libc::R_OK | libc::W_OK).is_ok());
-    assert!(access(&bob.path.join("pub/f"), libc::R_OK).is_ok());
-    assert_errno(access(&bob.path.join("pub/f"), libc::W_OK), libc::EACCES);
-    assert_errno(access(&carol.path.join("pub/f"), libc::R_OK), libc::EACCES);
-    assert!(access(&carol.path.join("pub/f"), libc::F_OK).is_ok());
-}
-
-#[test]
-fn a_directory_without_search_permission_hides_its_contents() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::create_dir(alice.path.join("pub/private")).unwrap();
-    fs::write(alice.path.join("pub/private/f"), b"x").unwrap();
-    chmod(&alice.path.join("pub/private/f"), 0o666).unwrap();
-    chmod(&alice.path.join("pub/private"), 0o700).unwrap();
-
-    // Even a world-readable file is out of reach behind it.
-    assert_errno(fs::read(bob.path.join("pub/private/f")), libc::EACCES);
-    assert_errno(fs::read_dir(bob.path.join("pub/private")), libc::EACCES);
-    assert_eq!(fs::read(alice.path.join("pub/private/f")).unwrap(), b"x");
-}
-
-#[test]
-fn listing_a_directory_takes_read_permission() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::create_dir(alice.path.join("pub/dropbox")).unwrap();
-    fs::write(alice.path.join("pub/dropbox/known"), b"x").unwrap();
-    chmod(&alice.path.join("pub/dropbox/known"), 0o644).unwrap();
-    chmod(&alice.path.join("pub/dropbox"), 0o711).unwrap();
-
-    // Bob can't list it, but can reach a name he already knows.
-    assert_errno(fs::read_dir(bob.path.join("pub/dropbox")), libc::EACCES);
-    assert_eq!(fs::read(bob.path.join("pub/dropbox/known")).unwrap(), b"x");
-}
-
-#[test]
-fn creating_and_removing_take_write_permission_on_the_directory() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::create_dir(alice.path.join("pub/mine")).unwrap();
-    fs::write(alice.path.join("pub/mine/f"), b"x").unwrap();
-    fs::create_dir(alice.path.join("pub/mine/d")).unwrap();
-    chmod(&alice.path.join("pub/mine"), 0o755).unwrap();
-
-    let mine = bob.path.join("pub/mine");
-    assert_errno(fs::write(mine.join("new"), b"x"), libc::EACCES);
-    assert_errno(fs::create_dir(mine.join("newdir")), libc::EACCES);
-    assert_errno(fs::remove_file(mine.join("f")), libc::EACCES);
-    assert_errno(fs::remove_dir(mine.join("d")), libc::EACCES);
-    assert!(alice.path.join("pub/mine/f").exists());
-    assert!(alice.path.join("pub/mine/d").exists());
-    // And the root, which neither owns.
-    assert_errno(fs::write(alice.path.join("top"), b"x"), libc::EACCES);
-}
-
-#[test]
-fn the_sticky_bit_stops_users_removing_each_others_files() {
-    let h = support::setup();
-    add_people(&h);
-    let tmp = h.path().join("tmp");
-    fs::create_dir(&tmp).unwrap();
-    chmod(&tmp, 0o1777).unwrap();
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::write(alice.path.join("tmp/alices"), b"x").unwrap();
-    fs::write(bob.path.join("tmp/bobs"), b"x").unwrap();
-
-    assert_errno(fs::remove_file(bob.path.join("tmp/alices")), libc::EPERM);
-    fs::remove_file(bob.path.join("tmp/bobs")).unwrap();
-    // The directory's owner may still clean up.
-    fs::remove_file(tmp.join("alices")).unwrap();
-}
-
-#[test]
-fn only_the_owner_may_chmod_and_only_to_their_own_groups_chgrp() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    let f = alice.path.join("pub/f");
-    fs::write(&f, b"x").unwrap();
-    chmod(&f, 0o666).unwrap();
-
-    assert_errno(chmod(&bob.path.join("pub/f"), 0o777), libc::EPERM);
-    assert_errno(chgrp(&bob.path.join("pub/f"), STAFF), libc::EPERM);
-    chgrp(&f, STAFF).unwrap();
-    assert_errno(chgrp(&f, CAROL), libc::EPERM);
-    assert_errno(std::os::unix::fs::chown(&f, Some(BOB), None), libc::EPERM);
-    let meta = fs::metadata(&f).unwrap();
-    assert_eq!(
-        (meta.uid(), meta.gid(), meta.mode() & 0o7777),
-        (ALICE, STAFF, 0o666)
-    );
-}
-
-#[test]
-fn a_setgid_group_directory_is_shared_by_its_members() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    let carol = h.mount_as("carol");
-    let shared = alice.path.join("pub/shared");
-    fs::create_dir(&shared).unwrap();
-    chgrp(&shared, STAFF).unwrap();
-    chmod(&shared, 0o2770).unwrap();
-
-    fs::write(bob.path.join("pub/shared/bobs"), b"from bob").unwrap();
-    fs::create_dir(bob.path.join("pub/shared/sub")).unwrap();
-    let file = fs::metadata(alice.path.join("pub/shared/bobs")).unwrap();
-    assert_eq!((file.uid(), file.gid()), (BOB, STAFF));
-    let sub = fs::metadata(alice.path.join("pub/shared/sub")).unwrap();
-    assert_eq!(sub.gid(), STAFF);
-    assert_eq!(sub.mode() & 0o2000, 0o2000, "subdirectories inherit setgid");
-
-    assert_errno(fs::read_dir(carol.path.join("pub/shared")), libc::EACCES);
-    assert_errno(
-        fs::write(carol.path.join("pub/shared/x"), b"x"),
-        libc::EACCES,
-    );
-}
-
-#[test]
-fn joining_or_leaving_a_group_applies_without_mounting_again() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let alice = h.mount_as("alice");
-    let carol = h.mount_as("carol");
-    let report = alice.path.join("pub/report");
-    fs::write(&report, b"figures").unwrap();
-    chgrp(&report, STAFF).unwrap();
-    chmod(&report, 0o640).unwrap();
-    let carols_view = carol.path.join("pub/report");
-    assert_errno(fs::read(&carols_view), libc::EACCES);
-
-    let joined = h
-        .runtime
-        .block_on(users::modify(&h.client, "carol", &[STAFF], &[]))
-        .unwrap();
-    assert_eq!(joined.groups, [STAFF]);
-    assert_eq!(fs::read(&carols_view).unwrap(), b"figures");
-
-    h.runtime
-        .block_on(users::modify(&h.client, "carol", &[], &[STAFF]))
-        .unwrap();
-    assert_errno(fs::read(&carols_view), libc::EACCES);
-}
-
-#[test]
-fn a_removed_account_is_cut_off_without_waiting_for_its_session() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let bob = h.mount_as("bob");
-    fs::write(bob.path.join("pub/before"), b"x").unwrap();
-    assert!(h.runtime.block_on(users::remove(&h.client, "bob")).unwrap());
-    assert_errno(fs::write(bob.path.join("pub/after"), b"x"), libc::EACCES);
-}
-
-#[test]
-fn groups_are_named_and_given_free_gids() {
-    let h = support::setup();
-    add_people(&h);
-    let in_use: Vec<u32> = h
-        .runtime
-        .block_on(users::list(&h.client))
-        .unwrap()
-        .into_iter()
-        .flat_map(|(_, a)| std::iter::once(a.gid).chain(a.groups))
-        .collect();
-
-    let devs = h
-        .runtime
-        .block_on(groups::add(&h.client, "devs", None))
-        .unwrap();
-    assert!(devs >= groups::FIRST_ALLOCATED_GID && !in_use.contains(&devs));
-    let next = h
-        .runtime
-        .block_on(groups::add(&h.client, "ops", None))
-        .unwrap();
-    assert_ne!(next, devs);
-    assert_eq!(
-        h.runtime
-            .block_on(groups::add(&h.client, "devs", Some(60_000)))
-            .unwrap_err()
-            .errno,
-        libc::EEXIST
-    );
-    assert_eq!(
-        h.runtime
-            .block_on(groups::add(&h.client, "qa", Some(devs)))
-            .unwrap_err()
-            .errno,
-        libc::EEXIST
-    );
-    // A gid users already have can be named on purpose.
-    assert_eq!(
-        h.runtime
-            .block_on(groups::add(&h.client, "staff", Some(STAFF)))
-            .unwrap(),
-        STAFF
-    );
-
-    let resolve = |g: &str| h.runtime.block_on(groups::resolve(&h.client, g));
-    assert_eq!(resolve("devs").unwrap(), devs);
-    assert_eq!(resolve("123").unwrap(), 123);
-    assert_eq!(resolve("nobody").unwrap_err().errno, libc::ENOENT);
-    let names: Vec<String> = h
-        .runtime
-        .block_on(groups::list(&h.client))
-        .unwrap()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(names, ["devs", "ops", "staff"]);
-
-    // Removing a group leaves its gid on the users who have it.
-    assert_eq!(
-        h.runtime
-            .block_on(groups::remove(&h.client, "staff"))
-            .unwrap(),
-        Some(STAFF)
-    );
-    assert_eq!(
-        h.runtime
-            .block_on(groups::remove(&h.client, "staff"))
-            .unwrap(),
-        None
-    );
-    assert_eq!(resolve("staff").unwrap_err().errno, libc::ENOENT);
-    let alice = h
-        .runtime
-        .block_on(users::get(&h.client, "alice"))
-        .unwrap()
-        .unwrap();
-    assert_eq!(alice.groups, [STAFF]);
-
-    assert_eq!(
-        h.runtime
-            .block_on(users::modify(&h.client, "nobody", &[devs], &[]))
-            .unwrap_err()
-            .errno,
-        libc::ENOENT
-    );
 }
 
 // ------------------------------------------------------- identity, tokens
@@ -1576,24 +1227,10 @@ fn connect_as(h: &support::Harness, user: &str, password: &str) -> Result<(), St
 #[test]
 fn a_wrong_password_is_refused() {
     let h = support::setup();
-    add_people(&h);
+    h.add_user("alice");
     let refused = connect_as(&h, "alice", "alice").unwrap_err();
     assert!(refused.contains("login refused"), "{refused}");
     connect_as(&h, "alice", &support::password("alice")).unwrap();
-}
-
-#[test]
-fn a_store_account_without_a_filesystem_identity_is_refused() {
-    let h = support::setup();
-    h.runtime
-        .block_on(
-            h.cluster
-                .admin
-                .create_user("dave", &support::password("dave"), false),
-        )
-        .unwrap();
-    let refused = connect_as(&h, "dave", &support::password("dave")).unwrap_err();
-    assert!(refused.contains("no filesystem account"), "{refused}");
 }
 
 /// Users get at the filesystem only through the servers. The store talks
@@ -1601,7 +1238,7 @@ fn a_store_account_without_a_filesystem_identity_is_refused() {
 #[test]
 fn users_cannot_connect_to_the_store_at_all() {
     let h = support::setup();
-    add_people(&h);
+    h.add_user("alice");
     h.runtime.block_on(async {
         let alice = raft5_client::Client::with_tls(
             [&h.cluster.client_address],
@@ -1621,12 +1258,19 @@ fn users_cannot_connect_to_the_store_at_all() {
     });
 }
 
-/// ...and even holding one, a user's own store account can't read the
-/// filesystem's keys, let alone write them.
+/// ...and even holding one, and a store account of their own -- which
+/// filesystem users don't need -- they couldn't read the filesystem's
+/// keys, let alone write them.
 #[test]
 fn users_cannot_reach_the_filesystems_keys_directly() {
     let h = support::setup();
-    add_people(&h);
+    h.runtime
+        .block_on(
+            h.cluster
+                .admin
+                .create_user("alice", &support::password("alice"), false),
+        )
+        .unwrap();
     h.runtime.block_on(async {
         let alice =
             raft5_client::Client::with_tls([&h.cluster.client_address], support::store_tls())
@@ -1682,29 +1326,6 @@ fn an_open_file_survives_its_servers_restarting() {
     assert_eq!(got, "abc3456789");
 }
 
-/// Access is decided at open, as POSIX has it: taking permissions away
-/// afterwards doesn't break a descriptor already open.
-#[test]
-fn an_open_file_keeps_the_access_it_was_opened_with() {
-    let h = support::setup();
-    let path = h.path().join("f");
-    fs::write(&path, b"data").unwrap();
-    let mut f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    chmod(&path, 0o000).unwrap();
-
-    assert_errno(fs::read(&path), libc::EACCES);
-    f.write_all(b"more").unwrap();
-    f.sync_all().unwrap();
-    let mut got = String::new();
-    f.seek(SeekFrom::Start(0)).unwrap();
-    std::io::Read::read_to_string(&mut f, &mut got).unwrap();
-    assert_eq!(got, "more");
-}
-
 /// Creating a file read-only and filling it through the descriptor that
 /// created it is ordinary -- `cp` does it for every read-only file.
 #[test]
@@ -1723,7 +1344,9 @@ fn a_file_created_read_only_can_be_written_through_its_creating_descriptor() {
     drop(f);
 
     assert_eq!(fs::read(&path).unwrap(), b"cont");
-    assert_errno(fs::OpenOptions::new().write(true).open(&path), libc::EACCES);
+    // The mode is kept and shown, but grants decide: this one is writable.
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o444);
+    fs::OpenOptions::new().write(true).open(&path).unwrap();
 }
 
 // ----------------------------------------------------------------- rename
@@ -1877,48 +1500,6 @@ fn rename_noreplace_refuses_an_existing_name_and_exchange_is_unsupported() {
     assert_errno(renameat2(&b, &c, libc::RENAME_EXCHANGE), libc::EINVAL);
 }
 
-#[test]
-fn renaming_takes_write_permission_on_both_directories_and_respects_sticky() {
-    let h = support::setup();
-    open_dir(&h, "pub");
-    let tmp = h.path().join("tmp");
-    fs::create_dir(&tmp).unwrap();
-    chmod(&tmp, 0o1777).unwrap();
-    let alice = h.mount_as("alice");
-    let bob = h.mount_as("bob");
-    fs::create_dir(alice.path.join("pub/mine")).unwrap();
-    chmod(&alice.path.join("pub/mine"), 0o755).unwrap();
-    fs::write(alice.path.join("pub/mine/f"), b"x").unwrap();
-    fs::write(alice.path.join("tmp/alices"), b"x").unwrap();
-    fs::create_dir(bob.path.join("pub/bobs")).unwrap();
-
-    // Out of a directory bob can't write, and into one.
-    assert_errno(
-        fs::rename(bob.path.join("pub/mine/f"), bob.path.join("pub/bobs/f")),
-        libc::EACCES,
-    );
-    fs::write(bob.path.join("pub/bobs/g"), b"x").unwrap();
-    assert_errno(
-        fs::rename(bob.path.join("pub/bobs/g"), bob.path.join("pub/mine/g")),
-        libc::EACCES,
-    );
-    // Someone else's file in a sticky directory.
-    assert_errno(
-        fs::rename(bob.path.join("tmp/alices"), bob.path.join("tmp/bobs-now")),
-        libc::EPERM,
-    );
-    assert!(alice.path.join("pub/mine/f").exists());
-    assert!(alice.path.join("tmp/alices").exists());
-}
-
-/// rmdir's emptiness check and a create in the same directory can't both
-/// win: either the directory goes and nothing was created in it, or the
-/// create lands and the directory stays. A create that slipped in after
-/// the check would leave an entry nothing can reach.
-///
-/// A smoke test, not proof: the window it probes is a single round trip
-/// wide, too narrow to hit reliably. What closes it is the locking
-/// argument on `is_empty_dir`.
 #[test]
 fn rmdir_and_a_concurrent_create_cannot_both_succeed() {
     let h = support::setup();

@@ -48,8 +48,9 @@ pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
         Kind::File => 0,
     });
     buf.extend_from_slice(&a.perm.to_be_bytes());
-    buf.extend_from_slice(&a.uid.to_be_bytes());
-    buf.extend_from_slice(&a.gid.to_be_bytes());
+    // Where a uid and gid once went: kept, as zeros, so the record's
+    // layout -- and every field after them -- stays where it was.
+    buf.extend_from_slice(&[0; 8]);
     buf.extend_from_slice(&a.size.to_be_bytes());
     buf.extend_from_slice(&a.nlink.to_be_bytes());
     push_time(&mut buf, a.atime);
@@ -67,8 +68,7 @@ pub(crate) fn decode_entry(ino: u64, bytes: &[u8]) -> Entry {
         Kind::File
     };
     let (perm, rest) = rest.split_at(2);
-    let (uid, rest) = rest.split_at(4);
-    let (gid, rest) = rest.split_at(4);
+    let (_owners, rest) = rest.split_at(8);
     let (size, rest) = rest.split_at(8);
     let (nlink, rest) = rest.split_at(4);
     let (atime, rest) = take_time(rest);
@@ -82,8 +82,6 @@ pub(crate) fn decode_entry(ino: u64, bytes: &[u8]) -> Entry {
         size: u64::from_be_bytes(size.try_into().unwrap()),
         perm: u16::from_be_bytes(perm.try_into().unwrap()),
         nlink: u32::from_be_bytes(nlink.try_into().unwrap()),
-        uid: u32::from_be_bytes(uid.try_into().unwrap()),
-        gid: u32::from_be_bytes(gid.try_into().unwrap()),
         atime,
         mtime,
         ctime,
@@ -105,8 +103,6 @@ mod tests {
                 size: 9000,
                 perm: 0o755,
                 nlink: 2,
-                uid: 1001,
-                gid: 100,
                 atime: t,
                 mtime: t + Duration::from_secs(1),
                 ctime: t + Duration::from_secs(2),

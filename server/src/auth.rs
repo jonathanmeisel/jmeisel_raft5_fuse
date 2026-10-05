@@ -1,43 +1,34 @@
-//! Sessions and handles: what lets a stateless server know who a request
-//! is from and what an open allowed, without remembering either.
+//! Sessions: what lets a stateless server know who a request is from
+//! without remembering it.
 //!
-//! Both are tokens signed with a key every server instance shares, so any
-//! instance can check what any other issued, and a server restart loses
-//! nothing. That is the whole of the servers' shared state.
-//!
-//! - A **session** says which account a client logged in as, and
-//!   expires. Every request but Hello and Login carries one. It doesn't
-//!   say what the account acts as: the server looks that up in the user
-//!   table (through a short-lived cache), so a changed group list or a
-//!   removed account applies to a mounted user within seconds, without
-//!   their logging in again.
-//! - A **handle** says that one inode was opened for reading and/or
-//!   writing, and by which uid. It doesn't expire by itself -- it is only
-//!   honoured alongside a live session of the same uid -- so an open file
-//!   keeps working across session renewals, as POSIX says it should even
-//!   if its mode changes after the open.
+//! A session is a token signed with a key every server instance shares, so
+//! any instance can check what any other issued, and a server restart
+//! loses nothing. It says which account a client logged in as, and
+//! expires. Every request but the login ones carries one. What the account
+//! may do isn't in it: grants decide that, on every request, and whether
+//! the account still exists is looked up too (through a short-lived
+//! cache), so removing it cuts a mounted user off within seconds.
 
 use std::time::Duration;
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use raft5fs_core::{Caller, FsError};
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 const ALGORITHM: Algorithm = Algorithm::HS256;
 
 /// How long a session lasts unless the server is told otherwise: how
-/// often a client proves again that it knows the password. Changes to the
-/// user table don't wait for it (see the server's identity cache).
+/// often a client proves again that it knows the password. Removing an
+/// account doesn't wait for it (see the server's account cache).
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Tells the two kinds of token apart, since one key signs both: a handle
-/// must never pass as a session, or the reverse.
+/// What a token is. There is only the one kind now, but the claim stays:
+/// the file handles older servers signed with the same key must never
+/// pass as sessions.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Kind {
     Session,
-    Handle,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,23 +37,6 @@ struct SessionClaims {
     /// The account name.
     sub: String,
     exp: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HandleClaims {
-    kind: Kind,
-    ino: u64,
-    read: bool,
-    write: bool,
-    uid: u32,
-}
-
-/// What a verified handle allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Handle {
-    pub ino: u64,
-    pub read: bool,
-    pub write: bool,
 }
 
 pub struct Signer {
@@ -110,10 +84,6 @@ impl Signer {
     /// The account a session token is for. Anything wrong with it --
     /// forged, expired, not a session at all -- is `UNAUTHENTICATED`, which
     /// tells the client to log in again.
-    ///
-    /// A token from before sessions stopped carrying the identity still
-    /// verifies (its extra claims are ignored), but the reverse doesn't:
-    /// an older server can't read these, so upgrade every server at once.
     pub fn verify_session(&self, token: &str) -> Result<String, Status> {
         let refused = |why: String| Status::unauthenticated(format!("session refused: {why}"));
         // `Validation::new` pins the algorithm and requires `exp`.
@@ -125,41 +95,6 @@ impl Signer {
         }
         Ok(claims.sub)
     }
-
-    /// A handle recording that `caller` opened `ino` as `read`/`write`.
-    pub fn handle(&self, caller: &Caller, ino: u64, read: bool, write: bool) -> String {
-        self.sign(&HandleClaims {
-            kind: Kind::Handle,
-            ino,
-            read,
-            write,
-            uid: caller.uid,
-        })
-    }
-
-    /// What `token` allows `caller`. A handle that is forged, or that
-    /// another uid opened, is `EBADF`: to the application it is simply
-    /// not a valid descriptor, and it isn't the session's fault.
-    pub fn verify_handle(&self, caller: &Caller, token: &str) -> Result<Handle, FsError> {
-        let mut validation = Validation::new(ALGORITHM);
-        validation.required_spec_claims.clear();
-        validation.validate_exp = false;
-        let bad = |why: &str| FsError::new(libc::EBADF, format!("handle refused: {why}"));
-        let claims = decode::<HandleClaims>(token, &self.decoding, &validation)
-            .map_err(|e| bad(&e.to_string()))?
-            .claims;
-        if claims.kind != Kind::Handle {
-            return Err(bad("not a handle"));
-        }
-        if claims.uid != caller.uid {
-            return Err(bad("opened by someone else"));
-        }
-        Ok(Handle {
-            ino: claims.ino,
-            read: claims.read,
-            write: claims.write,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -168,10 +103,6 @@ mod tests {
 
     fn signer() -> Signer {
         Signer::new(b"test key", DEFAULT_SESSION_TTL)
-    }
-
-    fn alice() -> Caller {
-        Caller::new(1000, 100, vec![4, 27])
     }
 
     #[test]
@@ -210,56 +141,19 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_still_carries_an_identity_verifies() {
+    fn an_old_file_handle_is_not_a_session() {
         #[derive(Serialize)]
-        struct Old {
-            kind: Kind,
+        struct Handle {
+            kind: &'static str,
             sub: String,
-            uid: u32,
-            gid: u32,
-            groups: Vec<u32>,
             exp: u64,
         }
         let s = signer();
-        let token = s.sign(&Old {
-            kind: Kind::Session,
+        let token = s.sign(&Handle {
+            kind: "handle",
             sub: "alice".into(),
-            uid: 1000,
-            gid: 100,
-            groups: vec![4],
             exp: jsonwebtoken::get_current_timestamp() + 60,
         });
-        assert_eq!(s.verify_session(&token).unwrap(), "alice");
-    }
-
-    #[test]
-    fn a_handle_is_not_a_session_and_a_session_is_not_a_handle() {
-        let s = signer();
-        let handle = s.handle(&alice(), 7, true, false);
-        assert!(s.verify_session(&handle).is_err());
-        let (session, _) = s.session("alice");
-        assert_eq!(
-            s.verify_handle(&alice(), &session).unwrap_err().errno,
-            libc::EBADF
-        );
-    }
-
-    #[test]
-    fn a_handle_carries_its_access_and_only_works_for_its_opener() {
-        let s = signer();
-        let handle = s.handle(&alice(), 7, true, false);
-        assert_eq!(
-            s.verify_handle(&alice(), &handle).unwrap(),
-            Handle {
-                ino: 7,
-                read: true,
-                write: false
-            }
-        );
-        let bob = Caller::new(1001, 100, vec![]);
-        assert_eq!(
-            s.verify_handle(&bob, &handle).unwrap_err().errno,
-            libc::EBADF
-        );
+        assert!(s.verify_session(&token).is_err());
     }
 }

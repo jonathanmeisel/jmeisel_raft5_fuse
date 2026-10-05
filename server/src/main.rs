@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::env;
 use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
-use raft5fs_core::users::{self, Account};
-use raft5fs_core::{DEFAULT_CHUNK_SIZE, DEFAULT_READ_CACHE_BYTES, FsCore, validate_chunk_size};
-use raft5fs_core::{accounts, groups, stored_encryption};
+use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, validate_chunk_size};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use tokio::net::TcpListener;
@@ -18,70 +15,41 @@ const USAGE: &str = "\
 usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       [--tls-cert <PEM> --tls-key <PEM>] [options]
                       <store options> <kv-seed-address>...
-       raft5fs-server user add <NAME> --uid <UID> --gid <GROUP>
-                      [--groups <GROUP>,...] [--enrol] <store options> <kv-seed-address>...
-       raft5fs-server user enrol <NAME> <store options> <kv-seed-address>...
-       raft5fs-server user mod <NAME> [--add-groups <GROUP>,...]
-                      [--remove-groups <GROUP>,...] <store options> <kv-seed-address>...
+       raft5fs-server user add <NAME> <store options> <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
-       raft5fs-server group add <NAME> [--gid <GID>] <store options> <kv-seed-address>...
-       raft5fs-server group del <NAME> <store options> <kv-seed-address>...
-       raft5fs-server group list <store options> <kv-seed-address>...
 
 Serving:
   --listen <ADDR>      address to serve clients on, e.g. 0.0.0.0:7700.
   --token-key-file <PATH>
-                       the key sessions and file handles are signed with.
-                       Every server of one filesystem needs the same key,
-                       and anyone holding it can act as any user, so keep
-                       it as secret as the store's credentials.
+                       the key sessions are signed with. Every server of
+                       one filesystem needs the same key, and anyone
+                       holding it can act as any user -- though, with
+                       everything encrypted, still not read what they
+                       couldn't before -- so keep it secret.
   --tls-cert <PEM>, --tls-key <PEM>
                        serve over TLS with this certificate and key.
-                       Without them clients connect in plaintext, and
-                       passwords and file data cross the network in the
-                       clear.
-  --session-ttl <SECS> how long a login lasts before the client must give
-                       the password again (default 86400).
+                       Without them clients connect in plaintext: what
+                       they store stays encrypted, but sessions cross the
+                       network in the clear, for anyone watching to reuse.
+  --session-ttl <SECS> how long a login lasts before the client must log
+                       in again (default 86400).
   --identity-ttl <SECS>
-                       how long a user table entry is trusted before it is
-                       read again (default 5): how long a changed group
-                       list or a removed account takes to reach a user who
-                       is already mounted.
+                       how long an account is trusted to still exist
+                       before looking again (default 5): how long removing
+                       one takes to reach a user who is already mounted.
   --chunk-size <SIZE>  size of each stored file chunk, as a byte count or
                        with a K/M suffix (default 1M). Only applies when
                        creating a new filesystem: an existing one keeps
                        the size it was created with, since chunk
                        boundaries are baked into its keys.
-  --read-cache-size <SIZE>
-                       memory for caching recently read chunks, same size
-                       syntax (default 64M, 0 disables).
-  --root-owner <UID>:<GID>
-                       owner of the root directory (default 0:0). Like
-                       --chunk-size, only applies to a new filesystem.
-  --encrypted          create the filesystem encrypted: clients encrypt
-                       every name and every byte before it leaves them,
-                       and log in without their password ever reaching a
-                       server. Only applies to a new filesystem; an
-                       existing one stays as it was created, and asking
-                       to encrypt an unencrypted one is an error.
 
-Users: which uid, gid and supplementary groups a store account acts as in
-the filesystem. A store account with no entry can't log in to the
-filesystem. Changes reach mounted users within --identity-ttl; nobody
-needs to mount again. `user add` replaces the whole entry; `user mod`
-changes only the groups it names.
-
-On an encrypted filesystem a user also needs keys, which only their own
-client can make. `user enrol` (or `user add --enrol`) prints a one-time
-code; the user runs `raft5fs-share enrol` with it to choose a password.
-A new code lets someone who forgot their password enrol again, losing
-access to whatever was shared with them until it is shared again.
-
-Groups: names for gids. A <GROUP> is a gid number, which needn't have a
-name, or the name of a group from `group add`. `group add` without --gid
-picks the lowest gid from 1000 up that no group or user uses. Removing a
-group removes only its name: entries listing its gid keep it.
+Users: `user add` prints a one-time code the user enrols with
+(`raft5fs-share enrol`), choosing their password; only their own machine
+ever has it, or their keys. A new code for an existing user lets them
+enrol again after forgetting it -- losing access to whatever was shared
+with them until it is shared again. `user del` removes a user and every
+grant made to them, cutting them off within --identity-ttl.
 
 Store options:
   --store-user <NAME>  the store account to work as; it needs write access
@@ -121,11 +89,6 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size too large: {s}"))
 }
 
-fn parse_owner(s: &str) -> Option<(u32, u32)> {
-    let (uid, gid) = s.split_once(':')?;
-    Some((uid.parse().ok()?, gid.parse().ok()?))
-}
-
 fn parse_number(flag: &str, s: &str) -> u32 {
     s.parse()
         .unwrap_or_else(|_| usage(&format!("{flag} takes a number, not {s:?}")))
@@ -140,8 +103,6 @@ struct Args {
     token_key_file: Option<String>,
     session_ttl: Option<Duration>,
     chunk_size: Option<u64>,
-    read_cache_bytes: Option<usize>,
-    root_owner: Option<(u32, u32)>,
     store_user: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
@@ -150,21 +111,6 @@ struct Args {
     store_key: Option<String>,
     store_server_name: Option<String>,
     identity_ttl: Option<Duration>,
-    encrypted: bool,
-    enrol: bool,
-    uid: Option<u32>,
-    gid: Option<String>,
-    groups: Vec<String>,
-    add_groups: Vec<String>,
-    remove_groups: Vec<String>,
-}
-
-/// The comma-separated items of a list flag, unresolved.
-fn split_list(s: &str) -> Vec<String> {
-    s.split(',')
-        .filter(|g| !g.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 fn parse_args() -> Args {
@@ -186,20 +132,6 @@ fn parse_args() -> Args {
                 a.chunk_size =
                     Some(parse_size(&value("--chunk-size")).unwrap_or_else(|why| usage(&why)));
             }
-            "--read-cache-size" => {
-                a.read_cache_bytes = Some(
-                    parse_size(&value("--read-cache-size"))
-                        .unwrap_or_else(|why| usage(&why))
-                        .try_into()
-                        .unwrap_or_else(|_| usage("--read-cache-size is too large")),
-                );
-            }
-            "--root-owner" => {
-                a.root_owner = Some(
-                    parse_owner(&value("--root-owner"))
-                        .unwrap_or_else(|| usage("--root-owner takes <UID>:<GID>")),
-                );
-            }
             "--store-user" => a.store_user = Some(value("--store-user")),
             "--tls-cert" => a.tls_cert = Some(value("--tls-cert")),
             "--tls-key" => a.tls_key = Some(value("--tls-key")),
@@ -207,17 +139,10 @@ fn parse_args() -> Args {
             "--store-cert" => a.store_cert = Some(value("--store-cert")),
             "--store-key" => a.store_key = Some(value("--store-key")),
             "--store-server-name" => a.store_server_name = Some(value("--store-server-name")),
-            "--encrypted" => a.encrypted = true,
-            "--enrol" => a.enrol = true,
             "--identity-ttl" => {
                 let secs = parse_number("--identity-ttl", &value("--identity-ttl"));
                 a.identity_ttl = Some(Duration::from_secs(secs.into()));
             }
-            "--uid" => a.uid = Some(parse_number("--uid", &value("--uid"))),
-            "--gid" => a.gid = Some(value("--gid")),
-            "--groups" => a.groups = split_list(&value("--groups")),
-            "--add-groups" => a.add_groups = split_list(&value("--add-groups")),
-            "--remove-groups" => a.remove_groups = split_list(&value("--remove-groups")),
             flag if flag.starts_with("--") => usage(&format!("unknown option {flag}")),
             _ => a.positional.push(arg),
         }
@@ -257,8 +182,8 @@ fn store_tls(a: &Args) -> Option<ClientTls> {
     Some(tls)
 }
 
-/// A client logged in as the store account, and how it was reached.
-async fn store_client(a: &Args, seeds: Vec<String>) -> (Client, Store) {
+/// A client logged in as the store account.
+async fn store_client(a: &Args, seeds: Vec<String>) -> Client {
     if seeds.is_empty() {
         usage("at least one seed address is required");
     }
@@ -279,143 +204,10 @@ async fn store_client(a: &Args, seeds: Vec<String>) -> (Client, Store) {
         .login(user, &password)
         .await
         .unwrap_or_else(|e| fail(format!("cannot log in to the store as {user}: {e}")));
-    (client, store)
-}
-
-/// The gids `items` name, each a number or a group name; an unknown name
-/// ends the command.
-async fn resolve_groups(client: &Client, items: &[String]) -> Vec<u32> {
-    let mut gids = Vec::new();
-    for item in items {
-        gids.push(
-            groups::resolve(client, item)
-                .await
-                .unwrap_or_else(|e| fail(e)),
-        );
-    }
-    gids
-}
-
-/// `gid`, and its name in brackets if it has one: `3000(devs)`.
-fn show_gid(names: &HashMap<u32, String>, gid: u32) -> String {
-    match names.get(&gid) {
-        Some(name) => format!("{gid}({name})"),
-        None => gid.to_string(),
-    }
-}
-
-/// Every group's name, by gid.
-async fn group_names(client: &Client) -> HashMap<u32, String> {
-    groups::list(client)
-        .await
-        .unwrap_or_else(|e| fail(e))
-        .into_iter()
-        .map(|(name, gid)| (gid, name))
-        .collect()
-}
-
-fn show_account(names: &HashMap<u32, String>, name: &str, a: &Account) -> String {
-    let groups: Vec<String> = a.groups.iter().map(|&g| show_gid(names, g)).collect();
-    format!(
-        "{name}\tuid={} gid={} groups={}",
-        a.uid,
-        show_gid(names, a.gid),
-        groups.join(",")
-    )
+    client
 }
 
 async fn user_command(a: Args) {
-    let mut positional = a.positional.iter().skip(1);
-    let command = positional.next().map(String::as_str);
-    let name = match command {
-        Some("add" | "del" | "mod" | "enrol") => Some(
-            positional
-                .next()
-                .cloned()
-                .unwrap_or_else(|| usage("which user?")),
-        ),
-        Some("list") => None,
-        _ => usage("user takes add, mod, enrol, del or list"),
-    };
-    if command == Some("mod") && a.add_groups.is_empty() && a.remove_groups.is_empty() {
-        usage("user mod needs --add-groups or --remove-groups");
-    }
-    let seeds = positional.cloned().collect();
-    let (client, _) = store_client(&a, seeds).await;
-    let result = match (command, name) {
-        (Some("add"), Some(name)) => {
-            let gid = a
-                .gid
-                .as_deref()
-                .unwrap_or_else(|| usage("--gid is required"));
-            let account = Account {
-                uid: a.uid.unwrap_or_else(|| usage("--uid is required")),
-                gid: resolve_groups(&client, &[gid.to_string()]).await[0],
-                groups: resolve_groups(&client, &a.groups).await,
-            };
-            match users::set(&client, &name, &account).await {
-                Ok(()) if a.enrol => issue_enrolment_code(&client, &name).await,
-                other => other,
-            }
-        }
-        (Some("enrol"), Some(name)) => match users::get(&client, &name).await {
-            Ok(Some(_)) => issue_enrolment_code(&client, &name).await,
-            Ok(None) => Err(raft5fs_core::FsError::new(
-                libc::ENOENT,
-                format!("{name} has no entry; add them first"),
-            )),
-            Err(e) => Err(e),
-        },
-        (Some("mod"), Some(name)) => {
-            let add = resolve_groups(&client, &a.add_groups).await;
-            let remove = resolve_groups(&client, &a.remove_groups).await;
-            match users::modify(&client, &name, &add, &remove).await {
-                Ok(account) => {
-                    let names = group_names(&client).await;
-                    println!("{}", show_account(&names, &name, &account));
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        }
-        (Some("del"), Some(name)) => users::remove(&client, &name).await.map(|existed| {
-            if !existed {
-                eprintln!("{name} had no entry");
-            }
-        }),
-        _ => match users::list(&client).await {
-            Ok(rows) => {
-                let names = group_names(&client).await;
-                for (name, a) in rows {
-                    println!("{}", show_account(&names, &name, &a));
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        },
-    };
-    result.unwrap_or_else(|e| fail(e));
-}
-
-/// Prints a fresh enrolment code for `name`, if the filesystem is
-/// encrypted.
-async fn issue_enrolment_code(client: &Client, name: &str) -> Result<(), raft5fs_core::FsError> {
-    match stored_encryption(client).await? {
-        Some(true) => {}
-        Some(false) => {
-            fail("this filesystem isn't encrypted; its users log in with store passwords")
-        }
-        None => fail(
-            "no filesystem server has created this filesystem yet; start one with --encrypted first",
-        ),
-    }
-    let code = accounts::issue_code(client, name).await?;
-    println!("enrolment code for {name}: {code}");
-    println!("(they run `raft5fs-share --user {name} enrol {code} <server-address>...`)");
-    Ok(())
-}
-
-async fn group_command(a: Args) {
     let mut positional = a.positional.iter().skip(1);
     let command = positional.next().map(String::as_str);
     let name = match command {
@@ -423,42 +215,27 @@ async fn group_command(a: Args) {
             positional
                 .next()
                 .cloned()
-                .unwrap_or_else(|| usage("which group?")),
+                .unwrap_or_else(|| usage("which user?")),
         ),
         Some("list") => None,
-        _ => usage("group takes add, del or list"),
+        _ => usage("user takes add, del or list"),
     };
-    let gid = a.gid.as_deref().map(|g| parse_number("--gid", g));
     let seeds = positional.cloned().collect();
-    let (client, _) = store_client(&a, seeds).await;
+    let client = store_client(&a, seeds).await;
     let result = match (command, name) {
-        (Some("add"), Some(name)) => groups::add(&client, &name, gid)
-            .await
-            .map(|gid| println!("{name}\tgid={gid}")),
-        (Some("del"), Some(name)) => match groups::remove(&client, &name).await {
-            Ok(None) => {
-                eprintln!("there was no group {name}");
-                Ok(())
+        (Some("add"), Some(name)) => accounts::issue_code(&client, &name).await.map(|code| {
+            println!("enrolment code for {name}: {code}");
+            println!("(they run `raft5fs-share --user {name} enrol {code} <server-address>...`)");
+        }),
+        (Some("del"), Some(name)) => accounts::remove(&client, &name).await.map(|existed| {
+            if !existed {
+                eprintln!("there was no user {name}");
             }
-            Ok(Some(gid)) => users::list(&client).await.map(|rows| {
-                let members: Vec<String> = rows
-                    .into_iter()
-                    .filter(|(_, a)| a.gid == gid || a.groups.contains(&gid))
-                    .map(|(user, _)| user)
-                    .collect();
-                if !members.is_empty() {
-                    eprintln!(
-                        "note: gid {gid} is still in the entries of {}; \
-                         it is now just unnamed",
-                        members.join(", ")
-                    );
-                }
-            }),
-            Err(e) => Err(e),
-        },
-        _ => groups::list(&client).await.map(|rows| {
-            for (name, gid) in rows {
-                println!("{name}\tgid={gid}");
+        }),
+        _ => accounts::list(&client).await.map(|rows| {
+            for (name, enrolled) in rows {
+                let state = if enrolled { "enrolled" } else { "code issued" };
+                println!("{name}\t{state}");
             }
         }),
     };
@@ -487,19 +264,10 @@ async fn serve_command(a: Args) {
         usage(&why);
     }
 
-    let (client, store) = store_client(&a, a.positional.clone()).await;
-    let core = FsCore::connect(
-        client,
-        chunk_size,
-        a.read_cache_bytes.unwrap_or(DEFAULT_READ_CACHE_BYTES),
-        a.root_owner.unwrap_or((0, 0)),
-        a.encrypted,
-    )
-    .await
-    .unwrap_or_else(|why| fail(format!("cannot open the filesystem: {why}")));
-    if core.encrypted() && !a.encrypted {
-        eprintln!("note: this filesystem is encrypted");
-    }
+    let client = store_client(&a, a.positional.clone()).await;
+    let core = FsCore::connect(client, chunk_size)
+        .await
+        .unwrap_or_else(|why| fail(format!("cannot open the filesystem: {why}")));
     if core.chunk_size() != chunk_size {
         eprintln!(
             "note: this filesystem was created with a {}-byte chunk size; \
@@ -510,7 +278,7 @@ async fn serve_command(a: Args) {
     let tls = identity(&a.tls_cert, &a.tls_key, "--tls-cert/--tls-key")
         .map(|identity| ServerTlsConfig::new().identity(identity));
     if tls.is_none() {
-        eprintln!("warning: serving without TLS; passwords will cross the network in the clear");
+        eprintln!("warning: serving without TLS; sessions will cross the network in the clear");
     }
     let signer = Signer::new(&key, a.session_ttl.unwrap_or(DEFAULT_SESSION_TTL));
     let listener = TcpListener::bind(&listen)
@@ -520,7 +288,6 @@ async fn serve_command(a: Args) {
     let fs = FsService::new(
         Arc::new(core),
         signer,
-        store,
         a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL),
     );
     if let Err(e) = raft5fs_server::serve(fs, listener, tls, pending()).await {
@@ -533,7 +300,6 @@ fn main() {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     match args.positional.first().map(String::as_str) {
         Some("user") => runtime.block_on(user_command(args)),
-        Some("group") => runtime.block_on(group_command(args)),
         _ => runtime.block_on(serve_command(args)),
     }
 }

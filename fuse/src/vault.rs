@@ -1,4 +1,4 @@
-//! The client's side of an encrypted filesystem: inode keys, and the root
+//! The client's side of the filesystem's encryption: inode keys, and the root
 //! a user sees.
 //!
 //! **Keys.** Every inode has a key, wrapped under its parent's (see
@@ -11,7 +11,7 @@
 //!
 //! **Data.** Nor any file's contents: each chunk is sealed under the
 //! file's key here (raft5fs-crypto's `data`), so the server can't patch a
-//! byte range the way it does for an unencrypted filesystem. A write that
+//! byte range. A write that
 //! covers a chunk whole just seals it; one that covers part of a chunk
 //! reads the chunk, opens it, changes it and seals it again -- stored only
 //! if no one changed the chunk in between (the store's sequence number
@@ -55,6 +55,7 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use raft5fs_crypto::Key;
 use raft5fs_crypto::data::{
@@ -64,13 +65,15 @@ use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, fingerprint, seal_grant
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
     Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode, Rotation,
-    SealedChunk, SealedMove, WriteError,
+    SealedChunk, SealedMove, SetAttr, WriteError,
 };
+
+use crate::chunk_cache::{ChunkCache, Lookup};
 
 use crate::remote::Remote;
 
-/// The inode the kernel knows a mount's root by. On an encrypted
-/// filesystem it is the virtual root, never the server's real one.
+/// The inode the kernel knows a mount's root by: the virtual root, never
+/// the server's real one.
 pub const VIRTUAL_ROOT: u64 = 1;
 
 /// An inode's key record, its current key, and (for a directory) the key
@@ -285,22 +288,41 @@ pub struct Vault {
     known: KnownKeys,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
     roots: Mutex<Roots>,
+    /// Decrypted chunks, each with the seq it was read or written at.
+    cache: Mutex<ChunkCache>,
 }
 
+/// How much decrypted file data a vault caches unless told otherwise.
+pub const DEFAULT_CACHE_BYTES: usize = 64 << 20;
+
+/// How long a cached chunk may go unconfirmed before it is dropped rather
+/// than revalidated. Not a staleness bound: every hit is confirmed with
+/// the server first (see `ChunkCache`), so what this buys is only that a
+/// chunk nothing has read for this long stops holding its share of the
+/// budget. Generous on purpose -- dropping an entry costs a whole chunk
+/// fetched and decrypted, where confirming one costs eight bytes.
+const CACHE_TTL: Duration = Duration::from_secs(60);
+
 impl Vault {
-    /// The vault of `remote`'s account, which must have logged in to an
-    /// encrypted filesystem.
+    /// The vault of `remote`'s account, which must have logged in.
     pub fn new(remote: Arc<Remote>) -> Result<Self, FsError> {
         let identity = remote
             .identity()
-            .ok_or_else(|| FsError::new(libc::EOPNOTSUPP, "not an encrypted filesystem's login"))?;
+            .ok_or_else(|| FsError::new(libc::EACCES, "not logged in"))?;
         Ok(Self {
             remote,
             identity,
             known: KnownKeys::in_memory(),
             nodes: Mutex::new(HashMap::new()),
             roots: Mutex::new(Roots::default()),
+            cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL)),
         })
+    }
+
+    /// Caches up to `bytes` of decrypted file data (0 caches none).
+    pub fn with_cache_size(mut self, bytes: usize) -> Self {
+        self.cache = Mutex::new(ChunkCache::new(bytes, CACHE_TTL));
+        self
     }
 
     /// Pins public keys in `known` rather than in memory only.
@@ -634,11 +656,17 @@ impl Vault {
         self.remote.lookup(parent, &tag).await
     }
 
+    /// Drops what is held for an inode that is gone.
+    fn forget_inode(&self, ino: u64) {
+        self.nodes.lock().unwrap().remove(&ino);
+        self.cache.lock().unwrap().invalidate_ino(ino);
+    }
+
     /// Removes a file, as `Remote::unlink`.
     pub async fn unlink(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let tag = self.tag(parent, name).await?;
         let ino = self.remote.unlink(parent, &tag).await?;
-        self.nodes.lock().unwrap().remove(&ino);
+        self.forget_inode(ino);
         Ok(ino)
     }
 
@@ -646,7 +674,7 @@ impl Vault {
     pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let tag = self.tag(parent, name).await?;
         let ino = self.remote.rmdir(parent, &tag).await?;
-        self.nodes.lock().unwrap().remove(&ino);
+        self.forget_inode(ino);
         Ok(ino)
     }
 
@@ -714,18 +742,13 @@ impl Vault {
 
     async fn mkdir_once(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         let (new, node, tag) = self.new_child(parent, name).await?;
-        let attr = self.remote.mkdir(parent, &tag, perm, Some(&new)).await?;
+        let attr = self.remote.mkdir(parent, &tag, perm, &new).await?;
         self.keep(attr.ino, node);
         Ok(attr)
     }
 
-    /// Creates and opens a file, as `Remote::create`.
-    pub async fn create(
-        &self,
-        parent: u64,
-        name: &OsStr,
-        perm: u16,
-    ) -> Result<(Attr, String), FsError> {
+    /// Creates a file, as `Remote::create`.
+    pub async fn create(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         match self.create_once(parent, name, perm).await {
             Err(e) if expired(&e) => {
                 self.freshen(parent).await?;
@@ -735,16 +758,11 @@ impl Vault {
         }
     }
 
-    async fn create_once(
-        &self,
-        parent: u64,
-        name: &OsStr,
-        perm: u16,
-    ) -> Result<(Attr, String), FsError> {
+    async fn create_once(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         let (new, node, tag) = self.new_child(parent, name).await?;
-        let created = self.remote.create(parent, &tag, perm, Some(&new)).await?;
-        self.keep(created.0.ino, node);
-        Ok(created)
+        let attr = self.remote.create(parent, &tag, perm, &new).await?;
+        self.keep(attr.ino, node);
+        Ok(attr)
     }
 
     /// Moves a name, as `Remote::rename`: the new name sealed under the
@@ -807,13 +825,13 @@ impl Vault {
         }
         let replaced = self
             .remote
-            .rename(parent, &tag, new_parent, &new_tag, noreplace, Some(&sealed))
+            .rename(parent, &tag, new_parent, &new_tag, noreplace, &sealed)
             .await?;
         if let Some(node) = rewrapped {
             self.keep(ino, node);
         }
         if let Some(victim) = replaced {
-            self.nodes.lock().unwrap().remove(&victim);
+            self.forget_inode(victim);
         }
         Ok(replaced)
     }
@@ -849,7 +867,7 @@ impl Vault {
     pub async fn delete_volume(&self, label: &OsStr) -> Result<(), FsError> {
         let ino = self.root_lookup(label).await?;
         self.remote.delete_volume(ino).await?;
-        self.nodes.lock().unwrap().remove(&ino);
+        self.forget_inode(ino);
         let mut roots = self.roots.lock().unwrap();
         roots.by_name.remove(label);
         roots.inos.remove(&ino);
@@ -902,7 +920,8 @@ impl Vault {
     }
 
     /// File `ino`'s bytes `[offset, offset + len)`, as far as its size,
-    /// with holes reading as zeros.
+    /// with holes reading as zeros. Chunks cached here are served from the
+    /// cache once the server confirms they haven't changed.
     pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         if len == 0 {
             return Ok(Vec::new());
@@ -910,27 +929,28 @@ impl Vault {
         let chunk_size = self.remote.chunk_size();
         let first = offset / chunk_size;
         let last = (offset + len as u64 - 1) / chunk_size;
-        let (size, chunks) = self.fetch(ino, first, last).await?;
+        let lookups: Vec<Lookup> = {
+            let mut cache = self.cache.lock().unwrap();
+            (first..=last).map(|index| cache.get(ino, index)).collect()
+        };
+        let known: Vec<u64> = lookups
+            .iter()
+            .map(|l| match l {
+                Lookup::Unconfirmed { version, .. } => *version,
+                Lookup::Miss { .. } => 0,
+            })
+            .collect();
+        let (size, chunks) = self.fetch(ino, first, last, &known).await?;
         if offset >= size {
             return Ok(Vec::new());
         }
         let end = (offset + len as u64).min(size);
         let mut out = vec![0; (end - offset) as usize];
-        let mut node = self.node(ino).await?;
-        let newest = chunks
-            .iter()
-            .filter_map(|c| c.blob.as_deref().and_then(|b| sealed_version(b).ok()))
-            .max()
-            .unwrap_or(0);
-        if newest > node.record.version {
-            node = self.refresh(ino).await?;
-        }
-        for chunk in chunks {
-            let Some(blob) = &chunk.blob else {
-                continue;
-            };
-            let plain = self.open(&node, ino, chunk.index, blob)?;
-            let start = chunk.index * chunk_size;
+        let mut node = None;
+        for (chunk, lookup) in chunks.into_iter().zip(lookups) {
+            let index = chunk.index;
+            let plain = self.chunk_from(ino, chunk, lookup, &mut node).await?;
+            let start = index * chunk_size;
             let lo = start.max(offset);
             let hi = (start + plain.len() as u64).min(end);
             if lo < hi {
@@ -941,20 +961,93 @@ impl Vault {
         Ok(out)
     }
 
+    /// The plaintext a read's answer for one chunk stands for: the cached
+    /// bytes it confirmed, or the bytes it sent, opened and cached. `node`
+    /// is the file's key, fetched the first time one is needed.
+    async fn chunk_from(
+        &self,
+        ino: u64,
+        chunk: SealedChunk,
+        lookup: Lookup,
+        node: &mut Option<Arc<Node>>,
+    ) -> Result<Arc<[u8]>, FsError> {
+        let index = chunk.index;
+        if chunk.unchanged {
+            if let Lookup::Unconfirmed {
+                data, generation, ..
+            } = lookup
+                && self.cache.lock().unwrap().confirm(ino, index, generation)
+            {
+                return Ok(data);
+            }
+            // Confirmed unchanged on the server, but invalidated here
+            // meanwhile -- a write of ours may have replaced it: read it
+            // afresh.
+            let fresh = self.fetch_one(ino, index, 0).await?;
+            let generation = self.cache.lock().unwrap().get(ino, index).generation();
+            return self.open_and_keep(ino, fresh, generation, node).await;
+        }
+        let generation = match lookup {
+            Lookup::Unconfirmed { generation, .. } | Lookup::Miss { generation } => generation,
+        };
+        self.open_and_keep(ino, chunk, generation, node).await
+    }
+
+    /// Opens a chunk as sent (empty for a hole) and caches it at its seq.
+    async fn open_and_keep(
+        &self,
+        ino: u64,
+        chunk: SealedChunk,
+        generation: u64,
+        node: &mut Option<Arc<Node>>,
+    ) -> Result<Arc<[u8]>, FsError> {
+        let plain: Arc<[u8]> = match &chunk.blob {
+            Some(blob) => {
+                let version = sealed_version(blob).map_err(|e| corrupt(ino, e))?;
+                let known = match node.take() {
+                    Some(known) => known,
+                    None => self.node(ino).await?,
+                };
+                // Sealed under a key newer than the one known here:
+                // someone rotated it since.
+                let current = if version > known.record.version {
+                    self.refresh(ino).await?
+                } else {
+                    known
+                };
+                let opened = self.open(&current, ino, chunk.index, blob)?;
+                *node = Some(current);
+                opened.into()
+            }
+            None => Arc::from(Vec::new()),
+        };
+        self.cache.lock().unwrap().insert(
+            ino,
+            chunk.index,
+            Arc::clone(&plain),
+            chunk.seq,
+            generation,
+        );
+        Ok(plain)
+    }
+
     /// Chunks `first..=last` of `ino`, in as many asks as the server's cap
-    /// takes, and the file's size as of the last.
+    /// takes, and the file's size as of the last. `known[i]` is the seq
+    /// chunk `first + i` is cached at, or 0.
     async fn fetch(
         &self,
         ino: u64,
         first: u64,
         last: u64,
+        known: &[u64],
     ) -> Result<(u64, Vec<SealedChunk>), FsError> {
         let mut chunks = Vec::new();
         let mut size = 0;
         let mut next = first;
         while next <= last {
             let count = (last - next + 1).min(u64::from(u32::MAX)) as u32;
-            let (attr, got) = self.remote.read_chunks(ino, next, count).await?;
+            let known = &known[(next - first) as usize..];
+            let (attr, got) = self.remote.read_chunks(ino, next, count, known).await?;
             size = attr.size;
             let Some(after) = got.last().map(|c| c.index + 1) else {
                 return Err(FsError::new(libc::EIO, "the server returned no chunks"));
@@ -965,9 +1058,10 @@ impl Vault {
         Ok((size, chunks))
     }
 
-    /// One chunk of `ino`, and the store's sequence number for it.
-    async fn fetch_one(&self, ino: u64, index: u64) -> Result<SealedChunk, FsError> {
-        let (_, mut got) = self.remote.read_chunks(ino, index, 1).await?;
+    /// One chunk of `ino`, and the store's seq for it; `unchanged`, with
+    /// no bytes, if it is still at `known` (0 for none).
+    async fn fetch_one(&self, ino: u64, index: u64, known: u64) -> Result<SealedChunk, FsError> {
+        let (_, mut got) = self.remote.read_chunks(ino, index, 1, &[known]).await?;
         got.pop()
             .filter(|c| c.index == index)
             .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
@@ -981,9 +1075,27 @@ impl Vault {
         open_chunk(&key, ino, index, blob).map_err(|e| corrupt(ino, e))
     }
 
+    /// The current plaintext of chunk `index` of `ino`, and the seq it is
+    /// at, to change and write back: the cached copy if there is one --
+    /// unconfirmed, since the write names the seq it expects and the
+    /// server refuses it if the copy was out of date -- or else fetched.
+    async fn base(&self, node: &Node, ino: u64, index: u64) -> Result<(Vec<u8>, u64), FsError> {
+        if let Lookup::Unconfirmed { data, version, .. } =
+            self.cache.lock().unwrap().get(ino, index)
+        {
+            return Ok((data.to_vec(), version));
+        }
+        let chunk = self.fetch_one(ino, index, 0).await?;
+        let plain = match &chunk.blob {
+            Some(blob) => self.open(node, ino, index, blob)?,
+            None => Vec::new(),
+        };
+        Ok((plain, chunk.seq))
+    }
+
     /// Writes `data` at `offset` in file `ino`, a batch at a time, growing
-    /// it as needed. As `Remote::write`, a failure says how many leading
-    /// bytes were stored, by whole batches.
+    /// it as needed. A failure says how many leading bytes were stored, by
+    /// whole batches.
     pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
         let failed = |written, error| WriteError { written, error };
         let mut node = self.node(ino).await.map_err(|e| failed(0, e))?;
@@ -996,7 +1108,7 @@ impl Vault {
                 }
                 other => other,
             };
-            return touched.map_err(|e| failed(0, e));
+            return touched.map(|(attr, _)| attr).map_err(|e| failed(0, e));
         }
         let chunk_size = self.remote.chunk_size();
         let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as usize;
@@ -1022,9 +1134,10 @@ impl Vault {
         Ok(attr.expect("a non-empty write has at least one batch"))
     }
 
-    /// One batch of `write`: seals each span's chunk -- whole, or read,
-    /// changed and re-sealed -- and stores them all, or does it over if a
-    /// chunk read changed before they could be.
+    /// One batch of `write`: seals each span's chunk -- whole, or changed
+    /// from its current bytes and re-sealed -- and stores them all, or
+    /// does it over if a chunk changed before they could be. What it
+    /// stores, it caches.
     async fn write_batch(
         &self,
         node: &Node,
@@ -1035,7 +1148,9 @@ impl Vault {
     ) -> Result<Attr, FsError> {
         let chunk_size = self.remote.chunk_size();
         for _ in 0..CHANGE_RETRIES {
+            let generation = self.cache.lock().unwrap().get(ino, spans[0].0).generation();
             let mut writes = Vec::with_capacity(spans.len());
+            let mut plains = Vec::with_capacity(spans.len());
             let mut cursor = 0;
             for &(index, within, n) in spans {
                 let piece = &data[cursor..cursor + n];
@@ -1043,26 +1158,40 @@ impl Vault {
                 let (plain, expected_seq) = if within == 0 && n as u64 == chunk_size {
                     (piece.to_vec(), None)
                 } else {
-                    let chunk = self.fetch_one(ino, index).await?;
-                    let mut plain = match &chunk.blob {
-                        Some(blob) => self.open(node, ino, index, blob)?,
-                        None => Vec::new(),
-                    };
+                    let (mut plain, seq) = self.base(node, ino, index).await?;
                     if plain.len() < within + n {
                         plain.resize(within + n, 0);
                     }
                     plain[within..within + n].copy_from_slice(piece);
-                    (plain, Some(chunk.seq))
+                    (plain, Some(seq))
                 };
                 writes.push(ChunkWrite {
                     index,
                     expected_seq,
                     blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
                 });
+                plains.push((index, plain));
             }
             match self.remote.write_chunks(ino, &writes, end).await {
-                Err(e) if e.errno == libc::EAGAIN => continue,
-                other => return other,
+                Err(e) if changed(&e) => {
+                    // A base was out of date: drop it, and fetch afresh.
+                    let mut cache = self.cache.lock().unwrap();
+                    for &(index, ..) in spans {
+                        cache.invalidate(ino, index..=index);
+                    }
+                }
+                Err(e) => {
+                    // Whether it landed is unknown: trust nothing cached.
+                    self.cache.lock().unwrap().invalidate_ino(ino);
+                    return Err(e);
+                }
+                Ok((attr, seq)) => {
+                    let mut cache = self.cache.lock().unwrap();
+                    for (index, plain) in plains {
+                        cache.insert(ino, index, plain.into(), seq, generation);
+                    }
+                    return Ok(attr);
+                }
             }
         }
         Err(FsError::new(
@@ -1071,11 +1200,27 @@ impl Vault {
         ))
     }
 
-    /// Readies file `ino` to be cut to `new_size`: re-seals the chunk the
-    /// new end falls in without what lies past it, which the server can't
-    /// cut itself. The truncation proper -- the size, and dropping the
-    /// chunks past it -- is the setattr that follows.
-    pub async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
+    /// Applies `changes` to `ino` (see `Remote::setattr`). Cutting a file
+    /// short first re-seals the chunk its new end falls in, cut short too,
+    /// which the server can't do itself.
+    pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
+        if let Some(size) = changes.size {
+            self.truncate(ino, size).await?;
+        }
+        let changed = self.remote.setattr(ino, changes).await;
+        if let Some(size) = changes.size {
+            // The chunks past the new end are gone, whatever came back.
+            let chunk_size = self.remote.chunk_size();
+            self.cache
+                .lock()
+                .unwrap()
+                .invalidate(ino, size / chunk_size..=u64::MAX);
+        }
+        changed
+    }
+
+    /// Re-seals the chunk `new_size` falls in without what lies past it.
+    async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
         match self.truncate_once(ino, new_size).await {
             Err(e) if expired(&e) => {
                 self.freshen(ino).await?;
@@ -1094,22 +1239,21 @@ impl Vault {
         let index = new_size / chunk_size;
         let node = self.node(ino).await?;
         for _ in 0..CHANGE_RETRIES {
-            let chunk = self.fetch_one(ino, index).await?;
-            let Some(blob) = &chunk.blob else {
-                return Ok(());
-            };
-            let mut plain = self.open(&node, ino, index, blob)?;
+            let (mut plain, seq) = self.base(&node, ino, index).await?;
             if plain.len() <= keep {
                 return Ok(());
             }
             plain.truncate(keep);
             let write = ChunkWrite {
                 index,
-                expected_seq: Some(chunk.seq),
+                expected_seq: Some(seq),
                 blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
             };
-            match self.remote.write_chunks(ino, &[write], 0).await {
-                Err(e) if e.errno == libc::EAGAIN => continue,
+            let written = self.remote.write_chunks(ino, &[write], 0).await;
+            // Whatever happened, the cached copy is superseded.
+            self.cache.lock().unwrap().invalidate(ino, index..=index);
+            match written {
+                Err(e) if changed(&e) => continue,
                 other => return other.map(drop),
             }
         }

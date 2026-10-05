@@ -7,15 +7,21 @@
 // which is what tells the client it may try another server.
 //
 // Every request but Hello, Prelogin, Login, Enrol and ChangePassword
-// carries a session token from Login,
-// as `authorization: Bearer <token>` metadata; who the request is from is
-// whoever that session belongs to. A missing, forged or expired session
-// is refused with UNAUTHENTICATED -- the one status that is about the
-// request rather than the server, and the client's cue to log in again.
+// carries a session token from Login, as `authorization: Bearer <token>`
+// metadata; who the request is from is whoever that session belongs to.
+// A missing, forged or expired session is refused with UNAUTHENTICATED --
+// the one status that is about the request rather than the server, and
+// the client's cue to log in again.
 //
-// Reading and writing file data takes a handle from Open or Create
-// instead of an inode: the handle records what that open was allowed,
-// so access is checked once, at open, as POSIX has it.
+// Everything is encrypted on the client (raft5fs-crypto): the server
+// stores and hands back what it can't open. Access is by grant: a user
+// reaches a directory, and everything under it, through a grant of it to
+// them, and only what lies under their grants -- checked on every
+// request. Every inode has a key record (raft5fs-crypto's `NodeKeys`),
+// opaque to the server but for its version numbers; a grant carries the
+// granted directory's key sealed to the grantee. Every `name` is a tag:
+// an HMAC of the real name under the directory's name key, which lets the
+// server find an entry without learning what it is called.
 syntax = "proto3";
 
 package raft5fs;
@@ -23,12 +29,12 @@ package raft5fs;
 service Fs {
   // What the client needs to know before buffering writes.
   rpc Hello(HelloRequest) returns (HelloResponse);
-  rpc Login(LoginRequest) returns (LoginResponse);
 
-  // Encrypted filesystems only. The password never reaches the server:
-  // the client stretches it with the salt and parameters from Prelogin
-  // and logs in with the `auth` half (see raft5fs-crypto's `password`).
+  // The password never reaches the server: the client stretches it with
+  // the salt and parameters from Prelogin and logs in with the `auth`
+  // half (see raft5fs-crypto's `password`).
   rpc Prelogin(PreloginRequest) returns (PreloginResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
   // Sets up an account's keys, once, with a code an administrator issued.
   rpc Enrol(EnrolRequest) returns (EmptyResponse);
   // Replaces an account's password-derived material; the key pair stays.
@@ -36,30 +42,19 @@ service Fs {
 
   rpc GetAttr(InodeRequest) returns (AttrResponse);
   rpc Lookup(NameRequest) returns (AttrResponse);
-  // Both check the caller may access the inode as `mask` asks; Open then
-  // hands back a handle carrying that access.
-  rpc Open(AccessRequest) returns (OpenResponse);
+  // Whether the caller may access the inode as `mask` asks: any grant
+  // over it reads, a writable one writes.
   rpc Access(AccessRequest) returns (EmptyResponse);
   rpc ReadDir(InodeRequest) returns (ReadDirResponse);
-  rpc Read(ReadRequest) returns (ReadResponse);
-  rpc Write(WriteRequest) returns (WriteResponse);
   rpc SetAttr(SetAttrRequest) returns (AttrResponse);
   rpc Mkdir(CreateRequest) returns (AttrResponse);
-  // Also opens the new file for reading and writing, whatever its mode.
-  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Create(CreateRequest) returns (AttrResponse);
   // Both return the inode removed.
   rpc Unlink(NameRequest) returns (InoResponse);
   rpc Rmdir(NameRequest) returns (InoResponse);
   // Returns the inode the move replaced, or 0 if it replaced nothing.
   rpc Rename(RenameRequest) returns (InoResponse);
 
-  // Encrypted filesystems only. There, access is by grant: a user reaches
-  // a directory, and everything under it, through a grant of it to them,
-  // and only what lies under their grants. Every inode has a key record
-  // (raft5fs-crypto's `NodeKeys`), opaque to the server but for its
-  // version numbers; a grant carries the granted directory's key sealed
-  // to the grantee.
-  //
   // An inode number to create with: a node's key record is bound to its
   // inode, so the client needs the number before it can make one.
   rpc AllocateInode(NoArgs) returns (InoResponse);
@@ -77,17 +72,16 @@ service Fs {
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume, and every grant of it.
   rpc DeleteVolume(InodeRequest) returns (EmptyResponse);
+
   // File data, which the client seals chunk by chunk (raft5fs-crypto's
-  // `data`), so the server can neither read it nor patch it: Read and
-  // Write are refused here, and the client reads, changes and re-seals
-  // whole chunks instead. Checked against the caller's grant every time,
-  // so these take an inode, not a handle.
+  // `data`), so the server can neither read it nor patch it: the client
+  // reads, changes and re-seals whole chunks.
   rpc ReadChunks(ReadChunksRequest) returns (ReadChunksResponse);
   // Stores whole sealed chunks, each sealed under the file's current key
   // version. A chunk with an `expected_seq` is stored only if it is still
   // as the client read it -- otherwise nothing is, and the answer is
   // EAGAIN, for the client to read again and redo its change.
-  rpc WriteChunks(WriteChunksRequest) returns (AttrResponse);
+  rpc WriteChunks(WriteChunksRequest) returns (WriteChunksResponse);
 
   // Every node at or under a directory that is granted to anyone, with
   // the path down to it and who holds the grants: what rotating the
@@ -111,94 +105,6 @@ service Fs {
 
 message NoArgs {}
 
-message Grantee {
-  string username = 1;
-  // As the server has it: check it against what was pinned before.
-  bytes public_key = 2;
-  bool writable = 3;
-}
-
-message GrantedNode {
-  uint64 ino = 1;
-  // From the directory asked about down to this node, both included.
-  repeated uint64 path = 2;
-  repeated Grantee grantees = 3;
-}
-
-message GrantsUnderResponse {
-  oneof result {
-    GrantedNodes list = 1;
-    Error error = 2;
-  }
-}
-
-message GrantedNodes {
-  repeated GrantedNode nodes = 1;
-}
-
-message ResealedGrant {
-  string username = 1;
-  // The node's new key sealed to them; empty to remove their grant.
-  bytes sealed_key = 2;
-}
-
-message Rotation {
-  uint64 ino = 1;
-  uint32 expected_version = 2;
-  bytes node_keys = 3;
-  repeated ResealedGrant grants = 4;
-}
-
-message RotateRequest {
-  // Parents before children.
-  repeated Rotation rotations = 1;
-}
-
-message ReadChunksRequest {
-  uint64 ino = 1;
-  uint64 first = 2;
-  // At most what one write batch holds; more is cut short, and the client
-  // asks again from where the answer stopped.
-  uint32 count = 3;
-}
-
-message SealedChunk {
-  uint64 index = 1;
-  // The store's sequence number for the chunk as read: what a write of it
-  // expects, to be sure nothing changed it meanwhile.
-  uint64 seq = 2;
-  // Empty for a chunk that was never written: a hole, all zeros.
-  bytes blob = 3;
-}
-
-message ChunkList {
-  // The file's attributes, for its size.
-  Attr attr = 1;
-  repeated SealedChunk chunks = 2;
-}
-
-message ReadChunksResponse {
-  oneof result {
-    ChunkList list = 1;
-    Error error = 2;
-  }
-}
-
-message ChunkWrite {
-  uint64 index = 1;
-  // Absent for a chunk being replaced whole, whatever it held.
-  optional uint64 expected_seq = 2;
-  bytes blob = 3;
-}
-
-message WriteChunksRequest {
-  uint64 ino = 1;
-  repeated ChunkWrite chunks = 2;
-  // The file grows to at least this, the end of what was written; 0 to
-  // leave its size alone.
-  uint64 end = 3;
-}
-
 message Error {
   int32 errno = 1;
   string message = 2;
@@ -215,14 +121,14 @@ enum Kind {
   KIND_DIRECTORY = 1;
 }
 
+// No owners: access goes by grants, and a mount shows its own user as the
+// owner of everything.
 message Attr {
   uint64 ino = 1;
   Kind kind = 2;
   uint64 size = 3;
   uint32 perm = 4;
   uint32 nlink = 5;
-  uint32 uid = 6;
-  uint32 gid = 7;
   Timestamp atime = 8;
   Timestamp mtime = 9;
   Timestamp ctime = 10;
@@ -230,21 +136,12 @@ message Attr {
 
 message HelloRequest {}
 
-message LoginRequest {
-  string username = 1;
-  // An unencrypted filesystem's login: checked against the store account.
-  string password = 2;
-  // An encrypted filesystem's login, in place of the password.
-  bytes auth = 3;
-}
-
-message Session {
-  string token = 1;
-  // When the token stops being accepted, in seconds since the Unix epoch.
-  uint64 expires_at = 2;
-  // Encrypted filesystems: the account's private key, wrapped under the
-  // key only the password opens. Empty otherwise.
-  bytes wrapped_private_key = 3;
+message HelloResponse {
+  // Fixed for the filesystem's lifetime.
+  uint64 chunk_size = 1;
+  // How much contiguous data one write transaction stores: the client
+  // buffers up to this much and aligns its batches to multiples of it.
+  uint64 batch_bytes = 2;
 }
 
 message PreloginRequest {
@@ -265,8 +162,29 @@ message PreloginResponse {
   }
 }
 
-// What an encrypted filesystem keeps for an account. The server can check
-// a login against `verifier`, and opens nothing.
+message LoginRequest {
+  string username = 1;
+  bytes auth = 3;
+}
+
+message Session {
+  string token = 1;
+  // When the token stops being accepted, in seconds since the Unix epoch.
+  uint64 expires_at = 2;
+  // The account's private key, wrapped under the key only the password
+  // opens.
+  bytes wrapped_private_key = 3;
+}
+
+message LoginResponse {
+  oneof result {
+    Session session = 1;
+    Error error = 2;
+  }
+}
+
+// What the server keeps for an account: it can check a login against
+// `verifier`, and opens nothing.
 message AccountKeys {
   bytes salt = 1;
   bytes kdf_params = 2;
@@ -288,23 +206,6 @@ message ChangePasswordRequest {
   AccountKeys keys = 3;
 }
 
-message LoginResponse {
-  oneof result {
-    Session session = 1;
-    Error error = 2;
-  }
-}
-
-message HelloResponse {
-  // Fixed for the filesystem's lifetime.
-  uint64 chunk_size = 1;
-  // How much contiguous data one write transaction stores: the client
-  // buffers up to this much and aligns its batches to multiples of it.
-  uint64 batch_bytes = 2;
-  // Whether the filesystem is encrypted, which changes how to log in.
-  bool encrypted = 3;
-}
-
 message InodeRequest {
   uint64 ino = 1;
 }
@@ -318,23 +219,21 @@ message AccessRequest {
 
 message NameRequest {
   uint64 parent = 1;
-  // Bytes, not string: a file name needn't be UTF-8.
+  // The entry's tag.
   bytes name = 2;
 }
 
-// On an encrypted filesystem, every `name` is a tag: an HMAC of the real
-// name under the directory's name key (raft5fs-crypto's `data`), which
-// lets the server find an entry without learning what it is called.
 message CreateRequest {
   uint64 parent = 1;
+  // The new entry's tag.
   bytes name = 2;
   uint32 perm = 3;
-  // Encrypted filesystems: the inode AllocateInode gave, and its key
-  // record, wrapped under the parent's current key.
+  // The inode AllocateInode gave, and its key record, wrapped under the
+  // parent's current key.
   uint64 ino = 4;
   bytes node_keys = 5;
-  // Encrypted filesystems: the real name, sealed under the parent's key,
-  // which listings hand back.
+  // The real name, sealed under the parent's key, which listings hand
+  // back.
   bytes sealed_name = 6;
 }
 
@@ -345,14 +244,68 @@ message RenameRequest {
   bytes new_name = 4;
   // Fail with EEXIST rather than replace an existing `new_name`.
   bool noreplace = 5;
-  // Encrypted filesystems, when the parent changes: the moved node's key
-  // record, re-wrapped under the new parent's current key, and the inode
-  // it is for -- the move is refused if `name` no longer names it.
+  // When the parent changes: the moved node's key record, re-wrapped
+  // under the new parent's current key.
   bytes node_keys = 6;
+  // The inode moving -- the move is refused if `name` no longer names it.
   uint64 moved_ino = 7;
-  // Encrypted filesystems: `new_name`'s real name, sealed under the new
-  // parent's key.
+  // `new_name`'s real name, sealed under the new parent's key.
   bytes sealed_new_name = 8;
+}
+
+message SetTime {
+  oneof time {
+    bool now = 1;
+    Timestamp at = 2;
+  }
+}
+
+message SetAttrRequest {
+  uint64 ino = 1;
+  optional uint32 mode = 2;
+  // A shrink's last chunk the client has re-sealed, cut short, already.
+  optional uint64 size = 5;
+  SetTime atime = 6;
+  SetTime mtime = 7;
+}
+
+message AttrResponse {
+  oneof result {
+    Attr attr = 1;
+    Error error = 2;
+  }
+}
+
+// Success unless `error` is set.
+message EmptyResponse {
+  Error error = 1;
+}
+
+message InoResponse {
+  oneof result {
+    uint64 ino = 1;
+    Error error = 2;
+  }
+}
+
+message DirItem {
+  uint64 ino = 1;
+  Kind kind = 2;
+  // The entry's tag.
+  bytes name = 3;
+  // The real name, sealed; empty for `.` and `..`.
+  bytes sealed_name = 4;
+}
+
+message DirList {
+  repeated DirItem items = 1;
+}
+
+message ReadDirResponse {
+  oneof result {
+    DirList list = 1;
+    Error error = 2;
+  }
 }
 
 message GrantInfo {
@@ -422,116 +375,109 @@ message CreateVolumeRequest {
   bytes sealed_label = 5;
 }
 
-message ReadRequest {
-  // From Open or Create, opened for reading.
-  string handle = 1;
-  uint64 offset = 2;
-  uint32 len = 3;
-}
-
-message WriteRequest {
-  // From Open or Create, opened for writing.
-  string handle = 1;
-  uint64 offset = 2;
-  bytes data = 3;
-}
-
-message SetTime {
-  oneof time {
-    bool now = 1;
-    Timestamp at = 2;
-  }
-}
-
-message SetAttrRequest {
+message ReadChunksRequest {
   uint64 ino = 1;
-  optional uint32 mode = 2;
-  optional uint32 uid = 3;
-  optional uint32 gid = 4;
-  optional uint64 size = 5;
-  SetTime atime = 6;
-  SetTime mtime = 7;
-  // A handle to `ino` opened for writing, which permits a size change
-  // whatever the mode now says (ftruncate).
-  optional string handle = 8;
+  uint64 first = 2;
+  // At most what one write batch holds; more is cut short, and the client
+  // asks again from where the answer stopped.
+  uint32 count = 3;
+  // For chunk `first + i`, the seq the client already holds it at, or 0.
+  // A chunk still at it comes back `unchanged`, without its bytes.
+  repeated uint64 known_seqs = 4;
 }
 
-message AttrResponse {
-  oneof result {
-    Attr attr = 1;
-    Error error = 2;
-  }
+message SealedChunk {
+  uint64 index = 1;
+  // The store's sequence number for the chunk as read: what a write of it
+  // expects, to be sure nothing changed it meanwhile.
+  uint64 seq = 2;
+  // Empty for a chunk that was never written -- a hole, all zeros -- or
+  // one `unchanged`.
+  bytes blob = 3;
+  // Still at the seq the client said it held.
+  bool unchanged = 4;
 }
 
-// Success unless `error` is set.
-message EmptyResponse {
-  Error error = 1;
-}
-
-message OpenResponse {
-  oneof result {
-    string handle = 1;
-    Error error = 2;
-  }
-}
-
-message Created {
+message ChunkList {
+  // The file's attributes, for its size.
   Attr attr = 1;
-  string handle = 2;
+  repeated SealedChunk chunks = 2;
 }
 
-message CreateResponse {
+message ReadChunksResponse {
   oneof result {
-    Created created = 1;
+    ChunkList list = 1;
     Error error = 2;
   }
 }
 
-message InoResponse {
-  oneof result {
-    uint64 ino = 1;
-    Error error = 2;
-  }
+message ChunkWrite {
+  uint64 index = 1;
+  // Absent for a chunk being replaced whole, whatever it held.
+  optional uint64 expected_seq = 2;
+  bytes blob = 3;
 }
 
-message DirItem {
+message WriteChunksRequest {
   uint64 ino = 1;
-  Kind kind = 2;
-  // On an encrypted filesystem, the entry's tag.
-  bytes name = 3;
-  // On an encrypted filesystem, the real name, sealed; empty for `.` and
-  // `..`, and everywhere on any other filesystem.
-  bytes sealed_name = 4;
+  repeated ChunkWrite chunks = 2;
+  // The file grows to at least this, the end of what was written; 0 to
+  // leave its size alone.
+  uint64 end = 3;
 }
 
-message DirList {
-  repeated DirItem items = 1;
+message ChunksWritten {
+  Attr attr = 1;
+  // The seq every chunk written is now at.
+  uint64 seq = 2;
 }
 
-message ReadDirResponse {
+message WriteChunksResponse {
   oneof result {
-    DirList list = 1;
+    ChunksWritten written = 1;
     Error error = 2;
   }
 }
 
-message ReadResponse {
+message Grantee {
+  string username = 1;
+  // As the server has it: check it against what was pinned before.
+  bytes public_key = 2;
+  bool writable = 3;
+}
+
+message GrantedNode {
+  uint64 ino = 1;
+  // From the directory asked about down to this node, both included.
+  repeated uint64 path = 2;
+  repeated Grantee grantees = 3;
+}
+
+message GrantedNodes {
+  repeated GrantedNode nodes = 1;
+}
+
+message GrantsUnderResponse {
   oneof result {
-    bytes data = 1;
+    GrantedNodes list = 1;
     Error error = 2;
   }
 }
 
-// A write that failed part-way: `written` leading bytes were stored
-// before `error`.
-message WriteFailure {
-  uint64 written = 1;
-  Error error = 2;
+message ResealedGrant {
+  string username = 1;
+  // The node's new key sealed to them; empty to remove their grant.
+  bytes sealed_key = 2;
 }
 
-message WriteResponse {
-  oneof result {
-    Attr attr = 1;
-    WriteFailure failure = 2;
-  }
+message Rotation {
+  uint64 ino = 1;
+  uint32 expected_version = 2;
+  bytes node_keys = 3;
+  repeated ResealedGrant grants = 4;
+}
+
+message RotateRequest {
+  // Parents before children.
+  repeated Rotation rotations = 1;
 }

@@ -1,3 +1,4 @@
+mod chunk_cache;
 pub mod cli;
 pub mod filesystem;
 pub mod remote;

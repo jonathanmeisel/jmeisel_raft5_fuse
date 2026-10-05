@@ -32,15 +32,15 @@
 //! credentials, and the request then retried -- which is why they are
 //! kept for the life of the mount.
 //!
-//! On an encrypted filesystem the password itself never goes to a server.
-//! The first login stretches it (with the salt Prelogin hands out) into
+//! The password itself never goes to a server. The first login stretches
+//! it (with the salt Prelogin hands out) into
 //! `auth`, which is what logs in, and a key that opens the account's
 //! private key from the login's reply. From then on only `auth` is kept,
 //! for renewals; the password is dropped.
 
 use std::ffi::OsStr;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -54,12 +54,12 @@ use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
-    PreloginRequest, PublicKeyRequest, ReadChunksRequest, ReadRequest, RenameRequest,
-    RotateRequest, SetAttrRequest, WriteChunksRequest, WriteRequest,
+    PreloginRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest, RotateRequest,
+    SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::types::{
     Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, Rotation,
-    SealedChunk, SealedMove, SetAttr, WriteError,
+    SealedChunk, SealedMove, SetAttr,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -109,8 +109,8 @@ impl Interceptor for Authorize {
 
 type Client = FsClient<InterceptedService<Channel, Authorize>>;
 
-/// What a login presents: the password, until an encrypted filesystem's
-/// first login has turned it into `auth`.
+/// What a login presents: the password, until the first login has turned
+/// it into `auth`.
 enum Secret {
     Password(Zeroizing<String>),
     Auth(Zeroizing<[u8; AUTH_LEN]>),
@@ -120,10 +120,11 @@ pub struct Remote {
     servers: Vec<(String, Client)>,
     username: String,
     secret: RwLock<Secret>,
-    /// Whether the filesystem is encrypted, from Hello.
-    encrypted: bool,
-    /// The account's key pair, once an encrypted login has opened it.
+    /// The account's key pair, once a login has opened it.
     identity: RwLock<Option<Arc<Identity>>>,
+    /// How many chunks have been asked for: for tests of the client's
+    /// cache, which should keep this from growing.
+    chunk_reads: AtomicU64,
     session: Session,
     /// Where to start: the last server that answered.
     current: AtomicUsize,
@@ -230,8 +231,8 @@ impl Remote {
             servers,
             username: credentials.username,
             secret: RwLock::new(Secret::Password(Zeroizing::new(credentials.password))),
-            encrypted: false,
             identity: RwLock::new(None),
+            chunk_reads: AtomicU64::new(0),
             session,
             current: AtomicUsize::new(0),
             chunk_size: 0,
@@ -245,11 +246,10 @@ impl Remote {
             .map_err(|e| e.message)?;
         remote.chunk_size = hello.chunk_size;
         remote.batch_bytes = hello.batch_bytes;
-        remote.encrypted = hello.encrypted;
         Ok(remote)
     }
 
-    /// Enrols `username` on the encrypted filesystem at `addresses`, with
+    /// Enrols `username` on the filesystem at `addresses`, with
     /// the one-time `code` an administrator issued: makes the account a
     /// key pair, and stores it wrapped under what `password` yields.
     /// Returns the new public key, for the user to note its fingerprint.
@@ -268,7 +268,6 @@ impl Remote {
         let remote = Self::dial(addresses, credentials, tls)
             .await
             .map_err(|e| FsError::new(libc::EIO, e))?;
-        remote.require_encrypted()?;
         let identity = Identity::generate();
         let (keys, _) = account_keys(username, password, params, &identity).await?;
         let req = EnrolRequest {
@@ -290,13 +289,12 @@ impl Remote {
 
     /// Changes this account's password to `new_password`. The key pair
     /// stays -- only its wrapping changes -- so everything shared with it
-    /// stays readable. Needs an encrypted login, which proves the old one.
+    /// stays readable. Needs a login, which proves the old one.
     pub async fn change_password(
         &self,
         new_password: &str,
         params: KdfParams,
     ) -> Result<(), FsError> {
-        self.require_encrypted()?;
         let identity = self
             .identity()
             .ok_or_else(|| FsError::new(libc::EACCES, "not logged in: no key pair to re-wrap"))?;
@@ -323,25 +321,15 @@ impl Remote {
         Ok(())
     }
 
-    /// Whether the filesystem is encrypted.
-    pub fn encrypted(&self) -> bool {
-        self.encrypted
-    }
-
-    /// The account's key pair: there after an encrypted filesystem's login.
+    /// The account's key pair: there after a login.
     pub fn identity(&self) -> Option<Arc<Identity>> {
         self.identity.read().unwrap().clone()
     }
 
-    fn require_encrypted(&self) -> Result<(), FsError> {
-        if self.encrypted {
-            Ok(())
-        } else {
-            Err(FsError::new(
-                libc::EOPNOTSUPP,
-                "this filesystem isn't encrypted",
-            ))
-        }
+    /// How many chunks this client has asked a server for, unchanged ones
+    /// not counted.
+    pub fn chunk_reads(&self) -> u64 {
+        self.chunk_reads.load(Ordering::Relaxed)
     }
 
     /// Logs in, on whichever server answers, and keeps the session for
@@ -353,11 +341,10 @@ impl Remote {
     async fn login(&self) -> Result<(), FsError> {
         let mut req = LoginRequest {
             username: self.username.clone(),
-            password: String::new(),
             auth: Vec::new(),
         };
-        // An encrypted filesystem's first login: the keys the password
-        // yields, kept until the server has accepted them.
+        // The first login: the keys the password yields, kept until the
+        // server has accepted them.
         let mut derived = None;
         let password = match &*self.secret.read().unwrap() {
             Secret::Auth(auth) => {
@@ -367,24 +354,20 @@ impl Remote {
             Secret::Password(password) => Some(password.clone()),
         };
         if let Some(password) = password {
-            if self.encrypted {
-                let settings = self
-                    .first_answer("a prelogin", |mut c| {
-                        let req = PreloginRequest {
-                            username: self.username.clone(),
-                        };
-                        async move { c.prelogin(req).await }
-                    })
-                    .await?
-                    .into_result()?;
-                let params = KdfParams::decode(&settings.params)
-                    .map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
-                let keys = derive(&password, settings.salt, params).await?;
-                req.auth = keys.auth.to_vec();
-                derived = Some(keys);
-            } else {
-                req.password = password.to_string();
-            }
+            let settings = self
+                .first_answer("a prelogin", |mut c| {
+                    let req = PreloginRequest {
+                        username: self.username.clone(),
+                    };
+                    async move { c.prelogin(req).await }
+                })
+                .await?
+                .into_result()?;
+            let params = KdfParams::decode(&settings.params)
+                .map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
+            let keys = derive(&password, settings.salt, params).await?;
+            req.auth = keys.auth.to_vec();
+            derived = Some(keys);
         }
         let session = self
             .first_answer("a login", |mut c| {
@@ -531,15 +514,6 @@ impl Remote {
         .into_result()
     }
 
-    /// Opens the inode for `mask` (`R_OK`/`W_OK`), returning the handle
-    /// that reads and writes through this open need.
-    pub async fn open(&self, ino: u64, mask: u32) -> Result<String, FsError> {
-        let req = AccessRequest { ino, mask };
-        self.call(Retry::ReadOnly, |mut c| async move { c.open(req).await })
-            .await?
-            .into_result()
-    }
-
     /// access(2).
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
         let req = AccessRequest { ino, mask };
@@ -558,81 +532,37 @@ impl Remote {
         .into_result()
     }
 
-    pub async fn read(&self, handle: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
-        let req = ReadRequest {
-            handle: handle.to_string(),
-            offset,
-            len: len as u32,
-        };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.read(req).await }
-        })
+    /// Changes mode, size or times. Cutting a file short needs its last
+    /// chunk re-sealed first (see `Vault::setattr`).
+    pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
+        let req = SetAttrRequest::new(ino, changes);
+        self.call(
+            Retry::Idempotent,
+            |mut c| async move { c.set_attr(req).await },
+        )
         .await?
         .into_result()
     }
 
-    /// Resendable despite being a write: a batch commits whole or not at
-    /// all, and storing the same bytes at the same offset again changes
-    /// nothing. So a batch whose server went away mid-request is simply
-    /// resent to another (but not one whose server only timed out; see
-    /// the module doc).
-    pub async fn write(&self, handle: &str, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
-        let req = WriteRequest {
-            handle: handle.to_string(),
-            offset,
-            data: data.to_vec(),
-        };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.write(req).await }
-        })
-        .await
-        .map_err(|error| WriteError { written: 0, error })?
-        .into_result()
-    }
-
-    /// `handle`, if the change comes through an open file, may permit a
-    /// size change the mode alone wouldn't.
-    pub async fn setattr(
-        &self,
-        ino: u64,
-        changes: SetAttr,
-        handle: Option<&str>,
-    ) -> Result<Attr, FsError> {
-        let req = SetAttrRequest::new(ino, changes, handle.map(str::to_string));
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.set_attr(req).await }
-        })
-        .await?
-        .into_result()
-    }
-
-    fn create_request(
-        parent: u64,
-        name: &OsStr,
-        perm: u16,
-        new: Option<&NewNode>,
-    ) -> CreateRequest {
+    fn create_request(parent: u64, name: &OsStr, perm: u16, new: &NewNode) -> CreateRequest {
         CreateRequest {
             parent,
             name: name_bytes(name),
             perm: perm.into(),
-            ino: new.map_or(0, |n| n.ino),
-            node_keys: new.map(|n| n.keys.clone()).unwrap_or_default(),
-            sealed_name: new.map(|n| n.sealed_name.clone()).unwrap_or_default(),
+            ino: new.ino,
+            node_keys: new.keys.clone(),
+            sealed_name: new.sealed_name.clone(),
         }
     }
 
-    /// `new`: on an encrypted filesystem, the reserved inode and its key
-    /// record (see `vault`); `None` elsewhere.
+    /// `name` is the tag, and `new` the reserved inode, its key record and
+    /// its sealed name (see `vault`).
     pub async fn mkdir(
         &self,
         parent: u64,
         name: &OsStr,
         perm: u16,
-        new: Option<&NewNode>,
+        new: &NewNode,
     ) -> Result<Attr, FsError> {
         let req = Self::create_request(parent, name, perm, new);
         self.call(Retry::Once, |mut c| {
@@ -643,15 +573,14 @@ impl Remote {
         .into_result()
     }
 
-    /// Creates a file and opens it for reading and writing, returning its
-    /// attributes and the handle.
+    /// As `mkdir`, for a file.
     pub async fn create(
         &self,
         parent: u64,
         name: &OsStr,
         perm: u16,
-        new: Option<&NewNode>,
-    ) -> Result<(Attr, String), FsError> {
+        new: &NewNode,
+    ) -> Result<Attr, FsError> {
         let req = Self::create_request(parent, name, perm, new);
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
@@ -675,10 +604,9 @@ impl Remote {
         .into_result()
     }
 
-    /// Moves a name, returning the inode it replaced, if any. `sealed`: on
-    /// an encrypted filesystem, the moved inode, its new name sealed, and
-    /// on a move to another directory its key record re-wrapped (see
-    /// `SealedMove`).
+    /// Moves a name, returning the inode it replaced, if any. `sealed`:
+    /// the moved inode, its new name sealed, and on a move to another
+    /// directory its key record re-wrapped (see `SealedMove`).
     pub async fn rename(
         &self,
         parent: u64,
@@ -686,7 +614,7 @@ impl Remote {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
-        sealed: Option<&SealedMove>,
+        sealed: &SealedMove,
     ) -> Result<Option<u64>, FsError> {
         let req = RenameRequest {
             parent,
@@ -694,9 +622,9 @@ impl Remote {
             new_parent,
             new_name: name_bytes(new_name),
             noreplace,
-            node_keys: sealed.map(|m| m.node_keys.clone()).unwrap_or_default(),
-            moved_ino: sealed.map_or(0, |m| m.ino),
-            sealed_new_name: sealed.map(|m| m.sealed_name.clone()).unwrap_or_default(),
+            node_keys: sealed.node_keys.clone(),
+            moved_ino: sealed.ino,
+            sealed_new_name: sealed.sealed_name.clone(),
         };
         let replaced = self
             .call(Retry::Once, |mut c| {
@@ -816,32 +744,45 @@ impl Remote {
     }
 
     /// Up to a batch's worth of `ino`'s sealed chunks from `first` on,
-    /// and its attributes. May return fewer than `count`.
+    /// and its attributes. May return fewer than `count`. `known_seqs[i]`,
+    /// if not 0, is the seq chunk `first + i` is cached at here: still at
+    /// it, it comes back `unchanged`, without its bytes.
     pub async fn read_chunks(
         &self,
         ino: u64,
         first: u64,
         count: u32,
+        known_seqs: &[u64],
     ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
-        let req = ReadChunksRequest { ino, first, count };
-        self.call(
-            Retry::ReadOnly,
-            |mut c| async move { c.read_chunks(req).await },
-        )
-        .await?
-        .into_result()
+        let req = ReadChunksRequest {
+            ino,
+            first,
+            count,
+            known_seqs: known_seqs.to_vec(),
+        };
+        let (attr, chunks) = self
+            .call(Retry::ReadOnly, |mut c| {
+                let req = req.clone();
+                async move { c.read_chunks(req).await }
+            })
+            .await?
+            .into_result()?;
+        let sent = chunks.iter().filter(|c| !c.unchanged).count();
+        self.chunk_reads.fetch_add(sent as u64, Ordering::Relaxed);
+        Ok((attr, chunks))
     }
 
     /// Stores sealed chunks of `ino`, if each is as its `expected_seq`
-    /// says, and grows the file to `end`. Resent like `write`: every
-    /// chunk replaced whole, or guarded by its seq, lands the same way
-    /// twice.
+    /// says, and grows the file to `end`; returns its attributes and the
+    /// seq the chunks are now at. Resent after any failure but a timeout
+    /// (see the module doc): every chunk is replaced whole, or guarded by
+    /// its seq, so a resend of one that landed changes nothing more.
     pub async fn write_chunks(
         &self,
         ino: u64,
         chunks: &[ChunkWrite],
         end: u64,
-    ) -> Result<Attr, FsError> {
+    ) -> Result<(Attr, u64), FsError> {
         let req = WriteChunksRequest {
             ino,
             chunks: chunks.iter().cloned().map(Into::into).collect(),

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use raft5_client::{Client, Error as KvError, Transaction};
@@ -14,30 +13,22 @@ use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
     Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, Kind, NewNode,
-    Rotation, SealedChunk, SealedMove, SetAttr, WriteError,
+    Rotation, SealedChunk, SealedMove, SetAttr,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
 use crate::grants::{self, Reads, key_versions, node_keys_key, reservation_key};
 use crate::layout::{
     CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, TOMBSTONE_PREFIX, attr_key,
-    chunk_key, chunk_prefix, chunk_spans, chunks_per_batch, dirent_ino, dirent_key, dirent_prefix,
+    chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key, dirent_prefix,
     dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key, validate_chunk_size,
 };
-use crate::perm::{self, R, W, X};
-use crate::read_cache::{ChunkCache, Lookup};
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
-/// Default byte budget of the chunk read cache.
-pub const DEFAULT_READ_CACHE_BYTES: usize = 64 << 20;
-/// How long a cached chunk may go unconfirmed before it is dropped rather
-/// than revalidated. Not a staleness bound: every hit confirms the chunk's
-/// seq against the store first (see `FsCore::chunk`), so what this buys
-/// is only that a chunk nothing has read for this long stops being held
-/// against the cache's byte budget. Generous on purpose -- expiring an
-/// entry costs a full re-fetch, where confirming one costs eight bytes.
-const READ_CACHE_TTL: Duration = Duration::from_secs(60);
+/// access(2)'s read and write bits.
+const R: u32 = libc::R_OK as u32;
+const W: u32 = libc::W_OK as u32;
 
 /// Runs `attempt` -- one whole transaction, from opening it to committing
 /// it -- until the store stops aborting it, and returns what it returned.
@@ -99,14 +90,11 @@ async fn live_entry(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError
     })
 }
 
-/// A directory `txn` may add or remove names in on `caller`'s behalf.
-async fn modifiable_dir(
-    txn: &Transaction,
-    caller: &Caller,
-    ino: u64,
-) -> Result<Result<Entry, FsError>, KvError> {
+/// Directory `ino`, to add or remove names in -- `caller` having been
+/// checked for a writable grant over it already.
+async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
     let dir = decide!(live_entry(txn, ino).await?);
-    decide!(perm::check_modify_dir(caller, &dir.attr));
+    decide!(check_kind(&dir, Kind::Directory));
     Ok(Ok(dir))
 }
 
@@ -166,55 +154,37 @@ pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, 
     .map_err(|e| e.to_string())?
 }
 
-/// Whether the filesystem in `client`'s store is encrypted: what the store
-/// records, or for a new filesystem, `requested`, which it then records.
-/// Like the chunk size, settled in one transaction so that servers
-/// starting a new filesystem together agree.
-///
-/// Asking for encryption of a filesystem that already exists unencrypted
-/// is an error rather than a note: carrying on would leave its owner
-/// believing their data is encrypted when it isn't. The reverse -- an
-/// encrypted filesystem opened without asking -- just stays encrypted.
-pub async fn resolve_encryption(client: &Client, requested: bool) -> Result<bool, String> {
+/// Checks the store in `client` holds a filesystem made by this raft5fs --
+/// every one encrypted -- or is new, and then records that it does. One
+/// made by an older raft5fs, which could make unencrypted ones, is
+/// refused rather than opened: carrying on would mix the two.
+pub async fn check_store(client: &Client) -> Result<(), String> {
     retrying(move || async move {
+        let txn = client.transaction(TXN_TTL).await?;
         let refused = || {
             Ok(Err(
-                "this filesystem was created unencrypted, and can't be made encrypted".to_string(),
+                "this store holds a filesystem made by an older, unencrypted raft5fs, \
+                 which this one can't open"
+                    .to_string(),
             ))
         };
-        let txn = client.transaction(TXN_TTL).await?;
         if let Some(bytes) = txn.read(ENCRYPTED_KEY).await?.value {
-            let encrypted = bytes.as_slice() == [1];
-            if requested && !encrypted {
-                return refused();
-            }
-            return Ok(Ok(encrypted));
+            return if bytes.as_slice() == [1] {
+                Ok(Ok(()))
+            } else {
+                refused()
+            };
         }
-        // No record, but a root: a filesystem from before encryption was
-        // recorded, which makes it unencrypted.
-        let existing = txn.read(&attr_key(ROOT_INO)).await?.value.is_some();
-        if existing && requested {
+        // No record but a root: from before there was a record.
+        if txn.read(&attr_key(ROOT_INO)).await?.value.is_some() {
             return refused();
         }
-        let encrypted = requested && !existing;
-        txn.write(ENCRYPTED_KEY, Some(&[u8::from(encrypted)]))
-            .await?;
+        txn.write(ENCRYPTED_KEY, Some(&[1])).await?;
         txn.commit().await?;
-        Ok(Ok(encrypted))
+        Ok(Ok(()))
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-/// Whether the filesystem in `client`'s store is encrypted, without
-/// settling it: `None` if no server has opened it yet.
-pub async fn stored_encryption(client: &Client) -> Result<Option<bool>, FsError> {
-    let recorded = client.read(ENCRYPTED_KEY).await?.value;
-    if let Some(bytes) = recorded {
-        return Ok(Some(bytes.as_slice() == [1]));
-    }
-    let existing = client.read(&attr_key(ROOT_INO)).await?.value.is_some();
-    Ok(existing.then_some(false))
 }
 
 fn decode_chunk_size(bytes: &[u8]) -> Result<u64, String> {
@@ -268,35 +238,19 @@ fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
 pub struct FsCore {
     client: Client,
     chunk_size: u64,
-    encrypted: bool,
-    chunk_cache: Mutex<ChunkCache>,
 }
 
 impl FsCore {
-    /// Opens the filesystem in `client`'s store, settling its chunk size
-    /// (see `resolve_chunk_size`), creating the root directory if the
-    /// filesystem is new -- owned by `root_owner` (uid, gid), mode 0755 --
-    /// and finishing any deletion an earlier process left half done (see
-    /// `reap_tombstones`). `read_cache_bytes` of 0 disables the read cache.
-    /// `encrypted` only matters to a new filesystem (see
-    /// `resolve_encryption`).
-    pub async fn connect(
-        client: Client,
-        preferred_chunk_size: u64,
-        read_cache_bytes: usize,
-        root_owner: (u32, u32),
-        encrypted: bool,
-    ) -> Result<Self, String> {
+    /// Opens the filesystem in `client`'s store (see `check_store`),
+    /// settling its chunk size (see `resolve_chunk_size`), creating the
+    /// real root if the filesystem is new, and finishing any deletion an
+    /// earlier process left half done (see `reap_tombstones`).
+    pub async fn connect(client: Client, preferred_chunk_size: u64) -> Result<Self, String> {
         // Before the root exists, which is how it tells a new filesystem.
-        let encrypted = resolve_encryption(&client, encrypted).await?;
+        check_store(&client).await?;
         let chunk_size = resolve_chunk_size(&client, preferred_chunk_size).await?;
-        let core = Self {
-            client,
-            chunk_size,
-            encrypted,
-            chunk_cache: Mutex::new(ChunkCache::new(read_cache_bytes, READ_CACHE_TTL)),
-        };
-        core.ensure_root(root_owner)
+        let core = Self { client, chunk_size };
+        core.ensure_root()
             .await
             .map_err(|e| format!("could not create the root directory: {e}"))?;
         // Not fatal: leftover deletions cost space, not correctness, and
@@ -309,11 +263,6 @@ impl FsCore {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
-    }
-
-    /// Whether this filesystem is encrypted: fixed when it was created.
-    pub fn encrypted(&self) -> bool {
-        self.encrypted
     }
 
     /// The store client this filesystem works through.
@@ -340,7 +289,7 @@ impl FsCore {
     /// Creates the root directory unless it exists. Checking and creating
     /// in one transaction is what lets several servers start on a new
     /// filesystem at once: whichever commits second finds the root there.
-    async fn ensure_root(&self, (uid, gid): (u32, u32)) -> Result<(), KvError> {
+    async fn ensure_root(&self) -> Result<(), KvError> {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             if txn.read(&attr_key(ROOT_INO)).await?.value.is_some() {
@@ -354,8 +303,6 @@ impl FsCore {
                     size: 0,
                     perm: 0o755,
                     nlink: 2,
-                    uid,
-                    gid,
                     atime: now,
                     mtime: now,
                     ctime: now,
@@ -375,11 +322,10 @@ impl FsCore {
         self.read_entry(ino).await?.ok_or_else(enoent)
     }
 
-    /// On an encrypted filesystem, whether `caller` reaches `ino` through
-    /// a grant (a writable one, for `write`), checked with `r`'s reads --
-    /// an operation's own transaction, so that the check and the change
-    /// commit together (see `grants`). Elsewhere, always: the mode bits
-    /// decide there, in `perm`.
+    /// Whether `caller` reaches `ino` through a grant (a writable one,
+    /// for `write`), checked with `r`'s reads -- an operation's own
+    /// transaction, so that the check and the change commit together (see
+    /// `grants`).
     async fn guard(
         &self,
         r: &impl Reads,
@@ -387,25 +333,14 @@ impl FsCore {
         ino: u64,
         write: bool,
     ) -> Result<Result<(), FsError>, KvError> {
-        if !self.encrypted {
-            return Ok(Ok(()));
-        }
-        let Some(user) = caller.user.as_deref() else {
-            return Ok(Err(FsError::new(
-                libc::EACCES,
-                "no account to check grants of",
-            )));
-        };
-        Ok(grants::authorize(r, user, ino, write).await?.map(|_| ()))
+        Ok(grants::authorize(r, &caller.user, ino, write)
+            .await?
+            .map(|_| ()))
     }
 
-    /// On an encrypted filesystem, whether `ino` and everything above it
-    /// to its volume are wrapped under their parents' current keys (see
-    /// `grants::check_fresh`). Elsewhere, always.
+    /// Whether `ino` and everything above it to its volume are wrapped
+    /// under their parents' current keys (see `grants::check_fresh`).
     async fn fresh(&self, txn: &Transaction, ino: u64) -> Result<Result<(), FsError>, KvError> {
-        if !self.encrypted {
-            return Ok(Ok(()));
-        }
         grants::check_fresh(txn, ino).await
     }
 
@@ -414,49 +349,21 @@ impl FsCore {
         self.guard(&self.client, caller, ino, write).await?
     }
 
-    /// Whether a new entry's `name` and `sealed_name` suit this filesystem:
-    /// on an encrypted one, a tag and a sealed name -- so no real name can
-    /// reach the store, even from a client that tried -- and elsewhere a
-    /// plain name with nothing sealed.
-    fn check_entry_name(&self, name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
-        let fits = if self.encrypted {
-            name.len() == TAG_LEN && !sealed_name.is_empty()
-        } else {
-            sealed_name.is_empty()
-        };
-        if fits {
+    /// Whether a new entry's `name` is a tag and comes with its real name
+    /// sealed: so no real name can reach the store, even from a client
+    /// that tried.
+    fn check_entry_name(name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
+        if name.len() == TAG_LEN && !sealed_name.is_empty() {
             Ok(())
-        } else if self.encrypted {
+        } else {
             Err(FsError::new(
                 libc::EINVAL,
                 "a name here must be a tag, with the real name sealed",
             ))
-        } else {
-            Err(FsError::new(
-                libc::EINVAL,
-                "this filesystem isn't encrypted",
-            ))
         }
     }
 
-    /// The account an encrypted filesystem's operation is for, or
-    /// `EOPNOTSUPP` on a filesystem that isn't encrypted.
-    fn account<'a>(&self, caller: &'a Caller) -> Result<&'a str, FsError> {
-        if !self.encrypted {
-            return Err(FsError::new(
-                libc::EOPNOTSUPP,
-                "this filesystem isn't encrypted",
-            ));
-        }
-        caller
-            .user
-            .as_deref()
-            .ok_or_else(|| FsError::new(libc::EACCES, "no account"))
-    }
-
-    /// Needs no permission on the inode itself: what guards it is search
-    /// permission on the path to it, which `lookup` checks -- or on an
-    /// encrypted filesystem, a grant over it.
+    /// Needs a grant over `ino`.
     pub async fn getattr(&self, caller: &Caller, ino: u64) -> Result<Attr, FsError> {
         self.guard_now(caller, ino, false).await?;
         Ok(self.resolve(ino).await?.attr)
@@ -478,27 +385,19 @@ impl FsCore {
         if dir.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
-        perm::check(caller, &dir.attr, X)?;
         let child = self.child_ino(parent, name).await?;
         Ok(self.resolve(child).await?.attr)
     }
 
-    /// Checks `caller` may open `ino` for `mask` (some of `R` and `W`).
-    pub async fn open(&self, caller: &Caller, ino: u64, mask: u32) -> Result<(), FsError> {
-        self.guard_now(caller, ino, mask & W != 0).await?;
-        let entry = self.resolve(ino).await?;
-        if entry.attr.kind == Kind::Directory && mask & W != 0 {
-            return Err(FsError::errno(libc::EISDIR));
-        }
-        perm::check(caller, &entry.attr, mask)
-    }
-
-    /// access(2): whether `caller` holds every right in `mask`, or with a
-    /// `mask` of 0, whether `ino` exists.
+    /// access(2), and what an open checks: whether `caller` holds every
+    /// right in `mask` (access(2)'s bits) -- any grant over `ino` reads
+    /// and searches, a writable one writes -- or with a `mask` of 0,
+    /// whether `ino` exists. Writing a directory's contents is a different
+    /// thing from writing the directory, which `EISDIR` refuses only when
+    /// `open` asks.
     pub async fn access(&self, caller: &Caller, ino: u64, mask: u32) -> Result<(), FsError> {
         self.guard_now(caller, ino, mask & W != 0).await?;
-        let entry = self.resolve(ino).await?;
-        perm::check(caller, &entry.attr, mask)
+        self.resolve(ino).await.map(drop)
     }
 
     pub async fn readdir(&self, caller: &Caller, ino: u64) -> Result<Vec<DirItem>, FsError> {
@@ -507,7 +406,6 @@ impl FsCore {
         if entry.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
-        perm::check(caller, &entry.attr, R)?;
 
         let mut items = vec![
             DirItem {
@@ -553,285 +451,16 @@ impl FsCore {
         Ok(items)
     }
 
-    /// `[offset, offset + len)` of `ino`, clamped to its size. End-of-file
-    /// lives in the attributes, not in the chunks: an absent chunk is a
-    /// hole, not the end, so the size has to come first.
-    ///
-    /// On an encrypted filesystem the grant is checked again on every
-    /// read, not just at open: a revoked grant stops even open files.
-    pub async fn read(
-        &self,
-        caller: &Caller,
-        ino: u64,
-        offset: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, FsError> {
-        self.refuse_plain_data()?;
-        self.guard_now(caller, ino, false).await?;
-        let size = self.read_entry(ino).await?.ok_or_else(enoent)?.attr.size;
-        Ok(self.read_range(ino, offset, len, size).await?)
-    }
-
-    /// Absent chunks and chunks shorter than the region asked for both
-    /// read as zeros, which falls out of building into an already-zeroed
-    /// buffer.
-    async fn read_range(
-        &self,
-        ino: u64,
-        offset: u64,
-        len: usize,
-        size: u64,
-    ) -> Result<Vec<u8>, KvError> {
-        if offset >= size {
-            return Ok(Vec::new());
-        }
-        let len = (len as u64).min(size - offset) as usize;
-        let mut out = vec![0u8; len];
-
-        let mut cursor = 0usize;
-        for (index, within, n) in chunk_spans(self.chunk_size, offset, len) {
-            let stored = self.chunk(ino, index).await?;
-            if within < stored.len() {
-                let end = (within + n).min(stored.len());
-                out[cursor..cursor + (end - within)].copy_from_slice(&stored[within..end]);
-            }
-            cursor += n;
-        }
-        Ok(out)
-    }
-
-    /// The stored bytes of one chunk (empty if absent), through the read
-    /// cache. The cache lock is released while the store is consulted.
-    ///
-    /// A cached chunk is never served on trust, because another mount's
-    /// writes are invisible here: `get_version` says what seq the chunk
-    /// currently holds, and only bytes read at that same seq are handed
-    /// back. That call is answered on exactly the terms `read` is -- the
-    /// stale, local-read terms -- so a confirmed hit is no less fresh than
-    /// re-reading the chunk, and costs eight bytes on the wire instead of
-    /// up to `MAX_CHUNK_SIZE`.
-    async fn chunk(&self, ino: u64, index: u64) -> Result<Arc<[u8]>, KvError> {
-        let key = chunk_key(ino, index);
-        // Bound to a name so the cache lock is released here: the arms
-        // below both await, and one of them locks the cache again.
-        let lookup = self.chunk_cache.lock().unwrap().get(ino, index);
-        let generation = match lookup {
-            Lookup::Unconfirmed {
-                data,
-                version,
-                generation,
-            } => {
-                // Both the seq check and the generation check have to pass:
-                // the first rules out another mount's write, the second a
-                // local one that landed while this was asking.
-                if self.client.get_version(&key).await? == version
-                    && self
-                        .chunk_cache
-                        .lock()
-                        .unwrap()
-                        .confirm(ino, index, generation)
-                {
-                    return Ok(data);
-                }
-                generation
-            }
-            Lookup::Miss { generation } => generation,
-        };
-        // `seq` is the version these very bytes were read at, so caching
-        // the two together costs no extra round trip.
-        let fetched = self.client.read(&key).await?;
-        let data: Arc<[u8]> = fetched.value.unwrap_or_default().into();
-        self.chunk_cache
-            .lock()
-            .unwrap()
-            .insert(ino, index, data.clone(), fetched.seq, generation);
-        Ok(data)
-    }
-
-    /// Splices `data` in at `offset` and updates the attributes to match.
-    ///
-    /// The chunks are stored in batches of up to `chunks_per_batch`, each
-    /// batch one transaction, so a write spanning many chunks costs one
-    /// commit per batch rather than one per chunk -- the commit being the
-    /// expensive part, since it is what replicates. The cost is atomicity
-    /// *between* batches: a reader can see the early batches of a write
-    /// without the later ones, and a failure part-way leaves the batches
-    /// already stored in place. Within a batch there is no such seam, as
-    /// a transaction commits whole or not at all.
-    ///
-    /// Every transaction extends the size only to cover what it stored, so
-    /// the size never runs ahead of the data. Reading the attributes
-    /// inside each one takes their lock, so concurrent writers to one file
-    /// still serialize per batch instead of clobbering each other's size.
-    ///
-    /// On failure the error carries how many leading bytes were stored, so
-    /// a caller can report a short write instead of losing track of them.
-    /// That count is per batch: a batch that failed contributes nothing,
-    /// since none of it can be assumed to have landed. A missing inode is
-    /// always reported as `ENOENT` with nothing written.
-    ///
-    /// On an encrypted filesystem the grant is checked again, once per
-    /// call, as for `read`.
-    pub async fn write(
-        &self,
-        caller: &Caller,
-        ino: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<Attr, WriteError> {
-        let missing = || WriteError {
-            written: 0,
-            error: enoent(),
-        };
-        if let Err(error) = self.refuse_plain_data() {
-            return Err(WriteError { written: 0, error });
-        }
-        if let Err(error) = self.guard_now(caller, ino, true).await {
-            return Err(WriteError { written: 0, error });
-        }
-        if data.is_empty() {
-            // Still a write as far as mtime is concerned.
-            return self
-                .write_batch(ino, offset, &[], &[])
-                .await
-                .map_err(|e| log_write_error(ino, offset, e, 0))?
-                .ok_or_else(missing);
-        }
-
-        // One span per chunk the range touches, ascending, so grouping
-        // them by count bounds both what a transaction may hold: at most
-        // `per_batch` keys, and at most `per_batch * chunk_size` bytes.
-        let spans: Vec<(u64, usize, usize)> =
-            chunk_spans(self.chunk_size, offset, data.len()).collect();
-        let per_batch = chunks_per_batch(self.chunk_size);
-
-        let mut attr = None;
-        let mut cursor = 0usize;
-        for group in spans.chunks(per_batch) {
-            let bytes: usize = group.iter().map(|&(_, _, n)| n).sum();
-            let end = offset + (cursor + bytes) as u64;
-            let stored = self
-                .write_batch(ino, end, group, &data[cursor..cursor + bytes])
-                .await
-                .map_err(|e| log_write_error(ino, offset, e, cursor))?;
-            cursor += bytes;
-            match stored {
-                Some(a) => attr = Some(a),
-                None => return Err(missing()),
-            }
-        }
-        attr.ok_or_else(missing)
-    }
-
-    /// One transaction of `write`: stores every span in `spans` -- each a
-    /// chunk index, the offset within that chunk, and how many bytes of
-    /// `data` belong to it -- and extends the file to at least `end`.
-    /// `data` holds exactly the bytes those spans cover, in order.
-    ///
-    /// An empty `spans` writes no chunk at all, which is how a zero-length
-    /// write still touches mtime.
-    async fn write_batch(
-        &self,
-        ino: u64,
-        end: u64,
-        spans: &[(u64, usize, usize)],
-        data: &[u8],
-    ) -> Result<Option<Attr>, KvError> {
-        let outcome = retrying(move || self.write_batch_attempt(ino, end, spans, data)).await;
-        if outcome.is_err() {
-            // The outcome is unknown, so the cache can't be trusted for
-            // these chunks either.
-            self.chunk_cache.lock().unwrap().invalidate_ino(ino);
-        }
-        outcome
-    }
-
-    /// One attempt at `write_batch`: opens a transaction, applies every
-    /// span, updates the attributes, and commits -- all of it, so that
-    /// `write_batch`'s retry can treat any failure the same way: throw
-    /// this attempt away and do the whole thing again from a fresh
-    /// transaction.
-    async fn write_batch_attempt(
-        &self,
-        ino: u64,
-        end: u64,
-        spans: &[(u64, usize, usize)],
-        data: &[u8],
-    ) -> Result<Option<Attr>, KvError> {
-        let txn = self.client.transaction(TXN_TTL).await?;
-        // First, and load-bearing: the attributes are deleted last
-        // when a file goes away, so finding them absent here is what
-        // stops a batch from storing chunks nothing could ever reach
-        // again.
-        let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
-            return Ok(None);
-        };
-        let mut entry = decode_entry(ino, &bytes);
-        // Equally load-bearing: a deletion marks the Entry before it
-        // removes the chunks, in a transaction that conflicts with this
-        // one on the attr key. So either this commit lands first, and its
-        // chunks are there for the deletion to remove, or it sees the mark
-        // here and stores nothing -- never a chunk written after the
-        // deletion has already scanned past it.
-        if entry.is_deleted() {
-            return Ok(None);
-        }
-
-        let mut cursor = 0usize;
-        for &(index, within, n) in spans {
-            let slice = &data[cursor..cursor + n];
-            cursor += n;
-            let key = chunk_key(ino, index);
-            // A write covering a whole chunk replaces it outright, so
-            // there is nothing to preserve and nothing to read first.
-            // Batches are aligned to the chunk grid, so this is the
-            // path every chunk of an aligned sequential write takes --
-            // such a batch reads no chunks at all.
-            if within == 0 && n as u64 == self.chunk_size {
-                txn.write(&key, Some(slice)).await?;
-            } else {
-                let mut buf = txn.read(&key).await?.value.unwrap_or_default();
-                // Covers both a hole ahead of `within` and extending
-                // the chunk to hold the new bytes.
-                if buf.len() < within + n {
-                    buf.resize(within + n, 0);
-                }
-                buf[within..within + n].copy_from_slice(slice);
-                txn.write(&key, Some(&buf)).await?;
-            }
-        }
-
-        if end > entry.attr.size {
-            entry.attr.size = end;
-        }
-        let now = SystemTime::now();
-        entry.attr.mtime = now;
-        entry.attr.ctime = now;
-        txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
-            .await?;
-        txn.commit().await?;
-
-        // One call for the whole batch: `invalidate` bumps the cache's
-        // generation each time, and a single bump costs concurrent
-        // readers fewer failed confirmations than one per chunk would.
-        if let (Some(&(first, ..)), Some(&(last, ..))) = (spans.first(), spans.last()) {
-            self.chunk_cache
-                .lock()
-                .unwrap()
-                .invalidate(ino, first..=last);
-        }
-        Ok(Some(entry.attr))
-    }
-
-    /// Applies a `setattr` if `caller` may (see `perm::check_setattr`;
-    /// `writable_handle` says it comes through a handle opened for
-    /// writing), including the data-side work a size change implies.
+    /// Applies `changes` -- mode, size and times; there are no owners to
+    /// change -- if `caller` has a writable grant over `ino`, including the
+    /// data-side work a size change implies. The chunk a cut size falls
+    /// inside the client has re-sealed already, cut short (see
+    /// `write_chunks`): the server can't open it to cut it.
     pub async fn setattr(
         &self,
         caller: &Caller,
         ino: u64,
         changes: SetAttr,
-        writable_handle: bool,
     ) -> Result<Attr, FsError> {
         // Whole chunks past the new end go first, before anything records
         // the smaller size. A crash here loses tail bytes the caller asked
@@ -842,23 +471,9 @@ impl FsCore {
             // transaction below, so the caller's right to truncate is
             // checked before it as well as in it.
             self.guard_now(caller, ino, true).await?;
-            let entry = self.resolve(ino).await?;
-            perm::check_setattr(caller, &entry.attr, &changes, writable_handle)?;
-            let last = new_size / self.chunk_size;
-            let rem = (new_size % self.chunk_size) as usize;
-            let first_dead = if rem == 0 { last } else { last + 1 };
-            // Invalidated before and after: the boundary chunk changes
-            // only at commit, and the dead ones vanish right now.
-            self.chunk_cache
-                .lock()
-                .unwrap()
-                .invalidate(ino, last..=u64::MAX);
-            let deleted = self.delete_chunks_from(ino, first_dead).await;
-            self.chunk_cache
-                .lock()
-                .unwrap()
-                .invalidate(ino, last..=u64::MAX);
-            deleted?;
+            self.resolve(ino).await?;
+            self.delete_chunks_from(ino, new_size.div_ceil(self.chunk_size))
+                .await?;
         }
 
         let attr = retrying(move || async move {
@@ -873,36 +488,11 @@ impl FsCore {
                 return Ok(Err(enoent()));
             }
             decide!(self.guard(&txn, caller, ino, true).await?);
-            if let Err(e) = perm::check_setattr(caller, &entry.attr, &changes, writable_handle) {
-                return Ok(Err(e));
+            if let Some(mode) = changes.mode {
+                entry.attr.perm = (mode & 0o7777) as u16;
             }
-            entry.attr.perm = perm::new_perm(caller, &entry.attr, &changes);
-
             if let Some(new_size) = changes.size {
-                let last = new_size / self.chunk_size;
-                let rem = (new_size % self.chunk_size) as usize;
-                // The chunk EOF now falls inside still holds bytes past
-                // it. Cutting it back is what makes a later grow read
-                // zeros rather than what used to be there.
-                // Not on an encrypted filesystem, whose chunks this can't
-                // cut: there the client re-sealed the boundary chunk
-                // already (see `write_chunks`).
-                if rem > 0
-                    && !self.encrypted
-                    && let Some(mut buf) = txn.read(&chunk_key(ino, last)).await?.value
-                    && buf.len() > rem
-                {
-                    buf.truncate(rem);
-                    txn.write(&chunk_key(ino, last), Some(&buf)).await?;
-                }
                 entry.attr.size = new_size;
-            }
-
-            if let Some(uid) = changes.uid {
-                entry.attr.uid = uid;
-            }
-            if let Some(gid) = changes.gid {
-                entry.attr.gid = gid;
             }
             if let Some(atime) = changes.atime {
                 entry.attr.atime = atime.resolve();
@@ -918,25 +508,18 @@ impl FsCore {
             Ok(Ok(entry.attr))
         })
         .await??;
-
-        if let Some(new_size) = changes.size {
-            self.chunk_cache
-                .lock()
-                .unwrap()
-                .invalidate(ino, new_size / self.chunk_size..=u64::MAX);
-        }
         Ok(attr)
     }
 
-    /// `new` is what an encrypted filesystem's create brings (see
-    /// `NewNode`), and must be `None` on any other.
+    /// `name` is the new entry's tag, and `new` the rest of what a create
+    /// brings (see `NewNode`).
     pub async fn mkdir(
         &self,
         caller: &Caller,
         parent: u64,
         name: &OsStr,
         perm: u16,
-        new: Option<&NewNode>,
+        new: &NewNode,
     ) -> Result<Attr, FsError> {
         self.create_child(caller, parent, name, Kind::Directory, perm, new)
             .await
@@ -949,16 +532,17 @@ impl FsCore {
         parent: u64,
         name: &OsStr,
         perm: u16,
-        new: Option<&NewNode>,
+        new: &NewNode,
     ) -> Result<Attr, FsError> {
         self.create_child(caller, parent, name, Kind::File, perm, new)
             .await
     }
 
-    /// The inode number an encrypted filesystem's create will use, held
-    /// for `caller` until it does.
+    /// The inode number `caller`'s next create will use, held for them
+    /// until it does: a node's key record is bound to its inode, so the
+    /// client needs the number before it can make one.
     pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
-        let user = self.account(caller)?;
+        let user = caller.user.as_str();
         let ino = allocate_inode(&self.client).await?;
         self.client
             .write(&reservation_key(ino), Some(user.as_bytes()))
@@ -966,13 +550,13 @@ impl FsCore {
         Ok(ino)
     }
 
-    /// Allocates an inode and claims `name` in `parent` for it, writing
-    /// both the entry and the directory entry in one transaction. Reading
-    /// the name inside that transaction is what makes the existence check
-    /// authoritative: two concurrent creates of one name can't both find
-    /// it absent. Reading the parent there too means the permission check
-    /// sees the directory as it is at commit, and that a directory whose
-    /// removal has begun takes no new entries.
+    /// Claims `name` in `parent` for `new`'s reserved inode, writing the
+    /// entry, its key record and the directory entry in one transaction.
+    /// Reading the name inside that transaction is what makes the
+    /// existence check authoritative: two concurrent creates of one name
+    /// can't both find it absent. Reading the parent there too means the
+    /// grant check sees the directory as it is at commit, and that a
+    /// directory whose removal has begun takes no new entries.
     async fn create_child(
         &self,
         caller: &Caller,
@@ -980,60 +564,38 @@ impl FsCore {
         name: &OsStr,
         kind: Kind,
         perm: u16,
-        new: Option<&NewNode>,
+        new: &NewNode,
     ) -> Result<Attr, FsError> {
-        let ino = match (self.encrypted, new) {
-            (true, Some(new)) => new.ino,
-            (false, None) => allocate_inode(&self.client).await?,
-            (true, None) => {
-                return Err(FsError::new(
-                    libc::EINVAL,
-                    "a create here needs a key record",
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(FsError::new(
-                    libc::EINVAL,
-                    "this filesystem isn't encrypted",
-                ));
-            }
-        };
-        let sealed_name = new.map_or(&[][..], |n| &n.sealed_name);
-        self.check_entry_name(name, sealed_name)?;
+        let ino = new.ino;
+        Self::check_entry_name(name, &new.sealed_name)?;
         let dirent = &dirent_key(parent, name);
-        let value = &dirent_value(ino, sealed_name);
+        let value = &dirent_value(ino, &new.sealed_name);
 
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
             // The new node's key and name are sealed under the parent's.
             decide!(self.fresh(&txn, parent).await?);
-            let mut dir = decide!(modifiable_dir(&txn, caller, parent).await?);
+            let mut dir = decide!(modifiable_dir(&txn, parent).await?);
             if txn.read(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
             }
-            if let Some(new) = new {
-                let (parent_version, _) = decide!(key_versions(&txn, parent).await?);
-                decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
-            }
-            let (uid, gid, perm) = perm::new_owner(caller, &dir.attr, kind, perm);
+            let (parent_version, _) = decide!(key_versions(&txn, parent).await?);
+            decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
             let now = SystemTime::now();
             let entry = Entry {
                 attr: Attr {
                     ino,
                     kind,
                     size: 0,
-                    perm,
+                    perm: perm & 0o7777,
                     nlink: if kind == Kind::Directory { 2 } else { 1 },
-                    uid,
-                    gid,
                     atime: now,
                     mtime: now,
                     ctime: now,
                 },
-                // Files too, though nothing but an encrypted filesystem's
-                // walk up to a grant needs it: a file's only parent is the
-                // one directory that names it.
+                // Files too: the walk up to a grant goes through it, and
+                // a file's only parent is the one directory naming it.
                 parent,
             };
             write_entry(&txn, &entry).await?;
@@ -1055,7 +617,7 @@ impl FsCore {
         new: &NewNode,
         versions: (u32, u32),
     ) -> Result<Result<(), FsError>, KvError> {
-        let user = caller.user.as_deref().unwrap_or_default();
+        let user = caller.user.as_str();
         let reserved = txn.read(&reservation_key(new.ino)).await?.value;
         if reserved.as_deref() != Some(user.as_bytes()) {
             return Ok(Err(FsError::new(
@@ -1109,14 +671,14 @@ impl FsCore {
     /// `parent`, removes the dirent, marks the Entry deleted and records a
     /// tombstone; it re-reads the dirent, so it only removes `ino` if the
     /// name still means `ino`. From then on no write can add a chunk (see
-    /// `write_batch_attempt`), whichever process it comes from, nor a
+    /// `write_chunks`), whichever process it comes from, nor a
     /// create add an entry to a removed directory. Then `finish_removal`
     /// deletes the chunks, the Entry and the tombstone. A crash between the
     /// two leaves the tombstone, which `reap_tombstones` finishes.
     ///
-    /// On an encrypted filesystem the caller needs a writable grant over
-    /// `guarded`: the parent, except for a volume, which is guarded by
-    /// itself (its parent, the real root, being no one's).
+    /// The caller needs a writable grant over `guarded`: the parent,
+    /// except for a volume, which is guarded by itself (its parent, the
+    /// real root, being no one's).
     async fn remove_child(
         &self,
         caller: &Caller,
@@ -1130,13 +692,12 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, guarded, true).await?);
-            let mut dir = decide!(modifiable_dir(&txn, caller, parent).await?);
+            let mut dir = decide!(modifiable_dir(&txn, parent).await?);
             if named(&txn, dirent).await? != Some(ino) {
                 return Ok(Err(enoent()));
             }
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, kind));
-            decide!(perm::check_sticky(caller, &dir.attr, &entry.attr));
             let now = SystemTime::now();
             entry.mark_deleted();
             entry.attr.ctime = now;
@@ -1174,9 +735,9 @@ impl FsCore {
         new_parent: u64,
         new_name: &OsStr,
         noreplace: bool,
-        sealed: Option<&SealedMove>,
+        sealed: &SealedMove,
     ) -> Result<Option<u64>, FsError> {
-        self.check_entry_name(new_name, sealed.map_or(&[][..], |m| &m.sealed_name))?;
+        Self::check_entry_name(new_name, &sealed.sealed_name)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
         let replaced = retrying(move || async move {
@@ -1185,19 +746,17 @@ impl FsCore {
             if new_parent != parent {
                 decide!(self.guard(&txn, caller, new_parent, true).await?);
             }
-            let mut src_dir = decide!(modifiable_dir(&txn, caller, parent).await?);
+            let mut src_dir = decide!(modifiable_dir(&txn, parent).await?);
             let mut dst_dir = if new_parent == parent {
                 None
             } else {
-                Some(decide!(modifiable_dir(&txn, caller, new_parent).await?))
+                Some(decide!(modifiable_dir(&txn, new_parent).await?))
             };
-            let dst_attr = dst_dir.as_ref().map_or(src_dir.attr, |d| d.attr);
 
             let Some(ino) = named(&txn, from).await? else {
                 return Ok(Err(enoent()));
             };
             let mut moved = decide!(live_entry(&txn, ino).await?);
-            decide!(perm::check_sticky(caller, &src_dir.attr, &moved.attr));
             let target = named(&txn, to).await?;
             if target == Some(ino) {
                 // Two names for one inode: POSIX says do nothing. (With no
@@ -1211,7 +770,6 @@ impl FsCore {
                     return Ok(Err(FsError::errno(libc::EEXIST)));
                 }
                 let mut victim = decide!(live_entry(&txn, victim_ino).await?);
-                decide!(perm::check_sticky(caller, &dst_attr, &victim.attr));
                 decide!(check_kind(&victim, moved.attr.kind));
                 victim.mark_deleted();
                 victim.attr.ctime = now;
@@ -1222,42 +780,37 @@ impl FsCore {
                 txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
             }
 
-            if let Some(sealed) = sealed {
-                // The sealed name and key record are for one inode, which
-                // must be the one moving.
-                if sealed.ino != ino {
+            // The sealed name and key record are for one inode, which must
+            // be the one moving.
+            if sealed.ino != ino {
+                return Ok(Err(FsError::new(
+                    libc::ESTALE,
+                    "the name moved meanwhile names another inode now",
+                )));
+            }
+            // Its name is sealed under the new parent's key, and a stale
+            // node mustn't come out of the move looking fresh.
+            decide!(self.fresh(&txn, new_parent).await?);
+            decide!(self.fresh(&txn, ino).await?);
+            if new_parent != parent {
+                // Its key moves with it, re-wrapped under the new parent's.
+                let keys = &sealed.node_keys;
+                let (version, _) = decide!(key_versions(&txn, ino).await?);
+                let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
+                if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                     return Ok(Err(FsError::new(
-                        libc::ESTALE,
-                        "the name moved meanwhile names another inode now",
+                        libc::EKEYEXPIRED,
+                        "the moved node's key record must keep its version, under the new parent's",
                     )));
                 }
-                // Its name is sealed under the new parent's key, and a
-                // stale node mustn't come out of the move looking fresh.
-                decide!(self.fresh(&txn, new_parent).await?);
-                decide!(self.fresh(&txn, ino).await?);
-                if new_parent != parent {
-                    // Its key moves with it, re-wrapped under the new
-                    // parent's.
-                    let keys = &sealed.node_keys;
-                    let (version, _) = decide!(key_versions(&txn, ino).await?);
-                    let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
-                    if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
-                        return Ok(Err(FsError::new(
-                            libc::EKEYEXPIRED,
-                            "the moved node's key record must keep its version, under the new parent's",
-                        )));
-                    }
-                    txn.write(&node_keys_key(ino), Some(keys)).await?;
-                }
+                txn.write(&node_keys_key(ino), Some(keys)).await?;
             }
             if moved.attr.kind == Kind::Directory && new_parent != parent {
-                // Its `..` changes, which is a change to the directory.
-                decide!(perm::check(caller, &moved.attr, W));
-                // Nor may it become its own descendant: walk up from where
-                // it is going. The walk reads every ancestor, so a
-                // concurrent rename that would close a loop the other way
-                // round -- which writes one of them -- conflicts with this
-                // one rather than slipping past it.
+                // A directory may not become its own descendant: walk up
+                // from where it is going. The walk reads every ancestor,
+                // so a concurrent rename that would close a loop the other
+                // way round -- which writes one of them -- conflicts with
+                // this one rather than slipping past it.
                 let mut cur = new_parent;
                 while cur != ROOT_INO {
                     if cur == ino {
@@ -1273,8 +826,8 @@ impl FsCore {
             moved.attr.ctime = now;
             write_entry(&txn, &moved).await?;
             txn.write(from, None).await?;
-            let sealed_name = sealed.map_or(&[][..], |m| &m.sealed_name);
-            txn.write(to, Some(&dirent_value(ino, sealed_name))).await?;
+            txn.write(to, Some(&dirent_value(ino, &sealed.sealed_name)))
+                .await?;
             touch_dir(&txn, &mut src_dir, now).await?;
             if let Some(dst_dir) = &mut dst_dir {
                 touch_dir(&txn, dst_dir, now).await?;
@@ -1294,43 +847,45 @@ impl FsCore {
         Ok(replaced)
     }
 
-    /// Refuses `read` and `write` on an encrypted filesystem, whose data
-    /// moves only sealed, by whole chunks (`read_chunks`, `write_chunks`):
-    /// nothing in the clear may reach the store, even from a client that
-    /// tried.
-    fn refuse_plain_data(&self) -> Result<(), FsError> {
-        if self.encrypted {
-            Err(FsError::new(
-                libc::EOPNOTSUPP,
-                "file data here is read and written sealed, by the chunk",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     /// Up to a write batch's worth of `ino`'s sealed chunks from `first`
     /// on -- fewer than `count` if that is more -- each with the store's
-    /// sequence number for it, and the file's attributes. Encrypted
-    /// filesystems only.
+    /// sequence number for it, and the file's attributes.
+    ///
+    /// `known[i]`, if there and not 0, is the seq the client already holds
+    /// chunk `first + i` at (decrypted, in its cache). A chunk still at it
+    /// comes back `unchanged`, without its bytes: the store is asked only
+    /// for its version, which costs eight bytes however big the chunk is.
     pub async fn read_chunks(
         &self,
         caller: &Caller,
         ino: u64,
         first: u64,
         count: u32,
+        known: &[u64],
     ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
-        self.account(caller)?;
         self.guard_now(caller, ino, false).await?;
         let attr = self.resolve(ino).await?.attr;
         let count = (count as usize).min(chunks_per_batch(self.chunk_size)) as u64;
         let mut chunks = Vec::with_capacity(count as usize);
-        for index in first..first.saturating_add(count) {
-            let read = self.client.read(&chunk_key(ino, index)).await?;
+        for (i, index) in (first..first.saturating_add(count)).enumerate() {
+            let key = chunk_key(ino, index);
+            if let Some(&seq) = known.get(i).filter(|&&seq| seq != 0)
+                && self.client.get_version(&key).await? == seq
+            {
+                chunks.push(SealedChunk {
+                    index,
+                    seq,
+                    blob: None,
+                    unchanged: true,
+                });
+                continue;
+            }
+            let read = self.client.read(&key).await?;
             chunks.push(SealedChunk {
                 index,
                 seq: read.seq,
                 blob: read.value,
+                unchanged: false,
             });
         }
         Ok((attr, chunks))
@@ -1340,15 +895,15 @@ impl FsCore {
     /// its `expected_seq` says, none (`EAGAIN`) -- and grows the file to
     /// `end`. Each must be sealed under the file's current key version
     /// (`EKEYEXPIRED` if not, for the client to fetch the key again).
-    /// Encrypted filesystems only.
+    /// Returns the file's attributes and the seq every chunk written is
+    /// now at, which is what lets the client cache what it wrote.
     pub async fn write_chunks(
         &self,
         caller: &Caller,
         ino: u64,
         writes: &[ChunkWrite],
         end: u64,
-    ) -> Result<Attr, FsError> {
-        self.account(caller)?;
+    ) -> Result<(Attr, u64), FsError> {
         if writes.len() > chunks_per_batch(self.chunk_size) {
             return Err(FsError::new(
                 libc::EINVAL,
@@ -1366,8 +921,11 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
-            // As in `write_batch_attempt`: no chunk for an inode whose
-            // deletion has begun.
+            // Read first, and load-bearing: a deletion marks the Entry
+            // before it removes the chunks, in a transaction this one
+            // conflicts with on it, so no chunk lands after the deletion
+            // has scanned past -- and the Entry goes last, so no chunk is
+            // stored for an inode nothing could reach again.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
             let (version, _) = decide!(key_versions(&txn, ino).await?);
@@ -1396,8 +954,8 @@ impl FsCore {
             entry.attr.mtime = now;
             entry.attr.ctime = now;
             write_entry(&txn, &entry).await?;
-            txn.commit().await?;
-            Ok(Ok(entry.attr))
+            let seq = txn.commit().await?;
+            Ok(Ok((entry.attr, seq)))
         })
         .await??;
         Ok(attr)
@@ -1406,13 +964,13 @@ impl FsCore {
     /// `caller`'s grant over `ino` and the key records down to it (see
     /// `grants::key_path`).
     pub async fn key_path(&self, caller: &Caller, ino: u64) -> Result<KeyPath, FsError> {
-        let user = self.account(caller)?;
+        let user = caller.user.as_str();
         grants::key_path(&self.client, user, ino).await
     }
 
     /// Every grant made to `caller`.
     pub async fn grants(&self, caller: &Caller) -> Result<Vec<Grant>, FsError> {
-        let user = self.account(caller)?;
+        let user = caller.user.as_str();
         grants::list(&self.client, user).await
     }
 
@@ -1434,7 +992,6 @@ impl FsCore {
         grantee: &str,
         grant: &Grant,
     ) -> Result<(), FsError> {
-        self.account(caller)?;
         grants::check_username(grantee)?;
         let ino = grant.ino;
         retrying(move || async move {
@@ -1481,7 +1038,7 @@ impl FsCore {
         sealed_key: &[u8],
         sealed_label: &[u8],
     ) -> Result<Attr, FsError> {
-        let user = self.account(caller)?;
+        let user = caller.user.as_str();
         let dirent = &dirent_key(ROOT_INO, OsStr::new(&new.ino.to_string()));
         let grant = &Grant {
             ino: new.ino,
@@ -1498,17 +1055,14 @@ impl FsCore {
             }
             // No parent key: a volume's key only reaches people by grant.
             decide!(self.claim(&txn, caller, new, (1, 0)).await?);
-            let (uid, gid, perm) = perm::new_owner(caller, &root.attr, Kind::Directory, perm);
             let now = SystemTime::now();
             let entry = Entry {
                 attr: Attr {
                     ino: new.ino,
                     kind: Kind::Directory,
                     size: 0,
-                    perm,
+                    perm: perm & 0o7777,
                     nlink: 2,
-                    uid,
-                    gid,
                     atime: now,
                     mtime: now,
                     ctime: now,
@@ -1533,7 +1087,6 @@ impl FsCore {
         caller: &Caller,
         top: u64,
     ) -> Result<Vec<GrantedNode>, FsError> {
-        self.account(caller)?;
         self.guard_now(caller, top, true).await?;
         grants::grants_under(&self.client, top).await
     }
@@ -1545,7 +1098,6 @@ impl FsCore {
     /// at its expected version any more, or its grants aren't the ones the
     /// rotation re-seals: someone else changed it meanwhile.
     pub async fn rotate(&self, caller: &Caller, rotations: &[Rotation]) -> Result<(), FsError> {
-        self.account(caller)?;
         let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
@@ -1614,7 +1166,6 @@ impl FsCore {
     /// Removes volume `ino`, which must be empty, with every grant of it.
     /// Needs a writable grant of the volume itself.
     pub async fn delete_volume(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
-        self.account(caller)?;
         self.guard_now(caller, ino, true).await?;
         if self.resolve(ino).await?.parent != ROOT_INO {
             return Err(FsError::new(
@@ -1638,15 +1189,12 @@ impl FsCore {
     /// tombstone together. Idempotent, so it is safe for several processes
     /// to finish the same deletion at once.
     async fn finish_removal(&self, ino: u64) -> Result<(), FsError> {
-        let deleted = self.delete_chunks_from(ino, 0).await;
-        self.chunk_cache.lock().unwrap().invalidate_ino(ino);
-        deleted?;
+        self.delete_chunks_from(ino, 0).await?;
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
-            // An encrypted filesystem's grants of it and key record; on
-            // another there are none, and this finds nothing.
+            // Its grants and key record go with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;
             Ok(())
@@ -1712,44 +1260,37 @@ impl FsCore {
     }
 }
 
-/// Logs the real cause of a failed batch -- `write_batch` only ever
-/// returns `KvError` on a genuine failure (`retrying` absorbs every
-/// `Aborted`), and this is the one place every write path funnels
-/// through, so it is the one place that needs to log it.
-fn log_write_error(ino: u64, offset: u64, e: KvError, written: usize) -> WriteError {
-    eprintln!("write to inode {ino} at offset {offset} failed after {written} bytes: {e}");
-    WriteError {
-        written,
-        error: e.into(),
-    }
-}
-
 /// Compile-time only: the server will run these on tonic's multithreaded
 /// runtime, which needs every request's future to be `Send`. Generic async
 /// closures (`retrying`) are exactly where that can quietly stop holding.
 #[allow(dead_code)]
-fn operations_are_send(core: &FsCore, caller: &Caller, name: &OsStr, data: &[u8]) {
+fn operations_are_send(
+    core: &FsCore,
+    caller: &Caller,
+    name: &OsStr,
+    new: &NewNode,
+    mv: &SealedMove,
+) {
     fn send<T: Send>(_: T) {}
     send(core.getattr(caller, 1));
     send(core.lookup(caller, 1, name));
-    send(core.open(caller, 1, R));
     send(core.access(caller, 1, R));
     send(core.readdir(caller, 1));
-    send(core.read(caller, 1, 0, 1));
-    send(core.write(caller, 1, 0, data));
-    send(core.setattr(caller, 1, SetAttr::default(), false));
-    send(core.create(caller, 1, name, 0o644, None));
-    send(core.mkdir(caller, 1, name, 0o755, None));
+    send(core.setattr(caller, 1, SetAttr::default()));
+    send(core.create(caller, 1, name, 0o644, new));
+    send(core.mkdir(caller, 1, name, 0o755, new));
     send(core.unlink(caller, 1, name));
     send(core.rmdir(caller, 1, name));
-    send(core.rename(caller, 1, name, 1, name, false, None));
+    send(core.rename(caller, 1, name, 1, name, false, mv));
     send(core.reserve_inode(caller));
     send(core.key_path(caller, 1));
     send(core.grants(caller));
     send(core.public_key("u"));
-    send(core.read_chunks(caller, 1, 0, 1));
+    send(core.read_chunks(caller, 1, 0, 1, &[]));
     send(core.write_chunks(caller, 1, &[], 0));
     send(core.grants_under(caller, 1));
     send(core.rotate(caller, &[]));
-    send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0), false));
+    send(core.create_volume(caller, new, 0o755, &[], &[]));
+    send(core.delete_volume(caller, 1));
+    send(FsCore::connect(core.client.clone(), 4096));
 }

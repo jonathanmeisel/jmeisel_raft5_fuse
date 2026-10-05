@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use fuser::Errno;
 
 /// Bytes accepted by `write` but not yet committed: one contiguous run,
@@ -18,14 +16,7 @@ pub struct WriteBuf {
     /// it; only `fsync`, or the release of the file's last descriptor,
     /// clears it.
     pub err: Option<Errno>,
-    /// The handle the run is committed with: the one the latest write
-    /// came through. Any writable handle this mount holds for the inode
-    /// would do -- the server only checks it permits writing that inode --
-    /// and a handle stays valid after its descriptor is closed, so a run
-    /// outliving the descriptor that wrote it can still be committed.
-    pub handle: Option<Arc<str>>,
-    /// The inode the run belongs to: what an encrypted filesystem's
-    /// commit goes by, rather than the handle.
+    /// The inode the run belongs to.
     pub ino: u64,
 }
 

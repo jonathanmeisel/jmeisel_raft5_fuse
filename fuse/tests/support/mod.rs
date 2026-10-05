@@ -27,8 +27,7 @@ use fuser::{BackgroundSession, Config, MountOption};
 use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
-use raft5fs_core::users::{self, Account};
-use raft5fs_core::{DEFAULT_READ_CACHE_BYTES, FsCore, accounts};
+use raft5fs_core::{FsCore, accounts};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
 use raft5fs_fuse::remote::{Credentials, Remote};
@@ -129,19 +128,6 @@ pub fn credentials(user: &str) -> Credentials {
     }
 }
 
-/// Whoever runs the tests: the tester's identity, and the root's owner.
-fn own_ids() -> (u32, u32, Vec<u32>) {
-    // SAFETY: plain libc calls; `getgroups` writes at most `n` entries
-    // into a buffer of that many.
-    unsafe {
-        let n = libc::getgroups(0, std::ptr::null_mut());
-        let mut groups = vec![0; n.max(0) as usize];
-        let n = libc::getgroups(groups.len() as i32, groups.as_mut_ptr());
-        groups.truncate(n.max(0) as usize);
-        (libc::getuid(), libc::getgid(), groups)
-    }
-}
-
 /// A single-node raft5 cluster running for one test, on its own
 /// temporary database directory and ephemeral ports. Dropping it stops
 /// the server and deletes the database.
@@ -158,9 +144,8 @@ pub struct TestCluster {
 impl TestCluster {
     /// Starts a fresh node on `runtime` and bootstraps it into a
     /// single-node cluster with authentication on, locked down the way a
-    /// real deployment is (only `SERVICE_USER` may touch any key), and
-    /// with `TESTER` set up as a filesystem user. Returns it alongside a
-    /// client logged in as `SERVICE_USER`.
+    /// real deployment is (only `SERVICE_USER` may touch any key).
+    /// Returns it alongside a client logged in as `SERVICE_USER`.
     pub fn start(runtime: &Runtime) -> (Self, Client) {
         let client_addr = free_local_addr();
         let peer_addr = free_local_addr();
@@ -257,37 +242,7 @@ impl TestCluster {
             client_address: address,
             admin,
         };
-        let (uid, gid, groups) = own_ids();
-        cluster.add_user(runtime, &service, TESTER, uid, gid, &groups);
         (cluster, service)
-    }
-
-    /// Creates store account `name` (password `password(name)`) and gives
-    /// it a filesystem identity, writing the user table through
-    /// `service`.
-    pub fn add_user(
-        &self,
-        runtime: &Runtime,
-        service: &Client,
-        name: &str,
-        uid: u32,
-        gid: u32,
-        groups: &[u32],
-    ) {
-        runtime.block_on(async {
-            self.admin
-                .create_user(name, &password(name), false)
-                .await
-                .unwrap_or_else(|e| panic!("create store account {name}: {e}"));
-            let account = Account {
-                uid,
-                gid,
-                groups: groups.to_vec(),
-            };
-            users::set(service, name, &account)
-                .await
-                .unwrap_or_else(|e| panic!("add {name} to the user table: {e}"));
-        });
     }
 }
 
@@ -326,7 +281,6 @@ const SERVER_CLUSTER_ENV: &str = "RAFT5FS_TEST_SERVER_CLUSTER";
 const SERVER_CHUNK_ENV: &str = "RAFT5FS_TEST_SERVER_CHUNK_SIZE";
 const SERVER_LISTEN_ENV: &str = "RAFT5FS_TEST_SERVER_LISTEN";
 const SERVER_TOKEN_KEY_ENV: &str = "RAFT5FS_TEST_SERVER_TOKEN_KEY";
-const SERVER_ENCRYPTED_ENV: &str = "RAFT5FS_TEST_SERVER_ENCRYPTED";
 /// The test that is really the server-mode entry point; see
 /// `serve_if_requested`.
 const SERVER_MODE_TEST: &str = "server_process_mode";
@@ -335,15 +289,11 @@ impl TestServer {
     /// Starts a server process over the cluster at `cluster_address` and
     /// waits until it is accepting connections. It opens the filesystem on
     /// the way (settling the chunk size, finishing interrupted deletions).
-    pub fn start(cluster_address: &str, chunk_size: u64, encrypted: bool) -> Self {
+    pub fn start(cluster_address: &str, chunk_size: u64) -> Self {
         for _ in 0..20 {
-            if let Some(server) = Self::try_start(
-                cluster_address,
-                chunk_size,
-                free_local_addr(),
-                TOKEN_KEY,
-                encrypted,
-            ) {
+            if let Some(server) =
+                Self::try_start(cluster_address, chunk_size, free_local_addr(), TOKEN_KEY)
+            {
                 return server;
             }
         }
@@ -357,7 +307,6 @@ impl TestServer {
         chunk_size: u64,
         listen: SocketAddr,
         token_key: &str,
-        encrypted: bool,
     ) -> Option<Self> {
         let exe = std::env::current_exe().expect("the test binary's own path");
         {
@@ -372,7 +321,6 @@ impl TestServer {
                 .env(SERVER_CHUNK_ENV, chunk_size.to_string())
                 .env(SERVER_LISTEN_ENV, listen.to_string())
                 .env(SERVER_TOKEN_KEY_ENV, token_key)
-                .env(SERVER_ENCRYPTED_ENV, if encrypted { "1" } else { "0" })
                 .env(CERT_ENV, &cert().cert)
                 .env(KEY_ENV, &cert().key)
                 .stdout(std::process::Stdio::null())
@@ -428,7 +376,6 @@ pub fn serve_if_requested() {
     let chunk_size: u64 = std::env::var(SERVER_CHUNK_ENV).unwrap().parse().unwrap();
     let listen: SocketAddr = std::env::var(SERVER_LISTEN_ENV).unwrap().parse().unwrap();
     let token_key = std::env::var(SERVER_TOKEN_KEY_ENV).unwrap();
-    let encrypted = std::env::var(SERVER_ENCRYPTED_ENV).as_deref() == Ok("1");
 
     // Die with the test that started us, even if it never gets to kill us:
     // a panicking test unwinds past `Drop`s only so far.
@@ -453,30 +400,20 @@ pub fn serve_if_requested() {
                 eprintln!("test server could not log in to the store: {e}");
                 std::process::exit(1);
             });
-        // The root belongs to whoever runs the tests, so their own mounts
-        // can work in it the way a user works in their home directory.
-        let (uid, gid, _) = own_ids();
-        let root_owner = (uid, gid);
-        let core = FsCore::connect(
-            client,
-            chunk_size,
-            DEFAULT_READ_CACHE_BYTES,
-            root_owner,
-            encrypted,
-        )
-        .await
-        .unwrap_or_else(|why| {
-            eprintln!("test server could not open the filesystem: {why}");
-            std::process::exit(1);
-        });
+        let core = FsCore::connect(client, chunk_size)
+            .await
+            .unwrap_or_else(|why| {
+                eprintln!("test server could not open the filesystem: {why}");
+                std::process::exit(1);
+            });
         let Ok(listener) = tokio::net::TcpListener::bind(listen).await else {
             // Taken since the parent chose it; the parent will pick another.
             std::process::exit(2);
         };
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
-        // Read the user table on every request, so a test that changes
-        // it sees the change at once.
-        let fs = FsService::new(Arc::new(core), signer, store, Duration::ZERO);
+        // Look accounts up on every request, so a test that removes one
+        // sees it at once.
+        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO);
         if let Err(e) = raft5fs_server::serve(
             fs,
             listener,
@@ -491,16 +428,23 @@ pub fn serve_if_requested() {
     });
 }
 
-fn start_servers(cluster: &TestCluster, chunk_size: u64, encrypted: bool) -> Vec<TestServer> {
+fn start_servers(cluster: &TestCluster, chunk_size: u64) -> Vec<TestServer> {
     (0..SERVERS)
-        .map(|_| TestServer::start(&cluster.client_address, chunk_size, encrypted))
+        .map(|_| TestServer::start(&cluster.client_address, chunk_size))
         .collect()
 }
+
+/// The volume `setup` makes, which most tests work in as if it were the
+/// root of an ordinary filesystem.
+pub const VOLUME: &str = "v";
 
 /// A `Raft5Fs` mounted at a real, temporary directory. Dropping it
 /// unmounts the filesystem and removes the (now-empty) mountpoint.
 pub struct MountedFs {
     session: Option<BackgroundSession>,
+    /// The mountpoint: the mounting user's root.
+    pub root: PathBuf,
+    /// Where tests work: the root, or a volume in it (see `in_volume`).
     pub path: PathBuf,
 }
 
@@ -530,8 +474,16 @@ impl MountedFs {
 
         Self {
             session: Some(session),
+            root: path.clone(),
             path,
         }
+    }
+
+    /// The same mount, with `path` the volume `VOLUME` rather than the
+    /// root.
+    pub fn in_volume(mut self) -> Self {
+        self.path = self.root.join(VOLUME);
+        self
     }
 }
 
@@ -539,7 +491,7 @@ impl Drop for MountedFs {
     fn drop(&mut self) {
         // Dropping the session unmounts before the directory is removed.
         self.session.take();
-        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -556,15 +508,30 @@ pub struct Harness {
     pub cluster: TestCluster,
     pub runtime: Runtime,
     pub chunk_size: u64,
-    /// Whether the servers were asked to make the filesystem encrypted;
-    /// if so, `add_user` also enrols the user.
-    pub encrypted: bool,
+    /// Whether `TESTER`'s mounts work in `VOLUME`, made at setup.
+    pub volume: bool,
 }
 
 impl Harness {
-    /// The mountpoint. Shorthand for the `mount.path` every test needs.
+    /// Where tests work: `VOLUME` (or with `setup_root`, the root).
+    /// Shorthand for the `mount.path` every test needs.
     pub fn path(&self) -> &std::path::Path {
         &self.mount.path
+    }
+
+    /// `TESTER`'s root, which lists what is shared with them.
+    pub fn root(&self) -> &std::path::Path {
+        &self.mount.root
+    }
+
+    /// A mount as `TESTER`, working where this harness's tests do.
+    fn tester_mount(&self, servers: Vec<String>) -> MountedFs {
+        let mount = MountedFs::mount(&self.runtime, servers);
+        if self.volume {
+            mount.in_volume()
+        } else {
+            mount
+        }
     }
 
     /// Restarts the servers (asking for `chunk_size`) and remounts, as a
@@ -574,9 +541,9 @@ impl Harness {
     /// The old mount comes down while its servers are still up, so what it
     /// buffered is stored on the way out.
     pub fn remount(&mut self, chunk_size: u64) {
-        let servers = start_servers(&self.cluster, chunk_size, self.encrypted);
+        let servers = start_servers(&self.cluster, chunk_size);
         let addresses = servers.iter().map(|s| s.address.clone()).collect();
-        self.mount = MountedFs::mount(&self.runtime, addresses);
+        self.mount = self.tester_mount(addresses);
         self.servers = servers;
     }
 
@@ -629,30 +596,25 @@ impl Harness {
 
     /// A second filesystem mounted over the same cluster, standing in for
     /// another host's mount: its own write buffers, the same store
-    /// underneath -- and it starts on a different server than the first
-    /// mount, so the two don't even share a read cache.
+    /// underneath, and a cache of its own -- and it starts on a different
+    /// server than the first mount.
     ///
     /// Bind it to a local declared *after* the `Harness`, so that it is
     /// dropped -- and unmounted -- before the cluster and runtime it
     /// talks to go away.
     pub fn second_mount(&self) -> MountedFs {
-        MountedFs::mount(&self.runtime, self.addresses_from(1))
+        self.tester_mount(self.addresses_from(1))
     }
 
     /// Like `second_mount`, but logged in as `user`: another user's
-    /// mount of the same filesystem.
+    /// mount of the same filesystem, working at its root.
     pub fn mount_as(&self, user: &str) -> MountedFs {
         MountedFs::mount_as(&self.runtime, self.addresses_from(1), user)
     }
 
-    /// Adds a filesystem user `name` (password `password(name)`) acting
-    /// as `uid`, `gid` and `groups`.
-    pub fn add_user(&self, name: &str, uid: u32, gid: u32, groups: &[u32]) {
-        self.cluster
-            .add_user(&self.runtime, &self.client, name, uid, gid, groups);
-        if self.encrypted {
-            self.enrol(name);
-        }
+    /// Adds user `name`, enrolled with password `password(name)`.
+    pub fn add_user(&self, name: &str) {
+        self.enrol(name);
     }
 
     /// The servers' addresses, in order.
@@ -660,7 +622,7 @@ impl Harness {
         self.addresses_from(0)
     }
 
-    /// Enrols `name` on this encrypted filesystem with password
+    /// Enrols `name` with password
     /// `password(name)`, through the real enrolment RPC, and returns their
     /// public key.
     pub fn enrol(&self, name: &str) -> [u8; 32] {
@@ -669,8 +631,8 @@ impl Harness {
 
     /// Restarts every server in place -- same addresses, so the mounts
     /// carry on with them -- signing with `token_key` from then on. To a
-    /// mount that is every session and handle it holds turning invalid at
-    /// once, as an expiry or a key rotation would make them.
+    /// mount that is every session it holds turning invalid at once, as an
+    /// expiry or a key rotation would make them.
     pub fn restart_servers_with_key(&mut self, token_key: &str) {
         for server in &mut self.servers {
             let listen = server.socket_addr();
@@ -685,7 +647,6 @@ impl Harness {
                     self.chunk_size,
                     listen,
                     token_key,
-                    self.encrypted,
                 ) {
                     break s;
                 }
@@ -699,29 +660,34 @@ impl Harness {
     }
 }
 
+/// A filesystem with `TESTER` enrolled and mounted, working in a volume
+/// made for the test (`VOLUME`): to most tests, an ordinary empty
+/// filesystem.
 pub fn setup() -> Harness {
     setup_with_chunk_size(TEST_CHUNK_SIZE)
 }
 
 pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
-    setup_with(chunk_size, false)
+    setup_with(chunk_size, true)
 }
 
-/// Like `setup`, but the filesystem is encrypted, and `TESTER` enrolled
-/// before mounting.
-pub fn setup_encrypted() -> Harness {
-    setup_with(TEST_CHUNK_SIZE, true)
+/// Like `setup`, but with nothing made: the mount works at `TESTER`'s
+/// root, which is empty.
+pub fn setup_root() -> Harness {
+    setup_with(TEST_CHUNK_SIZE, false)
 }
 
-fn setup_with(chunk_size: u64, encrypted: bool) -> Harness {
+fn setup_with(chunk_size: u64, volume: bool) -> Harness {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let (cluster, client) = TestCluster::start(&runtime);
-    let servers = start_servers(&cluster, chunk_size, encrypted);
+    let servers = start_servers(&cluster, chunk_size);
     let addresses: Vec<String> = servers.iter().map(|s| s.address.clone()).collect();
-    if encrypted {
-        enrol(&runtime, &client, &addresses, TESTER);
+    enrol(&runtime, &client, &addresses, TESTER);
+    let mut mount = MountedFs::mount(&runtime, addresses);
+    if volume {
+        std::fs::create_dir(mount.root.join(VOLUME)).expect("make the test's volume");
+        mount = mount.in_volume();
     }
-    let mount = MountedFs::mount(&runtime, addresses);
     Harness {
         mount,
         servers,
@@ -729,7 +695,7 @@ fn setup_with(chunk_size: u64, encrypted: bool) -> Harness {
         cluster,
         runtime,
         chunk_size,
-        encrypted,
+        volume,
     }
 }
 

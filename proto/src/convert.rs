@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::pb;
 use crate::types::{
     AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind,
-    Rotation, SealedChunk, SetAttr, SetTime, WriteError,
+    Rotation, SealedChunk, SetAttr, SetTime,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -61,8 +61,6 @@ impl From<Attr> for pb::Attr {
             size: a.size,
             perm: a.perm.into(),
             nlink: a.nlink,
-            uid: a.uid,
-            gid: a.gid,
             atime: Some(a.atime.into()),
             mtime: Some(a.mtime.into()),
             ctime: Some(a.ctime.into()),
@@ -78,8 +76,6 @@ impl From<pb::Attr> for Attr {
             size: a.size,
             perm: a.perm as u16,
             nlink: a.nlink,
-            uid: a.uid,
-            gid: a.gid,
             atime: time(a.atime),
             mtime: time(a.mtime),
             ctime: time(a.ctime),
@@ -140,13 +136,10 @@ fn set_time(t: Option<pb::SetTime>) -> Option<SetTime> {
 }
 
 impl pb::SetAttrRequest {
-    pub fn new(ino: u64, changes: SetAttr, handle: Option<String>) -> Self {
+    pub fn new(ino: u64, changes: SetAttr) -> Self {
         Self {
             ino,
-            handle,
             mode: changes.mode,
-            uid: changes.uid,
-            gid: changes.gid,
             size: changes.size,
             atime: changes.atime.map(Into::into),
             mtime: changes.mtime.map(Into::into),
@@ -156,8 +149,6 @@ impl pb::SetAttrRequest {
     pub fn changes(&self) -> SetAttr {
         SetAttr {
             mode: self.mode,
-            uid: self.uid,
-            gid: self.gid,
             size: self.size,
             atime: set_time(self.atime),
             mtime: set_time(self.mtime),
@@ -248,8 +239,8 @@ impl From<Result<pb::Session, FsError>> for pb::LoginResponse {
 }
 
 impl pb::LoginResponse {
-    /// The session: its token, when it expires, and (on an encrypted
-    /// filesystem) the wrapped private key.
+    /// The session: its token, when it expires, and the wrapped private
+    /// key.
     pub fn into_result(self) -> Result<pb::Session, FsError> {
         use pb::login_response::Result as R;
         match self.result {
@@ -307,60 +298,6 @@ impl From<pb::AccountKeys> for AccountKeys {
     }
 }
 
-impl From<Result<String, FsError>> for pb::OpenResponse {
-    fn from(r: Result<String, FsError>) -> Self {
-        use pb::open_response::Result as R;
-        Self {
-            result: Some(match r {
-                Ok(handle) => R::Handle(handle),
-                Err(e) => R::Error(e.into()),
-            }),
-        }
-    }
-}
-
-impl pb::OpenResponse {
-    pub fn into_result(self) -> Result<String, FsError> {
-        use pb::open_response::Result as R;
-        match self.result {
-            Some(R::Handle(h)) => Ok(h),
-            Some(R::Error(e)) => Err(e.into()),
-            None => Err(malformed("handle")),
-        }
-    }
-}
-
-impl From<Result<(Attr, String), FsError>> for pb::CreateResponse {
-    fn from(r: Result<(Attr, String), FsError>) -> Self {
-        use pb::create_response::Result as R;
-        Self {
-            result: Some(match r {
-                Ok((attr, handle)) => R::Created(pb::Created {
-                    attr: Some(attr.into()),
-                    handle,
-                }),
-                Err(e) => R::Error(e.into()),
-            }),
-        }
-    }
-}
-
-impl pb::CreateResponse {
-    /// The new file's attributes, and a handle open for reading and
-    /// writing it.
-    pub fn into_result(self) -> Result<(Attr, String), FsError> {
-        use pb::create_response::Result as R;
-        match self.result {
-            Some(R::Created(c)) => Ok((
-                c.attr.ok_or_else(|| malformed("attributes"))?.into(),
-                c.handle,
-            )),
-            Some(R::Error(e)) => Err(e.into()),
-            None => Err(malformed("created file")),
-        }
-    }
-}
-
 impl From<Result<u64, FsError>> for pb::InoResponse {
     fn from(r: Result<u64, FsError>) -> Self {
         use pb::ino_response::Result as R;
@@ -405,61 +342,6 @@ impl pb::ReadDirResponse {
             Some(R::List(list)) => Ok(list.items.into_iter().map(Into::into).collect()),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("listing")),
-        }
-    }
-}
-
-impl From<Result<Vec<u8>, FsError>> for pb::ReadResponse {
-    fn from(r: Result<Vec<u8>, FsError>) -> Self {
-        use pb::read_response::Result as R;
-        Self {
-            result: Some(match r {
-                Ok(data) => R::Data(data),
-                Err(e) => R::Error(e.into()),
-            }),
-        }
-    }
-}
-
-impl pb::ReadResponse {
-    pub fn into_result(self) -> Result<Vec<u8>, FsError> {
-        use pb::read_response::Result as R;
-        match self.result {
-            Some(R::Data(data)) => Ok(data),
-            Some(R::Error(e)) => Err(e.into()),
-            None => Err(malformed("data")),
-        }
-    }
-}
-
-impl From<Result<Attr, WriteError>> for pb::WriteResponse {
-    fn from(r: Result<Attr, WriteError>) -> Self {
-        use pb::write_response::Result as R;
-        Self {
-            result: Some(match r {
-                Ok(a) => R::Attr(a.into()),
-                Err(e) => R::Failure(pb::WriteFailure {
-                    written: e.written as u64,
-                    error: Some(e.error.into()),
-                }),
-            }),
-        }
-    }
-}
-
-impl pb::WriteResponse {
-    pub fn into_result(self) -> Result<Attr, WriteError> {
-        use pb::write_response::Result as R;
-        match self.result {
-            Some(R::Attr(a)) => Ok(a.into()),
-            Some(R::Failure(f)) => Err(WriteError {
-                written: f.written as usize,
-                error: f.error.map_or_else(|| malformed("error"), Into::into),
-            }),
-            None => Err(WriteError {
-                written: 0,
-                error: malformed("write outcome"),
-            }),
         }
     }
 }
@@ -582,6 +464,7 @@ impl From<Result<(Attr, Vec<SealedChunk>), FsError>> for pb::ReadChunksResponse 
                             index: c.index,
                             seq: c.seq,
                             blob: c.blob.unwrap_or_default(),
+                            unchanged: c.unchanged,
                         })
                         .collect(),
                 }),
@@ -605,12 +488,42 @@ impl pb::ReadChunksResponse {
                         index: c.index,
                         seq: c.seq,
                         blob: (!c.blob.is_empty()).then_some(c.blob),
+                        unchanged: c.unchanged,
                     })
                     .collect();
                 Ok((attr, chunks))
             }
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("chunk list")),
+        }
+    }
+}
+
+impl From<Result<(Attr, u64), FsError>> for pb::WriteChunksResponse {
+    fn from(r: Result<(Attr, u64), FsError>) -> Self {
+        use pb::write_chunks_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok((attr, seq)) => R::Written(pb::ChunksWritten {
+                    attr: Some(attr.into()),
+                    seq,
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::WriteChunksResponse {
+    /// The file's attributes, and the seq the chunks written are now at.
+    pub fn into_result(self) -> Result<(Attr, u64), FsError> {
+        use pb::write_chunks_response::Result as R;
+        match self.result {
+            Some(R::Written(w)) => {
+                Ok((w.attr.ok_or_else(|| malformed("attributes"))?.into(), w.seq))
+            }
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("written chunks")),
         }
     }
 }
@@ -737,8 +650,6 @@ mod tests {
             size: 4096,
             perm: 0o2770,
             nlink: 2,
-            uid: 1001,
-            gid: 100,
             atime: t,
             mtime: t,
             ctime: t,
@@ -747,19 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn errors_and_short_writes_survive_the_trip() {
+    fn errors_survive_the_trip() {
         let e = FsError::new(libc::EACCES, "nope");
         assert_eq!(
             pb::AttrResponse::from(Err(e.clone())).into_result(),
             Err(e.clone())
         );
-        let w = WriteError {
-            written: 123,
-            error: e,
-        };
         assert_eq!(
-            pb::WriteResponse::from(Err(w.clone())).into_result(),
-            Err(w)
+            pb::WriteChunksResponse::from(Err(e.clone())).into_result(),
+            Err(e)
         );
     }
 
@@ -771,7 +678,7 @@ mod tests {
             mtime: Some(SetTime::At(UNIX_EPOCH + Duration::from_secs(7))),
             ..Default::default()
         };
-        assert_eq!(pb::SetAttrRequest::new(3, changes, None).changes(), changes);
+        assert_eq!(pb::SetAttrRequest::new(3, changes).changes(), changes);
     }
 
     #[test]
@@ -795,12 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn a_created_file_without_attributes_is_eio() {
-        let r = pb::CreateResponse {
-            result: Some(pb::create_response::Result::Created(pb::Created {
-                attr: None,
-                handle: "h".into(),
-            })),
+    fn written_chunks_without_attributes_are_eio() {
+        let r = pb::WriteChunksResponse {
+            result: Some(pb::write_chunks_response::Result::Written(
+                pb::ChunksWritten { attr: None, seq: 1 },
+            )),
         };
         assert_eq!(r.into_result().unwrap_err().errno, libc::EIO);
     }

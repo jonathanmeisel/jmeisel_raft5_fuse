@@ -1,4 +1,4 @@
-//! Encrypted filesystems' access control: grants, key records, and the
+//! Access control: grants, key records, and the
 //! walk that decides whether a user may reach an inode.
 //!
 //! A user reaches an inode only through a grant of a directory at or above
@@ -64,7 +64,7 @@ pub(crate) fn grant_prefix(ino: u64) -> Vec<u8> {
     key
 }
 
-fn index_prefix(user: &str) -> Vec<u8> {
+pub(crate) fn index_prefix(user: &str) -> Vec<u8> {
     let mut key = GRANT_INDEX_PREFIX.to_vec();
     key.extend_from_slice(user.as_bytes());
     key.push(0);
@@ -142,7 +142,7 @@ pub(crate) fn decode_grant(ino: u64, bytes: &[u8]) -> Result<Grant, FsError> {
 }
 
 /// `(version, parent_version)` of `ino`'s key record, which every inode of
-/// an encrypted filesystem has.
+/// the filesystem has.
 pub(crate) async fn key_versions(
     r: &impl Reads,
     ino: u64,

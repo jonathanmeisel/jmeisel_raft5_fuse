@@ -17,9 +17,9 @@ pub(crate) const DELETE_BATCH: usize = 256;
 /// adopt it rather than reinterpreting every chunk boundary.
 pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
-/// Records whether a filesystem is encrypted (one byte, 1 or 0), fixed
-/// when it is created. A store from before this was recorded has a root
-/// but no such key, and is unencrypted.
+/// Marks a store as holding a filesystem made by an encrypting raft5fs
+/// (one byte, 1). An older raft5fs's store has a root but no such key, or
+/// a 0 here: unencrypted, which this one refuses (see `check_store`).
 pub const ENCRYPTED_KEY: &[u8] = b"\x04encrypted";
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
@@ -93,13 +93,10 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x03 ++ parent(BE8) ++ name         -> child ino(BE8) [++ sealed name], one per directory entry
 //   0x04 ++ name                        -> filesystem-wide singletons
 //   0x05 ++ ino(BE8)                    -> marker: this inode's deletion is under way
-//   0x06 ++ "u/" ++ username            -> the account's uid, gid and groups (`users`)
-//   0x06 ++ "g/" ++ group name          -> the group's gid(BE4) (`groups`)
-//   0x06 ++ "n/" ++ gid(BE4)            -> the name of that gid's group (`groups`)
-//   0x06 ++ "k/" ++ username            -> encrypted filesystems: the account's keys (`accounts`)
+//   0x06 ++ "k/" ++ username            -> the account's keys (`accounts`)
 //   0x06 ++ "e/" ++ username            -> a pending enrolment code's hash (`accounts`)
 //   0x07 ++ ino(BE8) ++ username        -> a grant of that directory to that user (`grants`)
-//   0x08 ++ ino(BE8)                    -> encrypted filesystems: the inode's key record
+//   0x08 ++ ino(BE8)                    -> the inode's key record
 //   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
 //   0x0A ++ ino(BE8)                    -> an inode number reserved for a create, by username
 //
@@ -138,9 +135,6 @@ pub(crate) fn attr_key(ino: u64) -> Vec<u8> {
     key
 }
 
-/// The prefix of every user table row; see `users`.
-pub(crate) const USERS_PREFIX: &[u8] = b"\x06u/";
-
 /// The prefix of every account key row; see `accounts`.
 pub(crate) const ACCOUNT_KEYS_PREFIX: &[u8] = b"\x06k/";
 
@@ -155,13 +149,6 @@ pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
 
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";
-
-/// The prefix of every group name row; see `groups`.
-pub(crate) const GROUPS_PREFIX: &[u8] = b"\x06g/";
-
-/// The prefix of every gid row, the group table's reverse index; see
-/// `groups`.
-pub(crate) const GIDS_PREFIX: &[u8] = b"\x06n/";
 
 /// The prefix every deletion marker shares; see the layout notes above.
 pub(crate) const TOMBSTONE_PREFIX: &[u8] = &[0x05];
@@ -201,8 +188,8 @@ pub fn dirent_prefix(parent: u64) -> Vec<u8> {
     key
 }
 
-/// A directory entry's value: the child's inode, then on an encrypted
-/// filesystem its real name, sealed (the key's name being only a tag).
+/// A directory entry's value: the child's inode, then its real name,
+/// sealed (the key's name being only a tag).
 pub(crate) fn dirent_value(ino: u64, sealed_name: &[u8]) -> Vec<u8> {
     let mut value = ino.to_be_bytes().to_vec();
     value.extend_from_slice(sealed_name);
@@ -225,30 +212,6 @@ pub(crate) fn dirent_key(parent: u64, name: &OsStr) -> Vec<u8> {
     key
 }
 
-/// Splits `[offset, offset + len)` into the chunks it touches, as
-/// `(index, offset_within_chunk, len_within_chunk)`. A free function
-/// taking `chunk_size` rather than a method, so it can be tested without
-/// a cluster.
-pub(crate) fn chunk_spans(
-    chunk_size: u64,
-    offset: u64,
-    len: usize,
-) -> impl Iterator<Item = (u64, usize, usize)> {
-    let mut pos = offset;
-    let mut remaining = len as u64;
-    std::iter::from_fn(move || {
-        if remaining == 0 {
-            return None;
-        }
-        let within = pos % chunk_size;
-        let n = remaining.min(chunk_size - within);
-        let span = (pos / chunk_size, within as usize, n as usize);
-        pos += n;
-        remaining -= n;
-        Some(span)
-    })
-}
-
 pub fn validate_chunk_size(n: u64) -> Result<(), String> {
     if !n.is_power_of_two() {
         return Err(format!("chunk size must be a power of two, got {n}"));
@@ -264,56 +227,6 @@ pub fn validate_chunk_size(n: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
-        chunk_spans(chunk_size, offset, len).collect()
-    }
-
-    #[test]
-    fn a_zero_length_range_touches_nothing() {
-        assert!(spans(1024, 0, 0).is_empty());
-        assert!(spans(1024, 5000, 0).is_empty());
-    }
-
-    #[test]
-    fn a_range_inside_one_chunk_is_one_span() {
-        assert_eq!(spans(1024, 0, 10), vec![(0, 0, 10)]);
-        assert_eq!(spans(1024, 100, 10), vec![(0, 100, 10)]);
-        assert_eq!(spans(1024, 1024, 10), vec![(1, 0, 10)]);
-    }
-
-    #[test]
-    fn a_range_exactly_filling_a_chunk_is_one_span() {
-        assert_eq!(spans(1024, 0, 1024), vec![(0, 0, 1024)]);
-        assert_eq!(spans(1024, 2048, 1024), vec![(2, 0, 1024)]);
-    }
-
-    #[test]
-    fn a_range_crossing_a_boundary_splits() {
-        assert_eq!(spans(1024, 1020, 8), vec![(0, 1020, 4), (1, 0, 4)]);
-        assert_eq!(spans(1024, 0, 1025), vec![(0, 0, 1024), (1, 0, 1)]);
-    }
-
-    #[test]
-    fn a_range_spanning_several_chunks_covers_each() {
-        assert_eq!(
-            spans(1024, 512, 2048),
-            vec![(0, 512, 512), (1, 0, 1024), (2, 0, 512)]
-        );
-    }
-
-    #[test]
-    fn spans_cover_the_range_exactly() {
-        for &(offset, len) in &[(0u64, 5000usize), (1023, 3000), (4095, 1), (100, 8192)] {
-            let spans = spans(1024, offset, len);
-            assert_eq!(spans.iter().map(|s| s.2).sum::<usize>(), len);
-            let mut pos = offset;
-            for (index, within, n) in spans {
-                assert_eq!(index * 1024 + within as u64, pos);
-                pos += n as u64;
-            }
-        }
-    }
 
     #[test]
     fn chunk_keys_sort_in_index_order() {

@@ -38,7 +38,7 @@ pub enum Lookup {
 }
 
 impl Lookup {
-    #[cfg(test)]
+    /// The generation to hand back to `insert` or `confirm`.
     pub fn generation(&self) -> u64 {
         match *self {
             Self::Miss { generation } | Self::Unconfirmed { generation, .. } => generation,
@@ -46,23 +46,27 @@ impl Lookup {
     }
 }
 
-/// An LRU cache of whole chunks, keyed by `(ino, chunk index)` and bounded
-/// by bytes.
+/// An LRU cache of whole decrypted chunks, keyed by `(ino, chunk index)`
+/// and bounded by bytes: the client's, so a hit saves the trip, the
+/// decryption, and the server's store read alike.
 ///
-/// Local writes invalidate exactly. Another mount's writes this cache
-/// cannot see at all, so a hit is never served on trust: every entry
-/// carries the seq it was read at, and the caller must confirm with the
-/// store that the seq is still current before using the bytes (see
-/// [`Lookup`]). That check costs one small round trip whatever the chunk
-/// weighs, and is answered on exactly the terms an uncached read would be,
-/// so a confirmed hit is as fresh as re-reading the chunk outright.
+/// This client's own writes invalidate exactly, or replace the entry with
+/// what they wrote. Other clients' writes it cannot see at all, so a hit
+/// is never served on trust: every entry carries the store's seq for the
+/// chunk as read, and a read hands that to the server, which sends the
+/// chunk again only if the seq moved on (see `Vault::read`). That check
+/// costs eight bytes whatever the chunk weighs, and answers on exactly the
+/// terms an uncached read would, so a confirmed hit is as fresh as reading
+/// the chunk outright. A write may take an entry's bytes unconfirmed, as
+/// the base of a read-modify-write: it names the seq it expects, so the
+/// server refuses it if the bytes were out of date.
 ///
 /// `ttl` therefore bounds not staleness but how long an entry may sit
 /// unconfirmed: it only expires entries nothing has looked at since.
 ///
 /// A `generation` counter closes the race between a reader using a chunk
 /// and a writer invalidating it: the reader notes the generation before it
-/// goes to the store, and `insert`/`confirm` refuse if any invalidation
+/// goes to the server, and `insert`/`confirm` refuse if any invalidation
 /// happened since.
 pub struct ChunkCache {
     capacity: usize,
@@ -93,7 +97,7 @@ impl ChunkCache {
     }
 
     #[cfg(test)]
-    pub fn enabled(&self) -> bool {
+    fn enabled(&self) -> bool {
         self.capacity > 0
     }
 
