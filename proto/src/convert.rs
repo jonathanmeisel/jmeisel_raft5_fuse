@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
 use crate::types::{
-    AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, Kind, SealedChunk, SetAttr,
-    SetTime, WriteError,
+    AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind,
+    Rotation, SealedChunk, SetAttr, SetTime, WriteError,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -631,6 +631,95 @@ impl From<pb::ChunkWrite> for ChunkWrite {
             index: c.index,
             expected_seq: c.expected_seq,
             blob: c.blob,
+        }
+    }
+}
+
+impl From<Result<Vec<GrantedNode>, FsError>> for pb::GrantsUnderResponse {
+    fn from(r: Result<Vec<GrantedNode>, FsError>) -> Self {
+        use pb::grants_under_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(nodes) => R::List(pb::GrantedNodes {
+                    nodes: nodes
+                        .into_iter()
+                        .map(|n| pb::GrantedNode {
+                            ino: n.ino,
+                            path: n.path,
+                            grantees: n
+                                .grantees
+                                .into_iter()
+                                .map(|g| pb::Grantee {
+                                    username: g.user,
+                                    public_key: g.public_key,
+                                    writable: g.writable,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::GrantsUnderResponse {
+    pub fn into_result(self) -> Result<Vec<GrantedNode>, FsError> {
+        use pb::grants_under_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .nodes
+                .into_iter()
+                .map(|n| GrantedNode {
+                    ino: n.ino,
+                    path: n.path,
+                    grantees: n
+                        .grantees
+                        .into_iter()
+                        .map(|g| Grantee {
+                            user: g.username,
+                            public_key: g.public_key,
+                            writable: g.writable,
+                        })
+                        .collect(),
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("granted nodes")),
+        }
+    }
+}
+
+impl From<Rotation> for pb::Rotation {
+    fn from(r: Rotation) -> Self {
+        Self {
+            ino: r.ino,
+            expected_version: r.expected_version,
+            node_keys: r.node_keys,
+            grants: r
+                .grants
+                .into_iter()
+                .map(|(username, sealed_key)| pb::ResealedGrant {
+                    username,
+                    sealed_key,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<pb::Rotation> for Rotation {
+    fn from(r: pb::Rotation) -> Self {
+        Self {
+            ino: r.ino,
+            expected_version: r.expected_version,
+            node_keys: r.node_keys,
+            grants: r
+                .grants
+                .into_iter()
+                .map(|g| (g.username, g.sealed_key))
+                .collect(),
         }
     }
 }

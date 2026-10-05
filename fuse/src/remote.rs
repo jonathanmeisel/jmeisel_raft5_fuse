@@ -55,11 +55,11 @@ use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
     PreloginRequest, PublicKeyRequest, ReadChunksRequest, ReadRequest, RenameRequest,
-    SetAttrRequest, WriteChunksRequest, WriteRequest,
+    RotateRequest, SetAttrRequest, WriteChunksRequest, WriteRequest,
 };
 use raft5fs_proto::types::{
-    Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, NewNode, SealedChunk, SealedMove, SetAttr,
-    WriteError,
+    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, Rotation,
+    SealedChunk, SealedMove, SetAttr, WriteError,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -850,6 +850,32 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.write_chunks(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Every node at or under `top` that is granted to anyone.
+    pub async fn grants_under(&self, top: u64) -> Result<Vec<GrantedNode>, FsError> {
+        let req = InodeRequest { ino: top };
+        self.call(
+            Retry::ReadOnly,
+            |mut c| async move { c.grants_under(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Gives nodes new keys (see `FsCore::rotate`). A resend of one that
+    /// landed finds the versions moved on and answers `EAGAIN`, which the
+    /// caller already handles by looking again.
+    pub async fn rotate(&self, rotations: Vec<Rotation>) -> Result<(), FsError> {
+        let req = RotateRequest {
+            rotations: rotations.into_iter().map(Into::into).collect(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.rotate(req).await }
         })
         .await?
         .into_result()

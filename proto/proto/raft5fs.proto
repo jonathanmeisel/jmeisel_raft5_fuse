@@ -88,9 +88,71 @@ service Fs {
   // as the client read it -- otherwise nothing is, and the answer is
   // EAGAIN, for the client to read again and redo its change.
   rpc WriteChunks(WriteChunksRequest) returns (AttrResponse);
+
+  // Every node at or under a directory that is granted to anyone, with
+  // the path down to it and who holds the grants: what rotating the
+  // directory's key -- and keeping every grant below it fresh -- needs.
+  // Needs read-write access to the directory.
+  rpc GrantsUnder(InodeRequest) returns (GrantsUnderResponse);
+  // Gives nodes new keys, in one transaction, top down. Each must still be
+  // at its expected version, its new key record one version on and
+  // wrapped under its parent's key as it is now (or as this same request
+  // leaves it), and every grant of it re-sealed -- or, sealed empty,
+  // removed, which is how a grant is revoked. Anything changed meanwhile
+  // is EAGAIN.
+  //
+  // Writes that hand out or depend on a node's key are refused with
+  // EKEYEXPIRED while any node from it up to its volume is wrapped under
+  // an older version of its parent's key: someone who held that older key
+  // -- someone revoked -- could still open it. The writer rotates the
+  // stale nodes with this, then writes again.
+  rpc Rotate(RotateRequest) returns (EmptyResponse);
 }
 
 message NoArgs {}
+
+message Grantee {
+  string username = 1;
+  // As the server has it: check it against what was pinned before.
+  bytes public_key = 2;
+  bool writable = 3;
+}
+
+message GrantedNode {
+  uint64 ino = 1;
+  // From the directory asked about down to this node, both included.
+  repeated uint64 path = 2;
+  repeated Grantee grantees = 3;
+}
+
+message GrantsUnderResponse {
+  oneof result {
+    GrantedNodes list = 1;
+    Error error = 2;
+  }
+}
+
+message GrantedNodes {
+  repeated GrantedNode nodes = 1;
+}
+
+message ResealedGrant {
+  string username = 1;
+  // The node's new key sealed to them; empty to remove their grant.
+  bytes sealed_key = 2;
+}
+
+message Rotation {
+  uint64 ino = 1;
+  uint32 expected_version = 2;
+  bytes node_keys = 3;
+  repeated ResealedGrant grants = 4;
+}
+
+message RotateRequest {
+  // Parents before children.
+  repeated Rotation rotations = 1;
+}
 
 message ReadChunksRequest {
   uint64 ino = 1;

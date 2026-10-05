@@ -133,6 +133,34 @@ pub struct KeyPath {
     pub nodes: Vec<(u64, Vec<u8>)>,
 }
 
+/// Someone a node is granted to, as the server knows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grantee {
+    pub user: String,
+    pub public_key: Vec<u8>,
+    pub writable: bool,
+}
+
+/// A node at or under some directory that is granted to someone: the path
+/// from that directory down to it (both included), and its grantees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantedNode {
+    pub ino: u64,
+    pub path: Vec<u64>,
+    pub grantees: Vec<Grantee>,
+}
+
+/// A new key for one node: its key record a version on from
+/// `expected_version`, and each of its grants re-sealed under it -- or,
+/// with an empty sealed key, removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotation {
+    pub ino: u64,
+    pub expected_version: u32,
+    pub node_keys: Vec<u8>,
+    pub grants: Vec<(String, Vec<u8>)>,
+}
+
 /// A file chunk as stored on an encrypted filesystem: sealed, with the
 /// store's sequence number for it. `blob` is `None` for a hole.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -18,11 +18,12 @@
 //! sealed to the grantee, so with the records along the way (`key_path`)
 //! the grantee can unwrap the key of anything under it.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 
 use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::node::NodeKeys;
-use raft5fs_proto::types::{FsError, Grant, KeyPath};
+use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 
 use crate::entry::decode_entry;
 use crate::layout::{
@@ -225,6 +226,159 @@ pub(crate) async fn authorize(
         Ok((grant, _)) => Ok(grant),
         Err(e) => Err(e),
     })
+}
+
+/// Whether every node from `ino` up to its volume is wrapped under its
+/// parent's current key -- `EKEYEXPIRED`, naming the first that isn't, if
+/// not. A stale node's key is one someone revoked may still hold (see
+/// raft5fs-crypto's `node`), so nothing new may be sealed under it, nor
+/// under anything below it, until it has a new one.
+pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), FsError>, KvError> {
+    let mut cur = ino;
+    for _ in 0..MAX_DEPTH {
+        if cur == ROOT_INO {
+            return Ok(Ok(()));
+        }
+        let Some(bytes) = r.get(&attr_key(cur)).await? else {
+            return Ok(Err(FsError::errno(libc::ENOENT)));
+        };
+        let parent = decode_entry(cur, &bytes).parent;
+        let (_, wrapped_under) = match key_versions(r, cur).await? {
+            Ok(versions) => versions,
+            Err(e) => return Ok(Err(e)),
+        };
+        // A volume's root: no parent key wraps it.
+        if wrapped_under == 0 {
+            return Ok(Ok(()));
+        }
+        let (parent_version, _) = match key_versions(r, parent).await? {
+            Ok(versions) => versions,
+            Err(e) => return Ok(Err(e)),
+        };
+        if wrapped_under != parent_version {
+            return Ok(Err(FsError::new(
+                libc::EKEYEXPIRED,
+                format!(
+                    "inode {cur} needs a new key: it is wrapped under an old one of its parent's"
+                ),
+            )));
+        }
+        cur = parent;
+    }
+    Ok(Err(FsError::new(
+        libc::EIO,
+        format!("inode {ino}'s parent links loop"),
+    )))
+}
+
+/// Every node at or under `top` that is granted to anyone, with the path
+/// from `top` down to it and its grantees -- each with their public key as
+/// the server has it, empty for one who no longer has keys.
+pub async fn grants_under(client: &Client, top: u64) -> Result<Vec<GrantedNode>, FsError> {
+    let mut by_ino: BTreeMap<u64, Vec<(String, bool)>> = BTreeMap::new();
+    let mut iter = client.key_iterator(GRANTS_PREFIX);
+    while let Some(key) = iter.next().await? {
+        if !key.starts_with(GRANTS_PREFIX) {
+            break;
+        }
+        let Some(ino) = key
+            .get(1..9)
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+        else {
+            continue;
+        };
+        let user = String::from_utf8_lossy(&key[9..]).into_owned();
+        // Gone since the scan saw it: revoked meanwhile.
+        let Some(bytes) = client.read(&key).await?.value else {
+            continue;
+        };
+        let writable = decode_grant(ino, &bytes)?.writable;
+        by_ino.entry(ino).or_default().push((user, writable));
+    }
+    let mut nodes = Vec::new();
+    for (ino, grants) in by_ino {
+        let Some(path) = path_from(client, top, ino).await? else {
+            continue;
+        };
+        let mut grantees = Vec::with_capacity(grants.len());
+        for (user, writable) in grants {
+            let public_key = crate::accounts::get(client, &user)
+                .await?
+                .map(|keys| keys.public_key)
+                .unwrap_or_default();
+            grantees.push(Grantee {
+                user,
+                public_key,
+                writable,
+            });
+        }
+        nodes.push(GrantedNode {
+            ino,
+            path,
+            grantees,
+        });
+    }
+    Ok(nodes)
+}
+
+/// The inodes from `top` down to `ino`, both included, if `ino` is at or
+/// under `top`.
+async fn path_from(client: &Client, top: u64, ino: u64) -> Result<Option<Vec<u64>>, FsError> {
+    let mut path = vec![ino];
+    let mut cur = ino;
+    for _ in 0..MAX_DEPTH {
+        if cur == top {
+            path.reverse();
+            return Ok(Some(path));
+        }
+        if cur == ROOT_INO {
+            return Ok(None);
+        }
+        let Some(bytes) = client.read(&attr_key(cur)).await?.value else {
+            return Ok(None);
+        };
+        cur = decode_entry(cur, &bytes).parent;
+        if cur == 0 {
+            return Ok(None);
+        }
+        path.push(cur);
+    }
+    Ok(None)
+}
+
+/// Every grant of `ino`, by grantee, as `txn` sees it -- holding each
+/// against change until it ends.
+pub(crate) async fn grants_of(
+    txn: &Transaction,
+    ino: u64,
+) -> Result<BTreeMap<String, Grant>, KvError> {
+    let prefix = grant_prefix(ino);
+    let mut keys = Vec::new();
+    let mut iter = txn.key_iterator(&prefix);
+    while let Some(key) = iter.next().await? {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        keys.push(key);
+    }
+    let mut grants = BTreeMap::new();
+    for key in keys {
+        if let Some(bytes) = txn.read(&key).await?.value
+            && let Ok(grant) = decode_grant(ino, &bytes)
+        {
+            grants.insert(
+                String::from_utf8_lossy(&key[prefix.len()..]).into_owned(),
+                grant,
+            );
+        }
+    }
+    Ok(grants)
+}
+
+/// Removes `user`'s grant of `ino`, with its index entry.
+pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Result<(), KvError> {
+    txn.write(&grant_key(ino, user), None).await?;
+    txn.write(&index_key(user, ino), None).await
 }
 
 /// What `user` needs to unwrap `ino`'s key: their grant over it and the

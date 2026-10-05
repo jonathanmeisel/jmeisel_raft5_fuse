@@ -2,6 +2,7 @@
 //! operation. No buffering and no FUSE: a front end (the FUSE client
 //! today, the server later) decides when to call these.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
@@ -12,8 +13,8 @@ use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, Caller, ChunkWrite, DirItem, FsError, Grant, KeyPath, Kind, NewNode, SealedChunk,
-    SealedMove, SetAttr, WriteError,
+    Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, Kind, NewNode,
+    Rotation, SealedChunk, SealedMove, SetAttr, WriteError,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -396,6 +397,16 @@ impl FsCore {
             )));
         };
         Ok(grants::authorize(r, user, ino, write).await?.map(|_| ()))
+    }
+
+    /// On an encrypted filesystem, whether `ino` and everything above it
+    /// to its volume are wrapped under their parents' current keys (see
+    /// `grants::check_fresh`). Elsewhere, always.
+    async fn fresh(&self, txn: &Transaction, ino: u64) -> Result<Result<(), FsError>, KvError> {
+        if !self.encrypted {
+            return Ok(Ok(()));
+        }
+        grants::check_fresh(txn, ino).await
     }
 
     /// `guard`, outside any transaction: for operations that only read.
@@ -995,6 +1006,8 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
+            // The new node's key and name are sealed under the parent's.
+            decide!(self.fresh(&txn, parent).await?);
             let mut dir = decide!(modifiable_dir(&txn, caller, parent).await?);
             if txn.read(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
@@ -1055,9 +1068,11 @@ impl FsCore {
         }
         match NodeKeys::versions(&new.keys) {
             Ok(found) if found == versions => {}
+            // Most likely a client holding an old version of the parent's
+            // key, which fetching it again cures.
             _ => {
                 return Ok(Err(FsError::new(
-                    libc::EINVAL,
+                    libc::EKEYEXPIRED,
                     format!(
                         "a new node's key record must be version {} under parent version {}",
                         versions.0, versions.1
@@ -1216,6 +1231,10 @@ impl FsCore {
                         "the name moved meanwhile names another inode now",
                     )));
                 }
+                // Its name is sealed under the new parent's key, and a
+                // stale node mustn't come out of the move looking fresh.
+                decide!(self.fresh(&txn, new_parent).await?);
+                decide!(self.fresh(&txn, ino).await?);
                 if new_parent != parent {
                     // Its key moves with it, re-wrapped under the new
                     // parent's.
@@ -1224,7 +1243,7 @@ impl FsCore {
                     let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
                     if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                         return Ok(Err(FsError::new(
-                            libc::EINVAL,
+                            libc::EKEYEXPIRED,
                             "the moved node's key record must keep its version, under the new parent's",
                         )));
                     }
@@ -1346,6 +1365,7 @@ impl FsCore {
         let attr = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
+            decide!(self.fresh(&txn, ino).await?);
             // As in `write_batch_attempt`: no chunk for an inode whose
             // deletion has begun.
             let mut entry = decide!(live_entry(&txn, ino).await?);
@@ -1420,6 +1440,8 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
+            // A stale key may be one someone revoked still holds.
+            decide!(self.fresh(&txn, ino).await?);
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::Directory));
             if txn
@@ -1436,7 +1458,7 @@ impl FsCore {
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(
-                    libc::EINVAL,
+                    libc::EKEYEXPIRED,
                     format!("a grant must hold the current key version, {version}"),
                 )));
             }
@@ -1499,6 +1521,92 @@ impl FsCore {
             touch_dir(&txn, &mut root, now).await?;
             txn.commit().await?;
             Ok(Ok(entry.attr))
+        })
+        .await?
+    }
+
+    /// Every node at or under `top` granted to anyone (see
+    /// `grants::grants_under`). Needs a writable grant over `top`: it is
+    /// what rotating `top`'s key takes.
+    pub async fn grants_under(
+        &self,
+        caller: &Caller,
+        top: u64,
+    ) -> Result<Vec<GrantedNode>, FsError> {
+        self.account(caller)?;
+        self.guard_now(caller, top, true).await?;
+        grants::grants_under(&self.client, top).await
+    }
+
+    /// Gives each node in `rotations` -- parents before children -- a new
+    /// key, in one transaction: its record one version on, wrapped under
+    /// its parent's key as it is now or as this leaves it, and every grant
+    /// of it re-sealed or (sealed empty) removed. `EAGAIN` if a node isn't
+    /// at its expected version any more, or its grants aren't the ones the
+    /// rotation re-seals: someone else changed it meanwhile.
+    pub async fn rotate(&self, caller: &Caller, rotations: &[Rotation]) -> Result<(), FsError> {
+        self.account(caller)?;
+        let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            // Versions this transaction has moved on, for the children
+            // rotated after their parents.
+            let mut rotated: HashMap<u64, u32> = HashMap::new();
+            for r in rotations {
+                let ino = r.ino;
+                decide!(self.guard(&txn, caller, ino, true).await?);
+                let entry = decide!(live_entry(&txn, ino).await?);
+                let (version, wrapped_under) = decide!(key_versions(&txn, ino).await?);
+                if version != r.expected_version {
+                    return changed(format!("inode {ino} has key version {version} now"));
+                }
+                let Ok((new_version, new_wrapped_under)) = NodeKeys::versions(&r.node_keys) else {
+                    return Ok(Err(FsError::new(libc::EINVAL, "an unreadable key record")));
+                };
+                let parent_version = if wrapped_under == 0 {
+                    0
+                } else if let Some(&v) = rotated.get(&entry.parent) {
+                    v
+                } else {
+                    decide!(key_versions(&txn, entry.parent).await?).0
+                };
+                if new_version != version + 1 {
+                    return Ok(Err(FsError::new(
+                        libc::EINVAL,
+                        format!("inode {ino}'s new key record must be version {}", version + 1),
+                    )));
+                }
+                if new_wrapped_under != parent_version {
+                    return changed(format!(
+                        "inode {ino}'s new key must be wrapped under its parent's version {parent_version}"
+                    ));
+                }
+                let existing = grants::grants_of(&txn, ino).await?;
+                let resealed: HashMap<&str, &[u8]> = r
+                    .grants
+                    .iter()
+                    .map(|(user, sealed)| (user.as_str(), sealed.as_slice()))
+                    .collect();
+                if resealed.len() != existing.len()
+                    || !existing.keys().all(|user| resealed.contains_key(user.as_str()))
+                {
+                    return changed(format!("inode {ino}'s grants aren't the ones re-sealed"));
+                }
+                for (user, mut grant) in existing {
+                    let sealed = resealed[user.as_str()];
+                    if sealed.is_empty() {
+                        grants::remove_grant(&txn, &user, ino).await?;
+                    } else {
+                        grant.key_version = new_version;
+                        grant.sealed_key = sealed.to_vec();
+                        grants::put_grant(&txn, &user, &grant).await?;
+                    }
+                }
+                txn.write(&node_keys_key(ino), Some(&r.node_keys)).await?;
+                rotated.insert(ino, new_version);
+            }
+            txn.commit().await?;
+            Ok(Ok(()))
         })
         .await?
     }
@@ -1641,5 +1749,7 @@ fn operations_are_send(core: &FsCore, caller: &Caller, name: &OsStr, data: &[u8]
     send(core.public_key("u"));
     send(core.read_chunks(caller, 1, 0, 1));
     send(core.write_chunks(caller, 1, &[], 0));
+    send(core.grants_under(caller, 1));
+    send(core.rotate(caller, &[]));
     send(FsCore::connect(core.client.clone(), 4096, 0, (0, 0), false));
 }

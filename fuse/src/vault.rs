@@ -25,6 +25,23 @@
 //! A listed name opens only if it matches its tag, so the server can't
 //! pass one entry off under another's name.
 //!
+//! **Revocation.** Taking a grant back gives the directory a new key --
+//! the old one stays in its history, under the new, so nothing written
+//! before is lost -- and re-seals it for everyone else who holds it. The
+//! revoked user still has the old key, and every key under it, so the rest
+//! is lazy: a node wrapped under an old version of its parent's key is
+//! stale, the server refuses writes that would seal anything new under a
+//! stale node (`EKEYEXPIRED`), and the vault then gives the stale nodes on
+//! the way new keys, top down (`freshen`), and writes again. One thing
+//! can't wait: whoever holds a grant further down can't rotate what is
+//! above it, so a revocation also rotates the path down to every other
+//! grant beneath it -- which keeps every grant, and everything above it,
+//! always fresh.
+//!
+//! **Public keys** come from the server, which could hand out its own.
+//! The vault pins each user's key the first time it seals to it
+//! (`KnownKeys`), and refuses to seal to a different one later.
+//!
 //! **The root.** The server's real root is no one's to see. What a mount
 //! shows at its root instead is virtual: one entry per grant made to this
 //! account, named as the granter named it (a label sealed to this account,
@@ -34,18 +51,20 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use raft5fs_crypto::Key;
 use raft5fs_crypto::data::{
     name_tag, open_chunk, open_name, seal_chunk, seal_name, sealed_version,
 };
-use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, seal_grant, seal_label};
+use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, fingerprint, seal_grant, seal_label};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, ChunkWrite, DirItem, FsError, Grant, KeyPath, NewNode, SealedChunk, SealedMove,
-    WriteError,
+    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode, Rotation,
+    SealedChunk, SealedMove, WriteError,
 };
 
 use crate::remote::Remote;
@@ -104,6 +123,132 @@ impl Node {
     }
 }
 
+/// How many times giving keys new versions is tried again when someone
+/// else changed them meanwhile.
+const ROTATION_ROUNDS: usize = 16;
+
+fn expired(e: &FsError) -> bool {
+    e.errno == libc::EKEYEXPIRED
+}
+
+fn changed(e: &FsError) -> bool {
+    e.errno == libc::EAGAIN
+}
+
+/// Public keys sealed to before, by user: the first one seen for a user is
+/// trusted, and a different one later refused -- the server could have
+/// substituted its own. Kept in memory, and in a file if given one (lines
+/// of `user hex-key`).
+pub struct KnownKeys {
+    keys: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
+    file: Option<PathBuf>,
+}
+
+impl KnownKeys {
+    pub fn in_memory() -> Self {
+        Self {
+            keys: Mutex::new(HashMap::new()),
+            file: None,
+        }
+    }
+
+    /// The keys pinned in `file`, which needn't exist yet; new pins are
+    /// added to it.
+    pub fn load(file: PathBuf) -> std::io::Result<Self> {
+        let mut keys = HashMap::new();
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let mut fields = line.split_whitespace();
+                    if let (Some(user), Some(hex)) = (fields.next(), fields.next())
+                        && let Some(key) = from_hex(hex)
+                    {
+                        keys.insert(user.to_string(), key);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(Self {
+            keys: Mutex::new(keys),
+            file: Some(file),
+        })
+    }
+
+    /// `key` as `user`'s, if it is the one pinned for them -- or, if none
+    /// is, after pinning it. `EPERM` if another one is pinned.
+    pub fn check(&self, user: &str, key: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        let key: [u8; PUBLIC_KEY_LEN] = key
+            .try_into()
+            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        let mut keys = self.keys.lock().unwrap();
+        match keys.get(user) {
+            Some(pinned) if *pinned == key => Ok(key),
+            Some(pinned) => Err(FsError::new(
+                libc::EPERM,
+                format!(
+                    "the server gave a different key for {user} than before ({} now, {} pinned); \
+                     if they enrolled again, check the new fingerprint with them and forget the old",
+                    fingerprint(&key),
+                    fingerprint(pinned)
+                ),
+            )),
+            None => {
+                if let Some(file) = &self.file {
+                    let saved = (|| {
+                        if let Some(dir) = file.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(file)?;
+                        writeln!(f, "{user} {}", to_hex(&key))
+                    })();
+                    saved.map_err(|e| {
+                        FsError::new(
+                            libc::EIO,
+                            format!("cannot pin {user}'s key in {}: {e}", file.display()),
+                        )
+                    })?;
+                }
+                keys.insert(user.to_string(), key);
+                Ok(key)
+            }
+        }
+    }
+
+    /// Forgets `user`'s pinned key, so the next one seen is trusted.
+    pub fn forget(&self, user: &str) -> std::io::Result<()> {
+        let mut keys = self.keys.lock().unwrap();
+        keys.remove(user);
+        if let Some(file) = &self.file {
+            let text: String = keys
+                .iter()
+                .map(|(user, key)| format!("{user} {}\n", to_hex(key)))
+                .collect();
+            std::fs::write(file, text)?;
+        }
+        Ok(())
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(hex: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    if hex.len() != PUBLIC_KEY_LEN * 2 {
+        return None;
+    }
+    let mut out = [0; PUBLIC_KEY_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// How many times a read-modify-write of a chunk is redone when someone
 /// else changed the chunk under it, before giving up with `EAGAIN`.
 const CHANGE_RETRIES: usize = 32;
@@ -137,6 +282,7 @@ struct Roots {
 pub struct Vault {
     remote: Arc<Remote>,
     identity: Arc<Identity>,
+    known: KnownKeys,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
     roots: Mutex<Roots>,
 }
@@ -151,13 +297,211 @@ impl Vault {
         Ok(Self {
             remote,
             identity,
+            known: KnownKeys::in_memory(),
             nodes: Mutex::new(HashMap::new()),
             roots: Mutex::new(Roots::default()),
         })
     }
 
+    /// Pins public keys in `known` rather than in memory only.
+    pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
+        self.known = known;
+        self
+    }
+
+    pub fn known_keys(&self) -> &KnownKeys {
+        &self.known
+    }
+
     pub fn remote(&self) -> &Arc<Remote> {
         &self.remote
+    }
+
+    /// Drops every key unwrapped so far, for the next use to fetch afresh:
+    /// what a rotation, here or anywhere, can leave out of date.
+    fn forget_all(&self) {
+        self.nodes.lock().unwrap().clear();
+    }
+
+    /// `ino`'s key fetched afresh, with everything above it: for data
+    /// sealed under a version newer than the one known here.
+    async fn refresh(&self, ino: u64) -> Result<Arc<Node>, FsError> {
+        self.forget_all();
+        self.node(ino).await
+    }
+
+    fn known_node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .cloned()
+            .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino}'s key went missing")))
+    }
+
+    /// `ino`'s key, after giving every stale node from this account's grant
+    /// down to it a new key, top down: what a write the server refused
+    /// with `EKEYEXPIRED` needs before it is tried again.
+    pub async fn freshen(&self, ino: u64) -> Result<Arc<Node>, FsError> {
+        for _ in 0..ROTATION_ROUNDS {
+            self.forget_all();
+            let path = self.remote.key_path(ino).await?;
+            let inos: Vec<u64> = path.nodes.iter().map(|&(i, _)| i).collect();
+            let last = self.unwrap_path(path)?;
+            let mut stale = None;
+            for pair in inos.windows(2) {
+                let parent = self.known_node(pair[0])?;
+                if self
+                    .known_node(pair[1])?
+                    .record
+                    .is_stale(parent.record.version)
+                {
+                    stale = Some((pair[1], parent));
+                    break;
+                }
+            }
+            let Some((stale, parent)) = stale else {
+                return Ok(last);
+            };
+            match self.rotate_from(stale, Some(&parent), None).await {
+                Ok(()) => {}
+                // Someone else got there first: look again.
+                Err(e) if changed(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("the keys above inode {ino} kept changing"),
+        ))
+    }
+
+    /// Gives `top` a new key, and every node from it down to each grant
+    /// beneath it, re-sealing every grant of them -- except `drop`'s of
+    /// `top`, which is removed. `parent`: `top`'s parent's node, which its
+    /// new key is wrapped under (unless `top` is a volume, which has none).
+    async fn rotate_from(
+        &self,
+        top: u64,
+        parent: Option<&Node>,
+        drop: Option<&str>,
+    ) -> Result<(), FsError> {
+        let under: Vec<GrantedNode> = self.remote.grants_under(top).await?;
+        let mut parent_of = HashMap::new();
+        let mut depth = HashMap::from([(top, 0)]);
+        let mut grantees: HashMap<u64, Vec<Grantee>> = HashMap::new();
+        for node in under {
+            for (d, pair) in node.path.windows(2).enumerate() {
+                parent_of.insert(pair[1], pair[0]);
+                depth.insert(pair[1], d + 1);
+            }
+            grantees.insert(node.ino, node.grantees);
+        }
+        if let Some(user) = drop
+            && !grantees
+                .get(&top)
+                .is_some_and(|gs| gs.iter().any(|g| g.user == user))
+        {
+            return Err(FsError::new(
+                libc::ENOENT,
+                format!("{user} has no grant of inode {top}"),
+            ));
+        }
+        let mut order: Vec<u64> = depth.keys().copied().collect();
+        order.sort_by_key(|ino| (depth[ino], *ino));
+
+        let mut new_keys: HashMap<u64, (Key, u32)> = HashMap::new();
+        let mut rotations = Vec::with_capacity(order.len());
+        for ino in order {
+            let current = self.node(ino).await?;
+            let wrap = if current.record.parent_version == 0 {
+                None
+            } else if ino == top {
+                let parent = parent.ok_or_else(|| {
+                    FsError::new(
+                        libc::EACCES,
+                        format!(
+                            "a new key for inode {top} must be wrapped under its parent's, \
+                             which this account can't reach"
+                        ),
+                    )
+                })?;
+                Some((parent.key.clone(), parent.record.version))
+            } else {
+                Some(new_keys[&parent_of[&ino]].clone())
+            };
+            let (record, key) = current
+                .record
+                .rotate(ino, &current.key, wrap.as_ref().map(|(k, v)| (k, *v)))
+                .map_err(|e| corrupt(ino, e))?;
+            let mut grants = Vec::new();
+            for grantee in grantees.remove(&ino).unwrap_or_default() {
+                let sealed = if ino == top && drop == Some(grantee.user.as_str()) {
+                    Vec::new()
+                } else if grantee.public_key.is_empty() {
+                    // Their account has no keys any more: nothing to seal
+                    // to, so the grant goes.
+                    eprintln!(
+                        "dropping {}'s grant of inode {ino}: they have no keys",
+                        grantee.user
+                    );
+                    Vec::new()
+                } else {
+                    let public_key = self.known.check(&grantee.user, &grantee.public_key)?;
+                    seal_grant(&public_key, ino, record.version, &key)
+                };
+                grants.push((grantee.user, sealed));
+            }
+            rotations.push(Rotation {
+                ino,
+                expected_version: current.record.version,
+                node_keys: record.encode(),
+                grants,
+            });
+            new_keys.insert(ino, (key, record.version));
+        }
+        let rotated = self.remote.rotate(rotations).await;
+        self.forget_all();
+        rotated
+    }
+
+    /// Takes `user`'s grant of directory `ino` back, giving it a new key
+    /// (see the module doc). Needs the key of the directory above it --
+    /// its new key is wrapped under that -- unless it is a volume.
+    pub async fn revoke(&self, ino: u64, user: &str) -> Result<(), FsError> {
+        for _ in 0..ROTATION_ROUNDS {
+            self.freshen(ino).await?;
+            let path = self.remote.key_path(ino).await?;
+            let parent = match path.nodes.len() {
+                0 | 1 => None,
+                n => Some(self.node(path.nodes[n - 2].0).await?),
+            };
+            match self.rotate_from(ino, parent.as_deref(), Some(user)).await {
+                Err(e) if changed(&e) => continue,
+                other => return other,
+            }
+        }
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("inode {ino}'s keys kept changing under this revocation"),
+        ))
+    }
+
+    /// Who directory `ino` is granted to, with their keys checked against
+    /// the pinned ones (`EPERM` on a mismatch).
+    pub async fn grantees(&self, ino: u64) -> Result<Vec<Grantee>, FsError> {
+        let mut grantees = Vec::new();
+        for node in self.remote.grants_under(ino).await? {
+            if node.ino == ino {
+                grantees = node.grantees;
+            }
+        }
+        for grantee in &grantees {
+            if !grantee.public_key.is_empty() {
+                self.known.check(&grantee.user, &grantee.public_key)?;
+            }
+        }
+        Ok(grantees)
     }
 
     /// `ino`'s key, unwrapping it from this account's grant if it isn't
@@ -311,7 +655,17 @@ impl Vault {
     /// directory's key holders made: it is left out, and said so.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         let items = self.remote.readdir(ino).await?;
-        let dir = self.node(ino).await?;
+        let mut dir = self.node(ino).await?;
+        // Names sealed under a key newer than the one known here: someone
+        // rotated it since.
+        let newest = items
+            .iter()
+            .filter_map(|i| sealed_version(&i.sealed_name).ok())
+            .max()
+            .unwrap_or(0);
+        if newest > dir.record.version {
+            dir = self.refresh(ino).await?;
+        }
         let mut named = Vec::with_capacity(items.len());
         for mut item in items {
             if item.sealed_name.is_empty() {
@@ -349,6 +703,16 @@ impl Vault {
     }
 
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
+        match self.mkdir_once(parent, name, perm).await {
+            Err(e) if expired(&e) => {
+                self.freshen(parent).await?;
+                self.mkdir_once(parent, name, perm).await
+            }
+            other => other,
+        }
+    }
+
+    async fn mkdir_once(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         let (new, node, tag) = self.new_child(parent, name).await?;
         let attr = self.remote.mkdir(parent, &tag, perm, Some(&new)).await?;
         self.keep(attr.ino, node);
@@ -357,6 +721,21 @@ impl Vault {
 
     /// Creates and opens a file, as `Remote::create`.
     pub async fn create(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        perm: u16,
+    ) -> Result<(Attr, String), FsError> {
+        match self.create_once(parent, name, perm).await {
+            Err(e) if expired(&e) => {
+                self.freshen(parent).await?;
+                self.create_once(parent, name, perm).await
+            }
+            other => other,
+        }
+    }
+
+    async fn create_once(
         &self,
         parent: u64,
         name: &OsStr,
@@ -372,6 +751,29 @@ impl Vault {
     /// new parent's key, and the moved node's key re-wrapped under it if
     /// the parent changes.
     pub async fn rename(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        noreplace: bool,
+    ) -> Result<Option<u64>, FsError> {
+        match self
+            .rename_once(parent, name, new_parent, new_name, noreplace)
+            .await
+        {
+            Err(e) if expired(&e) => {
+                self.freshen(new_parent).await?;
+                let moved = self.lookup(parent, name).await?.ino;
+                self.freshen(moved).await?;
+                self.rename_once(parent, name, new_parent, new_name, noreplace)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn rename_once(
         &self,
         parent: u64,
         name: &OsStr,
@@ -465,21 +867,23 @@ impl Vault {
         writable: bool,
         label: &OsStr,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
-        let public_key: [u8; PUBLIC_KEY_LEN] = self
-            .remote
-            .public_key(user)
-            .await?
-            .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        let public_key = self.remote.public_key(user).await?;
+        let public_key = self.known.check(user, &public_key)?;
         let node = self.node(ino).await?;
-        let grant = Grant {
+        let grant = |node: &Node| Grant {
             ino,
             writable,
             key_version: node.record.version,
             sealed_key: seal_grant(&public_key, ino, node.record.version, &node.key),
             sealed_label: seal_label(&public_key, ino, label.as_bytes()),
         };
-        self.remote.grant(user, grant).await?;
+        match self.remote.grant(user, grant(&node)).await {
+            Err(e) if expired(&e) => {
+                let node = self.freshen(ino).await?;
+                self.remote.grant(user, grant(&node)).await?;
+            }
+            other => other?,
+        }
         Ok(public_key)
     }
 
@@ -512,7 +916,15 @@ impl Vault {
         }
         let end = (offset + len as u64).min(size);
         let mut out = vec![0; (end - offset) as usize];
-        let node = self.node(ino).await?;
+        let mut node = self.node(ino).await?;
+        let newest = chunks
+            .iter()
+            .filter_map(|c| c.blob.as_deref().and_then(|b| sealed_version(b).ok()))
+            .max()
+            .unwrap_or(0);
+        if newest > node.record.version {
+            node = self.refresh(ino).await?;
+        }
         for chunk in chunks {
             let Some(blob) = &chunk.blob else {
                 continue;
@@ -574,14 +986,17 @@ impl Vault {
     /// bytes were stored, by whole batches.
     pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
         let failed = |written, error| WriteError { written, error };
-        let node = self.node(ino).await.map_err(|e| failed(0, e))?;
+        let mut node = self.node(ino).await.map_err(|e| failed(0, e))?;
         if data.is_empty() {
             // Still a write, as far as mtime is concerned.
-            return self
-                .remote
-                .write_chunks(ino, &[], offset)
-                .await
-                .map_err(|e| failed(0, e));
+            let touched = match self.remote.write_chunks(ino, &[], offset).await {
+                Err(e) if expired(&e) => {
+                    self.freshen(ino).await.map_err(|e| failed(0, e))?;
+                    self.remote.write_chunks(ino, &[], offset).await
+                }
+                other => other,
+            };
+            return touched.map_err(|e| failed(0, e));
         }
         let chunk_size = self.remote.chunk_size();
         let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as usize;
@@ -591,10 +1006,16 @@ impl Vault {
         for group in spans.chunks(per_batch) {
             let bytes: usize = group.iter().map(|&(_, _, n)| n).sum();
             let end = offset + (cursor + bytes) as u64;
-            let stored = self
-                .write_batch(&node, ino, group, &data[cursor..cursor + bytes], end)
-                .await
-                .map_err(|e| failed(cursor, e))?;
+            let piece = &data[cursor..cursor + bytes];
+            let stored = match self.write_batch(&node, ino, group, piece, end).await {
+                // A stale key, here or above: new keys, then again.
+                Err(e) if expired(&e) => {
+                    node = self.freshen(ino).await.map_err(|e| failed(cursor, e))?;
+                    self.write_batch(&node, ino, group, piece, end).await
+                }
+                other => other,
+            }
+            .map_err(|e| failed(cursor, e))?;
             attr = Some(stored);
             cursor += bytes;
         }
@@ -655,6 +1076,16 @@ impl Vault {
     /// cut itself. The truncation proper -- the size, and dropping the
     /// chunks past it -- is the setattr that follows.
     pub async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
+        match self.truncate_once(ino, new_size).await {
+            Err(e) if expired(&e) => {
+                self.freshen(ino).await?;
+                self.truncate_once(ino, new_size).await
+            }
+            other => other,
+        }
+    }
+
+    async fn truncate_once(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
         let chunk_size = self.remote.chunk_size();
         let keep = (new_size % chunk_size) as usize;
         if keep == 0 {
@@ -692,6 +1123,29 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_keys_survive_a_reload_and_a_different_key_is_refused() {
+        let file = std::env::temp_dir().join(format!("raft5fs-known-keys-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let known = KnownKeys::load(file.clone()).unwrap();
+        known.check("alice", &[1; 32]).unwrap();
+        known.check("bob", &[2; 32]).unwrap();
+
+        let again = KnownKeys::load(file.clone()).unwrap();
+        again.check("alice", &[1; 32]).unwrap();
+        assert_eq!(
+            again.check("alice", &[9; 32]).unwrap_err().errno,
+            libc::EPERM
+        );
+        assert_eq!(again.check("alice", &[1; 31]).unwrap_err().errno, libc::EIO);
+
+        again.forget("alice").unwrap();
+        let after = KnownKeys::load(file.clone()).unwrap();
+        after.check("alice", &[9; 32]).unwrap();
+        assert_eq!(after.check("bob", &[3; 32]).unwrap_err().errno, libc::EPERM);
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[test]
     fn spans_cover_a_range_chunk_by_chunk() {

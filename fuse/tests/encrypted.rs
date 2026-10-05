@@ -410,9 +410,13 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     assert_fs_errno(bare, libc::EINVAL);
     assert_fs_errno(create("unreserved", 1_000_000, version), libc::EACCES);
 
-    // A reserved inode, but a record claiming the wrong parent version.
+    // A reserved inode, but a record claiming the wrong parent version:
+    // what a client with an out-of-date key sends, told to fetch it again.
     let reserved = h.runtime.block_on(remote.allocate_inode()).unwrap();
-    assert_fs_errno(create("wrong-version", reserved, version + 1), libc::EINVAL);
+    assert_fs_errno(
+        create("wrong-version", reserved, version + 1),
+        libc::EKEYEXPIRED,
+    );
     create("right", reserved, version).unwrap();
 
     // Someone else's reservation won't do either.
@@ -742,4 +746,236 @@ fn the_server_takes_no_unsealed_or_mis_sealed_data() {
         libc::EAGAIN,
     );
     assert_eq!(fs::read(&f).unwrap(), b"sealed");
+}
+
+// ------------------------------------------------------------- revocation
+
+/// `ino`'s key record, as stored.
+fn record(h: &support::Harness, ino: u64) -> NodeKeys {
+    let mut key = vec![0x08];
+    key.extend_from_slice(&ino.to_be_bytes());
+    NodeKeys::decode(&h.read_key(&key).unwrap()).unwrap()
+}
+
+/// Chunk `index` of file `ino`, sealed, as stored.
+fn stored_chunk(h: &support::Harness, ino: u64, index: u64) -> Vec<u8> {
+    let mut key = vec![0x02];
+    key.extend_from_slice(&ino.to_be_bytes());
+    key.extend_from_slice(&index.to_be_bytes());
+    h.read_key(&key).unwrap()
+}
+
+/// A volume `v` holding `shared/sub/f` and `shared/sub/g`, each with some
+/// bytes in it.
+fn shared_tree(h: &support::Harness) -> std::path::PathBuf {
+    let v = h.path().join("v");
+    fs::create_dir_all(v.join("shared/sub")).unwrap();
+    fs::write(v.join("shared/sub/f"), b"before").unwrap();
+    fs::write(v.join("shared/sub/g"), b"untouched").unwrap();
+    v
+}
+
+#[test]
+fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
+    let h = support::setup_encrypted();
+    let v = shared_tree(&h);
+    let (sub, f, g) = (
+        ino(&v.join("shared/sub")),
+        ino(&v.join("shared/sub/f")),
+        ino(&v.join("shared/sub/g")),
+    );
+    h.add_user("alice", 50_001, 50_001, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    // Everything alice could ever learn: the keys as they are now.
+    let hers = vault(&h, "alice");
+    let her_sub_key = h.runtime.block_on(hers.node(sub)).unwrap().key.clone();
+    let her_f_key = h.runtime.block_on(hers.node(f)).unwrap().key.clone();
+    let alice = h.mount_as("alice");
+    assert_eq!(
+        fs::read(alice.path.join("v/shared/sub/f")).unwrap(),
+        b"before"
+    );
+
+    h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
+
+    // Cut off at once, open mount and all.
+    assert!(names(&alice.path).is_empty());
+    let remote = hers.remote();
+    assert_fs_errno(h.runtime.block_on(remote.getattr(f)), libc::EACCES);
+    assert_fs_errno(
+        h.runtime.block_on(remote.read_chunks(f, 0, 1)),
+        libc::EACCES,
+    );
+
+    // The volume has a new key; what is under it is stale until written.
+    assert_eq!(record(&h, ino(&v)).version, 2);
+    assert_eq!(record(&h, sub).version, 1);
+    // A write sealed under f's old key is refused, stale as it is.
+    let old = h.runtime.block_on(mine.node(f)).unwrap();
+    let blob = raft5fs_crypto::data::seal_chunk(&old.key, old.record.version, f, 0, b"leaky");
+    let write = raft5fs_core::ChunkWrite {
+        index: 0,
+        expected_seq: None,
+        blob,
+    };
+    assert_fs_errno(
+        h.runtime
+            .block_on(mine.remote().write_chunks(f, &[write], 5)),
+        libc::EKEYEXPIRED,
+    );
+
+    // Writing through the mount rotates the stale path on the way.
+    fs::write(v.join("shared/sub/f"), b"after").unwrap();
+    fs::write(v.join("shared/sub/new"), b"new").unwrap();
+    assert_eq!(record(&h, ino(&v.join("shared"))).version, 2);
+    assert_eq!(record(&h, sub).version, 2);
+    assert_eq!(record(&h, f).version, 2);
+    assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"after");
+
+    // None of it opens with what alice had.
+    let chunk = stored_chunk(&h, f, 0);
+    assert!(raft5fs_crypto::data::open_chunk(&her_f_key, f, 0, &chunk).is_err());
+    let new = ino(&v.join("shared/sub/new"));
+    assert!(record(&h, new).open(new, &her_sub_key).is_err());
+    assert!(record(&h, sub).name_key(sub, &her_sub_key).is_err());
+
+    // What was written before is still readable, through the history.
+    let fresh = vault(&h, support::TESTER);
+    assert_eq!(
+        h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
+        b"untouched"
+    );
+}
+
+#[test]
+fn a_revocation_keeps_the_grants_below_it_usable() {
+    let h = support::setup_encrypted();
+    let v = shared_tree(&h);
+    let sub = ino(&v.join("shared/sub"));
+    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("bob", 50_002, 50_002, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    h.runtime
+        .block_on(mine.grant(sub, "bob", true, OsStr::new("sub")))
+        .unwrap();
+
+    h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
+
+    // Bob's grant -- and the path down to it -- has new keys already: bob
+    // can't reach above his grant to rotate anything there himself.
+    assert_eq!(record(&h, sub).version, 2);
+    assert_eq!(record(&h, ino(&v.join("shared"))).version, 2);
+    let bobs = vault(&h, "bob");
+    let grants = h.runtime.block_on(bobs.remote().list_grants()).unwrap();
+    assert_eq!(grants[0].key_version, 2);
+    let bob = h.mount_as("bob");
+    fs::write(bob.path.join("sub/from-bob"), b"hi").unwrap();
+    assert_eq!(fs::read(bob.path.join("sub/f")).unwrap(), b"before");
+    assert_eq!(fs::read(v.join("shared/sub/from-bob")).unwrap(), b"hi");
+}
+
+#[test]
+fn revoking_takes_the_key_above_unless_it_is_a_volume() {
+    let h = support::setup_encrypted();
+    let v = shared_tree(&h);
+    let shared = ino(&v.join("shared"));
+    h.add_user("alice", 50_001, 50_001, &[]);
+    h.add_user("bob", 50_002, 50_002, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(shared, "alice", true, OsStr::new("shared")))
+        .unwrap();
+    let hers = vault(&h, "alice");
+    h.runtime
+        .block_on(hers.grant(shared, "bob", false, OsStr::new("shared")))
+        .unwrap();
+
+    // Alice can't reach `v`, so she can't wrap a new key for `shared`.
+    assert_fs_errno(h.runtime.block_on(hers.revoke(shared, "bob")), libc::EACCES);
+    assert_fs_errno(
+        h.runtime.block_on(mine.revoke(shared, "carol")),
+        libc::ENOENT,
+    );
+    h.runtime.block_on(mine.revoke(shared, "bob")).unwrap();
+    let bobs = vault(&h, "bob");
+    assert!(
+        h.runtime
+            .block_on(bobs.remote().list_grants())
+            .unwrap()
+            .is_empty()
+    );
+    // Alice's own grant came through re-sealed.
+    let alice = h.mount_as("alice");
+    assert_eq!(
+        fs::read(alice.path.join("shared/sub/f")).unwrap(),
+        b"before"
+    );
+}
+
+#[test]
+fn concurrent_writers_rotate_a_stale_path_once() {
+    let h = support::setup_encrypted();
+    let v = shared_tree(&h);
+    let f = ino(&v.join("shared/sub/f"));
+    h.add_user("alice", 50_001, 50_001, &[]);
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
+
+    let a = vault(&h, support::TESTER);
+    let b = vault(&h, support::TESTER);
+    h.runtime.block_on(async {
+        let (x, y) = tokio::join!(a.write(f, 0, b"aaaa"), b.write(f, 10, b"bbbb"));
+        x.unwrap();
+        y.unwrap();
+    });
+    for path in ["shared", "shared/sub", "shared/sub/f"] {
+        assert_eq!(record(&h, ino(&v.join(path))).version, 2, "{path}");
+    }
+    let data = fs::read(v.join("shared/sub/f")).unwrap();
+    assert_eq!(&data[0..4], b"aaaa");
+    assert_eq!(&data[10..14], b"bbbb");
+}
+
+#[test]
+fn a_changed_public_key_is_refused_until_forgotten() {
+    let h = support::setup_encrypted();
+    let v = shared_tree(&h);
+    h.add_user("alice", 50_001, 50_001, &[]);
+    let mine = vault(&h, support::TESTER);
+    let first = h
+        .runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+
+    // Alice enrols again -- or the server says she did, with its own key.
+    let second = h.enrol("alice");
+    assert_ne!(first, second);
+    let shared = ino(&v.join("shared"));
+    let refused = h
+        .runtime
+        .block_on(mine.grant(shared, "alice", false, OsStr::new("shared")));
+    assert_fs_errno(refused, libc::EPERM);
+    // Nor does a rotation re-seal her grant to the new key.
+    h.add_user("bob", 50_002, 50_002, &[]);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "bob", false, OsStr::new("v")))
+        .unwrap();
+    assert_fs_errno(h.runtime.block_on(mine.revoke(ino(&v), "bob")), libc::EPERM);
+
+    mine.known_keys().forget("alice").unwrap();
+    assert_eq!(
+        h.runtime
+            .block_on(mine.grant(shared, "alice", false, OsStr::new("shared")))
+            .unwrap(),
+        second
+    );
 }

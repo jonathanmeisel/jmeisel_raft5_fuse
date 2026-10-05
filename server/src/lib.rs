@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::perm::{R, W};
 use raft5fs_core::{
-    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, SealedMove, WriteError, accounts,
-    batch_bytes, users,
+    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, Rotation, SealedMove, WriteError,
+    accounts, batch_bytes, users,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
@@ -29,11 +29,11 @@ use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
     AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateResponse,
     CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest,
-    HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
-    LoginRequest, LoginResponse, NameRequest, NoArgs, OpenResponse, PreloginRequest,
-    PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
-    ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, Session, SetAttrRequest,
-    WriteChunksRequest, WriteRequest, WriteResponse,
+    GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings,
+    KeyPathResponse, LoginRequest, LoginResponse, NameRequest, NoArgs, OpenResponse,
+    PreloginRequest, PreloginResponse, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest,
+    ReadChunksResponse, ReadDirResponse, ReadRequest, ReadResponse, RenameRequest, RotateRequest,
+    Session, SetAttrRequest, WriteChunksRequest, WriteRequest, WriteResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -592,6 +592,24 @@ impl Fs for FsService {
         let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
         let written = self.core.write_chunks(&caller, r.ino, &writes, r.end).await;
         Ok(Response::new(written.into()))
+    }
+
+    async fn grants_under(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<GrantsUnderResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.grants_under(&caller, r.ino).await.into(),
+        ))
+    }
+
+    async fn rotate(&self, r: Request<RotateRequest>) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let rotations: Vec<Rotation> = r.rotations.into_iter().map(Into::into).collect();
+        Ok(Response::new(
+            self.core.rotate(&caller, &rotations).await.into(),
+        ))
     }
 }
 
