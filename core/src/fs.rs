@@ -13,7 +13,7 @@ use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
     Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, Kind, NewNode,
-    Rotation, SealedChunk, SealedMove, SetAttr,
+    RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -101,6 +101,53 @@ async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsE
 /// The inode a directory entry names, if it exists.
 async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError> {
     Ok(txn.read(dirent).await?.value.map(|b| dirent_ino(&b)))
+}
+
+/// Stores `writes` to file `ino` inside `txn`: each sealed under the
+/// file's current key version (`EKEYEXPIRED` if not), and each with an
+/// `expected_seq` only if the chunk is still at it (`EAGAIN` if not).
+/// With `existing`, every chunk must be there already, at its seq.
+async fn put_chunks(
+    txn: &Transaction,
+    ino: u64,
+    writes: &[ChunkWrite],
+    existing: bool,
+) -> Result<Result<(), FsError>, KvError> {
+    let (version, _) = decide!(key_versions(txn, ino).await?);
+    for w in writes {
+        if sealed_version(&w.blob).ok() != Some(version) {
+            return Ok(Err(FsError::new(
+                libc::EKEYEXPIRED,
+                format!("chunks of inode {ino} must be sealed under key version {version}"),
+            )));
+        }
+        let key = chunk_key(ino, w.index);
+        if let Some(expected) = w.expected_seq {
+            let read = txn.read(&key).await?;
+            if read.seq != expected || (existing && read.value.is_none()) {
+                return Ok(Err(FsError::new(
+                    libc::EAGAIN,
+                    format!("chunk {} of inode {ino} changed meanwhile", w.index),
+                )));
+            }
+        }
+        txn.write(&key, Some(&w.blob)).await?;
+    }
+    Ok(Ok(()))
+}
+
+/// Whether `sealed_name` is sealed under directory `dir`'s current key
+/// version, `version`: what every name filed in it must be, so that none
+/// is left under a version a revoked user holds -- or one a prune drops.
+fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), FsError> {
+    if sealed_version(sealed_name).ok() == Some(version) {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EKEYEXPIRED,
+            format!("names in inode {dir} must be sealed under key version {version}"),
+        ))
+    }
 }
 
 /// Whether directory `ino` has no entries. The caller must already have
@@ -363,6 +410,25 @@ impl FsCore {
         }
     }
 
+    /// What every batch of chunks to store must be: no more than a write
+    /// takes, and none larger than a sealed chunk.
+    fn check_chunk_writes(&self, writes: &[ChunkWrite]) -> Result<(), FsError> {
+        if writes.len() > chunks_per_batch(self.chunk_size) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "more chunks than one write takes",
+            ));
+        }
+        let largest = self.chunk_size as usize + CHUNK_OVERHEAD;
+        if writes.iter().any(|w| w.blob.len() > largest) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "a sealed chunk larger than a chunk",
+            ));
+        }
+        Ok(())
+    }
+
     /// Needs a grant over `ino`.
     pub async fn getattr(&self, caller: &Caller, ino: u64) -> Result<Attr, FsError> {
         self.guard_now(caller, ino, false).await?;
@@ -581,6 +647,7 @@ impl FsCore {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
             }
             let (parent_version, _) = decide!(key_versions(&txn, parent).await?);
+            decide!(check_name_version(parent, &new.sealed_name, parent_version));
             decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
             let now = SystemTime::now();
             let entry = Entry {
@@ -792,11 +859,16 @@ impl FsCore {
             // node mustn't come out of the move looking fresh.
             decide!(self.fresh(&txn, new_parent).await?);
             decide!(self.fresh(&txn, ino).await?);
+            let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
+            decide!(check_name_version(
+                new_parent,
+                &sealed.sealed_name,
+                dst_version
+            ));
             if new_parent != parent {
                 // Its key moves with it, re-wrapped under the new parent's.
                 let keys = &sealed.node_keys;
                 let (version, _) = decide!(key_versions(&txn, ino).await?);
-                let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
                 if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                     return Ok(Err(FsError::new(
                         libc::EKEYEXPIRED,
@@ -904,19 +976,7 @@ impl FsCore {
         writes: &[ChunkWrite],
         end: u64,
     ) -> Result<(Attr, u64), FsError> {
-        if writes.len() > chunks_per_batch(self.chunk_size) {
-            return Err(FsError::new(
-                libc::EINVAL,
-                "more chunks than one write takes",
-            ));
-        }
-        let largest = self.chunk_size as usize + CHUNK_OVERHEAD;
-        if writes.iter().any(|w| w.blob.len() > largest) {
-            return Err(FsError::new(
-                libc::EINVAL,
-                "a sealed chunk larger than a chunk",
-            ));
-        }
+        self.check_chunk_writes(writes)?;
         let attr = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
@@ -928,25 +988,7 @@ impl FsCore {
             // stored for an inode nothing could reach again.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            let (version, _) = decide!(key_versions(&txn, ino).await?);
-            for w in writes {
-                if sealed_version(&w.blob).ok() != Some(version) {
-                    return Ok(Err(FsError::new(
-                        libc::EKEYEXPIRED,
-                        format!("chunks of inode {ino} must be sealed under key version {version}"),
-                    )));
-                }
-                let key = chunk_key(ino, w.index);
-                if let Some(expected) = w.expected_seq
-                    && txn.read(&key).await?.seq != expected
-                {
-                    return Ok(Err(FsError::new(
-                        libc::EAGAIN,
-                        format!("chunk {} of inode {ino} changed meanwhile", w.index),
-                    )));
-                }
-                txn.write(&key, Some(&w.blob)).await?;
-            }
+            decide!(put_chunks(&txn, ino, writes, false).await?);
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1163,6 +1205,210 @@ impl FsCore {
         .await?
     }
 
+    /// Seals chunks of file `ino` again under its current key version --
+    /// each still at its `expected_seq`, which is required -- leaving the
+    /// file's size and times as they were: what a prune needs done first.
+    /// Needs a writable grant over `ino`, freshly keyed.
+    pub async fn reseal_chunks(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        writes: &[ChunkWrite],
+    ) -> Result<(), FsError> {
+        self.check_chunk_writes(writes)?;
+        if writes.iter().any(|w| w.expected_seq.is_none()) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "a re-sealed chunk must say the seq it was read at",
+            ));
+        }
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, ino, true).await?);
+            decide!(self.fresh(&txn, ino).await?);
+            // As in `write_chunks`, read first: no chunk lands after a
+            // deletion has started.
+            let entry = decide!(live_entry(&txn, ino).await?);
+            decide!(check_kind(&entry, Kind::File));
+            decide!(put_chunks(&txn, ino, writes, true).await?);
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// Seals entry names in directory `dir` again under its current key
+    /// version, each only if its tag still names the same inode, leaving
+    /// the directory's times as they were. Needs a writable grant over
+    /// `dir`, freshly keyed.
+    pub async fn reseal_names(
+        &self,
+        caller: &Caller,
+        dir: u64,
+        names: &[ResealedName],
+    ) -> Result<(), FsError> {
+        if names.len() > RESEAL_NAMES_BATCH {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "more names than one re-seal takes",
+            ));
+        }
+        for n in names {
+            Self::check_entry_name(&n.tag, &n.sealed_name)?;
+        }
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            decide!(self.guard(&txn, caller, dir, true).await?);
+            decide!(self.fresh(&txn, dir).await?);
+            decide!(modifiable_dir(&txn, dir).await?);
+            let (version, _) = decide!(key_versions(&txn, dir).await?);
+            for n in names {
+                decide!(check_name_version(dir, &n.sealed_name, version));
+                let dirent = dirent_key(dir, &n.tag);
+                if named(&txn, &dirent).await? != Some(n.ino) {
+                    return Ok(Err(FsError::new(
+                        libc::EAGAIN,
+                        format!("an entry of inode {dir} changed meanwhile"),
+                    )));
+                }
+                txn.write(&dirent, Some(&dirent_value(n.ino, &n.sealed_name)))
+                    .await?;
+            }
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// Replaces `ino`'s key record, at `expected_version`, with `node_keys`:
+    /// the same record with only its oldest history entries dropped.
+    /// Refused with `EBUSY` while anything is still sealed under a version
+    /// it drops. Needs a writable grant over `ino`.
+    ///
+    /// What could still be under an old version is looked for outside any
+    /// transaction, and the record then replaced only if it is still the
+    /// one the search started from. That is enough: while the record stays
+    /// the same, everything the server takes in for `ino` -- chunks, entry
+    /// names, children's keys, grants -- is checked, in the transaction
+    /// that stores it, against the current version, which the prune keeps.
+    /// Nothing under a dropped version can appear behind the search.
+    pub async fn prune_keys(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        expected_version: u32,
+        node_keys: &[u8],
+    ) -> Result<(), FsError> {
+        self.guard_now(caller, ino, true).await?;
+        let pruned = NodeKeys::decode(node_keys)
+            .map_err(|e| FsError::new(libc::EINVAL, format!("inode {ino}: {e}")))?;
+        let before_bytes = self
+            .client
+            .read(&node_keys_key(ino))
+            .await?
+            .value
+            .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino} has no key record")))?;
+        let before = NodeKeys::decode(&before_bytes)
+            .map_err(|e| FsError::new(libc::EIO, format!("inode {ino}: {e}")))?;
+        if before.version != expected_version {
+            return Err(FsError::new(
+                libc::EAGAIN,
+                format!("inode {ino} has key version {} now", before.version),
+            ));
+        }
+        if !pruned.is_pruning_of(&before) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                format!("inode {ino}'s new key record isn't its old one cut short"),
+            ));
+        }
+        if pruned.base() == before.base() {
+            return Ok(());
+        }
+        if let Some(what) = self.sealed_below(ino, pruned.base()).await? {
+            return Err(FsError::new(
+                libc::EBUSY,
+                format!(
+                    "{what} of inode {ino} is still sealed under a key version before {}",
+                    pruned.base()
+                ),
+            ));
+        }
+        let before_bytes = &before_bytes;
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            if txn.read(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
+                return Ok(Err(FsError::new(
+                    libc::EAGAIN,
+                    format!("inode {ino}'s key record changed meanwhile"),
+                )));
+            }
+            txn.write(&node_keys_key(ino), Some(node_keys)).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// The first thing found that is sealed under a version of `ino`'s key
+    /// before `base` -- a chunk, an entry's name, a child's key, a grant --
+    /// described, or `None`.
+    async fn sealed_below(&self, ino: u64, base: u32) -> Result<Option<String>, FsError> {
+        let below = |blob: &[u8]| sealed_version(blob).is_ok_and(|v| v < base);
+        let kind = self.resolve(ino).await?.attr.kind;
+        if kind == Kind::File {
+            let prefix = chunk_prefix(ino);
+            let mut iter = self.client.key_iterator(&prefix);
+            while let Some(key) = iter.next().await? {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if is_chunk_key(&key, &prefix)
+                    && let Some(blob) = self.client.read(&key).await?.value
+                    && below(&blob)
+                {
+                    let index = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+                    return Ok(Some(format!("chunk {index}")));
+                }
+            }
+        } else {
+            let prefix = dirent_prefix(ino);
+            let mut iter = self.client.key_iterator(&prefix);
+            while let Some(key) = iter.next().await? {
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let Some(value) = self.client.read(&key).await?.value else {
+                    continue;
+                };
+                let child = dirent_ino(&value);
+                if below(dirent_sealed_name(&value)) {
+                    return Ok(Some(format!("the name of entry {child}")));
+                }
+                if let Ok((_, parent_version)) = key_versions(&self.client, child).await?
+                    && parent_version != 0
+                    && parent_version < base
+                {
+                    return Ok(Some(format!("the key of child {child}")));
+                }
+            }
+        }
+        let prefix = grants::grant_prefix(ino);
+        let mut iter = self.client.key_iterator(&prefix);
+        while let Some(key) = iter.next().await? {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if let Some(bytes) = self.client.read(&key).await?.value
+                && grants::decode_grant(ino, &bytes)?.key_version < base
+            {
+                let user = String::from_utf8_lossy(&key[prefix.len()..]).into_owned();
+                return Ok(Some(format!("{user}'s grant")));
+            }
+        }
+        Ok(None)
+    }
+
     /// Removes volume `ino`, which must be empty, with every grant of it.
     /// Needs a writable grant of the volume itself.
     pub async fn delete_volume(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
@@ -1290,6 +1536,9 @@ fn operations_are_send(
     send(core.write_chunks(caller, 1, &[], 0));
     send(core.grants_under(caller, 1));
     send(core.rotate(caller, &[]));
+    send(core.reseal_chunks(caller, 1, &[]));
+    send(core.reseal_names(caller, 1, &[]));
+    send(core.prune_keys(caller, 1, 1, &[]));
     send(core.create_volume(caller, new, 0o755, &[], &[]));
     send(core.delete_volume(caller, 1));
     send(FsCore::connect(core.client.clone(), 4096));

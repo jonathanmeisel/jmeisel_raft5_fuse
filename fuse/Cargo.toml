@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "raft5fs-share"
 path = "src/bin/share.rs"
 
+[[bin]]
+name = "raft5fs-prune-keys"
+path = "src/bin/prune_keys.rs"
+
 [dependencies]
 fuser = { workspace = true }
 libc = { workspace = true }

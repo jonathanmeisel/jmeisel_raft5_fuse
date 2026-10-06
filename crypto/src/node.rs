@@ -11,9 +11,12 @@
 //! - `name_key`: a key for this directory's entry name tags, sealed under
 //!   the current key. Unlike the node key it never changes -- rotating it
 //!   would mean renaming every entry -- so a rotation just re-seals it;
-//! - `history`: entry `i - 1` is key version `i` sealed under version
-//!   `i + 1`. Holding any version opens every older one, one step at a
-//!   time, and nothing here leads from an old key to a newer one.
+//! - `history`: the versions from `base` up to the current one, each
+//!   sealed under the next. Holding any version opens every older one
+//!   down to `base`, one step at a time, and nothing here leads from an
+//!   old key to a newer one. It starts at version 1 and only grows, until
+//!   a prune drops the oldest entries once nothing is sealed under them
+//!   any more: `base` is `version - history.len()`.
 //!
 //! **Staleness.** When a node's key is rotated, its children's keys stay
 //! wrapped under the old version. Someone who held the old key -- a user
@@ -98,10 +101,16 @@ impl NodeKeys {
         Key::from_slice(&bytes)
     }
 
+    /// The oldest key version the history still opens.
+    pub fn base(&self) -> u32 {
+        self.version - self.history.len() as u32
+    }
+
     /// Version `want` of the key, walked down to from the current one.
     pub fn older(&self, ino: u64, current: &Key, want: u32) -> Result<Key, Error> {
         let what = "an older key version";
-        if want == 0 || want > self.version || self.history.len() + 1 != self.version as usize {
+        let base = self.base();
+        if want < base.max(1) || want > self.version {
             return Err(Error(what));
         }
         let mut key = current.clone();
@@ -109,7 +118,7 @@ impl NodeKeys {
             let bytes = open(
                 &key,
                 &history_aad(ino, older),
-                &self.history[older as usize - 1],
+                &self.history[(older - base) as usize],
                 what,
             )?;
             key = Key::from_slice(&bytes)?;
@@ -159,6 +168,27 @@ impl NodeKeys {
         })
     }
 
+    /// The same record, its history cut to the versions from `keep_from`
+    /// on: for once nothing is sealed under the older ones any more.
+    pub fn pruned(&self, keep_from: u32) -> Self {
+        let keep_from = keep_from.clamp(self.base(), self.version);
+        let drop = (keep_from - self.base()) as usize;
+        Self {
+            history: self.history[drop..].to_vec(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether this is `before` with only its oldest history entries gone:
+    /// all a prune may change. Checkable without any key.
+    pub fn is_pruning_of(&self, before: &NodeKeys) -> bool {
+        self.version == before.version
+            && self.parent_version == before.parent_version
+            && self.wrapper == before.wrapper
+            && self.name_key == before.name_key
+            && before.history.ends_with(&self.history)
+    }
+
     /// Whether this node needs a new key before anything is written under
     /// it, given its parent's current version.
     pub fn is_stale(&self, parent_version_now: u32) -> bool {
@@ -186,7 +216,7 @@ impl NodeKeys {
         let wrapper = r.bytes(what)?.to_vec();
         let name_key = r.bytes(what)?.to_vec();
         let count = r.u32(what)?;
-        if version == 0 || count as u64 + 1 != version as u64 {
+        if version == 0 || count >= version {
             return Err(Error(what));
         }
         let history = (0..count)
@@ -295,6 +325,38 @@ mod tests {
         assert_eq!(moved.parent_version, 4);
         assert!(moved.open(6, &a).is_err());
         assert!(record.rewrap(6, &Key::random(), (&b, 4)).is_err());
+    }
+
+    #[test]
+    fn a_pruned_record_opens_only_what_it_kept() {
+        let parent = Key::random();
+        let (v1, k1) = NodeKeys::create(3, Some((&parent, 1)));
+        let (v2, k2) = v1.rotate(3, &k1, Some((&parent, 1))).unwrap();
+        let (v3, k3) = v2.rotate(3, &k2, Some((&parent, 1))).unwrap();
+        assert_eq!(v3.base(), 1);
+
+        let kept = v3.pruned(2);
+        assert_eq!(kept.base(), 2);
+        assert_eq!(kept.older(3, &k3, 2).unwrap(), k2);
+        assert!(kept.older(3, &k3, 1).is_err(), "version 1 is gone");
+        assert!(kept.is_pruning_of(&v3));
+        assert!(!v3.is_pruning_of(&kept), "a prune can't put entries back");
+
+        let none = v3.pruned(3);
+        assert_eq!(none.base(), 3);
+        assert_eq!(none.older(3, &k3, 3).unwrap(), k3);
+        assert!(none.is_pruning_of(&kept));
+        assert_eq!(NodeKeys::decode(&none.encode()).unwrap(), none);
+        assert_eq!(none.name_key(3, &k3).unwrap(), v3.name_key(3, &k3).unwrap());
+        // Rotating a pruned record carries on from where it was cut.
+        let (v4, k4) = none.rotate(3, &k3, Some((&parent, 1))).unwrap();
+        assert_eq!(v4.base(), 3);
+        assert_eq!(v4.older(3, &k4, 3).unwrap(), k3);
+
+        // Anything but dropping old entries isn't a prune.
+        let (other, _) = NodeKeys::create(3, Some((&parent, 1)));
+        assert!(!other.is_pruning_of(&v1));
+        assert!(!v2.pruned(2).is_pruning_of(&v3));
     }
 
     #[test]

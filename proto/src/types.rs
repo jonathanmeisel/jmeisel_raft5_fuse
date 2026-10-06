@@ -166,6 +166,18 @@ pub struct SealedMove {
     pub sealed_name: Vec<u8>,
 }
 
+/// The most entry names one re-seal takes.
+pub const RESEAL_NAMES_BATCH: usize = 256;
+
+/// A directory entry's name sealed again, under the directory's current
+/// key: the entry filed under `tag`, which must still name `ino`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResealedName {
+    pub tag: OsString,
+    pub ino: u64,
+    pub sealed_name: Vec<u8>,
+}
+
 /// What the filesystem keeps for an account: enough to check a
 /// login and to hand the client back its wrapped private key, and nothing
 /// that opens anything. The fields are raft5fs-crypto's encodings.

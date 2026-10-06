@@ -1021,6 +1021,265 @@ fn a_changed_public_key_is_refused_until_forgotten() {
     );
 }
 
+// ---------------------------------------------------------------- pruning
+
+/// `dir` and everything under it, parents first.
+fn tree(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![dir.to_path_buf()];
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].is_dir() {
+            let mut children: Vec<_> = fs::read_dir(&out[i])
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            children.sort();
+            out.extend(children);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The stored values under `prefix`.
+fn values_under(h: &support::Harness, prefix: &[u8]) -> Vec<Vec<u8>> {
+    h.keys_with_prefix(prefix)
+        .into_iter()
+        .filter(|k| k.starts_with(prefix))
+        .filter_map(|k| h.read_key(&k))
+        .collect()
+}
+
+/// That nothing under `dir` is sealed under anything but its node's
+/// current key, nor wrapped under anything but its parent's, and that no
+/// key history is left.
+#[track_caller]
+fn assert_fully_pruned(h: &support::Harness, dir: &Path) {
+    use raft5fs_crypto::data::sealed_version;
+    for path in tree(dir) {
+        let n = ino(&path);
+        let rec = record(h, n);
+        assert_eq!(rec.base(), rec.version, "{path:?} still has a history");
+        if path.is_dir() {
+            for value in values_under(h, &raft5fs_core::dirent_prefix(n)) {
+                assert_eq!(sealed_version(&value[8..]).unwrap(), rec.version);
+                let child = u64::from_be_bytes(value[..8].try_into().unwrap());
+                assert_eq!(record(h, child).parent_version, rec.version);
+            }
+        } else {
+            for chunk in values_under(h, &raft5fs_core::chunk_prefix(n)) {
+                assert_eq!(sealed_version(&chunk).unwrap(), rec.version, "{path:?}");
+            }
+        }
+    }
+}
+
+/// `shared_tree` with a multi-chunk file in it too, granted to alice and
+/// revoked again, then partly written: some of it rotated since, some of
+/// it stale. Returns the volume, and the key alice held for `g`.
+fn revoked_tree(h: &support::Harness) -> (std::path::PathBuf, raft5fs_crypto::Key) {
+    let v = shared_tree(h);
+    let big: Vec<u8> = (0..h.chunk_size * 5 / 2).map(|i| i as u8).collect();
+    fs::write(v.join("shared/sub/big"), &big).unwrap();
+    h.add_user("alice");
+    let mine = vault(h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    let hers = vault(h, "alice");
+    let her_g_key = h
+        .runtime
+        .block_on(hers.node(ino(&v.join("shared/sub/g"))))
+        .unwrap()
+        .key
+        .clone();
+    h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
+    // Rotates v/shared, sub and f on the way, leaving g and big stale.
+    fs::write(v.join("shared/sub/f"), b"after").unwrap();
+    (v, her_g_key)
+}
+
+#[test]
+fn pruning_reseals_everything_and_drops_every_old_version() {
+    let h = support::setup_root();
+    let (v, her_g_key) = revoked_tree(&h);
+    let g = ino(&v.join("shared/sub/g"));
+    let big = fs::read(v.join("shared/sub/big")).unwrap();
+    let g_mtime = fs::metadata(v.join("shared/sub/g")).unwrap().mtime();
+    assert!(record(&h, ino(&v)).base() < record(&h, ino(&v)).version);
+
+    let mine = vault(&h, support::TESTER);
+    let dry = h.runtime.block_on(mine.prune_tree(ino(&v), true));
+    assert!(dry.skipped.is_empty(), "{:?}", dry.skipped);
+    assert!(dry.chunks > 0 && dry.names > 0 && dry.rotated > 0 && dry.dropped > 0);
+    assert!(
+        record(&h, ino(&v)).base() < record(&h, ino(&v)).version,
+        "a dry run changes nothing"
+    );
+
+    let stats = h.runtime.block_on(mine.prune_tree(ino(&v), false));
+    assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
+    assert_eq!(stats.nodes, tree(&v).len());
+    assert_eq!(
+        (stats.chunks, stats.names, stats.rotated),
+        (dry.chunks, dry.names, dry.rotated)
+    );
+    assert_fully_pruned(&h, &v);
+
+    // Everything reads as before, through a fresh login and the mount,
+    // and nothing's times moved.
+    assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"after");
+    assert_eq!(fs::read(v.join("shared/sub/g")).unwrap(), b"untouched");
+    assert_eq!(fs::read(v.join("shared/sub/big")).unwrap(), big);
+    assert_eq!(
+        fs::metadata(v.join("shared/sub/g")).unwrap().mtime(),
+        g_mtime
+    );
+    let fresh = vault(&h, support::TESTER);
+    assert_eq!(
+        h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
+        b"untouched"
+    );
+    // And what alice held no longer opens any of it.
+    let chunk = stored_chunk(&h, g, 0);
+    assert!(raft5fs_crypto::data::open_chunk(&her_g_key, g, 0, &chunk).is_err());
+
+    // A second run finds nothing to do.
+    let again = h.runtime.block_on(mine.prune_tree(ino(&v), false));
+    assert!(again.skipped.is_empty(), "{:?}", again.skipped);
+    assert_eq!(
+        (again.chunks, again.names, again.rotated, again.dropped),
+        (0, 0, 0, 0)
+    );
+}
+
+#[test]
+fn a_prune_is_refused_while_anything_is_under_a_version_it_drops() {
+    let h = support::setup_root();
+    let (v, _) = revoked_tree(&h);
+    let g = ino(&v.join("shared/sub/g"));
+    let sub = ino(&v.join("shared/sub"));
+    let mine = vault(&h, support::TESTER);
+    let remote = mine.remote();
+    // A new key for g, its chunk still sealed under the old one.
+    h.runtime.block_on(mine.freshen(g)).unwrap();
+    let rec = record(&h, g);
+    assert_eq!(rec.base(), 1);
+    assert_fs_errno(
+        h.runtime
+            .block_on(remote.prune_keys(g, rec.version, rec.pruned(rec.version).encode())),
+        libc::EBUSY,
+    );
+    // sub's entries' names are still under its old key.
+    let rec = record(&h, sub);
+    assert_fs_errno(
+        h.runtime
+            .block_on(remote.prune_keys(sub, rec.version, rec.pruned(rec.version).encode())),
+        libc::EBUSY,
+    );
+    // v's child `shared` is fresh, but its name in v isn't.
+    let top = ino(&v);
+    let rec = record(&h, top);
+    assert_fs_errno(
+        h.runtime
+            .block_on(remote.prune_keys(top, rec.version, rec.pruned(rec.version).encode())),
+        libc::EBUSY,
+    );
+    // Only cutting a history short is a prune.
+    let rec = record(&h, g);
+    assert_fs_errno(
+        h.runtime
+            .block_on(remote.prune_keys(g, rec.version, record(&h, sub).encode())),
+        libc::EINVAL,
+    );
+    assert_fs_errno(
+        h.runtime
+            .block_on(remote.prune_keys(g, rec.version - 1, rec.pruned(rec.version).encode())),
+        libc::EAGAIN,
+    );
+    assert_eq!(record(&h, g).base(), 1, "nothing was cut");
+}
+
+#[test]
+fn names_sealed_under_an_old_key_are_refused() {
+    let h = support::setup_root();
+    let (v, _) = revoked_tree(&h);
+    let sub = ino(&v.join("shared/sub"));
+    let mine = vault(&h, support::TESTER);
+    let node = h.runtime.block_on(mine.node(sub)).unwrap();
+    let old = node
+        .record
+        .older(sub, &node.key, node.record.version - 1)
+        .unwrap();
+    let tag = node.tag(OsStr::new("leaky"));
+    let new = NewNode {
+        ino: h.runtime.block_on(mine.remote().allocate_inode()).unwrap(),
+        keys: NodeKeys::create(0, Some((&node.key, node.record.version)))
+            .0
+            .encode(),
+        sealed_name: raft5fs_crypto::data::seal_name(
+            &old,
+            node.record.version - 1,
+            sub,
+            tag.as_bytes(),
+            b"leaky",
+        ),
+    };
+    assert_fs_errno(
+        h.runtime
+            .block_on(mine.remote().create(sub, &tag, 0o644, &new)),
+        libc::EKEYEXPIRED,
+    );
+}
+
+#[test]
+fn pruning_through_a_read_only_grant_changes_nothing() {
+    let h = support::setup_root();
+    let v = shared_tree(&h);
+    h.add_user("alice");
+    h.add_user("bob");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    h.runtime
+        .block_on(mine.grant(ino(&v), "bob", false, OsStr::new("v")))
+        .unwrap();
+    h.runtime.block_on(mine.revoke(ino(&v), "bob")).unwrap();
+    let before = record(&h, ino(&v));
+    assert!(before.base() < before.version);
+
+    let hers = vault(&h, "alice");
+    let roots = h.runtime.block_on(hers.grant_roots()).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert!(!roots[0].writable);
+    let stats = h.runtime.block_on(hers.prune_tree(ino(&v), false));
+    assert_eq!(stats.skipped.len(), 1);
+    assert_eq!(stats.skipped[0].1.errno, libc::EROFS);
+    assert_eq!(record(&h, ino(&v)), before);
+}
+
+#[test]
+fn pruning_while_a_mount_writes_loses_nothing() {
+    let h = support::setup_root();
+    let (v, _) = revoked_tree(&h);
+    let f = v.join("shared/sub/f");
+    let writer = {
+        let f = f.clone();
+        std::thread::spawn(move || {
+            for i in 0..40u32 {
+                fs::write(&f, format!("write {i}")).unwrap();
+            }
+        })
+    };
+    let mine = vault(&h, support::TESTER);
+    let stats = h.runtime.block_on(mine.prune_tree(ino(&v), false));
+    writer.join().unwrap();
+    assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
+    assert_eq!(fs::read(&f).unwrap(), b"write 39");
+    assert_fully_pruned(&h, &v);
+}
+
 // ------------------------------------------------------------------ cache
 
 #[test]

@@ -13,5 +13,6 @@ pub use layout::{
 };
 pub use raft5fs_proto::types::{
     AccountKeys, Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, SetTime,
+    Kind, NewNode, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
+    SetTime,
 };

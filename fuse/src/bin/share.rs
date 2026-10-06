@@ -86,15 +86,6 @@ fn new_password(var: &str, username: &str) -> String {
     first
 }
 
-/// Where pinned keys are kept unless `--known-keys` says otherwise.
-fn default_known_keys() -> PathBuf {
-    let config = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    config.join("raft5fs").join("known_keys")
-}
-
 /// Logs in and opens the account's keys,
 /// pinning keys in `known_keys`.
 fn log_in(
@@ -150,7 +141,7 @@ fn main() {
         usage("--tls-server-name needs --ca");
     }
 
-    let known_keys_file = known_keys_file.unwrap_or_else(default_known_keys);
+    let known_keys_file = known_keys_file.unwrap_or_else(cli::default_known_keys);
     let known_keys = || {
         KnownKeys::load(known_keys_file.clone()).unwrap_or_else(|e| {
             fail(format!(

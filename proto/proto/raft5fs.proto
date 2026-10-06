@@ -101,6 +101,26 @@ service Fs {
   // -- someone revoked -- could still open it. The writer rotates the
   // stale nodes with this, then writes again.
   rpc Rotate(RotateRequest) returns (EmptyResponse);
+
+  // Pruning: dropping key versions nothing is sealed under any more (see
+  // raft5fs-crypto's `NodeKeys::pruned`). Everything still under an old
+  // version is first sealed again under the current one:
+  //
+  // Re-seals existing chunks of a file under its current key version,
+  // each only if still at its `expected_seq` (which is required) --
+  // otherwise none are, and the answer is EAGAIN. The file's size and
+  // times stay as they were: its contents haven't changed.
+  rpc ResealChunks(ResealChunksRequest) returns (EmptyResponse);
+  // Re-seals directory entries' names under the directory's current key
+  // version, each only if its tag still names the same inode (EAGAIN if
+  // not). The directory's times stay as they were.
+  rpc ResealNames(ResealNamesRequest) returns (EmptyResponse);
+  // Replaces a node's key record with the same record cut short: only
+  // its oldest history entries gone, anything else EINVAL. Refused with
+  // EBUSY while anything -- a chunk, an entry name, a child's key, a grant
+  // -- is still sealed under a version it drops, and EAGAIN if the record
+  // changed meanwhile. Needs read-write access to the node.
+  rpc PruneKeys(PruneKeysRequest) returns (EmptyResponse);
 }
 
 message NoArgs {}
@@ -480,4 +500,29 @@ message Rotation {
 message RotateRequest {
   // Parents before children.
   repeated Rotation rotations = 1;
+}
+
+message ResealChunksRequest {
+  uint64 ino = 1;
+  repeated ChunkWrite chunks = 2;
+}
+
+message ResealedName {
+  // The entry's tag, as it is filed under.
+  bytes name = 1;
+  // The inode it must still name.
+  uint64 ino = 2;
+  bytes sealed_name = 3;
+}
+
+message ResealNamesRequest {
+  uint64 dir = 1;
+  repeated ResealedName names = 2;
+}
+
+message PruneKeysRequest {
+  uint64 ino = 1;
+  // The version the record is at: anything else is EAGAIN.
+  uint32 expected_version = 2;
+  bytes node_keys = 3;
 }

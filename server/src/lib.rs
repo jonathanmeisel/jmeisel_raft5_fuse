@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::{
-    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, Rotation, SealedMove, accounts,
-    batch_bytes,
+    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, ResealedName, Rotation,
+    SealedMove, accounts, batch_bytes,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
@@ -28,8 +28,9 @@ use raft5fs_proto::pb::{
     EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
     HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
     LoginRequest, LoginResponse, NameRequest, NoArgs, PreloginRequest, PreloginResponse,
-    PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse, ReadDirResponse,
-    RenameRequest, RotateRequest, Session, SetAttrRequest, WriteChunksRequest, WriteChunksResponse,
+    PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
+    ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
+    Session, SetAttrRequest, WriteChunksRequest, WriteChunksResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -461,6 +462,44 @@ impl Fs for FsService {
         let rotations: Vec<Rotation> = r.rotations.into_iter().map(Into::into).collect();
         Ok(Response::new(
             self.core.rotate(&caller, &rotations).await.into(),
+        ))
+    }
+
+    async fn reseal_chunks(
+        &self,
+        r: Request<ResealChunksRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
+        Ok(Response::new(
+            self.core
+                .reseal_chunks(&caller, r.ino, &writes)
+                .await
+                .into(),
+        ))
+    }
+
+    async fn reseal_names(
+        &self,
+        r: Request<ResealNamesRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let names: Vec<ResealedName> = r.names.into_iter().map(Into::into).collect();
+        Ok(Response::new(
+            self.core.reseal_names(&caller, r.dir, &names).await.into(),
+        ))
+    }
+
+    async fn prune_keys(
+        &self,
+        r: Request<PruneKeysRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core
+                .prune_keys(&caller, r.ino, r.expected_version, &r.node_keys)
+                .await
+                .into(),
         ))
     }
 }

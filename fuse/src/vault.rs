@@ -70,6 +70,9 @@ use raft5fs_proto::types::{
 
 use crate::chunk_cache::{ChunkCache, Lookup};
 
+mod prune;
+pub use prune::{GrantRoot, PruneStats};
+
 use crate::remote::Remote;
 
 /// The inode the kernel knows a mount's root by: the virtual root, never

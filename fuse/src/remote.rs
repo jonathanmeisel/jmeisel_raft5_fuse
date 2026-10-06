@@ -54,12 +54,12 @@ use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
-    PreloginRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest, RotateRequest,
-    SetAttrRequest, WriteChunksRequest,
+    PreloginRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
+    ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::types::{
-    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, Rotation,
-    SealedChunk, SealedMove, SetAttr,
+    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, ResealedName,
+    Rotation, SealedChunk, SealedMove, SetAttr,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -834,6 +834,61 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.rotate(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Seals chunks of `ino` again under its current key version (see
+    /// `FsCore::reseal_chunks`). Each is guarded by its seq, so a resend
+    /// of one that landed is refused with `EAGAIN`, and the caller reads
+    /// again -- finding them already done.
+    pub async fn reseal_chunks(&self, ino: u64, chunks: &[ChunkWrite]) -> Result<(), FsError> {
+        let req = ResealChunksRequest {
+            ino,
+            chunks: chunks.iter().cloned().map(Into::into).collect(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.reseal_chunks(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Seals entry names of `dir` again under its current key version
+    /// (see `FsCore::reseal_names`). Storing the same names twice changes
+    /// nothing more.
+    pub async fn reseal_names(&self, dir: u64, names: &[ResealedName]) -> Result<(), FsError> {
+        let req = ResealNamesRequest {
+            dir,
+            names: names.iter().cloned().map(Into::into).collect(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.reseal_names(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Cuts `ino`'s key history short (see `FsCore::prune_keys`). A
+    /// resend of one that landed finds the record already cut, and does
+    /// nothing.
+    pub async fn prune_keys(
+        &self,
+        ino: u64,
+        expected_version: u32,
+        node_keys: Vec<u8>,
+    ) -> Result<(), FsError> {
+        let req = PruneKeysRequest {
+            ino,
+            expected_version,
+            node_keys,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.prune_keys(req).await }
         })
         .await?
         .into_result()

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::pb;
 use crate::types::{
     AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind,
-    Rotation, SealedChunk, SetAttr, SetTime,
+    ResealedName, Rotation, SealedChunk, SetAttr, SetTime,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -633,6 +633,26 @@ impl From<pb::Rotation> for Rotation {
                 .into_iter()
                 .map(|g| (g.username, g.sealed_key))
                 .collect(),
+        }
+    }
+}
+
+impl From<ResealedName> for pb::ResealedName {
+    fn from(r: ResealedName) -> Self {
+        Self {
+            name: name_bytes(&r.tag),
+            ino: r.ino,
+            sealed_name: r.sealed_name,
+        }
+    }
+}
+
+impl From<pb::ResealedName> for ResealedName {
+    fn from(r: pb::ResealedName) -> Self {
+        Self {
+            tag: OsString::from_vec(r.name),
+            ino: r.ino,
+            sealed_name: r.sealed_name,
         }
     }
 }

@@ -1,7 +1,9 @@
-//! What the client binaries share: reading passwords and building TLS
-//! settings from their command lines.
+//! What the client binaries share: reading passwords, building TLS
+//! settings from their command lines, and where pinned keys are kept.
 
+use std::env;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use tonic::transport::{Certificate, ClientTlsConfig};
 
@@ -49,4 +51,13 @@ pub fn tls(ca: &str, server_name: Option<&str>) -> Result<ClientTlsConfig, Strin
         tls = tls.domain_name(name);
     }
     Ok(tls)
+}
+
+/// Where pinned public keys are kept unless `--known-keys` says otherwise.
+pub fn default_known_keys() -> PathBuf {
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    config.join("raft5fs").join("known_keys")
 }
