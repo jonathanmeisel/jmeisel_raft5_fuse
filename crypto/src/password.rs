@@ -45,6 +45,40 @@ impl KdfParams {
         parallelism: 1,
     };
 
+    /// The most a client will spend on a login: 4 GiB, 64 passes, 16
+    /// lanes -- far above anything an honest account needs.
+    pub const MAXIMUM: Self = Self {
+        memory_kib: 4 * 1024 * 1024,
+        iterations: 64,
+        parallelism: 16,
+    };
+
+    /// Refuses settings outside `floor` and `MAXIMUM`. The server hands
+    /// these out at login, so a client that took them as given could be
+    /// talked into stretching its password cheaply -- making the `auth`
+    /// it sends back fast to brute-force -- or into exhausting its memory.
+    pub fn check(&self, floor: KdfParams) -> Result<(), String> {
+        let max = Self::MAXIMUM;
+        if self.memory_kib < floor.memory_kib || self.iterations < floor.iterations {
+            return Err(format!(
+                "the server asked for weaker key stretching ({} KiB, {} passes) \
+                 than this client accepts ({} KiB, {} passes)",
+                self.memory_kib, self.iterations, floor.memory_kib, floor.iterations
+            ));
+        }
+        if self.memory_kib > max.memory_kib
+            || self.iterations > max.iterations
+            || self.parallelism > max.parallelism
+        {
+            return Err(format!(
+                "the server asked for more key stretching ({} KiB, {} passes, {} lanes) \
+                 than this client allows",
+                self.memory_kib, self.iterations, self.parallelism
+            ));
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> [u8; 12] {
         let mut out = [0; 12];
         out[..4].copy_from_slice(&self.memory_kib.to_be_bytes());
@@ -203,6 +237,36 @@ mod tests {
         assert!(check_verifier(&keys.auth, &stored));
         assert!(!check_verifier(&[0; AUTH_LEN], &stored));
         assert!(!check_verifier(&keys.auth, &stored[..31]));
+    }
+
+    #[test]
+    fn params_outside_the_floor_and_ceiling_are_refused() {
+        let floor = KdfParams::DEFAULT;
+        floor.check(floor).unwrap();
+        KdfParams::MAXIMUM.check(floor).unwrap();
+        assert!(KdfParams::TESTING.check(floor).is_err());
+        KdfParams::TESTING.check(KdfParams::TESTING).unwrap();
+        let fewer_passes = KdfParams {
+            iterations: 1,
+            ..floor
+        };
+        assert!(fewer_passes.check(floor).is_err());
+        for too_much in [
+            KdfParams {
+                memory_kib: u32::MAX,
+                ..floor
+            },
+            KdfParams {
+                iterations: u32::MAX,
+                ..floor
+            },
+            KdfParams {
+                parallelism: u32::MAX,
+                ..floor
+            },
+        ] {
+            assert!(too_much.check(floor).is_err());
+        }
     }
 
     #[test]

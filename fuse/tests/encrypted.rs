@@ -26,10 +26,7 @@ fn server_process_mode() {
 }
 
 fn connect(h: &support::Harness, user: &str, password: &str) -> Result<Remote, String> {
-    let credentials = Credentials {
-        username: user.to_string(),
-        password: password.to_string(),
-    };
+    let credentials = support::credentials_with(user, password);
     h.runtime.block_on(Remote::connect(
         &h.addresses(),
         credentials,
@@ -132,6 +129,50 @@ fn an_enrolment_code_works_once_and_only_for_its_user() {
         "the code was used up"
     );
     connect(&h, "alice", "pw").unwrap();
+}
+
+#[test]
+fn enrolling_again_drops_the_old_key_pairs_grants() {
+    let h = support::setup_root();
+    fs::create_dir(h.root().join("v")).unwrap();
+    fs::write(h.root().join("v/f"), b"x").unwrap();
+    h.add_user("alice");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&h.root().join("v")), "alice", true, OsStr::new("v")))
+        .unwrap();
+    let before = connect(&h, "alice", &support::password("alice")).unwrap();
+    assert_eq!(h.runtime.block_on(before.list_grants()).unwrap().len(), 1);
+
+    // Whoever enrols with a new code gets a new key pair and nothing
+    // else: not the right to delete or overwrite what they can't read.
+    h.enrol("alice");
+    let after = connect(&h, "alice", &support::password("alice")).unwrap();
+    assert!(h.runtime.block_on(after.list_grants()).unwrap().is_empty());
+    let mut index = vec![0x09];
+    index.extend_from_slice(b"alice\0");
+    assert!(h.keys_with_prefix(&index).is_empty(), "her grants are gone");
+    assert_eq!(fs::read(h.root().join("v/f")).unwrap(), b"x");
+}
+
+#[test]
+fn a_login_refuses_weaker_key_stretching_than_it_accepts() {
+    let h = support::setup_root();
+    // Enrolled with `KdfParams::TESTING`, which is what Prelogin now hands
+    // out for her -- as a server trying to cheapen her `auth` would.
+    h.add_user("alice");
+    let credentials = Credentials::new("alice", support::password("alice"));
+    let refused = h
+        .runtime
+        .block_on(Remote::connect(
+            &h.addresses(),
+            credentials,
+            Some(support::fs_tls()),
+        ))
+        .map(drop)
+        .unwrap_err();
+    assert!(refused.contains("weaker key stretching"), "{refused}");
+    connect(&h, "alice", &support::password("alice")).unwrap();
 }
 
 #[test]
@@ -959,10 +1000,15 @@ fn a_changed_public_key_is_refused_until_forgotten() {
         .runtime
         .block_on(mine.grant(shared, "alice", false, OsStr::new("shared")));
     assert_fs_errno(refused, libc::EPERM);
-    // Nor does a rotation re-seal her grant to the new key.
+    // Nor does a rotation re-seal a grant made to the new key by someone
+    // who never pinned the old one.
     h.add_user("bob");
     h.runtime
-        .block_on(mine.grant(ino(&v), "bob", false, OsStr::new("v")))
+        .block_on(mine.grant(ino(&v), "bob", true, OsStr::new("v")))
+        .unwrap();
+    let bobs = vault(&h, "bob");
+    h.runtime
+        .block_on(bobs.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
     assert_fs_errno(h.runtime.block_on(mine.revoke(ino(&v), "bob")), libc::EPERM);
 

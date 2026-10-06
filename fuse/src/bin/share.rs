@@ -106,10 +106,7 @@ fn log_in(
 ) -> Vault {
     let password = cli::password_from("RAFT5FS_PASSWORD", &format!("password for {username}: "))
         .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")));
-    let credentials = Credentials {
-        username: username.to_string(),
-        password,
-    };
+    let credentials = Credentials::new(username, password);
     let remote = runtime
         .block_on(Remote::connect(servers, credentials, tls))
         .unwrap_or_else(|e| fail(format!("cannot log in: {e}")));
@@ -195,10 +192,7 @@ fn main() {
                 &format!("current password for {username}: "),
             )
             .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")));
-            let credentials = Credentials {
-                username: username.clone(),
-                password,
-            };
+            let credentials = Credentials::new(username.clone(), password);
             let remote = runtime
                 .block_on(Remote::connect(&positional, credentials, tls))
                 .unwrap_or_else(|e| fail(format!("cannot log in: {e}")));

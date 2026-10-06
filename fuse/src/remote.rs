@@ -85,6 +85,21 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Credentials {
     pub username: String,
     pub password: String,
+    /// The weakest key stretching a login will accept from a server (see
+    /// `KdfParams::check`).
+    pub min_kdf: KdfParams,
+}
+
+impl Credentials {
+    /// `username` and `password`, accepting no weaker stretching than new
+    /// accounts get.
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+            min_kdf: KdfParams::DEFAULT,
+        }
+    }
 }
 
 /// The session token every request carries; empty until the first login.
@@ -120,6 +135,7 @@ pub struct Remote {
     servers: Vec<(String, Client)>,
     username: String,
     secret: RwLock<Secret>,
+    min_kdf: KdfParams,
     /// The account's key pair, once a login has opened it.
     identity: RwLock<Option<Arc<Identity>>>,
     /// How many chunks have been asked for: for tests of the client's
@@ -231,6 +247,7 @@ impl Remote {
             servers,
             username: credentials.username,
             secret: RwLock::new(Secret::Password(Zeroizing::new(credentials.password))),
+            min_kdf: credentials.min_kdf,
             identity: RwLock::new(None),
             chunk_reads: AtomicU64::new(0),
             session,
@@ -261,10 +278,7 @@ impl Remote {
         password: &str,
         params: KdfParams,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
-        let credentials = Credentials {
-            username: username.to_string(),
-            password: String::new(),
-        };
+        let credentials = Credentials::new(username, String::new());
         let remote = Self::dial(addresses, credentials, tls)
             .await
             .map_err(|e| FsError::new(libc::EIO, e))?;
@@ -365,6 +379,9 @@ impl Remote {
                 .into_result()?;
             let params = KdfParams::decode(&settings.params)
                 .map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
+            params
+                .check(self.min_kdf)
+                .map_err(|e| FsError::new(libc::EACCES, format!("login refused: {e}")))?;
             let keys = derive(&password, settings.salt, params).await?;
             req.auth = keys.auth.to_vec();
             derived = Some(keys);

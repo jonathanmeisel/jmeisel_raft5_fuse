@@ -1211,10 +1211,7 @@ fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
 
 fn connect_as(h: &support::Harness, user: &str, password: &str) -> Result<(), String> {
     let addresses: Vec<String> = h.servers.iter().map(|s| s.address.clone()).collect();
-    let credentials = raft5fs_fuse::remote::Credentials {
-        username: user.to_string(),
-        password: password.to_string(),
-    };
+    let credentials = support::credentials_with(user, password);
     h.runtime
         .block_on(raft5fs_fuse::remote::Remote::connect(
             &addresses,

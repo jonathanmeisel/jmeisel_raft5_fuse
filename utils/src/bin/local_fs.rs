@@ -666,10 +666,8 @@ fn mount(
     std::fs::create_dir_all(mountpoint)
         .map_err(|e| format!("could not create {}: {e}", mountpoint.display()))?;
 
-    let credentials = Credentials {
-        username: manifest.user.clone(),
-        password: read_trimmed(&dir.join(USER_PASSWORD))?,
-    };
+    let credentials =
+        Credentials::new(manifest.user.clone(), read_trimmed(&dir.join(USER_PASSWORD))?);
     let tls =
         ClientTlsConfig::new().ca_certificate(Certificate::from_pem(read(&dir.join(CA_CERT))?));
     let fs = Raft5Fs::new(

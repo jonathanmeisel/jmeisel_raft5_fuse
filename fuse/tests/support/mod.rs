@@ -121,10 +121,16 @@ pub fn password(user: &str) -> String {
     user.chars().rev().collect()
 }
 
+/// `user`'s credentials, accepting the cheap key stretching test
+/// accounts are enrolled with.
 pub fn credentials(user: &str) -> Credentials {
+    credentials_with(user, &password(user))
+}
+
+pub fn credentials_with(user: &str, password: &str) -> Credentials {
     Credentials {
-        username: user.to_string(),
-        password: password(user),
+        min_kdf: KdfParams::TESTING,
+        ..Credentials::new(user, password)
     }
 }
 

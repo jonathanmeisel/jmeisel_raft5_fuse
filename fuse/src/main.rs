@@ -94,7 +94,7 @@ fn main() {
             eprintln!("cannot read a password: {e}");
             std::process::exit(1);
         });
-    let credentials = Credentials { username, password };
+    let credentials = Credentials::new(username, password);
     let tls = ca.map(|path| {
         cli::tls(&path, server_name.as_deref()).unwrap_or_else(|e| {
             eprintln!("{e}");

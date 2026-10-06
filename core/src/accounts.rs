@@ -14,7 +14,7 @@
 //! their password enrol again -- with a new key pair, so whatever was
 //! granted to the old one is out of reach until granted again.
 
-use raft5_client::Client;
+use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::identity::PUBLIC_KEY_LEN;
 use raft5fs_crypto::password::{
     KdfParams, SALT_LEN, check_verifier, enrolment_code_hash, new_enrolment_code,
@@ -146,6 +146,14 @@ pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> 
 
 /// Stores `user`'s keys, if `code` is the one issued to them, and uses the
 /// code up. A wrong or used code is `EACCES`.
+///
+/// Enrolling again replaces the key pair, and takes every grant the
+/// account held with it. The server decides what an account may do by
+/// its grants, by name, not by what it can decrypt -- so grants left in
+/// place would let whoever holds the new code delete and overwrite what
+/// they can't read. A grant made concurrently can't slip past this: it
+/// reads the account's keys in its own transaction, which this one
+/// writes, so one of the two retries.
 pub async fn enrol(
     client: &Client,
     user: &str,
@@ -166,6 +174,11 @@ pub async fn enrol(
                     format!("no such enrolment code for {user}"),
                 )));
             }
+            if txn.read(&keys_key(user)).await?.value.is_some() {
+                for ino in granted_in(&txn, user).await? {
+                    crate::grants::remove_grant(&txn, user, ino).await?;
+                }
+            }
             txn.write(&code_key(user), None).await?;
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.commit().await?;
@@ -173,6 +186,23 @@ pub async fn enrol(
         }
     })
     .await?
+}
+
+/// The inodes `user` holds grants of, per their grant index, as `txn`
+/// sees it.
+async fn granted_in(txn: &Transaction, user: &str) -> Result<Vec<u64>, KvError> {
+    let prefix = crate::grants::index_prefix(user);
+    let mut granted = Vec::new();
+    let mut iter = txn.key_iterator(&prefix);
+    while let Some(key) = iter.next().await? {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        if let Ok(ino) = <[u8; 8]>::try_from(&key[prefix.len()..]) {
+            granted.push(u64::from_be_bytes(ino));
+        }
+    }
+    Ok(granted)
 }
 
 /// Replaces `user`'s password-derived material, if `old_auth` is right.
