@@ -1,0 +1,43 @@
+# One node of the raft5 store. Rendered by deploy/render.sh.
+[Unit]
+Description=raft5 store node @NODE@
+# The store's ports are bound to the WireGuard address, which only
+# exists once wg0 is up.
+Requires=wg-quick@wg0.service
+After=wg-quick@wg0.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=raft5
+Group=raft5
+StateDirectory=raft5
+StateDirectoryMode=0700
+# Only present while the cluster is being bootstrapped (install.sh
+# --bootstrap): the first administrator's login, which stops working
+# once the cluster exists.
+EnvironmentFile=-/etc/raft5/bootstrap.env
+ExecStart=/usr/local/bin/raft5-server --id @NODE@ --db /var/lib/raft5/db \
+    --client-addr @WG_IP@:27051 --peer-addr @WG_IP@:27052 \
+    --advertise https://@WG_IP@:27052 --advertise-client https://@WG_IP@:27051 \
+    --jwt-secret-file /etc/raft5/jwt.secret \
+    --peer-tls-cert /etc/raft5/node.pem --peer-tls-key /etc/raft5/node.key \
+    --peer-tls-ca /etc/raft5/internal-ca.pem \
+    --client-tls-cert /etc/raft5/node.pem --client-tls-key /etc/raft5/node.key \
+    --client-tls-ca /etc/raft5/internal-ca.pem \
+    $RAFT5_BOOTSTRAP_ARGS
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

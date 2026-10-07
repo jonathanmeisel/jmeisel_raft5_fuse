@@ -1,0 +1,14 @@
+#!/bin/sh
+# raft5fs-cert-check [DAYS]: fails, naming them, if any certificate the
+# servers use expires within DAYS days (default 30).
+days=${1:-30}
+status=0
+for pem in /etc/raft5/*.pem /etc/raft5fs/*.pem; do
+    [ -f "$pem" ] || continue
+    if ! openssl x509 -in "$pem" -noout -checkend $((days * 86400)) >/dev/null; then
+        echo "$pem expires $(openssl x509 -in "$pem" -noout -enddate | cut -d= -f2)" >&2
+        status=1
+    fi
+done
+[ $status = 0 ] && echo "every certificate is good for at least $days more days"
+exit $status

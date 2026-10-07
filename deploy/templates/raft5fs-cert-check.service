@@ -1,0 +1,9 @@
+# Fails -- showing in `systemctl --failed` and the journal -- when any
+# certificate the servers use expires within 30 days. Run daily by
+# raft5fs-cert-check.timer. Renew with deploy/certs.sh renew.
+[Unit]
+Description=Check the raft5fs certificates aren't about to expire
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/raft5fs-cert-check 30

@@ -1,0 +1,44 @@
+#!/bin/sh
+# raft5fs-admin: the filesystem's administration, on this node, with the
+# credentials installed here. Run as root.
+#
+#   raft5fs-admin user add <NAME>          a one-time enrolment code
+#   raft5fs-admin user del <NAME>
+#   raft5fs-admin user list
+#   raft5fs-admin snapshot create [<NAME>]
+#   raft5fs-admin snapshot del <NAME>
+#   raft5fs-admin snapshot list
+#
+# `user` works as the filesystem servers' store account. `snapshot` needs
+# the store's administrator: it asks for admin's password, or reads it
+# from RAFT5FS_ADMIN_PASSWORD.
+set -eu
+STORE="--store-ca /etc/raft5fs/internal-ca.pem --store-cert /etc/raft5fs/node.pem --store-key /etc/raft5fs/node.key"
+# Every store node, unless RAFT5FS_SEEDS names others.
+SEEDS="${RAFT5FS_SEEDS:-@SEEDS@}"
+
+case ${1:-} in
+user)
+    . /etc/raft5fs/store.env
+    export RAFT5FS_STORE_PASSWORD
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/raft5fs-server "$@" --store-user raft5fs $STORE $SEEDS
+    ;;
+snapshot)
+    if [ -z "${RAFT5FS_ADMIN_PASSWORD:-}" ]; then
+        printf "admin's store password: " >&2
+        stty -echo 2>/dev/null || true
+        read -r RAFT5FS_ADMIN_PASSWORD
+        stty echo 2>/dev/null || true
+        echo >&2
+    fi
+    RAFT5FS_STORE_PASSWORD=$RAFT5FS_ADMIN_PASSWORD
+    export RAFT5FS_STORE_PASSWORD
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/raft5fs-server "$@" --store-user admin $STORE $SEEDS
+    ;;
+*)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+    ;;
+esac

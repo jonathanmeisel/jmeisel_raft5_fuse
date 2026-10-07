@@ -1,0 +1,5 @@
+# Your cluster's own settings, keys and built bundles: never committed.
+/cluster.conf
+/secrets/
+/out/
+/backups/

@@ -1,0 +1,40 @@
+# The raft5fs filesystem server on @NODE@. Rendered by deploy/render.sh.
+#
+# Stateless: it serves users on the public port and keeps everything in
+# the store, through whichever store node answers -- so it needs the store
+# running, but not this node's in particular. Until the store is
+# bootstrapped it can't log in, and systemd keeps restarting it.
+[Unit]
+Description=raft5fs filesystem server
+After=raft5-server.service wg-quick@wg0.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=raft5fs
+Group=raft5fs
+# RAFT5FS_STORE_PASSWORD: the store account's password. Read by systemd,
+# as root; the file is root's alone.
+EnvironmentFile=/etc/raft5fs/store.env
+ExecStart=/usr/local/bin/raft5fs-server --listen 0.0.0.0:27060 \
+    --token-key-file /etc/raft5fs/token.key \
+    --tls-cert /etc/raft5fs/fs.pem --tls-key /etc/raft5fs/fs.key \
+    --chunk-size @CHUNK_SIZE@ \
+    --store-user raft5fs --store-ca /etc/raft5fs/internal-ca.pem \
+    --store-cert /etc/raft5fs/node.pem --store-key /etc/raft5fs/node.key \
+    @SEEDS@
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

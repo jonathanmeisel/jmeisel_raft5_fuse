@@ -1,0 +1,37 @@
+# The cluster's layout. Copy to cluster.conf and edit; every script here
+# reads it. Shell syntax.
+
+# One line per node:  <name> <public IP> <WireGuard IP> <public DNS name or ->
+#
+# <name> is also the store node's raft id, which must never change once
+# the cluster is bootstrapped. The first node listed is the one the
+# cluster is bootstrapped on. Users dial each node at its DNS name if it
+# has one, or else its public IP; the filesystem servers' certificate
+# covers both.
+NODES="
+node1 203.0.113.11 10.10.0.1 fs1.example.com
+node2 203.0.113.12 10.10.0.2 fs2.example.com
+node3 203.0.113.13 10.10.0.3 fs3.example.com
+"
+
+# How install.sh and friends log in to the nodes. Needs root, or sudo
+# without a password.
+SSH_USER=root
+# The port sshd listens on, which the firewall keeps open. Get this wrong
+# and install.sh locks you out.
+SSH_PORT=22
+
+# The port WireGuard listens on, between the nodes.
+WG_PORT=51820
+
+# Where the raft5 store's source is checked out (for build.sh: it builds
+# raft5-server and the `raft` admin shell from there).
+RAFT5_REPO=../../jmeisel_raft5
+
+# The filesystem's chunk size, fixed when the first server creates the
+# filesystem (see SETUP.txt section 4).
+CHUNK_SIZE=1M
+
+# How long the certificates issued by certs.sh last, in days. The CAs
+# last ten years.
+CERT_DAYS=397
