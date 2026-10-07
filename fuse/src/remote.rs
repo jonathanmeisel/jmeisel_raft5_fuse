@@ -53,13 +53,14 @@ use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
-    EnrolRequest, GrantRequest, HelloRequest, InodeRequest, LoginRequest, NameRequest, NoArgs,
-    PreloginRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
-    ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
+    EnrolRequest, GrantRequest, HelloRequest, InodeRequest, ListGrantsRequest, LoginRequest,
+    NameRequest, NoArgs, PreloginRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest,
+    RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest,
+    WriteChunksRequest,
 };
 use raft5fs_proto::types::{
     Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, ResealedName,
-    Rotation, SealedChunk, SealedMove, SetAttr,
+    Rotation, SealedChunk, SealedMove, SetAttr, SnapshotInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -146,6 +147,9 @@ pub struct Remote {
     current: AtomicUsize,
     chunk_size: u64,
     batch_bytes: u64,
+    /// The snapshot this client reads at, or empty for the live
+    /// filesystem. One at a snapshot only reads (see `at`).
+    snapshot: String,
 }
 
 /// Stretches `password` off the async threads: Argon2 is slow on purpose.
@@ -254,6 +258,7 @@ impl Remote {
             current: AtomicUsize::new(0),
             chunk_size: 0,
             batch_bytes: 0,
+            snapshot: String::new(),
         };
         let hello = remote
             .call(Retry::ReadOnly, |mut c| async move {
@@ -336,6 +341,35 @@ impl Remote {
     }
 
     /// The account's key pair: there after a login.
+    /// A client for reading snapshot `name`: the same servers, and the
+    /// same session -- a renewal by either is the other's too -- but
+    /// every read made as of the snapshot, and every write refused with
+    /// `EROFS` before it is sent.
+    pub fn at(&self, name: &str) -> Remote {
+        let secret = match &*self.secret.read().unwrap() {
+            Secret::Password(p) => Secret::Password(p.clone()),
+            Secret::Auth(a) => Secret::Auth(a.clone()),
+        };
+        Remote {
+            servers: self.servers.clone(),
+            username: self.username.clone(),
+            secret: RwLock::new(secret),
+            min_kdf: self.min_kdf,
+            identity: RwLock::new(self.identity()),
+            chunk_reads: AtomicU64::new(0),
+            session: Arc::clone(&self.session),
+            current: AtomicUsize::new(self.current.load(Ordering::Relaxed)),
+            chunk_size: self.chunk_size,
+            batch_bytes: self.batch_bytes,
+            snapshot: name.to_string(),
+        }
+    }
+
+    /// The snapshot this client reads at, if it isn't the live one.
+    pub fn snapshot(&self) -> Option<&str> {
+        (!self.snapshot.is_empty()).then_some(self.snapshot.as_str())
+    }
+
     pub fn identity(&self) -> Option<Arc<Identity>> {
         self.identity.read().unwrap().clone()
     }
@@ -458,6 +492,9 @@ impl Remote {
     where
         Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
+        if retry != Retry::ReadOnly && !self.snapshot.is_empty() {
+            return Err(FsError::new(libc::EROFS, "a snapshot is read-only"));
+        }
         let n = self.servers.len();
         let start = self.current.load(Ordering::Relaxed);
         let mut failures = Vec::new();
@@ -509,11 +546,14 @@ impl Remote {
     }
 
     pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
-        let req = InodeRequest { ino };
-        self.call(
-            Retry::ReadOnly,
-            |mut c| async move { c.get_attr(req).await },
-        )
+        let req = InodeRequest {
+            ino,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.get_attr(req).await }
+        })
         .await?
         .into_result()
     }
@@ -522,6 +562,7 @@ impl Remote {
         let req = NameRequest {
             parent,
             name: name_bytes(name),
+            snapshot: self.snapshot.clone(),
         };
         self.call(Retry::ReadOnly, |mut c| {
             let req = req.clone();
@@ -533,18 +574,28 @@ impl Remote {
 
     /// access(2).
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
-        let req = AccessRequest { ino, mask };
-        self.call(Retry::ReadOnly, |mut c| async move { c.access(req).await })
-            .await?
-            .into_result()
+        let req = AccessRequest {
+            ino,
+            mask,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.access(req).await }
+        })
+        .await?
+        .into_result()
     }
 
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
-        let req = InodeRequest { ino };
-        self.call(
-            Retry::ReadOnly,
-            |mut c| async move { c.read_dir(req).await },
-        )
+        let req = InodeRequest {
+            ino,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.read_dir(req).await }
+        })
         .await?
         .into_result()
     }
@@ -612,6 +663,7 @@ impl Remote {
         let req = NameRequest {
             parent,
             name: name_bytes(name),
+            snapshot: self.snapshot.clone(),
         };
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
@@ -658,6 +710,7 @@ impl Remote {
         let req = NameRequest {
             parent,
             name: name_bytes(name),
+            snapshot: self.snapshot.clone(),
         };
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
@@ -680,19 +733,35 @@ impl Remote {
     /// This account's grant over `ino`, and the key records from the
     /// granted directory down to it.
     pub async fn key_path(&self, ino: u64) -> Result<KeyPath, FsError> {
-        let req = InodeRequest { ino };
-        self.call(
-            Retry::ReadOnly,
-            |mut c| async move { c.get_key_path(req).await },
-        )
+        let req = InodeRequest {
+            ino,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.get_key_path(req).await }
+        })
         .await?
         .into_result()
     }
 
     /// Every grant made to this account.
     pub async fn list_grants(&self) -> Result<Vec<Grant>, FsError> {
+        let req = ListGrantsRequest {
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.list_grants(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Every snapshot there is, oldest first.
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>, FsError> {
         self.call(Retry::ReadOnly, |mut c| async move {
-            c.list_grants(NoArgs {}).await
+            c.list_snapshots(NoArgs {}).await
         })
         .await?
         .into_result()
@@ -751,11 +820,14 @@ impl Remote {
 
     /// Removes an empty volume.
     pub async fn delete_volume(&self, ino: u64) -> Result<(), FsError> {
-        let req = InodeRequest { ino };
-        self.call(
-            Retry::Once,
-            |mut c| async move { c.delete_volume(req).await },
-        )
+        let req = InodeRequest {
+            ino,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.delete_volume(req).await }
+        })
         .await?
         .into_result()
     }
@@ -776,6 +848,7 @@ impl Remote {
             first,
             count,
             known_seqs: known_seqs.to_vec(),
+            snapshot: self.snapshot.clone(),
         };
         let (attr, chunks) = self
             .call(Retry::ReadOnly, |mut c| {
@@ -815,11 +888,14 @@ impl Remote {
 
     /// Every node at or under `top` that is granted to anyone.
     pub async fn grants_under(&self, top: u64) -> Result<Vec<GrantedNode>, FsError> {
-        let req = InodeRequest { ino: top };
-        self.call(
-            Retry::ReadOnly,
-            |mut c| async move { c.grants_under(req).await },
-        )
+        let req = InodeRequest {
+            ino: top,
+            snapshot: self.snapshot.clone(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.grants_under(req).await }
+        })
         .await?
         .into_result()
     }

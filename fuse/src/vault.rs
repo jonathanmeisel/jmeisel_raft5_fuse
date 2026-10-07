@@ -79,6 +79,9 @@ use crate::remote::Remote;
 /// the server's real one.
 pub const VIRTUAL_ROOT: u64 = 1;
 
+/// Where the root shows the snapshots, though it doesn't list it.
+pub const SNAPSHOT_DIR: &str = ".snapshot";
+
 /// An inode's key record, its current key, and (for a directory) the key
 /// its entries' tags are made with.
 pub struct Node {
@@ -291,8 +294,11 @@ pub struct Vault {
     known: KnownKeys,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
     roots: Mutex<Roots>,
-    /// Decrypted chunks, each with the seq it was read or written at.
-    cache: Mutex<ChunkCache>,
+    /// Decrypted chunks, each with the seq it was read or written at:
+    /// shared with the vaults of the same mount's snapshots, each keeping
+    /// its own `space` in it.
+    cache: Arc<Mutex<ChunkCache>>,
+    space: u64,
 }
 
 /// How much decrypted file data a vault caches unless told otherwise.
@@ -318,14 +324,33 @@ impl Vault {
             known: KnownKeys::in_memory(),
             nodes: Mutex::new(HashMap::new()),
             roots: Mutex::new(Roots::default()),
-            cache: Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL)),
+            cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
+            space: 0,
         })
     }
 
     /// Caches up to `bytes` of decrypted file data (0 caches none).
     pub fn with_cache_size(mut self, bytes: usize) -> Self {
-        self.cache = Mutex::new(ChunkCache::new(bytes, CACHE_TTL));
+        self.cache = Arc::new(Mutex::new(ChunkCache::new(bytes, CACHE_TTL)));
         self
+    }
+
+    /// The vault of snapshot `name`: this account's view of the
+    /// filesystem as it was then, read-only. Its keys are its own -- a
+    /// snapshot's key records are as they were, not as they are -- but it
+    /// caches into this vault's cache, under `space`, which must be unique
+    /// to it and not 0.
+    pub fn at_snapshot(&self, name: &str, space: u64) -> Self {
+        debug_assert_ne!(space, 0, "space 0 is the live filesystem's");
+        Self {
+            remote: Arc::new(self.remote.at(name)),
+            identity: Arc::clone(&self.identity),
+            known: KnownKeys::in_memory(),
+            nodes: Mutex::new(HashMap::new()),
+            roots: Mutex::new(Roots::default()),
+            cache: Arc::clone(&self.cache),
+            space,
+        }
     }
 
     /// Pins public keys in `known` rather than in memory only.
@@ -591,7 +616,7 @@ impl Vault {
                 .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
             let mut name = label.clone();
             let mut n = 2;
-            while roots.by_name.contains_key(&name) || name.is_empty() {
+            while roots.by_name.contains_key(&name) || name.is_empty() || self.reserved(&name) {
                 let mut numbered = label.clone();
                 numbered.push(format!(" ({n})"));
                 name = numbered;
@@ -607,6 +632,12 @@ impl Vault {
             .collect();
         *self.roots.lock().unwrap() = roots;
         Ok(entries)
+    }
+
+    /// Whether `name` is taken in the root already, whatever is granted:
+    /// the live root's `.snapshot`, which a grant labelled so gives way to.
+    fn reserved(&self, name: &OsStr) -> bool {
+        self.remote.snapshot().is_none() && name == SNAPSHOT_DIR
     }
 
     /// The grant `name` stands for in the root, reading the grants afresh
@@ -662,7 +693,7 @@ impl Vault {
     /// Drops what is held for an inode that is gone.
     fn forget_inode(&self, ino: u64) {
         self.nodes.lock().unwrap().remove(&ino);
-        self.cache.lock().unwrap().invalidate_ino(ino);
+        self.cache.lock().unwrap().invalidate_ino(self.space, ino);
     }
 
     /// Removes a file, as `Remote::unlink`.
@@ -841,7 +872,7 @@ impl Vault {
 
     /// A new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        if self.root_lookup(label).await.is_ok() {
+        if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
             return Err(FsError::errno(libc::EEXIST));
         }
         let ino = self.remote.allocate_inode().await?;
@@ -934,7 +965,9 @@ impl Vault {
         let last = (offset + len as u64 - 1) / chunk_size;
         let lookups: Vec<Lookup> = {
             let mut cache = self.cache.lock().unwrap();
-            (first..=last).map(|index| cache.get(ino, index)).collect()
+            (first..=last)
+                .map(|index| cache.get(self.space, ino, index))
+                .collect()
         };
         let known: Vec<u64> = lookups
             .iter()
@@ -979,7 +1012,11 @@ impl Vault {
             if let Lookup::Unconfirmed {
                 data, generation, ..
             } = lookup
-                && self.cache.lock().unwrap().confirm(ino, index, generation)
+                && self
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .confirm(self.space, ino, index, generation)
             {
                 return Ok(data);
             }
@@ -987,7 +1024,12 @@ impl Vault {
             // meanwhile -- a write of ours may have replaced it: read it
             // afresh.
             let fresh = self.fetch_one(ino, index, 0).await?;
-            let generation = self.cache.lock().unwrap().get(ino, index).generation();
+            let generation = self
+                .cache
+                .lock()
+                .unwrap()
+                .get(self.space, ino, index)
+                .generation();
             return self.open_and_keep(ino, fresh, generation, node).await;
         }
         let generation = match lookup {
@@ -1025,6 +1067,7 @@ impl Vault {
             None => Arc::from(Vec::new()),
         };
         self.cache.lock().unwrap().insert(
+            self.space,
             ino,
             chunk.index,
             Arc::clone(&plain),
@@ -1084,7 +1127,7 @@ impl Vault {
     /// server refuses it if the copy was out of date -- or else fetched.
     async fn base(&self, node: &Node, ino: u64, index: u64) -> Result<(Vec<u8>, u64), FsError> {
         if let Lookup::Unconfirmed { data, version, .. } =
-            self.cache.lock().unwrap().get(ino, index)
+            self.cache.lock().unwrap().get(self.space, ino, index)
         {
             return Ok((data.to_vec(), version));
         }
@@ -1151,7 +1194,12 @@ impl Vault {
     ) -> Result<Attr, FsError> {
         let chunk_size = self.remote.chunk_size();
         for _ in 0..CHANGE_RETRIES {
-            let generation = self.cache.lock().unwrap().get(ino, spans[0].0).generation();
+            let generation = self
+                .cache
+                .lock()
+                .unwrap()
+                .get(self.space, ino, spans[0].0)
+                .generation();
             let mut writes = Vec::with_capacity(spans.len());
             let mut plains = Vec::with_capacity(spans.len());
             let mut cursor = 0;
@@ -1180,18 +1228,18 @@ impl Vault {
                     // A base was out of date: drop it, and fetch afresh.
                     let mut cache = self.cache.lock().unwrap();
                     for &(index, ..) in spans {
-                        cache.invalidate(ino, index..=index);
+                        cache.invalidate(self.space, ino, index..=index);
                     }
                 }
                 Err(e) => {
                     // Whether it landed is unknown: trust nothing cached.
-                    self.cache.lock().unwrap().invalidate_ino(ino);
+                    self.cache.lock().unwrap().invalidate_ino(self.space, ino);
                     return Err(e);
                 }
                 Ok((attr, seq)) => {
                     let mut cache = self.cache.lock().unwrap();
                     for (index, plain) in plains {
-                        cache.insert(ino, index, plain.into(), seq, generation);
+                        cache.insert(self.space, ino, index, plain.into(), seq, generation);
                     }
                     return Ok(attr);
                 }
@@ -1217,7 +1265,7 @@ impl Vault {
             self.cache
                 .lock()
                 .unwrap()
-                .invalidate(ino, size / chunk_size..=u64::MAX);
+                .invalidate(self.space, ino, size / chunk_size..=u64::MAX);
         }
         changed
     }
@@ -1254,7 +1302,10 @@ impl Vault {
             };
             let written = self.remote.write_chunks(ino, &[write], 0).await;
             // Whatever happened, the cached copy is superseded.
-            self.cache.lock().unwrap().invalidate(ino, index..=index);
+            self.cache
+                .lock()
+                .unwrap()
+                .invalidate(self.space, ino, index..=index);
             match written {
                 Err(e) if changed(&e) => continue,
                 other => return other.map(drop),

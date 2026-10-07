@@ -264,7 +264,7 @@ impl Vault {
                 // The same bytes, but at a new seq.
                 let mut cache = self.cache.lock().unwrap();
                 for w in &writes {
-                    cache.invalidate(ino, w.index..=w.index);
+                    cache.invalidate(self.space, ino, w.index..=w.index);
                 }
             }
             if next >= end {

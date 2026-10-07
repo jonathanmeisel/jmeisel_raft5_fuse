@@ -3,7 +3,10 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-type Key = (u64, u64);
+/// Which filesystem a chunk is of -- the live one, or one of its snapshots
+/// (see `Vault`), whose inode numbers are the same -- its inode, and its
+/// index.
+type Key = (u64, u64, u64);
 
 /// Bookkeeping charged per entry on top of its bytes, so a filesystem full
 /// of holes (empty entries) can't grow the cache without bound.
@@ -46,8 +49,9 @@ impl Lookup {
     }
 }
 
-/// An LRU cache of whole decrypted chunks, keyed by `(ino, chunk index)`
-/// and bounded by bytes: the client's, so a hit saves the trip, the
+/// An LRU cache of whole decrypted chunks, keyed by `(space, ino, chunk
+/// index)` -- `space` telling the live filesystem's apart from each
+/// snapshot's, so that one budget covers them all -- and bounded by bytes: the client's, so a hit saves the trip, the
 /// decryption, and the server's store read alike.
 ///
 /// This client's own writes invalidate exactly, or replace the entry with
@@ -103,8 +107,8 @@ impl ChunkCache {
 
     /// The cached chunk and the seq it was read at, for the caller to
     /// confirm against the store; or a miss.
-    pub fn get(&mut self, ino: u64, index: u64) -> Lookup {
-        let key = (ino, index);
+    pub fn get(&mut self, space: u64, ino: u64, index: u64) -> Lookup {
+        let key = (space, ino, index);
         let Some(slot) = self.map.get_mut(&key) else {
             return Lookup::Miss {
                 generation: self.generation,
@@ -135,11 +139,11 @@ impl ChunkCache {
     /// Also restarts the entry's `ttl`, since its version is current as of
     /// now. An entry evicted for space in the meantime is simply not
     /// re-cached; the bytes in the caller's hand are still good.
-    pub fn confirm(&mut self, ino: u64, index: u64, generation: u64) -> bool {
+    pub fn confirm(&mut self, space: u64, ino: u64, index: u64, generation: u64) -> bool {
         if generation != self.generation {
             return false;
         }
-        if let Some(slot) = self.map.get_mut(&(ino, index)) {
+        if let Some(slot) = self.map.get_mut(&(space, ino, index)) {
             slot.confirmed = Instant::now();
         }
         true
@@ -148,8 +152,16 @@ impl ChunkCache {
     /// Caches `data`, read at seq `version`, unless something was
     /// invalidated since `generation` was read -- in which case `data` may
     /// already be stale.
-    pub fn insert(&mut self, ino: u64, index: u64, data: Arc<[u8]>, version: u64, generation: u64) {
-        let key = (ino, index);
+    pub fn insert(
+        &mut self,
+        space: u64,
+        ino: u64,
+        index: u64,
+        data: Arc<[u8]>,
+        version: u64,
+        generation: u64,
+    ) {
+        let key = (space, ino, index);
         if generation != self.generation || cost(&data) > self.capacity {
             return;
         }
@@ -177,11 +189,11 @@ impl ChunkCache {
     }
 
     /// Drops the given chunk indices of `ino`.
-    pub fn invalidate(&mut self, ino: u64, indices: RangeInclusive<u64>) {
+    pub fn invalidate(&mut self, space: u64, ino: u64, indices: RangeInclusive<u64>) {
         self.generation += 1;
         let doomed: Vec<Key> = self
             .map
-            .range((ino, *indices.start())..=(ino, *indices.end()))
+            .range((space, ino, *indices.start())..=(space, ino, *indices.end()))
             .map(|(k, _)| *k)
             .collect();
         for key in doomed {
@@ -189,8 +201,8 @@ impl ChunkCache {
         }
     }
 
-    pub fn invalidate_ino(&mut self, ino: u64) {
-        self.invalidate(ino, 0..=u64::MAX);
+    pub fn invalidate_ino(&mut self, space: u64, ino: u64) {
+        self.invalidate(space, ino, 0..=u64::MAX);
     }
 
     fn remove(&mut self, key: Key) {
@@ -218,14 +230,14 @@ mod tests {
 
     /// The cached bytes, ignoring the version the caller would confirm.
     fn cached(c: &mut ChunkCache, ino: u64, idx: u64) -> Option<Arc<[u8]>> {
-        match c.get(ino, idx) {
+        match c.get(0, ino, idx) {
             Lookup::Unconfirmed { data, .. } => Some(data),
             Lookup::Miss { .. } => None,
         }
     }
 
     fn version_of(c: &mut ChunkCache, ino: u64, idx: u64) -> Option<u64> {
-        match c.get(ino, idx) {
+        match c.get(0, ino, idx) {
             Lookup::Unconfirmed { version, .. } => Some(version),
             Lookup::Miss { .. } => None,
         }
@@ -236,8 +248,8 @@ mod tests {
     }
 
     fn put_at(c: &mut ChunkCache, ino: u64, idx: u64, n: usize, version: u64) {
-        let generation = c.get(ino, idx).generation();
-        c.insert(ino, idx, chunk(n), version, generation);
+        let generation = c.get(0, ino, idx).generation();
+        c.insert(0, ino, idx, chunk(n), version, generation);
     }
 
     #[test]
@@ -293,12 +305,12 @@ mod tests {
             put(&mut c, 1, idx, 10);
         }
         put(&mut c, 2, 0, 10);
-        c.invalidate(1, 2..=u64::MAX);
+        c.invalidate(0, 1, 2..=u64::MAX);
         assert!(cached(&mut c, 1, 0).is_some());
         assert!(cached(&mut c, 1, 1).is_some());
         assert!(cached(&mut c, 1, 2).is_none());
         assert!(cached(&mut c, 1, 3).is_none());
-        c.invalidate_ino(1);
+        c.invalidate_ino(0, 1);
         assert!(cached(&mut c, 1, 0).is_none());
         assert!(cached(&mut c, 2, 0).is_some());
     }
@@ -306,9 +318,9 @@ mod tests {
     #[test]
     fn insert_after_invalidation_is_refused() {
         let mut c = ChunkCache::new(10_000, LONG);
-        let generation = c.get(1, 0).generation();
-        c.invalidate(1, 0..=0);
-        c.insert(1, 0, chunk(10), 1, generation);
+        let generation = c.get(0, 1, 0).generation();
+        c.invalidate(0, 1, 0..=0);
+        c.insert(0, 1, 0, chunk(10), 1, generation);
         assert!(cached(&mut c, 1, 0).is_none());
     }
 
@@ -316,13 +328,13 @@ mod tests {
     fn confirm_is_refused_after_an_invalidation() {
         let mut c = ChunkCache::new(10_000, LONG);
         put(&mut c, 1, 0, 10);
-        let generation = c.get(1, 0).generation();
+        let generation = c.get(0, 1, 0).generation();
 
         // A local write landing while the reader was asking the store for
         // the current seq: its bytes are superseded, however that call
         // came back.
-        c.invalidate(1, 0..=0);
-        assert!(!c.confirm(1, 0, generation));
+        c.invalidate(0, 1, 0..=0);
+        assert!(!c.confirm(0, 1, 0, generation));
     }
 
     #[test]
@@ -333,9 +345,9 @@ mod tests {
 
         for _ in 0..4 {
             std::thread::sleep(ttl / 2);
-            let generation = c.get(1, 0).generation();
+            let generation = c.get(0, 1, 0).generation();
             assert!(
-                c.confirm(1, 0, generation),
+                c.confirm(0, 1, 0, generation),
                 "a confirmed entry should not expire out from under a reader"
             );
         }
@@ -346,12 +358,12 @@ mod tests {
     fn confirm_of_an_evicted_entry_still_clears_its_bytes() {
         let mut c = ChunkCache::new(100 + ENTRY_OVERHEAD, LONG);
         put(&mut c, 1, 0, 100);
-        let generation = c.get(1, 0).generation();
+        let generation = c.get(0, 1, 0).generation();
         put(&mut c, 1, 1, 100); // evicts (1, 0) for space, no invalidation
 
         assert!(cached(&mut c, 1, 0).is_none());
         assert!(
-            c.confirm(1, 0, generation),
+            c.confirm(0, 1, 0, generation),
             "eviction is not staleness -- the caller's bytes are still current"
         );
     }

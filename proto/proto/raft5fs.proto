@@ -22,6 +22,15 @@
 // granted directory's key sealed to the grantee. Every `name` is a tag:
 // an HMAC of the real name under the directory's name key, which lets the
 // server find an entry without learning what it is called.
+//
+// Snapshots: the read-only requests (GetAttr, Lookup, Access, ReadDir,
+// GetKeyPath, ListGrants, ReadChunks) take a `snapshot`, the name of one
+// ListSnapshots lists, to read the filesystem as it was when it was taken
+// rather than as it is -- all of it, the grants that decide access
+// included, so what a user sees in one is what they could see then.
+// Empty reads the present. One that doesn't exist is ENOENT, and anything
+// that would write at one EROFS. Snapshots are taken and removed by the
+// store's administrator, not through this protocol.
 syntax = "proto3";
 
 package raft5fs;
@@ -63,7 +72,9 @@ service Fs {
   // key from scratch.
   rpc GetKeyPath(InodeRequest) returns (KeyPathResponse);
   // Every grant made to the caller: the entries of their root.
-  rpc ListGrants(NoArgs) returns (GrantListResponse);
+  rpc ListGrants(ListGrantsRequest) returns (GrantListResponse);
+  // Every snapshot there is, oldest first.
+  rpc ListSnapshots(NoArgs) returns (SnapshotListResponse);
   rpc PublicKey(PublicKeyRequest) returns (PublicKeyResponse);
   // Grants a directory (and all under it) to a user, replacing any grant
   // of it they had. Needs read-write access to it.
@@ -228,6 +239,9 @@ message ChangePasswordRequest {
 
 message InodeRequest {
   uint64 ino = 1;
+  // Read as of this snapshot; see the top of this file. Only the
+  // read-only requests take one.
+  string snapshot = 2;
 }
 
 // `mask` is access(2)'s: R_OK (4), W_OK (2) and X_OK (1) ORed, or 0 to
@@ -235,12 +249,15 @@ message InodeRequest {
 message AccessRequest {
   uint64 ino = 1;
   uint32 mask = 2;
+  string snapshot = 3;
 }
 
 message NameRequest {
   uint64 parent = 1;
   // The entry's tag.
   bytes name = 2;
+  // Only Lookup takes one.
+  string snapshot = 3;
 }
 
 message CreateRequest {
@@ -368,6 +385,27 @@ message GrantListResponse {
   }
 }
 
+message ListGrantsRequest {
+  string snapshot = 1;
+}
+
+message SnapshotInfo {
+  string name = 1;
+  // When it was taken, by the clock of whoever took it.
+  Timestamp created = 2;
+}
+
+message SnapshotList {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message SnapshotListResponse {
+  oneof result {
+    SnapshotList list = 1;
+    Error error = 2;
+  }
+}
+
 message PublicKeyRequest {
   string username = 1;
 }
@@ -404,6 +442,7 @@ message ReadChunksRequest {
   // For chunk `first + i`, the seq the client already holds it at, or 0.
   // A chunk still at it comes back `unchanged`, without its bytes.
   repeated uint64 known_seqs = 4;
+  string snapshot = 5;
 }
 
 message SealedChunk {

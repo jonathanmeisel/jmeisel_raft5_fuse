@@ -5,6 +5,9 @@
 //! to a client -- the write buffers, the auto-flush timer, the virtual
 //! root, and mapping errors to errnos.
 //!
+//! `/.snapshot`, which the root doesn't list, holds the filesystem's
+//! snapshots, read-only (see `snapshot_tree`).
+//!
 //! There are no owners in the filesystem: access goes by grants. A mount
 //! shows the local user who made it as the owner of everything, and
 //! refuses to give anything to anyone else.
@@ -24,6 +27,7 @@ use tokio::runtime::Handle;
 use tonic::transport::ClientTlsConfig;
 
 use crate::remote::{Credentials, Remote};
+use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
 use crate::vault::{DEFAULT_CACHE_BYTES, VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
 
@@ -95,10 +99,13 @@ pub struct Raft5Fs {
     /// the slot's own lock is what serializes a file's writes and flushes.
     write_bufs: Mutex<HashMap<u64, Arc<Mutex<WriteBuf>>>>,
     write_buffering: bool,
+    /// `/.snapshot` and everything under it.
+    snapshots: SnapshotTree,
 }
 
 impl Raft5Fs {
     pub fn new(servers: Vec<String>, credentials: Credentials, rt: Handle) -> Self {
+        let mounted_at = SystemTime::now();
         Self {
             rt,
             servers,
@@ -108,9 +115,10 @@ impl Raft5Fs {
             vault: OnceLock::new(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
-            mounted_at: SystemTime::now(),
+            mounted_at,
             write_bufs: Mutex::new(HashMap::new()),
             write_buffering: true,
+            snapshots: SnapshotTree::new(mounted_at),
         }
     }
 
@@ -447,6 +455,16 @@ impl Filesystem for Raft5Fs {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let vault = self.vault();
+        if parent.0 == VIRTUAL_ROOT && is_snapshot_dir(name) {
+            let attr = self.snapshots.list_attr();
+            return reply.entry(&TTL, &self.to_file_attr(&attr), Generation(0));
+        }
+        if is_snapshot_ino(parent.0) {
+            return match self.block(self.snapshots.lookup(vault, parent.0, name)) {
+                Ok(attr) => reply.entry(&TTL, &self.to_file_attr(&attr), Generation(0)),
+                Err(e) => reply.error(errno(&e)),
+            };
+        }
         let found = if parent.0 == VIRTUAL_ROOT {
             self.block(async {
                 let ino = vault.root_lookup(name).await?;
@@ -477,6 +495,12 @@ impl Filesystem for Raft5Fs {
         if ino.0 == VIRTUAL_ROOT {
             return reply.attr(&TTL, &self.to_file_attr(&self.root_attr()));
         }
+        if is_snapshot_ino(ino.0) {
+            return match self.block(self.snapshots.getattr(ino.0)) {
+                Ok(attr) => reply.attr(&TTL, &self.to_file_attr(&attr)),
+                Err(e) => reply.error(errno(&e)),
+            };
+        }
         if let Err(e) = self.flush_ino(ino.0) {
             return reply.error(e);
         }
@@ -505,6 +529,9 @@ impl Filesystem for Raft5Fs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if is_snapshot_ino(ino.0) {
+            return reply.error(errno(&read_only()));
+        }
         if ino.0 == VIRTUAL_ROOT || self.foreign_owner(uid, gid) {
             return reply.error(Errno::EPERM);
         }
@@ -535,6 +562,9 @@ impl Filesystem for Raft5Fs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        if is_snapshot_ino(parent.0) {
+            return reply.error(errno(&read_only()));
+        }
         let perm = (mode & !umask & 0o7777) as u16;
         let made = if parent.0 == VIRTUAL_ROOT {
             self.block(self.vault().create_volume(name, perm))
@@ -548,6 +578,9 @@ impl Filesystem for Raft5Fs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if is_snapshot_ino(parent.0) || (parent.0 == VIRTUAL_ROOT && is_snapshot_dir(name)) {
+            return reply.error(errno(&read_only()));
+        }
         let removed = if parent.0 == VIRTUAL_ROOT {
             self.block(self.vault().delete_volume(name))
         } else {
@@ -560,6 +593,9 @@ impl Filesystem for Raft5Fs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if is_snapshot_ino(parent.0) {
+            return reply.error(errno(&read_only()));
+        }
         if parent.0 == VIRTUAL_ROOT {
             return reply.error(Errno::EPERM);
         }
@@ -591,6 +627,14 @@ impl Filesystem for Raft5Fs {
             return reply.error(Errno::EINVAL);
         }
         let noreplace = flags.contains(RenameFlags::RENAME_NOREPLACE);
+        // Out of a snapshot into the live filesystem, or the reverse, is a
+        // move between filesystems, which `mv` knows to do as a copy; within
+        // one, nothing moves.
+        match (is_snapshot_ino(parent.0), is_snapshot_ino(newparent.0)) {
+            (true, true) => return reply.error(errno(&read_only())),
+            (true, false) | (false, true) => return reply.error(Errno::EXDEV),
+            (false, false) => {}
+        }
         // The virtual root's entries are grants, not names to move.
         if parent.0 == VIRTUAL_ROOT || newparent.0 == VIRTUAL_ROOT {
             return reply.error(Errno::EPERM);
@@ -627,6 +671,9 @@ impl Filesystem for Raft5Fs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        if is_snapshot_ino(parent.0) {
+            return reply.error(errno(&read_only()));
+        }
         if parent.0 == VIRTUAL_ROOT {
             return reply.error(Errno::EPERM);
         }
@@ -650,7 +697,12 @@ impl Filesystem for Raft5Fs {
         if ino.0 == VIRTUAL_ROOT {
             return reply.error(Errno::EISDIR);
         }
-        match self.block(self.remote().access(ino.0, open_mask(flags))) {
+        let access = if is_snapshot_ino(ino.0) {
+            self.block(self.snapshots.access(ino.0, open_mask(flags)))
+        } else {
+            self.block(self.remote().access(ino.0, open_mask(flags)))
+        };
+        match access {
             Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
             Err(e) => reply.error(errno(&e)),
         }
@@ -661,7 +713,12 @@ impl Filesystem for Raft5Fs {
         if ino.0 == VIRTUAL_ROOT {
             return reply.opened(FileHandle(0), FopenFlags::empty());
         }
-        match self.block(self.remote().access(ino.0, open_mask(flags))) {
+        let access = if is_snapshot_ino(ino.0) {
+            self.block(self.snapshots.access(ino.0, open_mask(flags)))
+        } else {
+            self.block(self.remote().access(ino.0, open_mask(flags)))
+        };
+        match access {
             Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
             Err(e) => reply.error(errno(&e)),
         }
@@ -675,7 +732,12 @@ impl Filesystem for Raft5Fs {
         if ino.0 == VIRTUAL_ROOT {
             return reply.ok();
         }
-        match self.block(self.remote().access(ino.0, mask.bits() as u32)) {
+        let access = if is_snapshot_ino(ino.0) {
+            self.block(self.snapshots.access(ino.0, mask.bits() as u32))
+        } else {
+            self.block(self.remote().access(ino.0, mask.bits() as u32))
+        };
+        match access {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
@@ -693,10 +755,15 @@ impl Filesystem for Raft5Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if let Err(e) = self.flush_ino(ino.0) {
-            return reply.error(e);
-        }
-        match self.block(self.vault().read(ino.0, offset, size as usize)) {
+        let read = if is_snapshot_ino(ino.0) {
+            self.block(self.snapshots.read(ino.0, offset, size as usize))
+        } else {
+            if let Err(e) = self.flush_ino(ino.0) {
+                return reply.error(e);
+            }
+            self.block(self.vault().read(ino.0, offset, size as usize))
+        };
+        match read {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 if e.errno != libc::ENOENT {
@@ -720,6 +787,9 @@ impl Filesystem for Raft5Fs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        if is_snapshot_ino(ino.0) {
+            return reply.error(errno(&read_only()));
+        }
         let result = if self.write_buffering {
             self.buffered_write(ino.0, offset, data)
         } else {
@@ -816,7 +886,12 @@ impl Filesystem for Raft5Fs {
         mut reply: ReplyDirectory,
     ) {
         let vault = self.vault();
-        let items = if ino.0 == VIRTUAL_ROOT {
+        let items = if is_snapshot_ino(ino.0) {
+            match self.block(self.snapshots.readdir(vault, VIRTUAL_ROOT, ino.0)) {
+                Ok(items) => items,
+                Err(e) => return reply.error(errno(&e)),
+            }
+        } else if ino.0 == VIRTUAL_ROOT {
             match self.block(vault.root_entries()) {
                 Ok(entries) => {
                     let dots = [".", ".."].map(|n| DirItem {

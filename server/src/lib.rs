@@ -27,10 +27,11 @@ use raft5fs_proto::pb::{
     AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
     HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
-    LoginRequest, LoginResponse, NameRequest, NoArgs, PreloginRequest, PreloginResponse,
-    PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
-    ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
-    Session, SetAttrRequest, WriteChunksRequest, WriteChunksResponse,
+    ListGrantsRequest, LoginRequest, LoginResponse, NameRequest, NoArgs, PreloginRequest,
+    PreloginResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest,
+    ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest,
+    RotateRequest, Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest,
+    WriteChunksResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -164,6 +165,21 @@ fn name(bytes: &[u8]) -> &OsStr {
     OsStr::from_bytes(bytes)
 }
 
+/// The snapshot a read-only request asks to read at, if any.
+fn at(snapshot: &str) -> Option<&[u8]> {
+    (!snapshot.is_empty()).then_some(snapshot.as_bytes())
+}
+
+/// Refuses a snapshot on a request that writes, which shares its message
+/// with ones that only read.
+fn live_only(snapshot: &str) -> Result<(), FsError> {
+    if snapshot.is_empty() {
+        Ok(())
+    } else {
+        Err(FsError::new(libc::EROFS, "a snapshot is read-only"))
+    }
+}
+
 #[tonic::async_trait]
 impl Fs for FsService {
     async fn hello(&self, _: Request<HelloRequest>) -> Result<Response<HelloResponse>, Status> {
@@ -253,20 +269,29 @@ impl Fs for FsService {
     async fn get_attr(&self, r: Request<InodeRequest>) -> Result<Response<AttrResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.getattr(&caller, r.ino).await.into(),
+            self.core
+                .getattr(&caller, r.ino, at(&r.snapshot))
+                .await
+                .into(),
         ))
     }
 
     async fn lookup(&self, r: Request<NameRequest>) -> Result<Response<AttrResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        let found = self.core.lookup(&caller, r.parent, name(&r.name)).await;
+        let found = self
+            .core
+            .lookup(&caller, r.parent, name(&r.name), at(&r.snapshot))
+            .await;
         Ok(Response::new(found.into()))
     }
 
     async fn access(&self, r: Request<AccessRequest>) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.access(&caller, r.ino, r.mask).await.into(),
+            self.core
+                .access(&caller, r.ino, r.mask, at(&r.snapshot))
+                .await
+                .into(),
         ))
     }
 
@@ -276,7 +301,10 @@ impl Fs for FsService {
     ) -> Result<Response<ReadDirResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.readdir(&caller, r.ino).await.into(),
+            self.core
+                .readdir(&caller, r.ino, at(&r.snapshot))
+                .await
+                .into(),
         ))
     }
 
@@ -319,10 +347,12 @@ impl Fs for FsService {
     async fn unlink(&self, r: Request<NameRequest>) -> Result<Response<InoResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core
-                .unlink(&caller, r.parent, name(&r.name))
-                .await
-                .into(),
+            async {
+                live_only(&r.snapshot)?;
+                self.core.unlink(&caller, r.parent, name(&r.name)).await
+            }
+            .await
+            .into(),
         ))
     }
 
@@ -352,10 +382,12 @@ impl Fs for FsService {
     async fn rmdir(&self, r: Request<NameRequest>) -> Result<Response<InoResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core
-                .rmdir(&caller, r.parent, name(&r.name))
-                .await
-                .into(),
+            async {
+                live_only(&r.snapshot)?;
+                self.core.rmdir(&caller, r.parent, name(&r.name)).await
+            }
+            .await
+            .into(),
         ))
     }
 
@@ -370,13 +402,29 @@ impl Fs for FsService {
     ) -> Result<Response<KeyPathResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.key_path(&caller, r.ino).await.into(),
+            self.core
+                .key_path(&caller, r.ino, at(&r.snapshot))
+                .await
+                .into(),
         ))
     }
 
-    async fn list_grants(&self, r: Request<NoArgs>) -> Result<Response<GrantListResponse>, Status> {
-        let (caller, _) = self.caller(r).await?;
-        Ok(Response::new(self.core.grants(&caller).await.into()))
+    async fn list_grants(
+        &self,
+        r: Request<ListGrantsRequest>,
+    ) -> Result<Response<GrantListResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.grants(&caller, at(&r.snapshot)).await.into(),
+        ))
+    }
+
+    async fn list_snapshots(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<SnapshotListResponse>, Status> {
+        self.caller(r).await?;
+        Ok(Response::new(self.core.snapshots().await.into()))
     }
 
     async fn public_key(
@@ -421,7 +469,12 @@ impl Fs for FsService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.delete_volume(&caller, r.ino).await.into(),
+            async {
+                live_only(&r.snapshot)?;
+                self.core.delete_volume(&caller, r.ino).await
+            }
+            .await
+            .into(),
         ))
     }
 
@@ -432,7 +485,14 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let read = self
             .core
-            .read_chunks(&caller, r.ino, r.first, r.count, &r.known_seqs)
+            .read_chunks(
+                &caller,
+                r.ino,
+                r.first,
+                r.count,
+                &r.known_seqs,
+                at(&r.snapshot),
+            )
             .await;
         Ok(Response::new(read.into()))
     }
@@ -453,7 +513,12 @@ impl Fs for FsService {
     ) -> Result<Response<GrantsUnderResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.grants_under(&caller, r.ino).await.into(),
+            async {
+                live_only(&r.snapshot)?;
+                self.core.grants_under(&caller, r.ino).await
+            }
+            .await
+            .into(),
         ))
     }
 

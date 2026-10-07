@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::pb;
 use crate::types::{
     AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind,
-    ResealedName, Rotation, SealedChunk, SetAttr, SetTime,
+    ResealedName, Rotation, SealedChunk, SetAttr, SetTime, SnapshotInfo,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -424,6 +424,44 @@ impl pb::GrantListResponse {
             Some(R::List(l)) => Ok(l.grants.into_iter().map(Into::into).collect()),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("grant list")),
+        }
+    }
+}
+
+impl From<Result<Vec<SnapshotInfo>, FsError>> for pb::SnapshotListResponse {
+    fn from(r: Result<Vec<SnapshotInfo>, FsError>) -> Self {
+        use pb::snapshot_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(snapshots) => R::List(pb::SnapshotList {
+                    snapshots: snapshots
+                        .into_iter()
+                        .map(|s| pb::SnapshotInfo {
+                            name: s.name,
+                            created: Some(s.created.into()),
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::SnapshotListResponse {
+    pub fn into_result(self) -> Result<Vec<SnapshotInfo>, FsError> {
+        use pb::snapshot_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .snapshots
+                .into_iter()
+                .map(|s| SnapshotInfo {
+                    name: s.name,
+                    created: time(s.created),
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("snapshot list")),
         }
     }
 }

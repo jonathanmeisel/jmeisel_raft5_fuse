@@ -23,6 +23,8 @@ use crate::layout::{
     chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key, dirent_prefix,
     dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key, validate_chunk_size,
 };
+use crate::snapshots;
+use crate::view::View;
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
@@ -317,19 +319,45 @@ impl FsCore {
         &self.client
     }
 
+    /// The live store, which every write goes to.
+    fn live(&self) -> View<'_> {
+        View::live(&self.client)
+    }
+
+    /// Where a read-only operation reads: the live store, or snapshot
+    /// `at` -- `ENOENT` if there is no such snapshot.
+    async fn view<'a>(&'a self, at: Option<&'a [u8]>) -> Result<View<'a>, FsError> {
+        let Some(id) = at else {
+            return Ok(self.live());
+        };
+        if snapshots::exists(&self.client, id).await? {
+            Ok(View::at(&self.client, id))
+        } else {
+            Err(FsError::new(
+                libc::ENOENT,
+                format!("no snapshot {}", String::from_utf8_lossy(id)),
+            ))
+        }
+    }
+
     /// An inode's Entry, or `None` if it doesn't exist -- including one
     /// whose deletion has started, which is gone as far as everything but
     /// the deletion itself is concerned.
-    async fn read_entry(&self, ino: u64) -> Result<Option<Entry>, FsError> {
-        let result = self.client.read(&attr_key(ino)).await?;
+    async fn read_entry(&self, view: &View<'_>, ino: u64) -> Result<Option<Entry>, FsError> {
+        let result = view.read(&attr_key(ino)).await?;
         Ok(result
             .value
             .map(|bytes| decode_entry(ino, &bytes))
             .filter(|entry| !entry.is_deleted()))
     }
 
-    async fn lookup_child(&self, parent: u64, name: &OsStr) -> Result<Option<u64>, FsError> {
-        let result = self.client.read(&dirent_key(parent, name)).await?;
+    async fn lookup_child(
+        &self,
+        view: &View<'_>,
+        parent: u64,
+        name: &OsStr,
+    ) -> Result<Option<u64>, FsError> {
+        let result = view.read(&dirent_key(parent, name)).await?;
         Ok(result.value.map(|b| dirent_ino(&b)))
     }
 
@@ -365,8 +393,8 @@ impl FsCore {
     }
 
     /// `read_entry`, with a missing inode as `ENOENT`.
-    async fn resolve(&self, ino: u64) -> Result<Entry, FsError> {
-        self.read_entry(ino).await?.ok_or_else(enoent)
+    async fn resolve(&self, view: &View<'_>, ino: u64) -> Result<Entry, FsError> {
+        self.read_entry(view, ino).await?.ok_or_else(enoent)
     }
 
     /// Whether `caller` reaches `ino` through a grant (a writable one,
@@ -391,9 +419,19 @@ impl FsCore {
         grants::check_fresh(txn, ino).await
     }
 
-    /// `guard`, outside any transaction: for operations that only read.
-    async fn guard_now(&self, caller: &Caller, ino: u64, write: bool) -> Result<(), FsError> {
-        self.guard(&self.client, caller, ino, write).await?
+    /// `guard`, outside any transaction, with `view`'s reads: for
+    /// operations that only read. Nothing may be written at a snapshot.
+    async fn guard_now(
+        &self,
+        view: &View<'_>,
+        caller: &Caller,
+        ino: u64,
+        write: bool,
+    ) -> Result<(), FsError> {
+        if write && view.is_snapshot() {
+            return Err(FsError::new(libc::EROFS, "a snapshot is read-only"));
+        }
+        self.guard(view, caller, ino, write).await?
     }
 
     /// Whether a new entry's `name` is a tag and comes with its real name
@@ -429,15 +467,23 @@ impl FsCore {
         Ok(())
     }
 
-    /// Needs a grant over `ino`.
-    pub async fn getattr(&self, caller: &Caller, ino: u64) -> Result<Attr, FsError> {
-        self.guard_now(caller, ino, false).await?;
-        Ok(self.resolve(ino).await?.attr)
+    /// Needs a grant over `ino`, at snapshot `at` if one is given.
+    pub async fn getattr(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        at: Option<&[u8]>,
+    ) -> Result<Attr, FsError> {
+        let view = self.view(at).await?;
+        self.guard_now(&view, caller, ino, false).await?;
+        Ok(self.resolve(&view, ino).await?.attr)
     }
 
     /// The inode `name` names in `parent`, without reading its attributes.
-    async fn child_ino(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
-        self.lookup_child(parent, name).await?.ok_or_else(enoent)
+    async fn child_ino(&self, view: &View<'_>, parent: u64, name: &OsStr) -> Result<u64, FsError> {
+        self.lookup_child(view, parent, name)
+            .await?
+            .ok_or_else(enoent)
     }
 
     pub async fn lookup(
@@ -445,14 +491,16 @@ impl FsCore {
         caller: &Caller,
         parent: u64,
         name: &OsStr,
+        at: Option<&[u8]>,
     ) -> Result<Attr, FsError> {
-        self.guard_now(caller, parent, false).await?;
-        let dir = self.resolve(parent).await?;
+        let view = self.view(at).await?;
+        self.guard_now(&view, caller, parent, false).await?;
+        let dir = self.resolve(&view, parent).await?;
         if dir.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
-        let child = self.child_ino(parent, name).await?;
-        Ok(self.resolve(child).await?.attr)
+        let child = self.child_ino(&view, parent, name).await?;
+        Ok(self.resolve(&view, child).await?.attr)
     }
 
     /// access(2), and what an open checks: whether `caller` holds every
@@ -460,15 +508,28 @@ impl FsCore {
     /// and searches, a writable one writes -- or with a `mask` of 0,
     /// whether `ino` exists. Writing a directory's contents is a different
     /// thing from writing the directory, which `EISDIR` refuses only when
-    /// `open` asks.
-    pub async fn access(&self, caller: &Caller, ino: u64, mask: u32) -> Result<(), FsError> {
-        self.guard_now(caller, ino, mask & W != 0).await?;
-        self.resolve(ino).await.map(drop)
+    /// `open` asks. Nothing at a snapshot is writable (`EROFS`).
+    pub async fn access(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        mask: u32,
+        at: Option<&[u8]>,
+    ) -> Result<(), FsError> {
+        let view = self.view(at).await?;
+        self.guard_now(&view, caller, ino, mask & W != 0).await?;
+        self.resolve(&view, ino).await.map(drop)
     }
 
-    pub async fn readdir(&self, caller: &Caller, ino: u64) -> Result<Vec<DirItem>, FsError> {
-        self.guard_now(caller, ino, false).await?;
-        let entry = self.resolve(ino).await?;
+    pub async fn readdir(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        at: Option<&[u8]>,
+    ) -> Result<Vec<DirItem>, FsError> {
+        let view = self.view(at).await?;
+        self.guard_now(&view, caller, ino, false).await?;
+        let entry = self.resolve(&view, ino).await?;
         if entry.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
@@ -489,7 +550,7 @@ impl FsCore {
         ];
 
         let prefix = dirent_prefix(ino);
-        let mut iter = self.client.key_iterator(&prefix);
+        let mut iter = view.key_iterator(&prefix);
         loop {
             let key = match iter.next().await? {
                 Some(key) if key.starts_with(&prefix) => key,
@@ -498,12 +559,12 @@ impl FsCore {
             let name = OsStr::from_bytes(&key[prefix.len()..]).to_os_string();
             // A concurrent unlink/rmdir between the key_iterator batch and
             // this read is the only way the value comes back empty; skip it.
-            let Some(bytes) = self.client.read(&key).await?.value else {
+            let Some(bytes) = view.read(&key).await?.value else {
                 continue;
             };
             let child_ino = dirent_ino(&bytes);
             let kind = self
-                .read_entry(child_ino)
+                .read_entry(&view, child_ino)
                 .await?
                 .map(|e| e.attr.kind)
                 .unwrap_or(Kind::File);
@@ -536,8 +597,8 @@ impl FsCore {
             // Deleting chunks is destructive and happens outside the
             // transaction below, so the caller's right to truncate is
             // checked before it as well as in it.
-            self.guard_now(caller, ino, true).await?;
-            self.resolve(ino).await?;
+            self.guard_now(&self.live(), caller, ino, true).await?;
+            self.resolve(&self.live(), ino).await?;
             self.delete_chunks_from(ino, new_size.div_ceil(self.chunk_size))
                 .await?;
         }
@@ -716,7 +777,7 @@ impl FsCore {
 
     /// Removes a file, returning the inode it was.
     pub async fn unlink(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
-        let child = self.child_ino(parent, name).await?;
+        let child = self.child_ino(&self.live(), parent, name).await?;
         self.remove_child(caller, parent, name, child, Kind::File, parent)
             .await?;
         Ok(child)
@@ -724,7 +785,7 @@ impl FsCore {
 
     /// Removes an empty directory, returning the inode it was.
     pub async fn rmdir(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
-        let child = self.child_ino(parent, name).await?;
+        let child = self.child_ino(&self.live(), parent, name).await?;
         self.remove_child(caller, parent, name, child, Kind::Directory, parent)
             .await?;
         Ok(child)
@@ -934,15 +995,17 @@ impl FsCore {
         first: u64,
         count: u32,
         known: &[u64],
+        at: Option<&[u8]>,
     ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
-        self.guard_now(caller, ino, false).await?;
-        let attr = self.resolve(ino).await?.attr;
+        let view = self.view(at).await?;
+        self.guard_now(&view, caller, ino, false).await?;
+        let attr = self.resolve(&view, ino).await?.attr;
         let count = (count as usize).min(chunks_per_batch(self.chunk_size)) as u64;
         let mut chunks = Vec::with_capacity(count as usize);
         for (i, index) in (first..first.saturating_add(count)).enumerate() {
             let key = chunk_key(ino, index);
             if let Some(&seq) = known.get(i).filter(|&&seq| seq != 0)
-                && self.client.get_version(&key).await? == seq
+                && view.get_version(&key).await? == seq
             {
                 chunks.push(SealedChunk {
                     index,
@@ -952,7 +1015,7 @@ impl FsCore {
                 });
                 continue;
             }
-            let read = self.client.read(&key).await?;
+            let read = view.read(&key).await?;
             chunks.push(SealedChunk {
                 index,
                 seq: read.seq,
@@ -1004,16 +1067,26 @@ impl FsCore {
     }
 
     /// `caller`'s grant over `ino` and the key records down to it (see
-    /// `grants::key_path`).
-    pub async fn key_path(&self, caller: &Caller, ino: u64) -> Result<KeyPath, FsError> {
-        let user = caller.user.as_str();
-        grants::key_path(&self.client, user, ino).await
+    /// `grants::key_path`), at snapshot `at` if one is given.
+    pub async fn key_path(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        at: Option<&[u8]>,
+    ) -> Result<KeyPath, FsError> {
+        let view = self.view(at).await?;
+        grants::key_path(&view, &caller.user, ino).await
     }
 
-    /// Every grant made to `caller`.
-    pub async fn grants(&self, caller: &Caller) -> Result<Vec<Grant>, FsError> {
-        let user = caller.user.as_str();
-        grants::list(&self.client, user).await
+    /// Every grant made to `caller`, as of snapshot `at` if one is given.
+    pub async fn grants(&self, caller: &Caller, at: Option<&[u8]>) -> Result<Vec<Grant>, FsError> {
+        let view = self.view(at).await?;
+        grants::list(&view, &caller.user).await
+    }
+
+    /// Every snapshot, oldest first.
+    pub async fn snapshots(&self) -> Result<Vec<raft5fs_proto::types::SnapshotInfo>, FsError> {
+        snapshots::list(&self.client).await
     }
 
     /// `user`'s public key, for sealing grants to them. `ENOENT` for an
@@ -1129,7 +1202,7 @@ impl FsCore {
         caller: &Caller,
         top: u64,
     ) -> Result<Vec<GrantedNode>, FsError> {
-        self.guard_now(caller, top, true).await?;
+        self.guard_now(&self.live(), caller, top, true).await?;
         grants::grants_under(&self.client, top).await
     }
 
@@ -1299,7 +1372,7 @@ impl FsCore {
         expected_version: u32,
         node_keys: &[u8],
     ) -> Result<(), FsError> {
-        self.guard_now(caller, ino, true).await?;
+        self.guard_now(&self.live(), caller, ino, true).await?;
         let pruned = NodeKeys::decode(node_keys)
             .map_err(|e| FsError::new(libc::EINVAL, format!("inode {ino}: {e}")))?;
         let before_bytes = self
@@ -1355,7 +1428,7 @@ impl FsCore {
     /// described, or `None`.
     async fn sealed_below(&self, ino: u64, base: u32) -> Result<Option<String>, FsError> {
         let below = |blob: &[u8]| sealed_version(blob).is_ok_and(|v| v < base);
-        let kind = self.resolve(ino).await?.attr.kind;
+        let kind = self.resolve(&self.live(), ino).await?.attr.kind;
         if kind == Kind::File {
             let prefix = chunk_prefix(ino);
             let mut iter = self.client.key_iterator(&prefix);
@@ -1412,8 +1485,8 @@ impl FsCore {
     /// Removes volume `ino`, which must be empty, with every grant of it.
     /// Needs a writable grant of the volume itself.
     pub async fn delete_volume(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
-        self.guard_now(caller, ino, true).await?;
-        if self.resolve(ino).await?.parent != ROOT_INO {
+        self.guard_now(&self.live(), caller, ino, true).await?;
+        if self.resolve(&self.live(), ino).await?.parent != ROOT_INO {
             return Err(FsError::new(
                 libc::EINVAL,
                 format!("inode {ino} isn't a volume"),
@@ -1518,10 +1591,10 @@ fn operations_are_send(
     mv: &SealedMove,
 ) {
     fn send<T: Send>(_: T) {}
-    send(core.getattr(caller, 1));
-    send(core.lookup(caller, 1, name));
-    send(core.access(caller, 1, R));
-    send(core.readdir(caller, 1));
+    send(core.getattr(caller, 1, Some(b"s")));
+    send(core.lookup(caller, 1, name, None));
+    send(core.access(caller, 1, R, None));
+    send(core.readdir(caller, 1, None));
     send(core.setattr(caller, 1, SetAttr::default()));
     send(core.create(caller, 1, name, 0o644, new));
     send(core.mkdir(caller, 1, name, 0o755, new));
@@ -1529,10 +1602,11 @@ fn operations_are_send(
     send(core.rmdir(caller, 1, name));
     send(core.rename(caller, 1, name, 1, name, false, mv));
     send(core.reserve_inode(caller));
-    send(core.key_path(caller, 1));
-    send(core.grants(caller));
+    send(core.key_path(caller, 1, None));
+    send(core.grants(caller, None));
+    send(core.snapshots());
     send(core.public_key("u"));
-    send(core.read_chunks(caller, 1, 0, 1, &[]));
+    send(core.read_chunks(caller, 1, 0, 1, &[], None));
     send(core.write_chunks(caller, 1, &[], 0));
     send(core.grants_under(caller, 1));
     send(core.rotate(caller, &[]));

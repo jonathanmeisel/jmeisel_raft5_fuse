@@ -19,12 +19,12 @@ raft5fs has three tiers:
 Everything is encrypted on the users' machines: file contents and names
 are sealed by the mount before they leave it, and users' passwords never
 reach a server. Neither the store nor the filesystem servers -- nor
-whoever runs them -- can read what is in the filesystem (section 8 says
+whoever runs them -- can read what is in the filesystem (section 9 says
 exactly what they can see). Access is by grants of directories to users
 (section 7).
 
 The steps below set up one store node, one filesystem server and one
-mount on a single machine, with TLS everywhere. Section 9 covers adding
+mount on a single machine, with TLS everywhere. Section 10 covers adding
 more of each.
 
 Commands are run from a scratch directory, here called $WORK. Ports used:
@@ -198,7 +198,9 @@ readable:
 A forgotten password can't be recovered: nothing on the servers opens
 her private key without it. `user add alice` again issues a new code; she
 enrols again with a new key pair, and whatever was shared with her has
-to be shared again. Others will be told her key changed (7.3).
+to be shared again. Others will be told her key changed (7.3). Nor can
+she open what was shared with her in snapshots taken before (section 8):
+those were sealed to her old key.
 
   raft5fs-server user list $STORE https://127.0.0.1:27051
   raft5fs-server user del alice $STORE https://127.0.0.1:27051
@@ -298,7 +300,8 @@ taken back stops even files bob has open, at once.
 A revocation gives the directory a new key, and new keys for everything
 under it before anything new is written there: what is written after it
 is sealed under keys bob never had. What bob could read before, he may
-have kept a copy of; revoking can't take that back. Revoking a grant of
+have kept a copy of; revoking can't take that back -- and snapshots taken
+while he held the grant still show it to him (section 8). Revoking a grant of
 a directory needs a grant of the directory above it (its new key is
 sealed under that one's), except for a volume.
 
@@ -317,7 +320,48 @@ Pins are kept per user name, so keep a known-keys file per filesystem.
 
 
 -------------------------------------------------------------------------
-8. WHAT THE SERVERS CAN AND CAN'T DO
+8. SNAPSHOTS
+-------------------------------------------------------------------------
+
+A snapshot pins the whole filesystem as it is at that moment, for every
+user to look back at. Taking and removing them needs the store's
+administrator -- not the raft5fs account the servers use -- so with the
+store options from section 4, but --store-user admin and admin's
+password:
+
+  export RAFT5FS_STORE_PASSWORD='<the admin password>'
+  ADMIN="--store-user admin --store-ca cert.pem \
+         --store-cert cert.pem --store-key key.pem"
+
+  raft5fs-server snapshot create daily-2026-10-06 $ADMIN https://127.0.0.1:27051
+  raft5fs-server snapshot list $ADMIN https://127.0.0.1:27051
+  raft5fs-server snapshot del daily-2026-10-06 $ADMIN https://127.0.0.1:27051
+
+A name is letters, digits, '.', '_', '-', ':' and '+'; leave it out of
+`create` to name the snapshot by the time. `list` prints each name with
+when it was taken, in seconds since the Unix epoch.
+
+Every mount shows the snapshots under .snapshot in its root, which `ls`
+doesn't list -- so `find` and backups of the mount don't wander into
+them -- but which is there to go into:
+
+  ls ~/raft5fs/.snapshot
+  ls ~/raft5fs/.snapshot/daily-2026-10-06/photos
+  cp ~/raft5fs/.snapshot/daily-2026-10-06/photos/cat.jpg ~/raft5fs/photos/
+
+Under each snapshot is the user's root as it was then: what was shared
+with them when it was taken, under the names it had, and everything
+under that as it stood -- including volumes and files deleted since.
+What was shared with them only later isn't there; what was taken back
+since still is. Nothing in a snapshot can be changed: it is read-only.
+
+What it costs: until it is removed, a snapshot keeps every version of
+everything changed or deleted since it was taken, so the store grows
+with every change. The store holds at most 32 at once.
+
+
+-------------------------------------------------------------------------
+9. WHAT THE SERVERS CAN AND CAN'T DO
 -------------------------------------------------------------------------
 
 They can't read file contents, names (of files, directories, or what a
@@ -330,6 +374,7 @@ They can see:
     times;
   - who is granted what, read-only or not, and who reads and writes
     which inodes, and when;
+  - the names of snapshots, which are chosen in the clear;
   - the tag each name is filed under. The tag of a name doesn't change
     when the directory's key does, so someone revoked who also got hold
     of the raw store could test guesses at the names of new files in a
@@ -360,7 +405,7 @@ trying all this out.
 
 
 -------------------------------------------------------------------------
-9. MORE THAN ONE OF EACH
+10. MORE THAN ONE OF EACH
 -------------------------------------------------------------------------
 
 More filesystem servers: start another raft5fs-server, the same way as
@@ -385,7 +430,7 @@ as seeds.
 
 
 -------------------------------------------------------------------------
-10. TROUBLESHOOTING
+11. TROUBLESHOOTING
 -------------------------------------------------------------------------
 
   "login refused: the username or password was wrong"

@@ -618,6 +618,24 @@ impl Harness {
         MountedFs::mount_as(&self.runtime, self.addresses_from(1), user)
     }
 
+    /// Takes snapshot `name` of the filesystem, as the store's
+    /// administrator does (`raft5fs-server snapshot create`).
+    pub fn snapshot(&self, name: &str) {
+        self.runtime
+            .block_on(raft5fs_core::snapshots::create(
+                &self.cluster.admin,
+                Some(name),
+            ))
+            .expect("take a snapshot");
+    }
+
+    /// Removes snapshot `name`, as `raft5fs-server snapshot del` does.
+    pub fn drop_snapshot(&self, name: &str) {
+        self.runtime
+            .block_on(raft5fs_core::snapshots::remove(&self.cluster.admin, name))
+            .expect("remove a snapshot");
+    }
+
     /// Adds user `name`, enrolled with password `password(name)`.
     pub fn add_user(&self, name: &str) {
         self.enrol(name);

@@ -5,6 +5,8 @@ mod entry;
 mod fs;
 pub mod grants;
 mod layout;
+pub mod snapshots;
+mod view;
 
 pub use fs::{FsCore, check_store, resolve_chunk_size};
 pub use layout::{
@@ -14,5 +16,5 @@ pub use layout::{
 pub use raft5fs_proto::types::{
     AccountKeys, Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
     Kind, NewNode, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
-    SetTime,
+    SetTime, SnapshotInfo,
 };

@@ -29,6 +29,7 @@ use crate::entry::decode_entry;
 use crate::layout::{
     GRANT_INDEX_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX, ROOT_INO, attr_key,
 };
+use crate::view::View;
 
 /// Deeper than any tree should get; a walk longer than this is a loop in
 /// the parent links, which only corruption could make.
@@ -382,12 +383,13 @@ pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Res
 }
 
 /// What `user` needs to unwrap `ino`'s key: their grant over it and the
-/// key records from the granted directory down to `ino`.
-pub async fn key_path(client: &Client, user: &str, ino: u64) -> Result<KeyPath, FsError> {
-    let (grant, path) = walk(client, user, ino).await??;
+/// key records from the granted directory down to `ino`, as `view` has
+/// them.
+pub(crate) async fn key_path(view: &View<'_>, user: &str, ino: u64) -> Result<KeyPath, FsError> {
+    let (grant, path) = walk(view, user, ino).await??;
     let mut nodes = Vec::with_capacity(path.len());
     for &node in path.iter().rev() {
-        let keys = client
+        let keys = view
             .read(&node_keys_key(node))
             .await?
             .value
@@ -397,11 +399,11 @@ pub async fn key_path(client: &Client, user: &str, ino: u64) -> Result<KeyPath, 
     Ok(KeyPath { grant, nodes })
 }
 
-/// Every grant made to `user`.
-pub async fn list(client: &Client, user: &str) -> Result<Vec<Grant>, FsError> {
+/// Every grant made to `user`, as `view` has them.
+pub(crate) async fn list(view: &View<'_>, user: &str) -> Result<Vec<Grant>, FsError> {
     let prefix = index_prefix(user);
     let mut inos = Vec::new();
-    let mut iter = client.key_iterator(&prefix);
+    let mut iter = view.key_iterator(&prefix);
     while let Some(key) = iter.next().await? {
         if !key.starts_with(&prefix) {
             break;
@@ -413,7 +415,7 @@ pub async fn list(client: &Client, user: &str) -> Result<Vec<Grant>, FsError> {
     let mut grants = Vec::with_capacity(inos.len());
     for ino in inos {
         // Gone between the scan and here: revoked meanwhile.
-        if let Some(bytes) = client.read(&grant_key(ino, user)).await?.value {
+        if let Some(bytes) = view.read(&grant_key(ino, user)).await?.value {
             grants.push(decode_grant(ino, &bytes)?);
         }
     }

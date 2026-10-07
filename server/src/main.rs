@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
-use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, validate_chunk_size};
+use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, snapshots, validate_chunk_size};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use tokio::net::TcpListener;
@@ -18,6 +18,9 @@ usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
        raft5fs-server user add <NAME> <store options> <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
+       raft5fs-server snapshot create [<NAME>] <store options> <kv-seed-address>...
+       raft5fs-server snapshot del <NAME> <store options> <kv-seed-address>...
+       raft5fs-server snapshot list <store options> <kv-seed-address>...
 
 Serving:
   --listen <ADDR>      address to serve clients on, e.g. 0.0.0.0:7700.
@@ -50,6 +53,15 @@ ever has it, or their keys. A new code for an existing user lets them
 enrol again after forgetting it -- losing access to whatever was shared
 with them until it is shared again. `user del` removes a user and every
 grant made to them, cutting them off within --identity-ttl.
+
+Snapshots: `snapshot create` pins the whole filesystem as it is now,
+under NAME (letters, digits, '.', '_', '-', ':' and '+'; the time if left
+out), and every mount shows it, read-only, at /.snapshot/NAME. What each
+user sees there is what they could see when it was taken. Until `snapshot
+del` removes it, a snapshot keeps every version of everything changed
+since, and the store holds at most 32. Taking and removing them needs a
+store administrator's account (e.g. --store-user admin), not the
+filesystem servers' own.
 
 Store options:
   --store-user <NAME>  the store account to work as; it needs write access
@@ -242,6 +254,45 @@ async fn user_command(a: Args) {
     result.unwrap_or_else(|e| fail(e));
 }
 
+async fn snapshot_command(a: Args) {
+    let mut positional = a.positional.iter().skip(1).peekable();
+    let command = positional.next().map(String::as_str);
+    let name = match command {
+        // A name can't hold a '/', which every seed address does.
+        Some("create") => positional.next_if(|p| !p.contains('/')).cloned(),
+        Some("del") => Some(
+            positional
+                .next()
+                .cloned()
+                .unwrap_or_else(|| usage("which snapshot?")),
+        ),
+        Some("list") => None,
+        _ => usage("snapshot takes create, del or list"),
+    };
+    let seeds = positional.cloned().collect();
+    let client = store_client(&a, seeds).await;
+    let result = match (command, name) {
+        (Some("create"), name) => snapshots::create(&client, name.as_deref())
+            .await
+            .map(|made| println!("took snapshot {}", made.name)),
+        (Some("del"), Some(name)) => snapshots::remove(&client, &name).await,
+        _ => snapshots::list(&client)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|list| {
+                for s in list {
+                    let secs = s
+                        .created
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    println!("{}\t{secs}", s.name);
+                }
+            }),
+    };
+    result.unwrap_or_else(|e| fail(e));
+}
+
 async fn serve_command(a: Args) {
     let listen = a
         .listen
@@ -300,6 +351,7 @@ fn main() {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     match args.positional.first().map(String::as_str) {
         Some("user") => runtime.block_on(user_command(args)),
+        Some("snapshot") => runtime.block_on(snapshot_command(args)),
         _ => runtime.block_on(serve_command(args)),
     }
 }

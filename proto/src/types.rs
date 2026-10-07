@@ -166,6 +166,14 @@ pub struct SealedMove {
     pub sealed_name: Vec<u8>,
 }
 
+/// A snapshot of the filesystem, which mounts show at `/.snapshot/<name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    pub name: String,
+    /// When it was taken, by the clock of whoever took it.
+    pub created: SystemTime,
+}
+
 /// The most entry names one re-seal takes.
 pub const RESEAL_NAMES_BATCH: usize = 256;
 
