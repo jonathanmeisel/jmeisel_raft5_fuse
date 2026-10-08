@@ -4,14 +4,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use raft5fs_crypto::identity::fingerprint;
-use raft5fs_crypto::password::KdfParams;
+use raft5fs_crypto::password::{KdfParams, check_new_password};
 use raft5fs_fuse::cli;
 use raft5fs_fuse::remote::{Credentials, Remote};
 use raft5fs_fuse::vault::{KnownKeys, Vault};
 use tokio::runtime::Runtime;
 
 const USAGE: &str = "\
-usage: raft5fs-share --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
+usage: raft5fs-share --user <NAME> --ca <PEM> [--tls-server-name <NAME>]
                      <command> <server-address>...
 
 Account commands:
@@ -24,26 +24,32 @@ Account commands:
 
 Sharing commands. A <PATH> starts with an entry of your root -- what a
 mount shows at its top -- and goes on below it: `photos/2024`.
-  grant <PATH> <USER> [--ro] [--name <NAME>]
+  grant <PATH> <USER> [--ro] [--name <NAME>] [--fingerprint <FP>]
                        give USER the directory at PATH and everything
                        under it, read-write unless --ro. It shows up in
                        their root as NAME (by default, PATH's last part).
-                       Prints the fingerprint of the key it was sealed
-                       to: check it with USER, who saw it when enrolling.
+                       The first grant to USER needs --fingerprint: their
+                       key's, as USER saw it when enrolling. (Or `trust`
+                       them first.)
   revoke <PATH> <USER> take USER's grant of PATH back. The directory gets
                        a new key, and what is written under it from now on
                        is sealed under new keys USER never had. (Revoking
                        a grant of a directory takes access to the one
                        above it, unless it is a top-level one.)
   grants <PATH>        who the directory at PATH is granted to.
+  trust <USER> <FINGERPRINT>
+                       pin USER's key, if the server's has FINGERPRINT --
+                       as USER saw it when enrolling. Grants from USER
+                       are read-only until their key is pinned: the
+                       server could have made up one from a stranger.
   forget-key <USER>    forget USER's pinned key, after checking the new
                        fingerprint with them (they enrolled again).
 
-The first time a user's key is sealed to, it is pinned in the known-keys
-file (--known-keys, by default ~/.config/raft5fs/known_keys), and a
-different key for them is refused from then on: the server is what hands
-out public keys, and could hand out its own. Keep one known-keys file per
-filesystem.
+Users' keys are pinned in the known-keys file (--known-keys, by default
+~/.config/raft5fs/known_keys), and a different key for them is refused
+from then on: the server is what hands out public keys, and could hand
+out its own. Keep one known-keys file per filesystem, and give mounts the
+same one.
 
 Passwords are asked for on the terminal, or read from RAFT5FS_PASSWORD
 (the current password, or for enrol the new one) and RAFT5FS_NEW_PASSWORD
@@ -51,7 +57,11 @@ Passwords are asked for on the terminal, or read from RAFT5FS_PASSWORD
 
   --user <NAME>        the account.
   --ca <PEM>           reach the servers over TLS, trusting certificates
-                       that chain to this (and nothing else).
+                       that chain to this (and nothing else). Required,
+                       unless --insecure-plaintext.
+  --insecure-plaintext talk to http:// servers without TLS. Only for
+                       throwaway setups: a login is enough to test
+                       password guesses against, and to act as the user.
   --tls-server-name <NAME>
                        check the servers' certificates against this name
                        instead of the host in each address.
@@ -67,9 +77,11 @@ fn fail(why: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// A new password: from `var`, or asked for twice on the terminal.
+/// A new password: from `var`, or asked for twice on the terminal. Long
+/// enough (`check_new_password`), either way.
 fn new_password(var: &str, username: &str) -> String {
     if let Ok(password) = env::var(var) {
+        check_new_password(&password).unwrap_or_else(|e| fail(e));
         return password;
     }
     let read = |prompt: &str| {
@@ -77,9 +89,7 @@ fn new_password(var: &str, username: &str) -> String {
             .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")))
     };
     let first = read(&format!("new password for {username}: "));
-    if first.is_empty() {
-        fail("the password can't be empty");
-    }
+    check_new_password(&first).unwrap_or_else(|e| fail(e));
     if read("again: ") != first {
         fail("the passwords didn't match");
     }
@@ -93,11 +103,13 @@ fn log_in(
     username: &str,
     servers: &[String],
     tls: Option<tonic::transport::ClientTlsConfig>,
+    plaintext: bool,
     known_keys: KnownKeys,
 ) -> Vault {
     let password = cli::password_from("RAFT5FS_PASSWORD", &format!("password for {username}: "))
         .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")));
-    let credentials = Credentials::new(username, password);
+    let mut credentials = Credentials::new(username, password);
+    credentials.allow_plaintext = plaintext;
     let remote = runtime
         .block_on(Remote::connect(servers, credentials, tls))
         .unwrap_or_else(|e| fail(format!("cannot log in: {e}")));
@@ -113,6 +125,8 @@ fn main() {
     let mut read_only = false;
     let mut label = None;
     let mut known_keys_file = None;
+    let mut expected_fingerprint = None;
+    let mut plaintext = false;
     let mut positional = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -127,6 +141,8 @@ fn main() {
             "--ro" => read_only = true,
             "--name" => label = Some(value("--name")),
             "--known-keys" => known_keys_file = Some(PathBuf::from(value("--known-keys"))),
+            "--fingerprint" => expected_fingerprint = Some(value("--fingerprint")),
+            "--insecure-plaintext" => plaintext = true,
             flag if flag.starts_with("--") => usage(&format!("unknown option {flag}")),
             _ => positional.push(arg),
         }
@@ -139,6 +155,10 @@ fn main() {
     let tls = ca.map(|path| cli::tls(&path, server_name.as_deref()).unwrap_or_else(|e| fail(e)));
     if tls.is_none() && server_name.is_some() {
         usage("--tls-server-name needs --ca");
+    }
+    let needs_server = !matches!(command.as_str(), "forget-key");
+    if needs_server && tls.is_none() && !plaintext {
+        usage("--ca is required (or --insecure-plaintext, for a throwaway setup)");
     }
 
     let known_keys_file = known_keys_file.unwrap_or_else(cli::default_known_keys);
@@ -161,13 +181,14 @@ fn main() {
                 usage("at least one server address is required");
             }
             let password = new_password("RAFT5FS_PASSWORD", &username);
+            let mut credentials = Credentials::new(username.clone(), password);
+            credentials.allow_plaintext = plaintext;
             let public_key = runtime
                 .block_on(Remote::enrol(
                     &positional,
                     tls,
-                    &username,
+                    credentials,
                     &code,
-                    &password,
                     KdfParams::DEFAULT,
                 ))
                 .unwrap_or_else(|e| fail(format!("cannot enrol: {e}")));
@@ -183,7 +204,8 @@ fn main() {
                 &format!("current password for {username}: "),
             )
             .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")));
-            let credentials = Credentials::new(username.clone(), password);
+            let mut credentials = Credentials::new(username.clone(), password);
+            credentials.allow_plaintext = plaintext;
             let remote = runtime
                 .block_on(Remote::connect(&positional, credentials, tls))
                 .unwrap_or_else(|e| fail(format!("cannot log in: {e}")));
@@ -206,9 +228,34 @@ fn main() {
                     .unwrap_or_default()
                     .to_string()
             });
-            let vault = log_in(&runtime, &username, &positional, tls, known_keys());
+            let vault = log_in(
+                &runtime,
+                &username,
+                &positional,
+                tls,
+                plaintext,
+                known_keys(),
+            );
             let public_key = runtime
                 .block_on(async {
+                    // A first grant to someone: their key only on the
+                    // fingerprint's say-so, never on the server's alone.
+                    if vault.known_keys().pinned(&grantee).is_none() {
+                        match &expected_fingerprint {
+                            Some(expected) => {
+                                vault.trust(&grantee, expected).await?;
+                            }
+                            None => {
+                                let served = vault.served_fingerprint(&grantee).await?;
+                                fail(format!(
+                                    "{grantee}'s key isn't pinned yet. The server says its \
+                                     fingerprint is\n  {served}\ncheck that with {grantee} \
+                                     (they saw it when enrolling), then grant again with \
+                                     --fingerprint"
+                                ));
+                            }
+                        }
+                    }
                     let ino = vault.resolve(&path).await?;
                     vault
                         .grant(ino, &grantee, !read_only, OsStr::new(&label))
@@ -227,7 +274,14 @@ fn main() {
             }
             let path = positional.remove(0);
             let user = positional.remove(0);
-            let vault = log_in(&runtime, &username, &positional, tls, known_keys());
+            let vault = log_in(
+                &runtime,
+                &username,
+                &positional,
+                tls,
+                plaintext,
+                known_keys(),
+            );
             runtime
                 .block_on(async {
                     let ino = vault.resolve(&path).await?;
@@ -241,7 +295,14 @@ fn main() {
                 usage("grants needs a path and at least one server address");
             }
             let path = positional.remove(0);
-            let vault = log_in(&runtime, &username, &positional, tls, known_keys());
+            let vault = log_in(
+                &runtime,
+                &username,
+                &positional,
+                tls,
+                plaintext,
+                known_keys(),
+            );
             let grantees = runtime
                 .block_on(async {
                     let ino = vault.resolve(&path).await?;
@@ -259,6 +320,25 @@ fn main() {
                 };
                 println!("{}\t{mode}\t{key}", g.user);
             }
+        }
+        "trust" => {
+            if positional.len() < 3 {
+                usage("trust needs a user, a fingerprint, and at least one server address");
+            }
+            let user = positional.remove(0);
+            let expected = positional.remove(0);
+            let vault = log_in(
+                &runtime,
+                &username,
+                &positional,
+                tls,
+                plaintext,
+                known_keys(),
+            );
+            let key = runtime
+                .block_on(vault.trust(&user, &expected))
+                .unwrap_or_else(|e| fail(format!("cannot trust {user}: {e}")));
+            println!("pinned {user}'s key: {}", fingerprint(&key));
         }
         "forget-key" => {
             if positional.is_empty() {

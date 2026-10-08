@@ -155,7 +155,9 @@ impl Vault {
             self.refresh(ino).await?
         } else {
             // Whatever above it is stale gets new keys first, this too.
-            self.freshen(ino).await?
+            let node = self.freshen(ino).await?;
+            node.sealable(ino)?;
+            node
         };
         // A dry run rotates nothing, so it reckons with the rotation its
         // parent's visit would have given this node: a version on, with
@@ -286,6 +288,7 @@ fn reseal_name(node: &Node, dir: u64, item: &DirItem) -> Result<ResealedName, Fs
         &key,
         &node.name_key,
         dir,
+        item.ino,
         item.name.as_bytes(),
         &item.sealed_name,
     )
@@ -293,6 +296,6 @@ fn reseal_name(node: &Node, dir: u64, item: &DirItem) -> Result<ResealedName, Fs
     Ok(ResealedName {
         tag: item.name.clone(),
         ino: item.ino,
-        sealed_name: node.seal(dir, &item.name, OsStr::from_bytes(&name)),
+        sealed_name: node.seal(dir, item.ino, &item.name, OsStr::from_bytes(&name)),
     })
 }

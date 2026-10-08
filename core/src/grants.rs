@@ -17,6 +17,12 @@
 //! version numbers at its front. A grant holds the granted directory's key
 //! sealed to the grantee, so with the records along the way (`key_path`)
 //! the grantee can unwrap the key of anything under it.
+//!
+//! Beside a granted node's grants the server keeps who its key holders say
+//! it is granted to (raft5fs-crypto's `grantees`), sealed under its key,
+//! which it can't read either. Every change to the grants brings a new one
+//! sealed under the node's current key version, and `grants_under` hands
+//! it out with the grants, for a rotating client to check them against.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -27,7 +33,8 @@ use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 
 use crate::entry::decode_entry;
 use crate::layout::{
-    GRANT_INDEX_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX, ROOT_INO, attr_key,
+    GRANT_INDEX_PREFIX, GRANTEES_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX,
+    ROOT_INO, attr_key,
 };
 use crate::view::View;
 
@@ -84,19 +91,39 @@ pub(crate) fn node_keys_key(ino: u64) -> Vec<u8> {
     key
 }
 
+/// Where `ino`'s sealed grantee list is kept.
+pub(crate) fn grantees_key(ino: u64) -> Vec<u8> {
+    let mut key = GRANTEES_PREFIX.to_vec();
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// Whether `sealed` is a grantee list of `ino` sealed under its key at
+/// `version` -- the current one, or the one a rotation is moving it to:
+/// one sealed under an older version is one someone revoked could have
+/// made. (What it says, the server can't check.)
+pub(crate) fn check_grantees_version(ino: u64, sealed: &[u8], version: u32) -> Result<(), FsError> {
+    if raft5fs_crypto::data::sealed_version(sealed).ok() == Some(version) {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EKEYEXPIRED,
+            format!("inode {ino}'s grantee list must be sealed under key version {version}"),
+        ))
+    }
+}
+
 pub(crate) fn reservation_key(ino: u64) -> Vec<u8> {
     let mut key = RESERVATION_PREFIX.to_vec();
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }
 
-/// A username that can't be part of the index's keys -- they end at a
-/// zero byte -- is refused wherever one would be written.
+/// A username outside `raft5fs_proto::types::check_username` -- which
+/// also keeps out the zero byte the index's keys end at -- is refused
+/// wherever one would be written or looked up.
 pub(crate) fn check_username(user: &str) -> Result<(), FsError> {
-    if user.is_empty() || user.as_bytes().contains(&0) {
-        return Err(FsError::new(libc::EINVAL, format!("bad username {user:?}")));
-    }
-    Ok(())
+    raft5fs_proto::types::check_username(user)
 }
 
 fn put(out: &mut Vec<u8>, field: &[u8]) {
@@ -313,10 +340,13 @@ pub async fn grants_under(client: &Client, top: u64) -> Result<Vec<GrantedNode>,
                 writable,
             });
         }
+        let listed = client.read(&grantees_key(ino)).await?;
         nodes.push(GrantedNode {
             ino,
             path,
             grantees,
+            sealed_grantees: listed.value.unwrap_or_default(),
+            grantees_seq: listed.seq,
         });
     }
     Ok(nodes)
@@ -445,6 +475,7 @@ pub(crate) async fn forget_inode(txn: &Transaction, ino: u64) -> Result<(), KvEr
         txn.write(&grant_key(ino, &user), None).await?;
         txn.write(&index_key(&user, ino), None).await?;
     }
+    txn.write(&grantees_key(ino), None).await?;
     txn.write(&node_keys_key(ino), None).await
 }
 
@@ -480,5 +511,6 @@ mod tests {
         check_username("alice").unwrap();
         assert!(check_username("").is_err());
         assert!(check_username("a\0b").is_err());
+        assert!(check_username("a\nb").is_err());
     }
 }

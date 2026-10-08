@@ -111,6 +111,12 @@ pub struct GrantedNode {
     pub ino: u64,
     pub path: Vec<u64>,
     pub grantees: Vec<Grantee>,
+    /// Who the node's key holders say it is granted to (raft5fs-crypto's
+    /// `grantees`), which `grantees` must agree with.
+    pub sealed_grantees: Vec<u8>,
+    /// The store's seq for `sealed_grantees`, for a grant to say which
+    /// list it replaces.
+    pub grantees_seq: u64,
 }
 
 /// A new key for one node: its key record a version on from
@@ -122,6 +128,9 @@ pub struct Rotation {
     pub expected_version: u32,
     pub node_keys: Vec<u8>,
     pub grants: Vec<(String, Vec<u8>)>,
+    /// The grantees as the rotation leaves them, sealed under the new key;
+    /// empty if none are left.
+    pub sealed_grantees: Vec<u8>,
 }
 
 /// A file chunk as stored: sealed, with the store's sequence number for
@@ -221,6 +230,38 @@ impl FsError {
     }
 }
 
+/// The longest account name there can be.
+pub const MAX_USERNAME_LEN: usize = 64;
+
+/// Whether `user` can be an account's name: a lower-case letter or `_`,
+/// then up to 63 more of those, digits, `.` and `-`. Names end up in
+/// store keys, in the known-keys file a client pins public keys in (one
+/// `name key` line each), and in front of people, so nothing that could
+/// break a line or a field, or look like another name, gets in. Both ends
+/// check: the server where an account is made or named, and the client
+/// on every name a server hands it.
+pub fn check_username(user: &str) -> Result<(), FsError> {
+    let mut chars = user.chars();
+    let ok = user.len() <= MAX_USERNAME_LEN
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EINVAL,
+            format!(
+                "bad username {user:?}: it must start with a lower-case letter or _, \
+                 then up to {} more lower-case letters, digits, _ . or -",
+                MAX_USERNAME_LEN - 1
+            ),
+        ))
+    }
+}
+
 #[cfg(feature = "raft5")]
 impl From<raft5_client::Error> for FsError {
     fn from(e: raft5_client::Error) -> Self {
@@ -243,4 +284,30 @@ impl std::error::Error for FsError {}
 pub struct WriteError {
     pub written: usize,
     pub error: FsError,
+}
+
+#[cfg(test)]
+mod username_tests {
+    use super::*;
+
+    #[test]
+    fn plain_names_pass_and_anything_that_could_break_a_line_or_key_fails() {
+        for good in ["alice", "_svc", "bob.smith-2", &"a".repeat(64)] {
+            check_username(good).unwrap();
+        }
+        for bad in [
+            "",
+            "Alice",
+            "1abc",
+            "-x",
+            "a b",
+            "a\nbob 00",
+            "a\0b",
+            "a/b",
+            "ålice",
+            &"a".repeat(65),
+        ] {
+            assert!(check_username(bad).is_err(), "{bad:?}");
+        }
+    }
 }

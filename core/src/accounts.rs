@@ -128,6 +128,9 @@ pub async fn check_login(
     user: &str,
     auth: &[u8],
 ) -> Result<Option<AccountKeys>, FsError> {
+    if crate::grants::check_username(user).is_err() {
+        return Ok(None);
+    }
     Ok(get(client, user)
         .await?
         .filter(|keys| check_verifier(auth, &keys.verifier)))
@@ -160,6 +163,7 @@ pub async fn enrol(
     code: &str,
     keys: &AccountKeys,
 ) -> Result<(), FsError> {
+    crate::grants::check_username(user)?;
     validate(keys)?;
     let hash = enrolment_code_hash(code);
     let encoded = encode(keys);

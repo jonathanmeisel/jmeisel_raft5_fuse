@@ -384,9 +384,8 @@ async fn enrol(dir: &Path, manifest: &Manifest, tls: &Tls) -> Result<(), Error> 
     let public_key = Remote::enrol(
         &[manifest.fs_url()],
         Some(fs_tls),
-        &manifest.user,
+        Credentials::new(&manifest.user, read_trimmed(&dir.join(USER_PASSWORD))?),
         &code,
-        &read_trimmed(&dir.join(USER_PASSWORD))?,
         KdfParams::DEFAULT,
     )
     .await?;
@@ -834,7 +833,16 @@ fn print_connection_info(dir: &Path, manifest: &Manifest, mountpoint: &Path) {
     println!();
     println!("sharing (password in {}):", path(USER_PASSWORD));
     println!(
-        "  raft5fs-share --user {} --ca {} grant <PATH> <USER> [--ro] {}",
+        "  raft5fs-share --user {} --ca {} grant <PATH> <USER> [--ro] \\",
+        manifest.user,
+        path(CA_CERT),
+    );
+    println!(
+        "    --fingerprint '<USER'S KEY FINGERPRINT, FROM THEIR ENROLMENT>' {}",
+        manifest.fs_url()
+    );
+    println!(
+        "  raft5fs-share --user {} --ca {} trust <USER> '<FINGERPRINT>' {}",
         manifest.user,
         path(CA_CERT),
         manifest.fs_url()

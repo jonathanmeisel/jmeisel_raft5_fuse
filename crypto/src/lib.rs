@@ -16,6 +16,8 @@
 //!   and no newer one.
 //! - `data`: file chunks and directory entry names, encrypted under their
 //!   node's key.
+//! - `grantees`: who a node is granted to, sealed under its key, so the
+//!   server can't add anyone a rotation would then re-seal the key to.
 //!
 //! Every ciphertext is bound (as associated data) to what it is and where
 //! it belongs -- its purpose, its inode, its versions -- so the server
@@ -23,6 +25,7 @@
 //! wrapper copied onto another inode, fails to open.
 
 pub mod data;
+pub mod grantees;
 pub mod identity;
 pub mod node;
 pub mod password;

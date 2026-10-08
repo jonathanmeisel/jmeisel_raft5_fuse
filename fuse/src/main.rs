@@ -4,24 +4,31 @@ use fuser::{Config, MountOption};
 use raft5fs_fuse::cli;
 use raft5fs_fuse::filesystem::Raft5Fs;
 use raft5fs_fuse::remote::Credentials;
+use raft5fs_fuse::vault::KnownKeys;
 use tokio::runtime::Runtime;
 
 const USAGE: &str = "\
-usage: raft5fs-fuse --user <NAME> [--ca <PEM> [--tls-server-name <NAME>]]
-                    [--cache-size <SIZE>] [--no-write-buffer]
-                    <mountpoint> <server-address>...
+usage: raft5fs-fuse --user <NAME> --ca <PEM> [--tls-server-name <NAME>]
+                    [--known-keys <PATH>] [--cache-size <SIZE>]
+                    [--no-write-buffer] <mountpoint> <server-address>...
 
   --user <NAME>        the account to use the filesystem as. Its password
                        is read from the RAFT5FS_PASSWORD environment
                        variable, or asked for on the terminal.
   --ca <PEM>           reach the servers over TLS, trusting certificates
-                       that chain to this (and nothing else). Without it
-                       sessions cross the network in the clear (though
-                       the password never does, and file data and names
-                       are encrypted either way).
+                       that chain to this (and nothing else). Required:
+                       what a login sends is enough to test password
+                       guesses against, and to act as the user.
   --tls-server-name <NAME>
                        check the servers' certificates against this name
                        instead of the host in each address.
+  --insecure-plaintext talk to http:// servers without TLS instead. Only
+                       for throwaway setups.
+  --known-keys <PATH>  where users' public keys are pinned (as for
+                       raft5fs-share; by default
+                       ~/.config/raft5fs/known_keys). Writing under a
+                       grant takes its sender's key pinned there -- see
+                       `raft5fs-share trust`.
   <server-address>     a filesystem server, e.g. https://fs1:7700. Give
                        several: requests go to whichever answers, and move
                        on to the next if one goes away.
@@ -60,6 +67,8 @@ fn main() {
     let mut username = None;
     let mut ca = None;
     let mut server_name = None;
+    let mut known_keys_file = None;
+    let mut plaintext = false;
     let mut positional = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -78,6 +87,13 @@ fn main() {
                         .unwrap_or_else(|| usage("--tls-server-name needs a value")),
                 );
             }
+            "--insecure-plaintext" => plaintext = true,
+            "--known-keys" => {
+                known_keys_file = Some(std::path::PathBuf::from(
+                    args.next()
+                        .unwrap_or_else(|| usage("--known-keys needs a value")),
+                ));
+            }
             "--user" => {
                 username = Some(args.next().unwrap_or_else(|| usage("--user needs a value")));
             }
@@ -94,7 +110,19 @@ fn main() {
             eprintln!("cannot read a password: {e}");
             std::process::exit(1);
         });
-    let credentials = Credentials::new(username, password);
+    let mut credentials = Credentials::new(username, password);
+    credentials.allow_plaintext = plaintext;
+    if ca.is_none() && !plaintext {
+        usage("--ca is required (or --insecure-plaintext, for a throwaway setup)");
+    }
+    let known_keys_file = known_keys_file.unwrap_or_else(cli::default_known_keys);
+    let known_keys = KnownKeys::load(known_keys_file.clone()).unwrap_or_else(|e| {
+        eprintln!(
+            "cannot read the known keys in {}: {e}",
+            known_keys_file.display()
+        );
+        std::process::exit(1);
+    });
     let tls = ca.map(|path| {
         cli::tls(&path, server_name.as_deref()).unwrap_or_else(|e| {
             eprintln!("{e}");
@@ -107,7 +135,8 @@ fn main() {
 
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let mut fs = Raft5Fs::new(positional, credentials, runtime.handle().clone())
-        .with_write_buffering(write_buffering);
+        .with_write_buffering(write_buffering)
+        .with_known_keys(known_keys);
     if let Some(bytes) = cache_bytes {
         fs = fs.with_cache_size(bytes);
     }

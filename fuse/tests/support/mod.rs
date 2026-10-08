@@ -31,6 +31,7 @@ use raft5fs_core::{FsCore, accounts};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
 use raft5fs_fuse::remote::{Credentials, Remote};
+use raft5fs_fuse::vault::KnownKeys;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{FsService, Store};
 use tokio::runtime::Runtime;
@@ -458,14 +459,16 @@ impl MountedFs {
     /// Mounts against `servers`, trying them in that order, logged in as
     /// `TESTER`.
     pub fn mount(runtime: &Runtime, servers: Vec<String>) -> Self {
-        Self::mount_as(runtime, servers, TESTER)
+        Self::mount_as(runtime, servers, TESTER, KnownKeys::in_memory())
     }
 
     /// Like `mount`, but logged in as `user` -- whatever local user
-    /// actually uses the mountpoint.
-    pub fn mount_as(runtime: &Runtime, servers: Vec<String>, user: &str) -> Self {
-        let fs =
-            Raft5Fs::new(servers, credentials(user), runtime.handle().clone()).with_tls(fs_tls());
+    /// actually uses the mountpoint -- with the public keys in `known`
+    /// pinned.
+    pub fn mount_as(runtime: &Runtime, servers: Vec<String>, user: &str, known: KnownKeys) -> Self {
+        let fs = Raft5Fs::new(servers, credentials(user), runtime.handle().clone())
+            .with_tls(fs_tls())
+            .with_known_keys(known);
         let path = temp_dir("mnt");
 
         let mut options = Config::default();
@@ -516,6 +519,8 @@ pub struct Harness {
     pub chunk_size: u64,
     /// Whether `TESTER`'s mounts work in `VOLUME`, made at setup.
     pub volume: bool,
+    /// `TESTER`'s public key, from their enrolment at setup.
+    pub tester_key: [u8; 32],
 }
 
 impl Harness {
@@ -613,9 +618,26 @@ impl Harness {
     }
 
     /// Like `second_mount`, but logged in as `user`: another user's
-    /// mount of the same filesystem, working at its root.
+    /// mount of the same filesystem, working at its root. It trusts
+    /// `TESTER`'s key, as if `user` had checked its fingerprint (see
+    /// `known_keys`).
     pub fn mount_as(&self, user: &str) -> MountedFs {
-        MountedFs::mount_as(&self.runtime, self.addresses_from(1), user)
+        MountedFs::mount_as(
+            &self.runtime,
+            self.addresses_from(1),
+            user,
+            self.known_keys(),
+        )
+    }
+
+    /// Pins, in memory, of `TESTER`'s key: what every other test user has
+    /// checked out of band, so grants from `TESTER` are trusted.
+    pub fn known_keys(&self) -> KnownKeys {
+        let known = KnownKeys::in_memory();
+        known
+            .check(TESTER, &self.tester_key)
+            .expect("pin the tester's key");
+        known
     }
 
     /// Takes snapshot `name` of the filesystem, as the store's
@@ -706,7 +728,7 @@ fn setup_with(chunk_size: u64, volume: bool) -> Harness {
     let (cluster, client) = TestCluster::start(&runtime);
     let servers = start_servers(&cluster, chunk_size);
     let addresses: Vec<String> = servers.iter().map(|s| s.address.clone()).collect();
-    enrol(&runtime, &client, &addresses, TESTER);
+    let tester_key = enrol(&runtime, &client, &addresses, TESTER);
     let mut mount = MountedFs::mount(&runtime, addresses);
     if volume {
         std::fs::create_dir(mount.root.join(VOLUME)).expect("make the test's volume");
@@ -720,6 +742,7 @@ fn setup_with(chunk_size: u64, volume: bool) -> Harness {
         runtime,
         chunk_size,
         volume,
+        tester_key,
     }
 }
 
@@ -733,9 +756,8 @@ fn enrol(runtime: &Runtime, client: &Client, addresses: &[String], name: &str) -
         Remote::enrol(
             addresses,
             Some(fs_tls()),
-            name,
+            credentials(name),
             &code,
-            &password(name),
             KdfParams::TESTING,
         )
         .await

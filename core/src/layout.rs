@@ -17,10 +17,15 @@ pub(crate) const DELETE_BATCH: usize = 256;
 /// adopt it rather than reinterpreting every chunk boundary.
 pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
-/// Marks a store as holding a filesystem made by an encrypting raft5fs
-/// (one byte, 1). An older raft5fs's store has a root but no such key, or
-/// a 0 here: unencrypted, which this one refuses (see `check_store`).
+/// Marks a store as holding a filesystem in this raft5fs's format (one
+/// byte, `STORE_FORMAT`). An older raft5fs's store has a root but no such
+/// key, or another byte here -- 0 for an unencrypted one, 1 for one whose
+/// grants, names and grantees aren't sealed the way this one's are --
+/// which this one refuses (see `check_store`).
 pub const ENCRYPTED_KEY: &[u8] = b"\x04encrypted";
+
+/// The format `ENCRYPTED_KEY` records.
+pub const STORE_FORMAT: u8 = 2;
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
 pub const MIN_CHUNK_SIZE: u64 = 4096;
@@ -99,6 +104,7 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x08 ++ ino(BE8)                    -> the inode's key record
 //   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
 //   0x0A ++ ino(BE8)                    -> an inode number reserved for a create, by username
+//   0x0B ++ ino(BE8)                    -> who ino is granted to, sealed under its key (`grants`)
 //
 // Deleting an inode takes several transactions (its chunks can't all fit
 // in one), so it is announced first: one transaction removes the dirent,
@@ -146,6 +152,8 @@ pub(crate) const NODE_KEYS_PREFIX: &[u8] = &[0x08];
 pub(crate) const GRANT_INDEX_PREFIX: &[u8] = &[0x09];
 /// The prefix of every inode reservation; see `grants`.
 pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
+/// The prefix of every sealed grantee list; see `grants`.
+pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
 
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";

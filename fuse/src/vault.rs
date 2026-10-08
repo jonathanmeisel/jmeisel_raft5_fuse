@@ -39,8 +39,25 @@
 //! always fresh.
 //!
 //! **Public keys** come from the server, which could hand out its own.
-//! The vault pins each user's key the first time it seals to it
+//! The vault pins each user's key the first time it grants to them
 //! (`KnownKeys`), and refuses to seal to a different one later.
+//!
+//! **What the server says isn't taken on trust.** It decides who sees
+//! what, but a server that lied could still learn nothing it shouldn't:
+//!
+//! - A rotation re-seals a node's key only to who is on the grantee list
+//!   its key holders sealed under it (raft5fs-crypto's `grantees`), with
+//!   the public keys on it -- never to a grantee only the server names.
+//! - A grant is opened with its sender's public key, which proves who
+//!   made it. One from a sender this account hasn't pinned (or itself) may
+//!   be one the server made up, with a key it knows; it can be read, but
+//!   nothing is sealed under it until the sender is trusted.
+//! - A looked-up entry's sealed name must name the inode the server
+//!   answered with, as listed names must.
+//! - A node wrapped, or under one wrapped, under an old version of its
+//!   parent's key gets a new key before anything is sealed under it,
+//!   whether or not the server asks; and a key record or grant older
+//!   than one already seen this session is refused.
 //!
 //! **The root.** The server's real root is no one's to see. What a mount
 //! shows at its root instead is virtual: one entry per grant made to this
@@ -61,11 +78,14 @@ use raft5fs_crypto::Key;
 use raft5fs_crypto::data::{
     name_tag, open_chunk, open_name, seal_chunk, seal_name, sealed_version,
 };
-use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN, fingerprint, seal_grant, seal_label};
+use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
+use raft5fs_crypto::identity::{
+    Identity, PUBLIC_KEY_LEN, fingerprint, grant_sender, seal_grant, seal_label,
+};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
     Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode, Rotation,
-    SealedChunk, SealedMove, SetAttr, WriteError,
+    SealedChunk, SealedMove, SetAttr, WriteError, check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
@@ -88,18 +108,60 @@ pub struct Node {
     pub record: NodeKeys,
     pub key: Key,
     name_key: Key,
+    /// Wrapped -- or under a node wrapped -- under an old version of its
+    /// parent's key: one someone revoked may hold. Nothing new is sealed
+    /// under it until `freshen` has given it a new one.
+    stale: bool,
+    /// Who the grant it was reached through is from, if that isn't someone
+    /// this account trusts (itself, or a key pinned for them): see
+    /// `sealable`.
+    untrusted: Option<Arc<Untrusted>>,
+}
+
+/// A grant's sender, as the server vouches for them.
+#[derive(Debug)]
+struct Untrusted {
+    sender: String,
+    key: [u8; PUBLIC_KEY_LEN],
 }
 
 impl Node {
     /// `ino`'s node with current key `key`, which this checks: a key that
-    /// doesn't open the record's name key isn't this node's.
+    /// doesn't open the record's name key isn't this node's. Fresh, and
+    /// trusted, unless the caller says otherwise.
     fn new(ino: u64, record: NodeKeys, key: Key) -> Result<Self, FsError> {
         let name_key = record.name_key(ino, &key).map_err(|e| corrupt(ino, e))?;
         Ok(Self {
             record,
             key,
             name_key,
+            stale: false,
+            untrusted: None,
         })
+    }
+
+    /// Whether anything may be sealed under this node: not if the grant it
+    /// was reached through is from someone untrusted. Such a grant may be
+    /// one the server made, with a key the server knows -- and the tree
+    /// under it, too -- so whatever was written there, or shared on from
+    /// there, the server could read.
+    fn sealable(&self, ino: u64) -> Result<(), FsError> {
+        match &self.untrusted {
+            None => Ok(()),
+            Some(u) => Err(FsError::new(
+                libc::EACCES,
+                format!(
+                    "inode {ino} is shared with this account by {}, whose key isn't pinned \
+                     here: the server could have made the share up, so nothing is written \
+                     under it. If {} really shared it, check their key's fingerprint ({}) \
+                     with them, then: raft5fs-share trust {} <fingerprint>",
+                    u.sender,
+                    u.sender,
+                    fingerprint(&u.key),
+                    u.sender
+                ),
+            )),
+        }
     }
 
     /// The tag `name` is filed under in this directory.
@@ -107,13 +169,14 @@ impl Node {
         OsString::from_vec(name_tag(&self.name_key, name.as_bytes()).to_vec())
     }
 
-    /// `name`, filed under `tag` in this directory `ino`, sealed under its
-    /// current key.
-    pub fn seal(&self, ino: u64, tag: &OsStr, name: &OsStr) -> Vec<u8> {
+    /// `name`, filed under `tag` in this directory `ino` and naming inode
+    /// `child`, sealed under its current key.
+    pub fn seal(&self, ino: u64, child: u64, tag: &OsStr, name: &OsStr) -> Vec<u8> {
         seal_name(
             &self.key,
             self.record.version,
             ino,
+            child,
             tag.as_bytes(),
             name.as_bytes(),
         )
@@ -147,7 +210,11 @@ fn changed(e: &FsError) -> bool {
 /// Public keys sealed to before, by user: the first one seen for a user is
 /// trusted, and a different one later refused -- the server could have
 /// substituted its own. Kept in memory, and in a file if given one (lines
-/// of `user hex-key`).
+/// of `user hex-key`, readable only by its owner).
+///
+/// Names come from the server, so each is checked (`check_username`)
+/// before it goes near the file: a name with a line break in it could
+/// otherwise write a line pinning someone else's key.
 pub struct KnownKeys {
     keys: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
     file: Option<PathBuf>,
@@ -162,35 +229,40 @@ impl KnownKeys {
     }
 
     /// The keys pinned in `file`, which needn't exist yet; new pins are
-    /// added to it.
+    /// added to it. A line that isn't a good name and a key, or a second
+    /// key for one name, makes the whole file refused: it isn't one this
+    /// wrote, and which key to believe can't be guessed.
     pub fn load(file: PathBuf) -> std::io::Result<Self> {
-        let mut keys = HashMap::new();
-        match std::fs::read_to_string(&file) {
-            Ok(text) => {
-                for line in text.lines() {
-                    let mut fields = line.split_whitespace();
-                    if let (Some(user), Some(hex)) = (fields.next(), fields.next())
-                        && let Some(key) = from_hex(hex)
-                    {
-                        keys.insert(user.to_string(), key);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        let keys = read_pins(&file)?;
         Ok(Self {
             keys: Mutex::new(keys),
             file: Some(file),
         })
     }
 
+    /// The key pinned for `user`, if any -- looking in the file again if
+    /// none is known here yet, so that a pin made since (`raft5fs-share
+    /// trust`, while a mount runs) counts. A file that no longer reads
+    /// right adds nothing.
+    pub fn pinned(&self, user: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
+        let mut keys = self.keys.lock().unwrap();
+        if let Some(key) = keys.get(user) {
+            return Some(*key);
+        }
+        let key = *read_pins(self.file.as_ref()?).ok()?.get(user)?;
+        keys.insert(user.to_string(), key);
+        Some(key)
+    }
+
     /// `key` as `user`'s, if it is the one pinned for them -- or, if none
     /// is, after pinning it. `EPERM` if another one is pinned.
     pub fn check(&self, user: &str, key: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        check_username(user)?;
         let key: [u8; PUBLIC_KEY_LEN] = key
             .try_into()
             .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        // Whatever the file has for them by now, made here or not.
+        self.pinned(user);
         let mut keys = self.keys.lock().unwrap();
         match keys.get(user) {
             Some(pinned) if *pinned == key => Ok(key),
@@ -205,17 +277,7 @@ impl KnownKeys {
             )),
             None => {
                 if let Some(file) = &self.file {
-                    let saved = (|| {
-                        if let Some(dir) = file.parent() {
-                            std::fs::create_dir_all(dir)?;
-                        }
-                        let mut f = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(file)?;
-                        writeln!(f, "{user} {}", to_hex(&key))
-                    })();
-                    saved.map_err(|e| {
+                    append_pin(file, user, &key).map_err(|e| {
                         FsError::new(
                             libc::EIO,
                             format!("cannot pin {user}'s key in {}: {e}", file.display()),
@@ -230,17 +292,84 @@ impl KnownKeys {
 
     /// Forgets `user`'s pinned key, so the next one seen is trusted.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
+        check_username(user).map_err(|e| std::io::Error::other(e.message))?;
         let mut keys = self.keys.lock().unwrap();
         keys.remove(user);
         if let Some(file) = &self.file {
-            let text: String = keys
-                .iter()
+            let mut users: Vec<_> = keys.iter().collect();
+            users.sort();
+            let text: String = users
+                .into_iter()
                 .map(|(user, key)| format!("{user} {}\n", to_hex(key)))
                 .collect();
-            std::fs::write(file, text)?;
+            replace_private(file, text.as_bytes())?;
         }
         Ok(())
     }
+}
+
+/// The pins in `file`, which needn't exist. A line that isn't a good name
+/// and a key, or a second key for one name, makes the whole file refused.
+fn read_pins(file: &std::path::Path) -> std::io::Result<HashMap<String, [u8; PUBLIC_KEY_LEN]>> {
+    let bad = |n: usize, why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} line {}: {why}", file.display(), n + 1),
+        )
+    };
+    let mut keys = HashMap::new();
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(keys),
+        Err(e) => return Err(e),
+    };
+    for (n, line) in text.lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (user, hex) = match fields.as_slice() {
+            [] => continue,
+            [user, hex] => (*user, *hex),
+            _ => return Err(bad(n, "not a user name and a key")),
+        };
+        check_username(user).map_err(|e| bad(n, &e.message))?;
+        let key = from_hex(hex).ok_or_else(|| bad(n, "not a public key"))?;
+        if keys.insert(user.to_string(), key).is_some_and(|k| k != key) {
+            return Err(bad(n, &format!("a second, different key for {user}")));
+        }
+    }
+    Ok(keys)
+}
+
+/// Adds a `user key` line to `file`, made readable by its owner only.
+fn append_pin(file: &std::path::Path, user: &str, key: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(file)?;
+    writeln!(f, "{user} {}", to_hex(key))
+}
+
+/// Replaces `file` with `contents` all at once -- written beside it, then
+/// renamed over it -- readable by its owner only.
+fn replace_private(file: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(contents)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, file)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -293,6 +422,12 @@ pub struct Vault {
     identity: Arc<Identity>,
     known: KnownKeys,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
+    /// The newest key version seen for each inode this session -- kept
+    /// when `nodes` is cleared -- so that a server can't hand back an
+    /// older record, under a key someone since revoked still holds.
+    seen: Mutex<HashMap<u64, u32>>,
+    /// Public keys the server gave for grant senders, by name.
+    senders: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
     roots: Mutex<Roots>,
     /// Decrypted chunks, each with the seq it was read or written at:
     /// shared with the vaults of the same mount's snapshots, each keeping
@@ -323,6 +458,8 @@ impl Vault {
             identity,
             known: KnownKeys::in_memory(),
             nodes: Mutex::new(HashMap::new()),
+            seen: Mutex::new(HashMap::new()),
+            senders: Mutex::new(HashMap::new()),
             roots: Mutex::new(Roots::default()),
             cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
             space: 0,
@@ -347,6 +484,8 @@ impl Vault {
             identity: Arc::clone(&self.identity),
             known: KnownKeys::in_memory(),
             nodes: Mutex::new(HashMap::new()),
+            seen: Mutex::new(HashMap::new()),
+            senders: Mutex::new(HashMap::new()),
             roots: Mutex::new(Roots::default()),
             cache: Arc::clone(&self.cache),
             space,
@@ -380,6 +519,25 @@ impl Vault {
         self.node(ino).await
     }
 
+    /// `ino`'s key, to seal something new under: refused if it is reached
+    /// through an untrusted grant (`Node::sealable`), and given a new key
+    /// first -- with every stale node above it -- if it is stale.
+    async fn fresh_node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
+        let mut node = self.node(ino).await?;
+        // Its grant's sender trusted since it was opened: open it again.
+        if let Some(untrusted) = &node.untrusted
+            && self.known.pinned(&untrusted.sender).is_some()
+        {
+            self.forget_all();
+            node = self.node(ino).await?;
+        }
+        node.sealable(ino)?;
+        if node.stale {
+            return self.freshen(ino).await;
+        }
+        Ok(node)
+    }
+
     fn known_node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         self.nodes
             .lock()
@@ -391,13 +549,14 @@ impl Vault {
 
     /// `ino`'s key, after giving every stale node from this account's grant
     /// down to it a new key, top down: what a write the server refused
-    /// with `EKEYEXPIRED` needs before it is tried again.
+    /// with `EKEYEXPIRED` needs before it is tried again, and what sealing
+    /// under a node seen to be stale needs anyway.
     pub async fn freshen(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         for _ in 0..ROTATION_ROUNDS {
             self.forget_all();
             let path = self.remote.key_path(ino).await?;
             let inos: Vec<u64> = path.nodes.iter().map(|&(i, _)| i).collect();
-            let last = self.unwrap_path(path)?;
+            let last = self.unwrap_path(path).await?;
             let mut stale = None;
             for pair in inos.windows(2) {
                 let parent = self.known_node(pair[0])?;
@@ -426,9 +585,88 @@ impl Vault {
         ))
     }
 
+    /// Who `granted` is granted to, by name -- as far as both the server
+    /// and the grantee list its key holders sealed under its key (`node`'s,
+    /// current) agree, and with the public key each grant was sealed to.
+    /// Grantees the server lists but the sealed list doesn't, or lists
+    /// differently, are `EPERM`: only a server that wanted a key sealed to
+    /// someone else would add them. Grantees with no keys left -- their
+    /// account went -- are left out, as are any on the sealed list the
+    /// server no longer has: dropping a grant takes no one's say-so.
+    fn checked_grantees(
+        &self,
+        node: &Node,
+        ino: u64,
+        granted: &GrantedNode,
+    ) -> Result<HashMap<String, GranteeEntry>, FsError> {
+        let mismatch = |why: String| {
+            FsError::new(
+                libc::EPERM,
+                format!(
+                    "inode {ino}: the server's list of who it is granted to doesn't match the \
+                     one sealed under its key ({why}); refusing to seal its key to anyone on it"
+                ),
+            )
+        };
+        let named: Vec<&Grantee> = granted
+            .grantees
+            .iter()
+            .filter(|g| !g.public_key.is_empty())
+            .collect();
+        if named.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if granted.sealed_grantees.is_empty() {
+            return Err(mismatch("there is no sealed list".to_string()));
+        }
+        let version = sealed_version(&granted.sealed_grantees).map_err(|e| corrupt(ino, e))?;
+        if version != node.record.version {
+            return Err(mismatch(format!(
+                "the sealed list is under key version {version}, not the current {}",
+                node.record.version
+            )));
+        }
+        let sealed = open_grantees(&node.key, ino, &granted.sealed_grantees)
+            .map_err(|e| mismatch(e.to_string()))?;
+        let mut out = HashMap::new();
+        for grantee in named {
+            check_username(&grantee.user).map_err(|e| mismatch(e.message))?;
+            let Some(entry) = sealed.iter().find(|e| e.user == grantee.user) else {
+                return Err(mismatch(format!(
+                    "{} isn't on the sealed list",
+                    grantee.user
+                )));
+            };
+            if entry.public_key.as_slice() != grantee.public_key.as_slice() {
+                return Err(mismatch(format!(
+                    "{}'s key isn't the one their grant was sealed to",
+                    grantee.user
+                )));
+            }
+            if entry.writable != grantee.writable {
+                return Err(mismatch(format!(
+                    "{}'s grant is read-{} on the sealed list",
+                    grantee.user,
+                    if entry.writable { "write" } else { "only" }
+                )));
+            }
+            // Pinned here as someone else: whoever put them on the list
+            // took a key this account wouldn't have.
+            if let Some(pinned) = self.known.pinned(&grantee.user)
+                && pinned != entry.public_key
+            {
+                self.known.check(&grantee.user, &entry.public_key)?;
+            }
+            out.insert(grantee.user.clone(), entry.clone());
+        }
+        Ok(out)
+    }
+
     /// Gives `top` a new key, and every node from it down to each grant
     /// beneath it, re-sealing every grant of them -- except `drop`'s of
-    /// `top`, which is removed. `parent`: `top`'s parent's node, which its
+    /// `top`, which is removed -- to the grantees and keys on each node's
+    /// sealed grantee list (`checked_grantees`), and sealing that list
+    /// again under the new key. `parent`: `top`'s parent's node, which its
     /// new key is wrapped under (unless `top` is a volume, which has none).
     async fn rotate_from(
         &self,
@@ -439,18 +677,18 @@ impl Vault {
         let under: Vec<GrantedNode> = self.remote.grants_under(top).await?;
         let mut parent_of = HashMap::new();
         let mut depth = HashMap::from([(top, 0)]);
-        let mut grantees: HashMap<u64, Vec<Grantee>> = HashMap::new();
+        let mut granted: HashMap<u64, GrantedNode> = HashMap::new();
         for node in under {
             for (d, pair) in node.path.windows(2).enumerate() {
                 parent_of.insert(pair[1], pair[0]);
                 depth.insert(pair[1], d + 1);
             }
-            grantees.insert(node.ino, node.grantees);
+            granted.insert(node.ino, node);
         }
         if let Some(user) = drop
-            && !grantees
+            && !granted
                 .get(&top)
-                .is_some_and(|gs| gs.iter().any(|g| g.user == user))
+                .is_some_and(|n| n.grantees.iter().any(|g| g.user == user))
         {
             return Err(FsError::new(
                 libc::ENOENT,
@@ -460,10 +698,12 @@ impl Vault {
         let mut order: Vec<u64> = depth.keys().copied().collect();
         order.sort_by_key(|ino| (depth[ino], *ino));
 
+        let me = self.remote.username();
         let mut new_keys: HashMap<u64, (Key, u32)> = HashMap::new();
         let mut rotations = Vec::with_capacity(order.len());
         for ino in order {
             let current = self.node(ino).await?;
+            current.sealable(ino)?;
             let wrap = if current.record.parent_version == 0 {
                 None
             } else if ino == top {
@@ -476,6 +716,7 @@ impl Vault {
                         ),
                     )
                 })?;
+                parent.sealable(ino)?;
                 Some((parent.key.clone(), parent.record.version))
             } else {
                 Some(new_keys[&parent_of[&ino]].clone())
@@ -485,28 +726,59 @@ impl Vault {
                 .rotate(ino, &current.key, wrap.as_ref().map(|(k, v)| (k, *v)))
                 .map_err(|e| corrupt(ino, e))?;
             let mut grants = Vec::new();
-            for grantee in grantees.remove(&ino).unwrap_or_default() {
-                let sealed = if ino == top && drop == Some(grantee.user.as_str()) {
-                    Vec::new()
-                } else if grantee.public_key.is_empty() {
-                    // Their account has no keys any more: nothing to seal
-                    // to, so the grant goes.
-                    eprintln!(
-                        "dropping {}'s grant of inode {ino}: they have no keys",
-                        grantee.user
-                    );
-                    Vec::new()
-                } else {
-                    let public_key = self.known.check(&grantee.user, &grantee.public_key)?;
-                    seal_grant(&public_key, ino, record.version, &key)
+            let mut kept = Vec::new();
+            if let Some(node) = granted.remove(&ino) {
+                // Whoever is being dropped needs no one's say-so: not even
+                // a grantee the server made up, whom this is how to remove.
+                let dropping = |g: &Grantee| ino == top && drop == Some(g.user.as_str());
+                let checked = GrantedNode {
+                    grantees: node
+                        .grantees
+                        .iter()
+                        .filter(|g| !dropping(g))
+                        .cloned()
+                        .collect(),
+                    ..node.clone()
                 };
-                grants.push((grantee.user, sealed));
+                let listed = self.checked_grantees(&current, ino, &checked)?;
+                for grantee in node.grantees {
+                    let sealed = match listed.get(&grantee.user) {
+                        _ if ino == top && drop == Some(grantee.user.as_str()) => Vec::new(),
+                        Some(entry) => {
+                            kept.push(entry.clone());
+                            seal_grant(
+                                &self.identity,
+                                me,
+                                &entry.public_key,
+                                ino,
+                                record.version,
+                                &key,
+                            )
+                        }
+                        // Their account has no keys any more: nothing to
+                        // seal to, so the grant goes.
+                        None => {
+                            eprintln!(
+                                "dropping {}'s grant of inode {ino}: they have no keys",
+                                grantee.user
+                            );
+                            Vec::new()
+                        }
+                    };
+                    grants.push((grantee.user, sealed));
+                }
             }
+            let sealed_grantees = if kept.is_empty() {
+                Vec::new()
+            } else {
+                seal_grantees(&key, record.version, ino, &kept)
+            };
             rotations.push(Rotation {
                 ino,
                 expected_version: current.record.version,
                 node_keys: record.encode(),
                 grants,
+                sealed_grantees,
             });
             new_keys.insert(ino, (key, record.version));
         }
@@ -537,21 +809,22 @@ impl Vault {
         ))
     }
 
-    /// Who directory `ino` is granted to, with their keys checked against
-    /// the pinned ones (`EPERM` on a mismatch).
+    /// Who directory `ino` is granted to, checked against the grantee list
+    /// sealed under its key, and the keys pinned here (`EPERM` if either
+    /// disagrees).
     pub async fn grantees(&self, ino: u64) -> Result<Vec<Grantee>, FsError> {
-        let mut grantees = Vec::new();
-        for node in self.remote.grants_under(ino).await? {
-            if node.ino == ino {
-                grantees = node.grantees;
-            }
-        }
-        for grantee in &grantees {
-            if !grantee.public_key.is_empty() {
-                self.known.check(&grantee.user, &grantee.public_key)?;
-            }
-        }
-        Ok(grantees)
+        let node = self.node(ino).await?;
+        let Some(granted) = self
+            .remote
+            .grants_under(ino)
+            .await?
+            .into_iter()
+            .find(|n| n.ino == ino)
+        else {
+            return Ok(Vec::new());
+        };
+        self.checked_grantees(&node, ino, &granted)?;
+        Ok(granted.grantees)
     }
 
     /// `ino`'s key, unwrapping it from this account's grant if it isn't
@@ -561,20 +834,69 @@ impl Vault {
             return Ok(Arc::clone(node));
         }
         let path = self.remote.key_path(ino).await?;
-        self.unwrap_path(path)
+        self.unwrap_path(path).await
+    }
+
+    /// Opens the grant of `ino` that `grant` is, with its sender's public
+    /// key: the key and version it holds, and the sender, if they aren't
+    /// trusted -- this account, or someone whose key is pinned here.
+    async fn open_grant(
+        &self,
+        ino: u64,
+        grant: &Grant,
+    ) -> Result<(u32, Key, Option<Arc<Untrusted>>), FsError> {
+        let refused = |e: String| FsError::new(libc::EACCES, format!("inode {ino}: {e}"));
+        let sealed = &grant.sealed_key;
+        let sender = grant_sender(sealed).map_err(|e| refused(e.to_string()))?;
+        check_username(sender).map_err(|e| refused(e.message))?;
+        if sender == self.remote.username() {
+            let (version, key) = self
+                .identity
+                .open_grant(&self.identity.public_key(), ino, sealed)
+                .map_err(|e| refused(e.to_string()))?;
+            return Ok((version, key, None));
+        }
+        if let Some(pinned) = self.known.pinned(sender)
+            && let Ok((version, key)) = self.identity.open_grant(&pinned, ino, sealed)
+        {
+            return Ok((version, key, None));
+        }
+        let served = self.sender_key(sender).await?;
+        let (version, key) = self
+            .identity
+            .open_grant(&served, ino, sealed)
+            .map_err(|e| refused(e.to_string()))?;
+        let untrusted = Untrusted {
+            sender: sender.to_string(),
+            key: served,
+        };
+        Ok((version, key, Some(Arc::new(untrusted))))
+    }
+
+    /// `user`'s public key, as the server has it.
+    async fn sender_key(&self, user: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        if let Some(key) = self.senders.lock().unwrap().get(user) {
+            return Ok(*key);
+        }
+        let key: [u8; PUBLIC_KEY_LEN] = self
+            .remote
+            .public_key(user)
+            .await?
+            .try_into()
+            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        self.senders.lock().unwrap().insert(user.to_string(), key);
+        Ok(key)
     }
 
     /// Unwraps every key along `path`, keeping each, and returns the last.
-    fn unwrap_path(&self, path: KeyPath) -> Result<Arc<Node>, FsError> {
+    async fn unwrap_path(&self, path: KeyPath) -> Result<Arc<Node>, FsError> {
         let mut nodes = path.nodes.into_iter();
         let (root_ino, root_bytes) = nodes
             .next()
             .ok_or_else(|| FsError::new(libc::EIO, "an empty key path"))?;
         let record = NodeKeys::decode(&root_bytes).map_err(|e| corrupt(root_ino, e))?;
-        let (version, key) = self
-            .identity
-            .open_grant(root_ino, &path.grant.sealed_key)
-            .map_err(|e| FsError::new(libc::EACCES, format!("inode {root_ino}: {e}")))?;
+        self.check_not_older(root_ino, &record)?;
+        let (version, key, untrusted) = self.open_grant(root_ino, &path.grant).await?;
         // A grant always holds the current version: a rotation re-seals
         // every grant of the node it rotates.
         if version != record.version {
@@ -585,18 +907,45 @@ impl Vault {
         }
         // `Node::new` proves the key: whatever the grant claims, one that
         // doesn't open the record isn't this node's.
-        let root = Node::new(root_ino, record, key)?;
+        let mut root = Node::new(root_ino, record, key)?;
+        root.untrusted = untrusted;
         let mut parent = (root_ino, self.keep(root_ino, root));
         for (ino, bytes) in nodes {
             let record = NodeKeys::decode(&bytes).map_err(|e| corrupt(ino, e))?;
+            self.check_not_older(ino, &record)?;
             let wrapping = parent.1.key_at(parent.0, record.parent_version)?;
             let key = record.open(ino, &wrapping).map_err(|e| corrupt(ino, e))?;
-            parent = (ino, self.keep(ino, Node::new(ino, record, key)?));
+            let stale = parent.1.stale || record.is_stale(parent.1.record.version);
+            let mut node = Node::new(ino, record, key)?;
+            node.stale = stale;
+            node.untrusted = parent.1.untrusted.clone();
+            parent = (ino, self.keep(ino, node));
         }
         Ok(parent.1)
     }
 
+    /// `EIO` if `record` is older than one seen for `ino` before: what a
+    /// server would hand back to have new things sealed under a key that
+    /// was since rotated away from someone.
+    fn check_not_older(&self, ino: u64, record: &NodeKeys) -> Result<(), FsError> {
+        match self.seen.lock().unwrap().get(&ino) {
+            Some(&seen) if record.version < seen => Err(FsError::new(
+                libc::EIO,
+                format!(
+                    "inode {ino}: the server handed back key version {}, older than \
+                     version {seen} seen before",
+                    record.version
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn keep(&self, ino: u64, node: Node) -> Arc<Node> {
+        let mut seen = self.seen.lock().unwrap();
+        let newest = seen.entry(ino).or_insert(node.record.version);
+        *newest = (*newest).max(node.record.version);
+        drop(seen);
         let node = Arc::new(node);
         self.nodes.lock().unwrap().insert(ino, Arc::clone(&node));
         node
@@ -667,7 +1016,7 @@ impl Vault {
         parent: u64,
         name: &OsStr,
     ) -> Result<(NewNode, Node, OsString), FsError> {
-        let parent_node = self.node(parent).await?;
+        let parent_node = self.fresh_node(parent).await?;
         let ino = self.remote.allocate_inode().await?;
         let (record, key) =
             NodeKeys::create(ino, Some((&parent_node.key, parent_node.record.version)));
@@ -675,7 +1024,7 @@ impl Vault {
         let new = NewNode {
             ino,
             keys: record.encode(),
-            sealed_name: parent_node.seal(parent, &tag, name),
+            sealed_name: parent_node.seal(parent, ino, &tag, name),
         };
         Ok((new, Node::new(ino, record, key)?, tag))
     }
@@ -685,9 +1034,39 @@ impl Vault {
         Ok(self.node(parent).await?.tag(name))
     }
 
+    /// `name` in directory `parent`, checked: the entry's sealed name must
+    /// open under the directory's key as `name`, naming the inode the
+    /// server answered with -- or the server could have answered with any
+    /// inode this account can reach, and had what is written to `name`
+    /// land somewhere others read.
     pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
-        let tag = self.tag(parent, name).await?;
-        self.remote.lookup(parent, &tag).await
+        let mut dir = self.node(parent).await?;
+        let tag = dir.tag(name);
+        let (attr, sealed) = self.remote.lookup(parent, &tag).await?;
+        let version = sealed_version(&sealed).map_err(|e| corrupt(parent, e))?;
+        if version > dir.record.version {
+            // Sealed under a key newer than the one known here.
+            dir = self.refresh(parent).await?;
+        }
+        let key = dir.key_at(parent, version)?;
+        open_name(
+            &key,
+            &dir.name_key,
+            parent,
+            attr.ino,
+            tag.as_bytes(),
+            &sealed,
+        )
+        .map_err(|e| {
+            corrupt(
+                parent,
+                format!(
+                    "{e}: the entry the server gave doesn't name inode {}",
+                    attr.ino
+                ),
+            )
+        })?;
+        Ok(attr)
     }
 
     /// Drops what is held for an inode that is gone.
@@ -747,6 +1126,7 @@ impl Vault {
                         &key,
                         &dir.name_key,
                         ino,
+                        item.ino,
                         item.name.as_bytes(),
                         &item.sealed_name,
                     )
@@ -800,8 +1180,12 @@ impl Vault {
     }
 
     /// Moves a name, as `Remote::rename`: the new name sealed under the
-    /// new parent's key, and the moved node's key re-wrapped under it if
-    /// the parent changes.
+    /// new parent's key, and -- if the parent changes -- the moved node
+    /// given a new key first, which is then re-wrapped under the new
+    /// parent's. Without the new key, whoever holds the old parent's (a
+    /// directory shared with others, say) would keep a key to what is
+    /// written to the node after it moved. What is under the moved node
+    /// gets new keys too, as it is next written (it is stale).
     pub async fn rename(
         &self,
         parent: u64,
@@ -810,6 +1194,9 @@ impl Vault {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<Option<u64>, FsError> {
+        if parent != new_parent {
+            self.rotate_moving(parent, name).await?;
+        }
         match self
             .rename_once(parent, name, new_parent, new_name, noreplace)
             .await
@@ -834,17 +1221,18 @@ impl Vault {
         noreplace: bool,
     ) -> Result<Option<u64>, FsError> {
         let from = self.node(parent).await?;
-        let to = self.node(new_parent).await?;
+        let to = self.fresh_node(new_parent).await?;
         let tag = from.tag(name);
         let new_tag = to.tag(new_name);
-        let ino = self.remote.lookup(parent, &tag).await?.ino;
+        let ino = self.lookup(parent, name).await?.ino;
         let mut sealed = SealedMove {
             ino,
             node_keys: Vec::new(),
-            sealed_name: to.seal(new_parent, &new_tag, new_name),
+            sealed_name: to.seal(new_parent, ino, &new_tag, new_name),
         };
         let mut rewrapped = None;
         if parent != new_parent {
+            from.sealable(parent)?;
             let moved = self.node(ino).await?;
             let record = moved
                 .record
@@ -855,6 +1243,8 @@ impl Vault {
                 record,
                 key: moved.key.clone(),
                 name_key: moved.name_key.clone(),
+                stale: moved.stale,
+                untrusted: to.untrusted.clone(),
             });
         }
         let replaced = self
@@ -870,6 +1260,26 @@ impl Vault {
         Ok(replaced)
     }
 
+    /// Gives the node `name` in `parent` names a new key, wrapped under
+    /// `parent`'s, ahead of moving it to another directory (see `rename`).
+    async fn rotate_moving(&self, parent: u64, name: &OsStr) -> Result<(), FsError> {
+        for _ in 0..ROTATION_ROUNDS {
+            let from = self.fresh_node(parent).await?;
+            let moved = self.lookup(parent, name).await?.ino;
+            match self.rotate_from(moved, Some(&from), None).await {
+                Err(e) if changed(&e) || expired(&e) => {
+                    self.forget_all();
+                    continue;
+                }
+                other => return other,
+            }
+        }
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("the keys of the node moving out of inode {parent} kept changing"),
+        ))
+    }
+
     /// A new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
         if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
@@ -878,8 +1288,19 @@ impl Vault {
         let ino = self.remote.allocate_inode().await?;
         let (record, key) = NodeKeys::create(ino, None);
         let me = self.identity.public_key();
-        let sealed_key = seal_grant(&me, ino, record.version, &key);
+        let username = self.remote.username();
+        let sealed_key = seal_grant(&self.identity, username, &me, ino, record.version, &key);
         let sealed_label = seal_label(&me, ino, label.as_bytes());
+        let sealed_grantees = seal_grantees(
+            &key,
+            record.version,
+            ino,
+            &[GranteeEntry {
+                user: username.to_string(),
+                public_key: me,
+                writable: true,
+            }],
+        );
         let new = NewNode {
             ino,
             keys: record.encode(),
@@ -888,7 +1309,7 @@ impl Vault {
         let node = Node::new(ino, record, key)?;
         let attr = self
             .remote
-            .create_volume(&new, perm, sealed_key, sealed_label)
+            .create_volume(&new, perm, sealed_key, sealed_label, sealed_grantees)
             .await?;
         self.keep(ino, node);
         let mut roots = self.roots.lock().unwrap();
@@ -909,9 +1330,13 @@ impl Vault {
     }
 
     /// Grants directory `ino`, and everything under it, to `user`, to show
-    /// up in their root as `label`. Returns the public key it was sealed
-    /// to -- the server's word for whose it is, which is worth checking
-    /// against the fingerprint the grantee saw when they enrolled.
+    /// up in their root as `label`, adding them to its sealed grantee list.
+    /// Returns the public key it was sealed to -- the server's word for
+    /// whose it is, pinned if nothing was for `user` yet, which is worth
+    /// checking against the fingerprint the grantee saw when they
+    /// enrolled. (`raft5fs-share` insists on that before a first grant,
+    /// by `trust`ing them first.) A pin is trust both ways: shares from
+    /// `user` are trusted from then on too.
     pub async fn grant(
         &self,
         ino: u64,
@@ -919,24 +1344,112 @@ impl Vault {
         writable: bool,
         label: &OsStr,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        check_username(user)?;
+        // Checked before `user`'s key is pinned: a pin also makes shares
+        // from `user` trusted, which sharing from a share that isn't
+        // mustn't bring about.
+        self.fresh_node(ino).await?;
         let public_key = self.remote.public_key(user).await?;
         let public_key = self.known.check(user, &public_key)?;
-        let node = self.node(ino).await?;
-        let grant = |node: &Node| Grant {
-            ino,
-            writable,
-            key_version: node.record.version,
-            sealed_key: seal_grant(&public_key, ino, node.record.version, &node.key),
-            sealed_label: seal_label(&public_key, ino, label.as_bytes()),
-        };
-        match self.remote.grant(user, grant(&node)).await {
-            Err(e) if expired(&e) => {
-                let node = self.freshen(ino).await?;
-                self.remote.grant(user, grant(&node)).await?;
+        let mut expired_once = false;
+        for _ in 0..CHANGE_RETRIES {
+            let node = self.fresh_node(ino).await?;
+            let granted = self
+                .remote
+                .grants_under(ino)
+                .await?
+                .into_iter()
+                .find(|n| n.ino == ino);
+            let seq = granted.as_ref().map_or(0, |g| g.grantees_seq);
+            let mut entries: Vec<GranteeEntry> = match &granted {
+                Some(granted) => self
+                    .checked_grantees(&node, ino, granted)?
+                    .into_values()
+                    .filter(|e| e.user != user)
+                    .collect(),
+                None => Vec::new(),
+            };
+            entries.push(GranteeEntry {
+                user: user.to_string(),
+                public_key,
+                writable,
+            });
+            let version = node.record.version;
+            let grant = Grant {
+                ino,
+                writable,
+                key_version: version,
+                sealed_key: seal_grant(
+                    &self.identity,
+                    self.remote.username(),
+                    &public_key,
+                    ino,
+                    version,
+                    &node.key,
+                ),
+                sealed_label: seal_label(&public_key, ino, label.as_bytes()),
+            };
+            let sealed_grantees = seal_grantees(&node.key, version, ino, &entries);
+            match self.remote.grant(user, grant, sealed_grantees, seq).await {
+                Err(e) if expired(&e) && !expired_once => {
+                    expired_once = true;
+                    self.freshen(ino).await?;
+                }
+                // Someone else granted it meanwhile: start from their list.
+                Err(e) if changed(&e) => {}
+                other => return other.map(|()| public_key),
             }
-            other => other?,
         }
-        Ok(public_key)
+        Err(FsError::new(
+            libc::EAGAIN,
+            format!("inode {ino}'s grantees kept changing under this grant"),
+        ))
+    }
+
+    /// Pins `user`'s public key, as the server has it, if its fingerprint
+    /// is `expected` (as `fingerprint` writes it; spaces and case don't
+    /// matter): what makes grants from `user` trusted (see `Node::sealable`),
+    /// and lets a first grant to them go ahead without trusting the server
+    /// for their key. `EPERM` if the fingerprint differs, or another key
+    /// is pinned for them already.
+    pub async fn trust(&self, user: &str, expected: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        check_username(user)?;
+        let served: [u8; PUBLIC_KEY_LEN] = self
+            .remote
+            .public_key(user)
+            .await?
+            .try_into()
+            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        let norm = |f: &str| -> String {
+            f.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        };
+        if norm(expected) != norm(&fingerprint(&served)) {
+            return Err(FsError::new(
+                libc::EPERM,
+                format!(
+                    "the server's key for {user} has fingerprint {}, not {expected}: not pinning it",
+                    fingerprint(&served)
+                ),
+            ));
+        }
+        let key = self.known.check(user, &served)?;
+        // What was opened as from them before was opened untrusted.
+        self.forget_all();
+        Ok(key)
+    }
+
+    /// The fingerprint of the public key the server has for `user`.
+    pub async fn served_fingerprint(&self, user: &str) -> Result<String, FsError> {
+        let key: [u8; PUBLIC_KEY_LEN] = self
+            .remote
+            .public_key(user)
+            .await?
+            .try_into()
+            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+        Ok(fingerprint(&key))
     }
 
     /// The inode at `path`: a root entry's name, then names under it,
@@ -1144,7 +1657,7 @@ impl Vault {
     /// whole batches.
     pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
         let failed = |written, error| WriteError { written, error };
-        let mut node = self.node(ino).await.map_err(|e| failed(0, e))?;
+        let mut node = self.fresh_node(ino).await.map_err(|e| failed(0, e))?;
         if data.is_empty() {
             // Still a write, as far as mtime is concerned.
             let touched = match self.remote.write_chunks(ino, &[], offset).await {
@@ -1288,7 +1801,7 @@ impl Vault {
             return Ok(());
         }
         let index = new_size / chunk_size;
-        let node = self.node(ino).await?;
+        let node = self.fresh_node(ino).await?;
         for _ in 0..CHANGE_RETRIES {
             let (mut plain, seq) = self.base(&node, ino, index).await?;
             if plain.len() <= keep {
@@ -1342,6 +1855,57 @@ mod tests {
         let after = KnownKeys::load(file.clone()).unwrap();
         after.check("alice", &[9; 32]).unwrap();
         assert_eq!(after.check("bob", &[3; 32]).unwrap_err().errno, libc::EPERM);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_name_that_could_forge_a_pin_line_is_refused() {
+        let file =
+            std::env::temp_dir().join(format!("raft5fs-known-inject-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let known = KnownKeys::load(file.clone()).unwrap();
+        let forged = format!("x\nbob {}\ny", to_hex(&[7; 32]));
+        assert_eq!(
+            known.check(&forged, &[1; 32]).unwrap_err().errno,
+            libc::EINVAL
+        );
+        assert!(known.forget(&forged).is_err());
+        known.check("bob", &[2; 32]).unwrap();
+        assert_eq!(
+            KnownKeys::load(file.clone()).unwrap().pinned("bob"),
+            Some([2; 32])
+        );
+        // Only its owner reads the file.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        known.forget("bob").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_pin_file_that_isnt_one_this_wrote_is_refused() {
+        let file = std::env::temp_dir().join(format!("raft5fs-known-bad-{}", std::process::id()));
+        let line = |user: &str, byte: u8| format!("{user} {}\n", to_hex(&[byte; 32]));
+        for text in [
+            // Two keys for one name: which is bob's can't be guessed.
+            format!("{}{}", line("bob", 1), line("bob", 2)),
+            format!("{}junk\n", line("bob", 1)),
+            line("Bob", 1),
+            format!("bob {} extra\n", to_hex(&[1; 32])),
+            "bob 1234\n".to_string(),
+        ] {
+            std::fs::write(&file, &text).unwrap();
+            assert!(KnownKeys::load(file.clone()).is_err(), "{text:?}");
+        }
+        // The same key twice, and blank lines, are fine.
+        std::fs::write(&file, format!("{}\n{}", line("bob", 1), line("bob", 1))).unwrap();
+        assert_eq!(
+            KnownKeys::load(file.clone()).unwrap().pinned("bob"),
+            Some([1; 32])
+        );
         let _ = std::fs::remove_file(&file);
     }
 

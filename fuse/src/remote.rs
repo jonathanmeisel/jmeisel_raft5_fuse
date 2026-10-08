@@ -37,6 +37,13 @@
 //! `auth`, which is what logs in, and a key that opens the account's
 //! private key from the login's reply. From then on only `auth` is kept,
 //! for renewals; the password is dropped.
+//!
+//! `auth` and the session are as good as the password to whoever sees
+//! them -- `auth` is a guess-checker for it, offline -- so they only travel
+//! over TLS: an address that isn't `https://`, or a connection without
+//! TLS settings, is refused unless the credentials explicitly allow
+//! plaintext (`Credentials::allow_plaintext`), which only tests and
+//! throwaway setups should.
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -89,6 +96,9 @@ pub struct Credentials {
     /// The weakest key stretching a login will accept from a server (see
     /// `KdfParams::check`).
     pub min_kdf: KdfParams,
+    /// Whether to talk to servers without TLS at all. Off unless asked:
+    /// see the module doc.
+    pub allow_plaintext: bool,
 }
 
 impl Credentials {
@@ -99,6 +109,7 @@ impl Credentials {
             username: username.into(),
             password: password.into(),
             min_kdf: KdfParams::DEFAULT,
+            allow_plaintext: false,
         }
     }
 }
@@ -153,12 +164,20 @@ pub struct Remote {
 }
 
 /// Stretches `password` off the async threads: Argon2 is slow on purpose.
-async fn derive(password: &str, salt: Vec<u8>, params: KdfParams) -> Result<PasswordKeys, FsError> {
+async fn derive(
+    password: &str,
+    username: &str,
+    salt: Vec<u8>,
+    params: KdfParams,
+) -> Result<PasswordKeys, FsError> {
     let password = Zeroizing::new(password.to_string());
-    tokio::task::spawn_blocking(move || password::derive(password.as_bytes(), &salt, params))
-        .await
-        .expect("key derivation panicked")
-        .map_err(|e| FsError::new(libc::EIO, e.to_string()))
+    let username = username.to_string();
+    tokio::task::spawn_blocking(move || {
+        password::derive(password.as_bytes(), &username, &salt, params)
+    })
+    .await
+    .expect("key derivation panicked")
+    .map_err(|e| FsError::new(libc::EIO, e.to_string()))
 }
 
 /// What the server keeps for an account whose password is `password` and
@@ -170,7 +189,7 @@ async fn account_keys(
     identity: &Identity,
 ) -> Result<(AccountKeys, Zeroizing<[u8; AUTH_LEN]>), FsError> {
     let salt = new_salt();
-    let keys = derive(password, salt.to_vec(), params).await?;
+    let keys = derive(password, username, salt.to_vec(), params).await?;
     let account = AccountKeys {
         salt: salt.to_vec(),
         kdf_params: params.encode().to_vec(),
@@ -225,6 +244,22 @@ impl Remote {
         if addresses.is_empty() {
             return Err("no server addresses".to_string());
         }
+        raft5fs_proto::types::check_username(&credentials.username).map_err(|e| e.message)?;
+        if !credentials.allow_plaintext {
+            if tls.is_none() {
+                return Err(
+                    "refusing to log in without TLS: the login and the session would \
+                     cross the network in the clear (give the servers' CA certificate)"
+                        .to_string(),
+                );
+            }
+            if let Some(plain) = addresses.iter().find(|a| !a.starts_with("https://")) {
+                return Err(format!(
+                    "refusing {plain}: only https:// addresses are used, so the login \
+                     and the session never cross the network in the clear"
+                ));
+            }
+        }
         let session = Session::default();
         let authorize = Authorize(Arc::clone(&session));
         let mut servers = Vec::new();
@@ -271,19 +306,21 @@ impl Remote {
         Ok(remote)
     }
 
-    /// Enrols `username` on the filesystem at `addresses`, with
-    /// the one-time `code` an administrator issued: makes the account a
-    /// key pair, and stores it wrapped under what `password` yields.
-    /// Returns the new public key, for the user to note its fingerprint.
+    /// Enrols `credentials.username` on the filesystem at `addresses`,
+    /// with the one-time `code` an administrator issued: makes the account
+    /// a key pair, and stores it wrapped under what `credentials.password`
+    /// yields. Returns the new public key, for the user to note its
+    /// fingerprint.
     pub async fn enrol(
         addresses: &[String],
         tls: Option<ClientTlsConfig>,
-        username: &str,
+        credentials: Credentials,
         code: &str,
-        password: &str,
         params: KdfParams,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
-        let credentials = Credentials::new(username, String::new());
+        let username = credentials.username.clone();
+        let password = Zeroizing::new(credentials.password.clone());
+        let (username, password) = (username.as_str(), password.as_str());
         let remote = Self::dial(addresses, credentials, tls)
             .await
             .map_err(|e| FsError::new(libc::EIO, e))?;
@@ -370,6 +407,11 @@ impl Remote {
         (!self.snapshot.is_empty()).then_some(self.snapshot.as_str())
     }
 
+    /// The account this client logs in as.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
     pub fn identity(&self) -> Option<Arc<Identity>> {
         self.identity.read().unwrap().clone()
     }
@@ -416,7 +458,7 @@ impl Remote {
             params
                 .check(self.min_kdf)
                 .map_err(|e| FsError::new(libc::EACCES, format!("login refused: {e}")))?;
-            let keys = derive(&password, settings.salt, params).await?;
+            let keys = derive(&password, &self.username, settings.salt, params).await?;
             req.auth = keys.auth.to_vec();
             derived = Some(keys);
         }
@@ -558,7 +600,10 @@ impl Remote {
         .into_result()
     }
 
-    pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
+    /// The entry `name` (a tag) in `parent`: its attributes, and its name
+    /// sealed as the listing has it -- for the caller to check, since only
+    /// that proves the entry names the inode the server says.
+    pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<(Attr, Vec<u8>), FsError> {
         let req = NameRequest {
             parent,
             name: name_bytes(name),
@@ -780,12 +825,23 @@ impl Remote {
         .into_result()
     }
 
-    /// Grants `grant.ino` to `user`. Resending one that landed writes the
-    /// same grant again.
-    pub async fn grant(&self, user: &str, grant: Grant) -> Result<(), FsError> {
+    /// Grants `grant.ino` to `user`, with the node's grantee list as it
+    /// leaves it, sealed under its key, replacing the one at
+    /// `expected_grantees_seq` (`EAGAIN` if it changed meanwhile). A
+    /// resend of one that landed is refused so, for the list it changed --
+    /// which the caller then reads again, finding the grant there.
+    pub async fn grant(
+        &self,
+        user: &str,
+        grant: Grant,
+        sealed_grantees: Vec<u8>,
+        expected_grantees_seq: u64,
+    ) -> Result<(), FsError> {
         let req = GrantRequest {
             username: user.to_string(),
             grant: Some(grant.into()),
+            sealed_grantees,
+            expected_grantees_seq,
         };
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
@@ -802,6 +858,7 @@ impl Remote {
         perm: u16,
         sealed_key: Vec<u8>,
         sealed_label: Vec<u8>,
+        sealed_grantees: Vec<u8>,
     ) -> Result<Attr, FsError> {
         let req = CreateVolumeRequest {
             ino: new.ino,
@@ -809,6 +866,7 @@ impl Remote {
             node_keys: new.keys.clone(),
             sealed_key,
             sealed_label,
+            sealed_grantees,
         };
         self.call(Retry::Once, |mut c| {
             let req = req.clone();

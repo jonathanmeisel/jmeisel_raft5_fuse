@@ -1,8 +1,11 @@
 //! From a password to the two secrets a login needs.
 //!
-//! Argon2id stretches the password (with a per-user salt the server keeps
-//! and hands out before login) into a master secret, and HKDF splits that
-//! into:
+//! Argon2id stretches the password into a master secret, and HKDF splits
+//! that into the two below. The salt is the server's per-user one (which
+//! it keeps and hands out before login) hashed with the user's name, here:
+//! a server that handed many users one salt still couldn't crack their
+//! `auth`s together, since each is stretched with a salt of its own.
+//!
 //!
 //! - `auth`, sent to the server at login. The server stores only
 //!   `verifier(auth)`, a plain hash: `auth` is already 256 uniformly
@@ -20,6 +23,20 @@ use crate::{Error, KEY_LEN, Key, Reader};
 
 pub const SALT_LEN: usize = 16;
 pub const AUTH_LEN: usize = 32;
+/// The shortest password a client will set. The password is what every
+/// key a user holds comes down to.
+pub const MIN_PASSWORD_LEN: usize = 12;
+
+/// Whether `password` is long enough to set (see `MIN_PASSWORD_LEN`), in
+/// characters.
+pub fn check_new_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "a password must be at least {MIN_PASSWORD_LEN} characters long"
+        ));
+    }
+    Ok(())
+}
 
 /// Argon2id's cost settings, kept beside the salt so they can be raised
 /// for new enrolments without breaking existing ones.
@@ -31,10 +48,13 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// OWASP's suggested Argon2id settings: 19 MiB, two passes.
+    /// 64 MiB, three passes: RFC 9106's second recommended setting, in
+    /// one lane. Every filesystem server sees `auth`, and a server that
+    /// shouldn't could test password guesses against it offline at this
+    /// cost per guess, so it is set as high as a login can bear.
     pub const DEFAULT: Self = Self {
-        memory_kib: 19 * 1024,
-        iterations: 2,
+        memory_kib: 64 * 1024,
+        iterations: 3,
         parallelism: 1,
     };
 
@@ -113,9 +133,26 @@ pub struct PasswordKeys {
     pub kek: Key,
 }
 
-/// Stretches `password`. Slow on purpose (see `KdfParams`); unusable
-/// parameters -- which only a tampered record would hold -- are an error.
-pub fn derive(password: &[u8], salt: &[u8], params: KdfParams) -> Result<PasswordKeys, Error> {
+/// The salt Argon2 is given: the server's, bound to the account's name.
+fn user_salt(user: &str, salt: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"raft5fs/salt");
+    hash.update((user.len() as u32).to_be_bytes());
+    hash.update(user.as_bytes());
+    hash.update(salt);
+    hash.finalize().into()
+}
+
+/// Stretches `user`'s `password`. Slow on purpose (see `KdfParams`);
+/// unusable parameters -- which only a tampered record would hold -- are
+/// an error.
+pub fn derive(
+    password: &[u8],
+    user: &str,
+    salt: &[u8],
+    params: KdfParams,
+) -> Result<PasswordKeys, Error> {
+    let salt = user_salt(user, salt);
     let argon_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -125,7 +162,7 @@ pub fn derive(password: &[u8], salt: &[u8], params: KdfParams) -> Result<Passwor
     .map_err(|_| Error("the account's KDF parameters"))?;
     let mut master = [0; KEY_LEN];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params)
-        .hash_password_into(password, salt, &mut master)
+        .hash_password_into(password, &salt, &mut master)
         .map_err(|_| Error("the account's KDF parameters"))?;
     let hkdf = Hkdf::<Sha256>::new(None, &master);
     master.zeroize();
@@ -213,8 +250,8 @@ mod tests {
     #[test]
     fn one_password_and_salt_always_give_the_same_keys() {
         let salt = new_salt();
-        let a = derive(b"hunter2", &salt, KdfParams::TESTING).unwrap();
-        let b = derive(b"hunter2", &salt, KdfParams::TESTING).unwrap();
+        let a = derive(b"hunter2", "u", &salt, KdfParams::TESTING).unwrap();
+        let b = derive(b"hunter2", "u", &salt, KdfParams::TESTING).unwrap();
         assert_eq!(a.auth, b.auth);
         assert_eq!(a.kek, b.kek);
     }
@@ -222,17 +259,21 @@ mod tests {
     #[test]
     fn auth_and_kek_are_unrelated_and_depend_on_password_and_salt() {
         let salt = new_salt();
-        let keys = derive(b"hunter2", &salt, KdfParams::TESTING).unwrap();
+        let keys = derive(b"hunter2", "u", &salt, KdfParams::TESTING).unwrap();
         assert_ne!(&keys.auth, keys.kek.as_bytes());
-        let other_password = derive(b"hunter3", &salt, KdfParams::TESTING).unwrap();
+        let other_password = derive(b"hunter3", "u", &salt, KdfParams::TESTING).unwrap();
         assert_ne!(keys.auth, other_password.auth);
-        let other_salt = derive(b"hunter2", &new_salt(), KdfParams::TESTING).unwrap();
+        let other_salt = derive(b"hunter2", "u", &new_salt(), KdfParams::TESTING).unwrap();
         assert_ne!(keys.kek, other_salt.kek);
+        // One server salt handed to two users still stretches differently.
+        let other_user = derive(b"hunter2", "v", &salt, KdfParams::TESTING).unwrap();
+        assert_ne!(keys.auth, other_user.auth);
+        assert_ne!(keys.kek, other_user.kek);
     }
 
     #[test]
     fn the_verifier_accepts_only_its_auth() {
-        let keys = derive(b"pw", &new_salt(), KdfParams::TESTING).unwrap();
+        let keys = derive(b"pw", "u", &new_salt(), KdfParams::TESTING).unwrap();
         let stored = verifier(&keys.auth);
         assert!(check_verifier(&keys.auth, &stored));
         assert!(!check_verifier(&[0; AUTH_LEN], &stored));
@@ -279,6 +320,15 @@ mod tests {
             iterations: 0,
             parallelism: 0,
         };
-        assert!(derive(b"pw", &new_salt(), zero).is_err());
+        assert!(derive(b"pw", "u", &new_salt(), zero).is_err());
+    }
+
+    #[test]
+    fn short_passwords_are_refused() {
+        assert!(check_new_password("short").is_err());
+        assert!(check_new_password("elevenchars").is_err());
+        check_new_password("twelve chars").unwrap();
+        // Characters, not bytes.
+        assert!(check_new_password("ééééééééééé").is_err());
     }
 }

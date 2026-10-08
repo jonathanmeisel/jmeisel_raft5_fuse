@@ -28,7 +28,7 @@ use tonic::transport::ClientTlsConfig;
 
 use crate::remote::{Credentials, Remote};
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
-use crate::vault::{DEFAULT_CACHE_BYTES, VIRTUAL_ROOT, Vault};
+use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -79,7 +79,7 @@ fn commit_result(result: Result<Attr, WriteError>) -> Result<(), Errno> {
 
 pub struct Raft5Fs {
     rt: Handle,
-    /// Servers to use, `http://host:port`; any of them will do.
+    /// Servers to use, `https://host:port`; any of them will do.
     servers: Vec<String>,
     /// Who the mount logs in as.
     credentials: Credentials,
@@ -87,6 +87,9 @@ pub struct Raft5Fs {
     tls: Option<ClientTlsConfig>,
     /// How much decrypted file data to cache.
     cache_bytes: usize,
+    /// Where public keys are pinned, for the vault `init` opens; in memory
+    /// only if not given.
+    known_keys: Option<KnownKeys>,
     /// Opened by `init`, before the kernel sends any other request.
     vault: OnceLock<Arc<Vault>>,
     /// Who everything seems to belong to: the local user who mounted it.
@@ -112,6 +115,7 @@ impl Raft5Fs {
             credentials,
             tls: None,
             cache_bytes: DEFAULT_CACHE_BYTES,
+            known_keys: None,
             vault: OnceLock::new(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -125,6 +129,13 @@ impl Raft5Fs {
     /// Reaches the servers over TLS, as `tls` says.
     pub fn with_tls(mut self, tls: ClientTlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Pins public keys in `known` -- whose pins also decide which grants
+    /// this mount trusts enough to write under -- rather than in memory.
+    pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
+        self.known_keys = Some(known);
         self
     }
 
@@ -443,12 +454,15 @@ impl Filesystem for Raft5Fs {
                 eprintln!("cannot connect to the filesystem: {why}");
                 std::io::Error::from_raw_os_error(libc::EHOSTUNREACH)
             })?;
-        let vault = Vault::new(Arc::new(remote))
+        let mut vault = Vault::new(Arc::new(remote))
             .map_err(|e| {
                 eprintln!("cannot open the account's keys: {e}");
                 std::io::Error::from_raw_os_error(libc::EACCES)
             })?
             .with_cache_size(self.cache_bytes);
+        if let Some(known) = self.known_keys.take() {
+            vault = vault.with_known_keys(known);
+        }
         let _ = self.vault.set(Arc::new(vault));
         Ok(())
     }

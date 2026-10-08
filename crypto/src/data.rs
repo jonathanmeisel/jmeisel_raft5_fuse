@@ -8,8 +8,9 @@
 //! -- is what the server files the entry under, so lookups by name still
 //! work without the server learning it. Its *sealed* form is what the
 //! listing returns, readable by key holders. Opening a sealed name checks
-//! it against the tag, so the server can't show one entry under another
-//! entry's name.
+//! it against the tag, and it is bound to the inode the entry names, so
+//! the server can't show one entry under another entry's name, nor point
+//! a name at another inode.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -67,34 +68,47 @@ fn name_mac(name_key: &Key, name: &[u8]) -> Hmac<Sha256> {
     mac
 }
 
-fn name_aad(parent: u64, tag: &[u8], version: u32) -> Vec<u8> {
+fn name_aad(parent: u64, child: u64, tag: &[u8], version: u32) -> Vec<u8> {
     aad(
         "name",
-        &[&parent.to_be_bytes(), tag, &version.to_be_bytes()],
+        &[
+            &parent.to_be_bytes(),
+            &child.to_be_bytes(),
+            tag,
+            &version.to_be_bytes(),
+        ],
     )
 }
 
-/// `name`, filed under `tag` in directory `parent`, sealed under the
-/// directory's key at `version`.
-pub fn seal_name(key: &Key, version: u32, parent: u64, tag: &[u8], name: &[u8]) -> Vec<u8> {
+/// `name`, filed under `tag` in directory `parent` and naming inode
+/// `child`, sealed under the directory's key at `version`.
+pub fn seal_name(
+    key: &Key,
+    version: u32,
+    parent: u64,
+    child: u64,
+    tag: &[u8],
+    name: &[u8],
+) -> Vec<u8> {
     let mut out = version.to_be_bytes().to_vec();
-    out.extend_from_slice(&seal(key, &name_aad(parent, tag, version), name));
+    out.extend_from_slice(&seal(key, &name_aad(parent, child, tag, version), name));
     out
 }
 
 /// Opens a sealed name with the directory's key at its version, and
-/// checks it is the name `tag` stands for.
+/// checks it is the name `tag` stands for, and that it names `child`.
 pub fn open_name(
     key: &Key,
     name_key: &Key,
     parent: u64,
+    child: u64,
     tag: &[u8],
     blob: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let version = sealed_version(blob)?;
     let name = open(
         key,
-        &name_aad(parent, tag, version),
+        &name_aad(parent, child, tag, version),
         &blob[4..],
         "an entry name",
     )?;
@@ -142,16 +156,20 @@ mod tests {
         let name_key = Key::random();
         let tag = name_tag(&name_key, b"report.txt");
         let other = name_tag(&name_key, b"other.txt");
-        let blob = seal_name(&key, 1, 7, &tag, b"report.txt");
+        let blob = seal_name(&key, 1, 7, 20, &tag, b"report.txt");
         assert_eq!(
-            open_name(&key, &name_key, 7, &tag, &blob).unwrap(),
+            open_name(&key, &name_key, 7, 20, &tag, &blob).unwrap(),
             b"report.txt"
         );
-        assert!(open_name(&key, &name_key, 8, &tag, &blob).is_err());
-        assert!(open_name(&key, &name_key, 7, &other, &blob).is_err());
+        assert!(open_name(&key, &name_key, 8, 20, &tag, &blob).is_err());
+        assert!(open_name(&key, &name_key, 7, 20, &other, &blob).is_err());
+        assert!(
+            open_name(&key, &name_key, 7, 21, &tag, &blob).is_err(),
+            "the name is bound to the inode it names"
+        );
         // A name sealed under the right tag but not matching it: what a
         // client with the key, but no honesty, could write.
-        let lying = seal_name(&key, 1, 7, &other, b"report.txt");
-        assert!(open_name(&key, &name_key, 7, &other, &lying).is_err());
+        let lying = seal_name(&key, 1, 7, 20, &other, b"report.txt");
+        assert!(open_name(&key, &name_key, 7, 20, &other, &lying).is_err());
     }
 }

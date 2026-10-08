@@ -162,12 +162,16 @@ The first server to start on an empty store creates the filesystem.
                 still exist before looking again (default 5): how long
                 removing a user takes to reach one who is mounted.
 
-A store made by an older raft5fs, which could make unencrypted
-filesystems, is refused: there is no migrating one.
+A store made by an older raft5fs -- one that could make unencrypted
+filesystems, or one whose grants and names were sealed differently -- is
+refused: there is no migrating one.
 
 Leaving off --tls-cert/--tls-key serves in plaintext, and the server
-warns you: what is stored stays encrypted, but sessions cross the
-network in the clear, for anyone watching to reuse.
+warns you: what is stored stays encrypted, but logins and sessions would
+cross the network in the clear, for anyone watching to reuse -- and a
+login is enough to test password guesses against. The clients refuse to
+talk to such a server unless given --insecure-plaintext (and http://
+addresses): for throwaway setups only.
 
 
 -------------------------------------------------------------------------
@@ -183,15 +187,19 @@ Hand the code to alice, who runs, on her own machine:
 
   raft5fs-share --user alice --ca cert.pem enrol <CODE> https://127.0.0.1:27060
 
-She chooses her password there. Her machine makes her key pair, stores
-the private key on the server sealed under a key only her password
-yields, and prints the key's fingerprint. She should note it: it is how
-others can check, when sharing with her, that the server handed them her
-real key (7.3).
+She chooses her password there: at least 12 characters, and it is worth
+more. Her machine makes her key pair, stores the private key on the
+server sealed under a key only her password yields, and prints the key's
+fingerprint. She should note it, and give it to the people she shares
+with: it is how they check that the server handed them her real key
+(7.3).
 
-Her password is stretched on her machine into a login secret, which is
-all a server ever gets. To change it -- everything shared with her stays
-readable:
+Her password is stretched on her machine (Argon2id, 64 MiB, three
+passes) into a login secret, which is all a server ever gets. But a
+server that wanted to could test guesses at her password against that
+secret, as fast as it can stretch them -- and everything shared with her
+comes down to her password -- so it should be one no one would guess.
+To change it -- everything shared with her stays readable:
 
   raft5fs-share --user alice --ca cert.pem passwd https://127.0.0.1:27060
 
@@ -206,7 +214,10 @@ those were sealed to her old key.
   raft5fs-server user del alice $STORE https://127.0.0.1:27051
 
 `user del` removes the account and every grant made to it. A mounted user
-who is removed is refused within --identity-ttl.
+who is removed is refused within --identity-ttl. It doesn't give anything
+new keys, as a revocation does (7.2): to shut someone out of what is
+written from then on, even should they get hold of the raw store,
+revoke their grants first.
 
 
 -------------------------------------------------------------------------
@@ -220,7 +231,8 @@ As the local user who will use the mount (not root):
 
 It asks for alice's password on the terminal, or reads it from the
 RAFT5FS_PASSWORD environment variable. It runs in the foreground; leave
-it running, and use ~/raft5fs from another shell.
+it running, and use ~/raft5fs from another shell. --ca is required (see
+section 4).
 
 The root of the mount isn't the filesystem's real root. It lists only
 what has been shared with alice, each under the name it was shared as,
@@ -249,6 +261,10 @@ mounted it. Each person mounts with their own login.
                      so it is never stale.
   --tls-server-name <NAME>  check the server certificate against NAME
                      instead of the host in the address.
+  --known-keys <PATH>  where users' keys are pinned (7.3; by default
+                     ~/.config/raft5fs/known_keys, as for raft5fs-share).
+                     Only what is shared by someone pinned there can be
+                     written to.
   --no-write-buffer  store every write at once instead of buffering
                      small writes (slower; mostly for debugging).
 
@@ -280,9 +296,12 @@ raft5fs-share, a path starts at an entry of the root, as the mount shows
 it:
 
   raft5fs-share --user alice --ca cert.pem \
-    grant photos/2024 bob --ro --name from-alice https://127.0.0.1:27060
+    grant photos/2024 bob --ro --name from-alice \
+    --fingerprint '<bob's fingerprint>' https://127.0.0.1:27060
 
-bob's root now shows from-alice. --ro makes the grant read-only, and
+--fingerprint is needed the first time alice shares with bob: it is his
+key's, as he saw it when he enrolled (7.3). bob's root now shows
+from-alice. --ro makes the grant read-only, and
 writes under it then fail with "Read-only file system"; without it bob
 may change anything under it, and share it on. To share, alice needs a
 read-write grant of the directory -- which she has of every volume she
@@ -292,6 +311,10 @@ made.
 
 Grants alone decide access, and are checked on every request, so a grant
 taken back stops even files bob has open, at once.
+
+Moving a file or directory to another directory gives it a new key, so
+that whoever could read where it was can't read what is written to it
+where it went.
 
 7.2 Revoking
 
@@ -308,15 +331,30 @@ sealed under that one's), except for a volume.
 7.3 Whose key?
 
 Sharing with bob seals the directory's key to bob's public key, and only
-the server can say what that is. raft5fs-share pins each user's key the
-first time it seals to them, in ~/.config/raft5fs/known_keys (or
---known-keys), and refuses a different one after that. Check the
-fingerprint `grant` prints against the one bob saw when he enrolled. If
-he really did enrol again, check his new fingerprint with him, then:
+the server can say what that is: a server that wanted to read what alice
+shares could hand her its own key as bob's. So keys are pinned, in
+~/.config/raft5fs/known_keys (or --known-keys): the first grant to bob
+takes his fingerprint, checked with him, and pins his key; a different
+key for him is refused after that.
+
+It works the other way too. bob's mount opens a grant with the key of
+whoever made it, which proves who that was -- but a server could make up
+a user, and a share from them, labelled like one bob expects. Until bob
+has pinned alice's key, what she shares with him is read-only: he can
+look, but nothing he writes could end up sealed under a key the server
+made. To pin her key without sharing anything with her:
+
+  raft5fs-share --user bob --ca cert.pem \
+    trust alice '<alice's fingerprint>' https://127.0.0.1:27060
+
+A running mount takes the new pin the next time it writes there. If
+someone really did enrol again, check their new fingerprint with them,
+then:
 
   raft5fs-share --user alice forget-key bob
 
-Pins are kept per user name, so keep a known-keys file per filesystem.
+Pins are kept per user name, so keep a known-keys file per filesystem,
+and give mounts and raft5fs-share the same one.
 
 
 -------------------------------------------------------------------------
@@ -365,8 +403,12 @@ with every change. The store holds at most 32 at once.
 -------------------------------------------------------------------------
 
 They can't read file contents, names (of files, directories, or what a
-grant is called), or passwords; nor forge or alter data without the
-change being detected when it is read.
+grant is called), or passwords; nor forge or alter what is sealed
+without the change being detected when it is read. A server can't get a
+key sealed to anyone the people sharing it didn't share it with: who
+each directory is shared with is kept sealed under its key too, and a
+mount re-seals keys only to who is on that list. Nor can it point a name
+at another file: every name is sealed bound to the inode it names.
 
 They can see:
 
@@ -382,12 +424,24 @@ They can see:
 
 And as the ones holding the data, they can always lose it, withhold
 it, change what isn't sealed (sizes, times, permission bits, the tree's
-shape), or hand back an older version of a chunk that was really written
-once (sealing proves where data came from, not that it is the latest).
-A malicious server could also show a user a directory it made up
-itself, or answer a lookup with the wrong inode (listings are checked;
-single lookups aren't). The fingerprints in 7.3 are what stop it reading
-what users share with each other.
+shape), or hand back an older version of something that was really
+written once (sealing proves where data came from, not that it is the
+latest). In particular:
+
+  - a chunk withheld reads as zeros, like a hole, and a size changed
+    makes a file shorter or longer;
+  - a mount refuses a directory's key older than one it has already seen
+    while it runs, but a newly started one can't tell: a server
+    colluding with someone revoked could hand it the old one, and have
+    what it then writes sealed under a key they had;
+  - a server could show a user a share it made up, from a user it made
+    up -- which stays read-only (7.3). The pinned keys are what stop it
+    reading what users share with each other, so check fingerprints.
+
+And anyone with a key -- read-only or not -- can write a directory's
+sealed list of who it is shared with. Read-only is the servers' rule,
+not the keys': someone with a read-only grant and the raw store could
+get a key sealed to an account of theirs at the next revocation.
 
 What it costs:
 
@@ -397,8 +451,10 @@ What it costs:
     files the mount hasn't touched cost more; a smaller --chunk-size,
     chosen when the filesystem is created, helps.
   - Each chunk is stored 44 bytes larger.
-  - A revocation scans every grant in the filesystem. Fine for
-    hundreds; slow for very many.
+  - A revocation, a grant, and a move to another directory each scan
+    every grant in the filesystem. Fine for hundreds; slow for very many.
+  - A move to another directory gives what moved a new key, and
+    everything under it a new key the next time it is written.
 
 local-fs (in utils) runs a whole installation on one machine, for
 trying all this out.
@@ -447,11 +503,26 @@ as seeds.
       Either they enrolled again or the server is lying. Check their
       fingerprint with them before `raft5fs-share forget-key <user>`.
 
+  "Permission denied" writing under something shared with you, and
+  "... whose key isn't pinned here" from raft5fs-share
+      Whoever shared it isn't trusted yet (7.3): check their fingerprint
+      with them, then `raft5fs-share trust <user> <fingerprint>`.
+
+  "the server's list of who it is granted to doesn't match the one
+  sealed under its key"
+      The server says the directory is shared with someone its key
+      holders never shared it with. Nothing was sealed to them. If the
+      name is no one you know, revoke it; and look into the server.
+
+  "refusing to log in without TLS" / "only https:// addresses"
+      Give --ca and https:// addresses (or --insecure-plaintext, for a
+      throwaway setup).
+
   "... can't reach" (revoke)
       Revoking a grant of a directory takes a grant of the one above it;
       ask someone who has one, or revoke at the volume.
 
-  "this store holds a filesystem made by an older, unencrypted raft5fs"
+  "this store holds a filesystem made by an older raft5fs"
       There is no migrating it; start from an empty store.
 
   "cannot log in to the store as raft5fs" (filesystem server)

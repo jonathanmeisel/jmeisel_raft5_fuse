@@ -27,11 +27,11 @@ use raft5fs_proto::pb::{
     AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
     HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
-    ListGrantsRequest, LoginRequest, LoginResponse, NameRequest, NoArgs, PreloginRequest,
-    PreloginResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest,
-    ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest,
-    RotateRequest, Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest,
-    WriteChunksResponse,
+    ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest, NoArgs,
+    PreloginRequest, PreloginResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse,
+    ReadChunksRequest, ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest,
+    ResealNamesRequest, RotateRequest, Session, SetAttrRequest, SnapshotListResponse,
+    WriteChunksRequest, WriteChunksResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -276,7 +276,7 @@ impl Fs for FsService {
         ))
     }
 
-    async fn lookup(&self, r: Request<NameRequest>) -> Result<Response<AttrResponse>, Status> {
+    async fn lookup(&self, r: Request<NameRequest>) -> Result<Response<LookupResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let found = self
             .core
@@ -440,7 +440,17 @@ impl Fs for FsService {
     async fn grant(&self, r: Request<GrantRequest>) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let granted = match r.grant {
-            Some(grant) => self.core.grant(&caller, &r.username, &grant.into()).await,
+            Some(grant) => {
+                self.core
+                    .grant(
+                        &caller,
+                        &r.username,
+                        &grant.into(),
+                        &r.sealed_grantees,
+                        r.expected_grantees_seq,
+                    )
+                    .await
+            }
             None => Err(FsError::new(libc::EINVAL, "a grant request needs a grant")),
         };
         Ok(Response::new(granted.into()))
@@ -458,7 +468,14 @@ impl Fs for FsService {
         };
         let made = self
             .core
-            .create_volume(&caller, &new, r.perm as u16, &r.sealed_key, &r.sealed_label)
+            .create_volume(
+                &caller,
+                &new,
+                r.perm as u16,
+                &r.sealed_key,
+                &r.sealed_label,
+                &r.sealed_grantees,
+            )
             .await;
         Ok(Response::new(made.into()))
     }

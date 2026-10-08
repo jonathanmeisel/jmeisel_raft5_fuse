@@ -35,7 +35,9 @@ fn connect(h: &support::Harness, user: &str) -> Remote {
 }
 
 fn vault(h: &support::Harness, user: &str) -> Vault {
-    Vault::new(Arc::new(connect(h, user))).unwrap()
+    Vault::new(Arc::new(connect(h, user)))
+        .unwrap()
+        .with_known_keys(h.known_keys())
 }
 
 fn ino(path: &Path) -> u64 {

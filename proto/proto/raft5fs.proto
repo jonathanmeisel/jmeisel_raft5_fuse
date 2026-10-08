@@ -50,7 +50,9 @@ service Fs {
   rpc ChangePassword(ChangePasswordRequest) returns (EmptyResponse);
 
   rpc GetAttr(InodeRequest) returns (AttrResponse);
-  rpc Lookup(NameRequest) returns (AttrResponse);
+  // The entry's attributes, with its sealed name, for the client to check
+  // the name really names that inode.
+  rpc Lookup(NameRequest) returns (LookupResponse);
   // Whether the caller may access the inode as `mask` asks: any grant
   // over it reads, a writable one writes.
   rpc Access(AccessRequest) returns (EmptyResponse);
@@ -313,6 +315,20 @@ message AttrResponse {
   }
 }
 
+message LookedUp {
+  Attr attr = 1;
+  // As the directory listing has it: sealed under the parent's key, bound
+  // to the tag and the inode.
+  bytes sealed_name = 2;
+}
+
+message LookupResponse {
+  oneof result {
+    LookedUp entry = 1;
+    Error error = 2;
+  }
+}
+
 // Success unless `error` is set.
 message EmptyResponse {
   Error error = 1;
@@ -420,6 +436,12 @@ message PublicKeyResponse {
 message GrantRequest {
   string username = 1;
   GrantInfo grant = 2;
+  // The node's grantees with this one added, sealed under its current key.
+  bytes sealed_grantees = 3;
+  // The seq of the list this one was made from (GrantedNode's): refused
+  // if it changed meanwhile, so no grant made at the same time is lost
+  // from it.
+  uint64 expected_grantees_seq = 4;
 }
 
 message CreateVolumeRequest {
@@ -431,6 +453,8 @@ message CreateVolumeRequest {
   // The creator's grant: key version 1, sealed to them.
   bytes sealed_key = 4;
   bytes sealed_label = 5;
+  // Its grantees, the creator alone, sealed under key version 1.
+  bytes sealed_grantees = 6;
 }
 
 message ReadChunksRequest {
@@ -510,6 +534,11 @@ message GrantedNode {
   // From the directory asked about down to this node, both included.
   repeated uint64 path = 2;
   repeated Grantee grantees = 3;
+  // Who its key holders say it is granted to, sealed under its key.
+  bytes sealed_grantees = 4;
+  // The store's sequence number for that list: what a grant changing it
+  // says it started from.
+  uint64 grantees_seq = 5;
 }
 
 message GrantedNodes {
@@ -534,6 +563,9 @@ message Rotation {
   uint32 expected_version = 2;
   bytes node_keys = 3;
   repeated ResealedGrant grants = 4;
+  // Its grantees as the rotation leaves them, sealed under the new key;
+  // empty if it leaves none.
+  bytes sealed_grantees = 5;
 }
 
 message RotateRequest {

@@ -32,13 +32,18 @@ histories before this is run: older ones can't read a pruned node's keys.
                        be given more than once.
   --dry-run            count what would be done, and change nothing.
   --ca <PEM>           reach the servers over TLS, trusting certificates
-                       that chain to this (and nothing else).
+                       that chain to this (and nothing else). Required,
+                       unless --insecure-plaintext.
+  --insecure-plaintext talk to http:// servers without TLS. Only for
+                       throwaway setups.
   --tls-server-name <NAME>
                        check the servers' certificates against this name
                        instead of the host in each address.
   --known-keys <PATH>  where pinned keys are kept (as for raft5fs-share):
-                       giving a stale child a new key re-seals any grant
-                       of it, which only goes to pinned keys.
+                       grants from users not pinned there are skipped,
+                       and giving a stale child a new key re-seals its
+                       grants only to the keys its key holders sealed
+                       them to.
 
 The password is asked for on the terminal, or read from RAFT5FS_PASSWORD.";
 
@@ -80,6 +85,7 @@ fn main() {
     let mut known_keys_file = None;
     let mut paths = Vec::new();
     let mut dry_run = false;
+    let mut plaintext = false;
     let mut servers = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -94,6 +100,7 @@ fn main() {
             "--known-keys" => known_keys_file = Some(PathBuf::from(value("--known-keys"))),
             "--path" => paths.push(value("--path")),
             "--dry-run" => dry_run = true,
+            "--insecure-plaintext" => plaintext = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -110,6 +117,9 @@ fn main() {
     if tls.is_none() && server_name.is_some() {
         usage("--tls-server-name needs --ca");
     }
+    if tls.is_none() && !plaintext {
+        usage("--ca is required (or --insecure-plaintext, for a throwaway setup)");
+    }
     let known_keys_file = known_keys_file.unwrap_or_else(cli::default_known_keys);
     let known_keys = KnownKeys::load(known_keys_file.clone()).unwrap_or_else(|e| {
         fail(format!(
@@ -121,12 +131,10 @@ fn main() {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let password = cli::password_from("RAFT5FS_PASSWORD", &format!("password for {username}: "))
         .unwrap_or_else(|e| fail(format!("cannot read a password: {e}")));
+    let mut credentials = Credentials::new(username, password);
+    credentials.allow_plaintext = plaintext;
     let remote = runtime
-        .block_on(Remote::connect(
-            &servers,
-            Credentials::new(username, password),
-            tls,
-        ))
+        .block_on(Remote::connect(&servers, credentials, tls))
         .unwrap_or_else(|e| fail(format!("cannot log in: {e}")));
     let vault = Vault::new(Arc::new(remote))
         .unwrap_or_else(|e| fail(e))

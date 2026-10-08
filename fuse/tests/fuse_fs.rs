@@ -1144,7 +1144,7 @@ fn a_mount_fails_over_when_its_server_goes_away() {
     // The mount starts on the first server. Take it away, and make sure
     // it is really gone rather than still answering an open connection.
     let server = h.servers.remove(0);
-    let gone = server.address.trim_start_matches("http://").to_string();
+    let gone = server.address.trim_start_matches("https://").to_string();
     drop(server);
     assert!(
         std::net::TcpStream::connect(&gone).is_err(),

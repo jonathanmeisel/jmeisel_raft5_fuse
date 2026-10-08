@@ -209,6 +209,36 @@ impl pb::AttrResponse {
     }
 }
 
+impl From<Result<(Attr, Vec<u8>), FsError>> for pb::LookupResponse {
+    fn from(r: Result<(Attr, Vec<u8>), FsError>) -> Self {
+        use pb::lookup_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok((attr, sealed_name)) => R::Entry(pb::LookedUp {
+                    attr: Some(attr.into()),
+                    sealed_name,
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::LookupResponse {
+    /// The entry's attributes and its sealed name.
+    pub fn into_result(self) -> Result<(Attr, Vec<u8>), FsError> {
+        use pb::lookup_response::Result as R;
+        match self.result {
+            Some(R::Entry(pb::LookedUp {
+                attr: Some(attr),
+                sealed_name,
+            })) => Ok((attr.into(), sealed_name)),
+            Some(R::Error(e)) => Err(e.into()),
+            _ => Err(malformed("a looked-up entry")),
+        }
+    }
+}
+
 impl From<Result<(), FsError>> for pb::EmptyResponse {
     fn from(r: Result<(), FsError>) -> Self {
         Self {
@@ -606,6 +636,8 @@ impl From<Result<Vec<GrantedNode>, FsError>> for pb::GrantsUnderResponse {
                                     writable: g.writable,
                                 })
                                 .collect(),
+                            sealed_grantees: n.sealed_grantees,
+                            grantees_seq: n.grantees_seq,
                         })
                         .collect(),
                 }),
@@ -634,6 +666,8 @@ impl pb::GrantsUnderResponse {
                             writable: g.writable,
                         })
                         .collect(),
+                    sealed_grantees: n.sealed_grantees,
+                    grantees_seq: n.grantees_seq,
                 })
                 .collect()),
             Some(R::Error(e)) => Err(e.into()),
@@ -656,6 +690,7 @@ impl From<Rotation> for pb::Rotation {
                     sealed_key,
                 })
                 .collect(),
+            sealed_grantees: r.sealed_grantees,
         }
     }
 }
@@ -671,6 +706,7 @@ impl From<pb::Rotation> for Rotation {
                 .into_iter()
                 .map(|g| (g.username, g.sealed_key))
                 .collect(),
+            sealed_grantees: r.sealed_grantees,
         }
     }
 }

@@ -17,11 +17,14 @@ use raft5fs_proto::types::{
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
-use crate::grants::{self, Reads, key_versions, node_keys_key, reservation_key};
+use crate::grants::{
+    self, Reads, check_grantees_version, grantees_key, key_versions, node_keys_key, reservation_key,
+};
 use crate::layout::{
-    CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, TOMBSTONE_PREFIX, attr_key,
-    chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key, dirent_prefix,
-    dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key, validate_chunk_size,
+    CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, STORE_FORMAT,
+    TOMBSTONE_PREFIX, attr_key, chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key,
+    dirent_prefix, dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key,
+    validate_chunk_size,
 };
 use crate::snapshots;
 use crate::view::View;
@@ -204,21 +207,21 @@ pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, 
 }
 
 /// Checks the store in `client` holds a filesystem made by this raft5fs --
-/// every one encrypted -- or is new, and then records that it does. One
-/// made by an older raft5fs, which could make unencrypted ones, is
-/// refused rather than opened: carrying on would mix the two.
+/// in its format, `STORE_FORMAT` -- or is new, and then records that it
+/// does. One made by an older raft5fs is refused rather than opened:
+/// carrying on would mix the two.
 pub async fn check_store(client: &Client) -> Result<(), String> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
         let refused = || {
             Ok(Err(
-                "this store holds a filesystem made by an older, unencrypted raft5fs, \
-                 which this one can't open"
+                "this store holds a filesystem made by an older raft5fs, in a format \
+                 this one can't open"
                     .to_string(),
             ))
         };
         if let Some(bytes) = txn.read(ENCRYPTED_KEY).await?.value {
-            return if bytes.as_slice() == [1] {
+            return if bytes.as_slice() == [STORE_FORMAT] {
                 Ok(Ok(()))
             } else {
                 refused()
@@ -228,7 +231,7 @@ pub async fn check_store(client: &Client) -> Result<(), String> {
         if txn.read(&attr_key(ROOT_INO)).await?.value.is_some() {
             return refused();
         }
-        txn.write(ENCRYPTED_KEY, Some(&[1])).await?;
+        txn.write(ENCRYPTED_KEY, Some(&[STORE_FORMAT])).await?;
         txn.commit().await?;
         Ok(Ok(()))
     })
@@ -486,21 +489,27 @@ impl FsCore {
             .ok_or_else(enoent)
     }
 
+    /// The entry `name` (a tag) in `parent`: its attributes, and its name
+    /// sealed as the listing has it, for the client to check that the
+    /// name really names that inode.
     pub async fn lookup(
         &self,
         caller: &Caller,
         parent: u64,
         name: &OsStr,
         at: Option<&[u8]>,
-    ) -> Result<Attr, FsError> {
+    ) -> Result<(Attr, Vec<u8>), FsError> {
         let view = self.view(at).await?;
         self.guard_now(&view, caller, parent, false).await?;
         let dir = self.resolve(&view, parent).await?;
         if dir.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
-        let child = self.child_ino(&view, parent, name).await?;
-        Ok(self.resolve(&view, child).await?.attr)
+        let Some(bytes) = view.read(&dirent_key(parent, name)).await?.value else {
+            return Err(enoent());
+        };
+        let attr = self.resolve(&view, dirent_ino(&bytes)).await?.attr;
+        Ok((attr, dirent_sealed_name(&bytes).to_vec()))
     }
 
     /// access(2), and what an open checks: whether `caller` holds every
@@ -1101,11 +1110,19 @@ impl FsCore {
     /// Grants directory `grant.ino` to `grantee`, replacing any grant of
     /// it they had. `caller` needs a writable grant over it, and the grant
     /// must hold its current key version.
+    ///
+    /// `sealed_grantees` is the node's grantee list with this grant in it,
+    /// sealed under its current key version, which replaces the one kept
+    /// -- if that is still at `expected_grantees_seq`, the seq the list it
+    /// was made from was at (`EAGAIN` if not: a grant made meanwhile would
+    /// be lost from it).
     pub async fn grant(
         &self,
         caller: &Caller,
         grantee: &str,
         grant: &Grant,
+        sealed_grantees: &[u8],
+        expected_grantees_seq: u64,
     ) -> Result<(), FsError> {
         grants::check_username(grantee)?;
         let ino = grant.ino;
@@ -1134,7 +1151,15 @@ impl FsCore {
                     format!("a grant must hold the current key version, {version}"),
                 )));
             }
+            decide!(check_grantees_version(ino, sealed_grantees, version));
+            if txn.read(&grantees_key(ino)).await?.seq != expected_grantees_seq {
+                return Ok(Err(FsError::new(
+                    libc::EAGAIN,
+                    format!("inode {ino}'s grantee list changed meanwhile"),
+                )));
+            }
             grants::put_grant(&txn, grantee, grant).await?;
+            txn.write(&grantees_key(ino), Some(sealed_grantees)).await?;
             txn.commit().await?;
             Ok(Ok(()))
         })
@@ -1152,8 +1177,10 @@ impl FsCore {
         perm: u16,
         sealed_key: &[u8],
         sealed_label: &[u8],
+        sealed_grantees: &[u8],
     ) -> Result<Attr, FsError> {
         let user = caller.user.as_str();
+        check_grantees_version(new.ino, sealed_grantees, 1)?;
         let dirent = &dirent_key(ROOT_INO, OsStr::new(&new.ino.to_string()));
         let grant = &Grant {
             ino: new.ino,
@@ -1187,6 +1214,8 @@ impl FsCore {
             write_entry(&txn, &entry).await?;
             txn.write(dirent, Some(&dirent_value(new.ino, &[]))).await?;
             grants::put_grant(&txn, user, grant).await?;
+            txn.write(&grantees_key(new.ino), Some(sealed_grantees))
+                .await?;
             touch_dir(&txn, &mut root, now).await?;
             txn.commit().await?;
             Ok(Ok(entry.attr))
@@ -1259,6 +1288,7 @@ impl FsCore {
                 {
                     return changed(format!("inode {ino}'s grants aren't the ones re-sealed"));
                 }
+                let mut kept = 0;
                 for (user, mut grant) in existing {
                     let sealed = resealed[user.as_str()];
                     if sealed.is_empty() {
@@ -1267,7 +1297,16 @@ impl FsCore {
                         grant.key_version = new_version;
                         grant.sealed_key = sealed.to_vec();
                         grants::put_grant(&txn, &user, &grant).await?;
+                        kept += 1;
                     }
+                }
+                // Whoever is left, re-listed under the new key.
+                if kept > 0 {
+                    decide!(check_grantees_version(ino, &r.sealed_grantees, new_version));
+                    txn.write(&grantees_key(ino), Some(&r.sealed_grantees))
+                        .await?;
+                } else {
+                    txn.write(&grantees_key(ino), None).await?;
                 }
                 txn.write(&node_keys_key(ino), Some(&r.node_keys)).await?;
                 rotated.insert(ino, new_version);
@@ -1466,6 +1505,11 @@ impl FsCore {
                 }
             }
         }
+        if let Some(sealed) = self.client.read(&grantees_key(ino)).await?.value
+            && below(&sealed)
+        {
+            return Ok(Some("the grantee list".to_string()));
+        }
         let prefix = grants::grant_prefix(ino);
         let mut iter = self.client.key_iterator(&prefix);
         while let Some(key) = iter.next().await? {
@@ -1613,7 +1657,7 @@ fn operations_are_send(
     send(core.reseal_chunks(caller, 1, &[]));
     send(core.reseal_names(caller, 1, &[]));
     send(core.prune_keys(caller, 1, 1, &[]));
-    send(core.create_volume(caller, new, 0o755, &[], &[]));
+    send(core.create_volume(caller, new, 0o755, &[], &[], &[]));
     send(core.delete_volume(caller, 1));
     send(FsCore::connect(core.client.clone(), 4096));
 }
