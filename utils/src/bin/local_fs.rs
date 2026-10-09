@@ -39,8 +39,11 @@ use raft5_server::{ClientApiTls, PeerTls, ServerConfig, serve_config};
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts};
 use raft5fs_crypto::identity::fingerprint;
 use raft5fs_crypto::password::KdfParams;
+use raft5fs_fuse::cli;
 use raft5fs_fuse::filesystem::Raft5Fs;
+use raft5fs_fuse::pruner::PrunerConfig;
 use raft5fs_fuse::remote::{Credentials, Remote};
+use raft5fs_fuse::vault::KnownKeys;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use rcgen::{
@@ -669,17 +672,26 @@ fn mount(
         manifest.user.clone(),
         read_trimmed(&dir.join(USER_PASSWORD))?,
     );
-    let tls =
-        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(read(&dir.join(CA_CERT))?));
+    let ca_pem = read(&dir.join(CA_CERT))?;
+    let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&ca_pem));
+    // Pins and the prune queue where `raft5fs` keeps them for this
+    // filesystem, so its commands and this mount agree.
+    let fs_id = cli::ca_id(&ca_pem)?;
+    let known_keys = KnownKeys::load(cli::default_known_keys(&cli::config_dir(), &fs_id))?;
     let fs = Raft5Fs::new(
         vec![manifest.fs_url()],
         credentials,
         runtime.handle().clone(),
     )
-    .with_tls(tls);
+    .with_tls(tls)
+    .with_known_keys(known_keys)
+    .with_prune_queue(
+        cli::prune_queue_for(&manifest.user, &fs_id),
+        PrunerConfig::default(),
+    );
 
     let mut options = Config::default();
-    // As in raft5fs-fuse: the server checks every request against the
+    // As in `raft5fs mount`: the server checks every request against the
     // mount's one identity, so no `default_permissions`, and no
     // `allow_other` to hand that identity to other local users.
     options.mount_options = vec![MountOption::FSName("raft5fs".to_string())];
@@ -811,56 +823,37 @@ fn print_connection_info(dir: &Path, manifest: &Manifest, mountpoint: &Path) {
     println!("your root lists what is shared with you; mkdir there makes a new");
     println!("top-level directory, shared with no one.");
     println!();
-    println!("more users (each gets a code to enrol with, choosing their password):");
+    let ca = path(CA_CERT);
+    let fs_url = manifest.fs_url();
+    println!("more users (each gets an invitation to enrol with, choosing their password):");
     println!(
         "  export RAFT5FS_STORE_PASSWORD=$(cat {})",
         path(SERVICE_PASSWORD)
     );
+    println!("  raft5fs-server user add <NAME> --invite-server {fs_url} --invite-ca {ca} \\");
     println!(
-        "  raft5fs-server user add <NAME> --store-user {SERVICE_USER} --store-ca {} \\",
-        path(CA_CERT)
-    );
-    println!(
-        "    --store-cert {} --store-key {} {seeds}",
+        "    --store-user {SERVICE_USER} --store-ca {ca} --store-cert {} --store-key {} {seeds}",
         path(NODE_CERT),
         path(NODE_KEY)
     );
-    println!(
-        "  raft5fs-share --user <NAME> --ca {} enrol <CODE> {}",
-        path(CA_CERT),
-        manifest.fs_url()
-    );
+    println!("  (they run: raft5fs enrol '<INVITATION>')");
     println!();
-    println!("sharing (password in {}):", path(USER_PASSWORD));
+    let me = format!(
+        "raft5fs --user {} --ca {ca} --server {fs_url}",
+        manifest.user
+    );
     println!(
-        "  raft5fs-share --user {} --ca {} grant <PATH> <USER> [--ro] \\",
+        "as {} (password in {}):",
         manifest.user,
-        path(CA_CERT),
+        path(USER_PASSWORD)
     );
-    println!(
-        "    --fingerprint '<USER'S KEY FINGERPRINT, FROM THEIR ENROLMENT>' {}",
-        manifest.fs_url()
-    );
-    println!(
-        "  raft5fs-share --user {} --ca {} trust <USER> '<FINGERPRINT>' {}",
-        manifest.user,
-        path(CA_CERT),
-        manifest.fs_url()
-    );
-    println!(
-        "  raft5fs-share --user {} --ca {} revoke <PATH> <USER> {}",
-        manifest.user,
-        path(CA_CERT),
-        manifest.fs_url()
-    );
-    println!();
-    println!("another mount (password in {}):", path(USER_PASSWORD));
-    println!(
-        "  raft5fs-fuse --user {} --ca {} <MOUNTPOINT> {}",
-        manifest.user,
-        path(CA_CERT),
-        manifest.fs_url()
-    );
+    println!("  {me} whoami");
+    println!("  {me} grant <PATH> <USER> [--ro] --fingerprint '<THEIR FINGERPRINT>'");
+    println!("  {me} pending");
+    println!("  {me} trust <USER> <THEIR FINGERPRINT>");
+    println!("  {me} revoke <PATH> <USER>");
+    println!("  {me} prune --status");
+    println!("  {me} mount <MOUNTPOINT>");
     println!();
     println!("Ctrl-C to unmount and stop.");
 }

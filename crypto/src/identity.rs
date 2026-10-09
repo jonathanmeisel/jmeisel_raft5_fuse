@@ -168,8 +168,68 @@ fn seal_to(public_key: &[u8; PUBLIC_KEY_LEN], plain: &[u8]) -> Vec<u8> {
         .expect("sealing in-memory data can't fail")
 }
 
+/// How many words `fingerprint_words` reads a key out as.
+pub const FINGERPRINT_WORDS: usize = 12;
+
+/// A public key's fingerprint as words, for people to read to each other
+/// out of band: the first 132 bits of its SHA-256, 11 bits a word, from
+/// the BIP-39 English list. A little more than the hex form's 128 bits,
+/// and much easier to compare over the phone.
+pub fn fingerprint_words(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
+    let digest = Sha256::digest(public_key);
+    (0..FINGERPRINT_WORDS)
+        .map(|i| crate::wordlist::WORDS[bits_at(&digest, i * 11, 11) as usize])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `n` bits of `bytes` from bit `start` on, most significant first.
+fn bits_at(bytes: &[u8], start: usize, n: usize) -> u32 {
+    (start..start + n).fold(0, |acc, bit| {
+        (acc << 1) | u32::from((bytes[bit / 8] >> (7 - bit % 8)) & 1)
+    })
+}
+
+/// Whether `written` -- a fingerprint as someone read it out, in either
+/// form: `fingerprint`'s 32 hex digits, or `fingerprint_words`' 12 words
+/// -- is `public_key`'s. Case, spaces and hyphens don't matter. Anything
+/// that is neither form is an error rather than a mismatch, so a typo
+/// isn't mistaken for a different key.
+pub fn fingerprint_matches(
+    public_key: &[u8; PUBLIC_KEY_LEN],
+    written: &str,
+) -> Result<bool, String> {
+    let lower = written.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || c == '-' || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let digest = Sha256::digest(public_key);
+    let hex: String = words.concat();
+    if hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        let theirs = (0..16)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        return Ok(theirs == digest[..16]);
+    }
+    if words.len() != FINGERPRINT_WORDS {
+        return Err(format!(
+            "a fingerprint is {FINGERPRINT_WORDS} words, or 32 hex digits"
+        ));
+    }
+    let mut matches = true;
+    for (i, word) in words.iter().enumerate() {
+        let Some(index) = crate::wordlist::WORDS.iter().position(|w| w == word) else {
+            return Err(format!("{word:?} isn't a fingerprint word"));
+        };
+        matches &= index as u32 == bits_at(&digest, i * 11, 11);
+    }
+    Ok(matches)
+}
+
 /// A short, readable digest of a public key, for people to compare out of
-/// band: `ab12 cd34 ...`, 16 bytes of SHA-256 in groups of two.
+/// band: `ab12 cd34 ...`, 16 bytes of SHA-256 in groups of two. (See
+/// `fingerprint_words` for the friendlier form.)
 pub fn fingerprint(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
     let digest = Sha256::digest(public_key);
     digest[..16]
@@ -249,6 +309,44 @@ mod tests {
         assert_eq!(alice.open_label(7, &label).unwrap(), b"photos");
         assert!(alice.open_label(8, &label).is_err());
         assert!(Identity::generate().open_label(7, &label).is_err());
+    }
+
+    #[test]
+    fn the_word_list_is_the_bip39_one() {
+        use crate::wordlist::WORDS;
+        assert_eq!((WORDS[0], WORDS[2047]), ("abandon", "zoo"));
+        assert!(WORDS.windows(2).all(|w| w[0] < w[1]), "sorted, no repeats");
+        let mut prefixes: Vec<&str> = WORDS.iter().map(|w| &w[..w.len().min(4)]).collect();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), 2048, "no two share four letters");
+    }
+
+    #[test]
+    fn a_fingerprint_matches_in_either_form_and_only_its_key() {
+        let a = Identity::generate().public_key();
+        let b = Identity::generate().public_key();
+        let words = fingerprint_words(&a);
+        assert_eq!(words.split(' ').count(), FINGERPRINT_WORDS);
+        assert_eq!(fingerprint_words(&a), words, "stable");
+        assert!(fingerprint_matches(&a, &words).unwrap());
+        assert!(fingerprint_matches(&a, &words.to_uppercase().replace(' ', "-")).unwrap());
+        assert!(fingerprint_matches(&a, &fingerprint(&a)).unwrap());
+        assert!(fingerprint_matches(&a, &fingerprint(&a).replace(' ', "")).unwrap());
+        assert!(!fingerprint_matches(&b, &words).unwrap());
+        assert!(!fingerprint_matches(&b, &fingerprint(&a)).unwrap());
+        // One word swapped for another real one: a mismatch, not a match.
+        let mut one_off: Vec<&str> = words.split(' ').collect();
+        one_off[11] = if one_off[11] == "zoo" {
+            "abandon"
+        } else {
+            "zoo"
+        };
+        assert!(!fingerprint_matches(&a, &one_off.join(" ")).unwrap());
+        // Neither form: an error, so a typo isn't read as another key.
+        assert!(fingerprint_matches(&a, "not a fingerprint").is_err());
+        let typo = words.replacen(one_off[0], "zzzz", 1);
+        assert!(fingerprint_matches(&a, &typo).is_err());
+        assert!(fingerprint_matches(&a, &fingerprint(&a)[..20]).is_err());
     }
 
     #[test]

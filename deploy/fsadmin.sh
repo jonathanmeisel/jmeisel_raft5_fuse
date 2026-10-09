@@ -2,7 +2,7 @@
 # The filesystem's administration, run on a node (the first, unless the
 # first argument names one) -- see templates/raft5fs-admin:
 #
-#   ./fsadmin.sh [<node>] user add <NAME>       prints a one-time code
+#   ./fsadmin.sh [<node>] user add <NAME>       prints an invitation to enrol with
 #   ./fsadmin.sh [<node>] user del <NAME>
 #   ./fsadmin.sh [<node>] user list
 #   ./fsadmin.sh [<node>] snapshot create [<NAME>]

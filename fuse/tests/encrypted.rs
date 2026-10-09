@@ -1626,3 +1626,142 @@ fn a_name_that_could_break_a_line_is_no_account() {
     ));
     assert_fs_errno(granted, libc::EINVAL);
 }
+
+// ------------------------------------------------- shares and the pruner
+
+/// A prune queue of its own, in a fresh temporary directory.
+fn temp_queue(name: &str) -> raft5fs_fuse::prune_queue::PruneQueue {
+    let dir = std::env::temp_dir().join(format!(
+        "raft5fs-test-queue-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    raft5fs_fuse::prune_queue::PruneQueue::at(dir)
+}
+
+#[test]
+fn shares_say_whose_they_are_and_whether_trusted() {
+    use raft5fs_fuse::vault::ShareTrust;
+    let h = support::setup_root();
+    let v = shared_tree(&h);
+    h.add_user("alice");
+    let mallory_key = h.enrol("mallory");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("from-tester")))
+        .unwrap();
+    let hers = vault(&h, "mallory");
+    let fake = h
+        .runtime
+        .block_on(hers.create_volume(OsStr::new("m"), 0o755))
+        .unwrap()
+        .ino;
+    h.runtime
+        .block_on(hers.grant(fake, "alice", true, OsStr::new("from-mallory")))
+        .unwrap();
+
+    let alices = vault(&h, "alice");
+    let shares = h.runtime.block_on(alices.shares()).unwrap();
+    let by_label = |label: &str| {
+        shares
+            .iter()
+            .find(|s| s.label == label)
+            .unwrap_or_else(|| panic!("no share {label}"))
+    };
+    let tester = by_label("from-tester");
+    assert_eq!(tester.sender, support::TESTER);
+    assert!(matches!(tester.trust, ShareTrust::Trusted));
+    let mallory = by_label("from-mallory");
+    assert_eq!((mallory.sender.as_str(), mallory.ino), ("mallory", fake));
+    match &mallory.trust {
+        ShareTrust::Untrusted { key } => assert_eq!(*key, mallory_key),
+        other => panic!("{other:?}"),
+    }
+    // Trusting her, by the words she would read out, changes that.
+    let words = raft5fs_crypto::identity::fingerprint_words(&mallory_key);
+    h.runtime.block_on(alices.trust("mallory", &words)).unwrap();
+    let shares = h.runtime.block_on(alices.shares()).unwrap();
+    assert!(
+        shares
+            .iter()
+            .all(|s| matches!(s.trust, ShareTrust::Trusted))
+    );
+}
+
+#[test]
+fn a_mount_prunes_what_is_queued_in_the_background() {
+    let h = support::setup_root();
+    let (v, _) = revoked_tree(&h);
+    let f = v.join("shared/sub/f");
+    let queue = temp_queue("background");
+    queue.add(ino(&v), "v (revoked alice)").unwrap();
+    let dir = queue.dir().to_path_buf();
+    let _mount = h.pruning_mount(queue);
+    // Writes through the first mount go on meanwhile.
+    let writer = {
+        let f = f.clone();
+        std::thread::spawn(move || {
+            for i in 0..40u32 {
+                fs::write(&f, format!("write {i}")).unwrap();
+            }
+        })
+    };
+    let queue = raft5fs_fuse::prune_queue::PruneQueue::at(dir);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !queue.entries().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still queued: {:?}",
+            queue.statuses()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    writer.join().unwrap();
+    assert_eq!(fs::read(&f).unwrap(), b"write 39");
+    assert_fully_pruned(&h, &v);
+    let _ = fs::remove_dir_all(queue.dir());
+}
+
+#[test]
+fn a_prune_that_skips_anything_stays_queued() {
+    let h = support::setup_root();
+    let v = shared_tree(&h);
+    h.add_user("alice");
+    h.add_user("bob");
+    let mine = vault(&h, support::TESTER);
+    for user in ["alice", "bob"] {
+        h.runtime
+            .block_on(mine.grant(ino(&v), user, false, OsStr::new("v")))
+            .unwrap();
+    }
+    h.runtime.block_on(mine.revoke(ino(&v), "bob")).unwrap();
+
+    // Alice can't prune what she may only read: it stays queued, saying
+    // why, for someone who can.
+    let queue = temp_queue("skips");
+    queue.add(ino(&v), "v").unwrap();
+    let hers = vault(&h, "alice");
+    let stats = h.runtime.block_on(raft5fs_fuse::pruner::prune_entry(
+        &hers,
+        &queue,
+        ino(&v),
+        std::time::Duration::ZERO,
+    ));
+    assert!(!stats.skipped.is_empty());
+    assert_eq!(queue.entries().unwrap().len(), 1);
+    let status = &queue.statuses().unwrap()[&ino(&v)];
+    assert!(status.starts_with("incomplete"), "{status}");
+
+    // The tester can, which empties it.
+    let stats = h.runtime.block_on(raft5fs_fuse::pruner::prune_entry(
+        &mine,
+        &queue,
+        ino(&v),
+        std::time::Duration::ZERO,
+    ));
+    assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
+    assert!(queue.entries().unwrap().is_empty());
+    assert_fully_pruned(&h, &v);
+    let _ = fs::remove_dir_all(queue.dir());
+}

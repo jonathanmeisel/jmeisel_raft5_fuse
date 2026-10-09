@@ -26,6 +26,8 @@ use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, SetAttr, SetTime, Write
 use tokio::runtime::Handle;
 use tonic::transport::ClientTlsConfig;
 
+use crate::prune_queue::PruneQueue;
+use crate::pruner::{self, PrunerConfig};
 use crate::remote::{Credentials, Remote};
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
@@ -90,6 +92,10 @@ pub struct Raft5Fs {
     /// Where public keys are pinned, for the vault `init` opens; in memory
     /// only if not given.
     known_keys: Option<KnownKeys>,
+    /// The prune queue to work through in the background, and how, if
+    /// given; and the task doing it, once `init` has started it.
+    prune_queue: Option<(PruneQueue, PrunerConfig)>,
+    pruner: Option<tokio::task::JoinHandle<()>>,
     /// Opened by `init`, before the kernel sends any other request.
     vault: OnceLock<Arc<Vault>>,
     /// Who everything seems to belong to: the local user who mounted it.
@@ -116,6 +122,8 @@ impl Raft5Fs {
             tls: None,
             cache_bytes: DEFAULT_CACHE_BYTES,
             known_keys: None,
+            prune_queue: None,
+            pruner: None,
             vault: OnceLock::new(),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -136,6 +144,13 @@ impl Raft5Fs {
     /// this mount trusts enough to write under -- rather than in memory.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.known_keys = Some(known);
+        self
+    }
+
+    /// Works through `queue` in the background while mounted, as `config`
+    /// paces it (see `pruner`).
+    pub fn with_prune_queue(mut self, queue: PruneQueue, config: PrunerConfig) -> Self {
+        self.prune_queue = Some((queue, config));
         self
     }
 
@@ -459,9 +474,19 @@ impl Filesystem for Raft5Fs {
                 eprintln!("cannot open the account's keys: {e}");
                 std::io::Error::from_raw_os_error(libc::EACCES)
             })?
-            .with_cache_size(self.cache_bytes);
+            .with_cache_size(self.cache_bytes)
+            .with_untrusted_warnings();
         if let Some(known) = self.known_keys.take() {
             vault = vault.with_known_keys(known);
+        }
+        if let Some((queue, config)) = self.prune_queue.take() {
+            let pruning = Vault::new(Arc::clone(vault.remote()))
+                .map_err(|e| {
+                    eprintln!("cannot open the account's keys: {e}");
+                    std::io::Error::from_raw_os_error(libc::EACCES)
+                })?
+                .with_known_keys(vault.known_keys().duplicate());
+            self.pruner = Some(pruner::spawn(&self.rt, pruning, queue, config));
         }
         let _ = self.vault.set(Arc::new(vault));
         Ok(())
@@ -880,6 +905,10 @@ impl Filesystem for Raft5Fs {
 
     /// Unmount: nothing after this can store what is still buffered.
     fn destroy(&mut self) {
+        // Whatever it was pruning stays queued, for next time.
+        if let Some(pruner) = self.pruner.take() {
+            pruner.abort();
+        }
         if self.vault.get().is_none() {
             return;
         }

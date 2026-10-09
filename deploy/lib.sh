@@ -45,6 +45,15 @@ store_seeds() {
     nodes | awk '{printf "%shttps://%s:27051", (NR > 1 ? " " : ""), $3}'
 }
 
+# The invite options for `raft5fs-server user add`: every node's public
+# filesystem address. (The CA goes with them, from /etc/raft5fs.)
+invite_servers() {
+    local node
+    for node in $(node_names); do
+        printf -- '--invite-server https://%s:27060 ' "$(public_address "$node")"
+    done
+}
+
 # The address users dial for node $1.
 public_address() {
     local name

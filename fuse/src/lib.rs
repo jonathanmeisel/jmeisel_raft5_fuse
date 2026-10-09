@@ -1,6 +1,9 @@
 mod chunk_cache;
 pub mod cli;
+pub mod commands;
 pub mod filesystem;
+pub mod prune_queue;
+pub mod pruner;
 pub mod remote;
 mod snapshot_tree;
 pub mod vault;

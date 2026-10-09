@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::time::Duration;
 
 use raft5fs_crypto::data::{open_name, seal_chunk, sealed_version};
 use raft5fs_proto::types::{ChunkWrite, DirItem, FsError, Kind, RESEAL_NAMES_BATCH, ResealedName};
@@ -100,6 +101,20 @@ impl Vault {
     /// that can't be pruned is skipped, with everything under it, and the
     /// walk goes on. With `dry_run`, only counts what it would do.
     pub async fn prune_tree(&self, top: u64, dry_run: bool) -> PruneStats {
+        self.prune_tree_paced(top, dry_run, Duration::ZERO, &mut |_| {})
+            .await
+    }
+
+    /// `prune_tree`, waiting `pace` after each node -- so that a prune in
+    /// the background leaves the store to whatever else is going on -- and
+    /// telling `progress` how far it has got after each.
+    pub async fn prune_tree_paced(
+        &self,
+        top: u64,
+        dry_run: bool,
+        pace: Duration,
+        progress: &mut (dyn FnMut(&PruneStats) + Send),
+    ) -> PruneStats {
         let mut stats = PruneStats::default();
         let mut queue = VecDeque::from([Visit {
             ino: top,
@@ -116,6 +131,10 @@ impl Vault {
                 // Removed while the walk was on its way to it.
                 Err(e) if e.errno == libc::ENOENT => {}
                 Err(e) => stats.skipped.push((ino, e)),
+            }
+            progress(&stats);
+            if !pace.is_zero() && !queue.is_empty() {
+                tokio::time::sleep(pace).await;
             }
         }
         stats

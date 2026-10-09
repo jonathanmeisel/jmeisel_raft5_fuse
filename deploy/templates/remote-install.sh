@@ -63,6 +63,7 @@ for f in node.pem node.key internal-ca.pem fs.pem fs.key token.key; do
     put "raft5fs/$f" "/etc/raft5fs/$f" 0640 root:raft5fs raft5fs-server
 done
 put raft5fs/store.env /etc/raft5fs/store.env 0600 root:root raft5fs-server
+put raft5fs/fs-ca.pem /etc/raft5fs/fs-ca.pem 0644 root:root raft5fs-admin
 
 if $bootstrap; then
     put bootstrap/admin.pw /etc/raft5/admin.pw 0640 root:raft5 raft5-server

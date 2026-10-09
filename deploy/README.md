@@ -146,14 +146,16 @@ The first filesystem server to start creates the filesystem, with
 ./fsadmin.sh user add alice
 ```
 
-alice enrols and mounts from her own machine, with `fs-ca.pem` and every
-server's address:
+This prints an invitation: one line holding alice's one-time code, every
+server's public address and `fs-ca.pem`. It is as secret as the code, so
+hand it to alice alone. On her own machine she runs:
 
 ```sh
-raft5fs-share --user alice --ca fs-ca.pem enrol <CODE> https://fs1.example.com:27060
-raft5fs-fuse --user alice --ca fs-ca.pem ~/raft5fs \
-  https://fs1.example.com:27060 https://fs2.example.com:27060 https://fs3.example.com:27060
+raft5fs enrol 'raft5fs-invite:1:...'
+mkdir -p ~/raft5fs && raft5fs mount ~/raft5fs
 ```
+
+`enrol` saves a profile, so no command needs the servers or the CA again.
 
 ## Day to day
 

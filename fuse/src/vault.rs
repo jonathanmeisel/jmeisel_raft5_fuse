@@ -80,7 +80,8 @@ use raft5fs_crypto::data::{
 };
 use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
 use raft5fs_crypto::identity::{
-    Identity, PUBLIC_KEY_LEN, fingerprint, grant_sender, seal_grant, seal_label,
+    Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, fingerprint_words, grant_sender,
+    seal_grant, seal_label,
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
@@ -116,6 +117,30 @@ pub struct Node {
     /// this account trusts (itself, or a key pinned for them): see
     /// `sealable`.
     untrusted: Option<Arc<Untrusted>>,
+}
+
+/// A grant made to this account, as `Vault::shares` lists it.
+#[derive(Debug)]
+pub struct Share {
+    /// What it shows up as in the root.
+    pub label: OsString,
+    pub ino: u64,
+    pub writable: bool,
+    /// Who it says made it.
+    pub sender: String,
+    pub trust: ShareTrust,
+}
+
+/// Whether a share's sender is trusted here.
+#[derive(Debug)]
+pub enum ShareTrust {
+    /// This account, or someone whose key is pinned here.
+    Trusted,
+    /// Someone else, whose key -- `key`, as the server has it -- isn't
+    /// pinned: read-only until it is (`Vault::trust`).
+    Untrusted { key: [u8; PUBLIC_KEY_LEN] },
+    /// It doesn't open.
+    Unreadable(FsError),
 }
 
 /// A grant's sender, as the server vouches for them.
@@ -157,7 +182,7 @@ impl Node {
                      with them, then: raft5fs-share trust {} <fingerprint>",
                     u.sender,
                     u.sender,
-                    fingerprint(&u.key),
+                    fingerprint_words(&u.key),
                     u.sender
                 ),
             )),
@@ -238,6 +263,15 @@ impl KnownKeys {
             keys: Mutex::new(keys),
             file: Some(file),
         })
+    }
+
+    /// Another handle on the same pins: what is pinned now, and the same
+    /// file, so pins either makes later reach the other through it.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            keys: Mutex::new(self.keys.lock().unwrap().clone()),
+            file: self.file.clone(),
+        }
     }
 
     /// The key pinned for `user`, if any -- looking in the file again if
@@ -355,7 +389,7 @@ fn append_pin(file: &std::path::Path, user: &str, key: &[u8]) -> std::io::Result
 
 /// Replaces `file` with `contents` all at once -- written beside it, then
 /// renamed over it -- readable by its owner only.
-fn replace_private(file: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn replace_private(file: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut tmp = file.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
@@ -428,6 +462,10 @@ pub struct Vault {
     seen: Mutex<HashMap<u64, u32>>,
     /// Public keys the server gave for grant senders, by name.
     senders: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
+    /// Whether to say so, once each, when a grant from someone untrusted
+    /// is opened (`with_untrusted_warnings`), and the ones said already.
+    warn_untrusted: bool,
+    warned: Mutex<HashSet<u64>>,
     roots: Mutex<Roots>,
     /// Decrypted chunks, each with the seq it was read or written at:
     /// shared with the vaults of the same mount's snapshots, each keeping
@@ -460,6 +498,8 @@ impl Vault {
             nodes: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
+            warn_untrusted: false,
+            warned: Mutex::new(HashSet::new()),
             roots: Mutex::new(Roots::default()),
             cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
             space: 0,
@@ -486,10 +526,20 @@ impl Vault {
             nodes: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
+            warn_untrusted: false,
+            warned: Mutex::new(HashSet::new()),
             roots: Mutex::new(Roots::default()),
             cache: Arc::clone(&self.cache),
             space,
         }
+    }
+
+    /// Says on stderr, once for each, when a grant from someone untrusted
+    /// is opened: what a mount does, as the one place it can say why
+    /// writes there are refused.
+    pub fn with_untrusted_warnings(mut self) -> Self {
+        self.warn_untrusted = true;
+        self
     }
 
     /// Pins public keys in `known` rather than in memory only.
@@ -908,6 +958,16 @@ impl Vault {
         // `Node::new` proves the key: whatever the grant claims, one that
         // doesn't open the record isn't this node's.
         let mut root = Node::new(root_ino, record, key)?;
+        if let Some(u) = &untrusted
+            && self.warn_untrusted
+            && self.warned.lock().unwrap().insert(root_ino)
+        {
+            eprintln!(
+                "a share from {} is read-only here until their key is trusted: \
+                 see `raft5fs pending`",
+                u.sender
+            );
+        }
         root.untrusted = untrusted;
         let mut parent = (root_ino, self.keep(root_ino, root));
         for (ino, bytes) in nodes {
@@ -1414,24 +1474,16 @@ impl Vault {
     /// is pinned for them already.
     pub async fn trust(&self, user: &str, expected: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
-        let served: [u8; PUBLIC_KEY_LEN] = self
-            .remote
-            .public_key(user)
-            .await?
-            .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
-        let norm = |f: &str| -> String {
-            f.chars()
-                .filter(|c| !c.is_whitespace())
-                .collect::<String>()
-                .to_ascii_lowercase()
-        };
-        if norm(expected) != norm(&fingerprint(&served)) {
+        let served = self.served_key(user).await?;
+        let matches = fingerprint_matches(&served, expected)
+            .map_err(|e| FsError::new(libc::EINVAL, format!("{expected:?}: {e}")))?;
+        if !matches {
             return Err(FsError::new(
                 libc::EPERM,
                 format!(
-                    "the server's key for {user} has fingerprint {}, not {expected}: not pinning it",
-                    fingerprint(&served)
+                    "the server's key for {user} has fingerprint\n  {}\nnot the one given: \
+                     not pinning it",
+                    fingerprint_words(&served)
                 ),
             ));
         }
@@ -1441,15 +1493,43 @@ impl Vault {
         Ok(key)
     }
 
-    /// The fingerprint of the public key the server has for `user`.
-    pub async fn served_fingerprint(&self, user: &str) -> Result<String, FsError> {
-        let key: [u8; PUBLIC_KEY_LEN] = self
-            .remote
+    /// The public key the server has for `user` -- its word, nothing more.
+    pub async fn served_key(&self, user: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        check_username(user)?;
+        self.remote
             .public_key(user)
             .await?
             .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
-        Ok(fingerprint(&key))
+            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))
+    }
+
+    /// Every grant made to this account, with who made it and whether
+    /// they are trusted here (see `Node::sealable`).
+    pub async fn shares(&self) -> Result<Vec<Share>, FsError> {
+        let mut grants = self.remote.list_grants().await?;
+        grants.sort_by_key(|g| g.ino);
+        let mut shares = Vec::with_capacity(grants.len());
+        for grant in grants {
+            let label = self
+                .identity
+                .open_label(grant.ino, &grant.sealed_label)
+                .map(OsString::from_vec)
+                .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
+            let sender = grant_sender(&grant.sealed_key).unwrap_or("?").to_string();
+            let trust = match self.open_grant(grant.ino, &grant).await {
+                Ok((_, _, None)) => ShareTrust::Trusted,
+                Ok((_, _, Some(untrusted))) => ShareTrust::Untrusted { key: untrusted.key },
+                Err(e) => ShareTrust::Unreadable(e),
+            };
+            shares.push(Share {
+                label,
+                ino: grant.ino,
+                writable: grant.writable,
+                sender,
+                trust,
+            });
+        }
+        Ok(shares)
     }
 
     /// The inode at `path`: a root entry's name, then names under it,

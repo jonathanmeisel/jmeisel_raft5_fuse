@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, snapshots, validate_chunk_size};
+use raft5fs_proto::invite::{Invite, pem_to_der};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use tokio::net::TcpListener;
@@ -15,7 +16,8 @@ const USAGE: &str = "\
 usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       [--tls-cert <PEM> --tls-key <PEM>] [options]
                       <store options> <kv-seed-address>...
-       raft5fs-server user add <NAME> <store options> <kv-seed-address>...
+       raft5fs-server user add <NAME> [<invite options>] <store options>
+                      <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
        raft5fs-server snapshot create [<NAME>] <store options> <kv-seed-address>...
@@ -48,8 +50,11 @@ Serving:
                        boundaries are baked into its keys.
 
 Users: `user add` prints a one-time code the user enrols with
-(`raft5fs-share enrol`), choosing their password; only their own machine
-ever has it, or their keys. A new code for an existing user lets them
+(`raft5fs enrol`), choosing their password; only their own machine ever
+has it, or their keys. With the invite options it also prints an
+invitation: one line holding the code, the filesystem servers'
+addresses and their CA certificate, which is all `raft5fs enrol` needs.
+An invitation is as secret as the code: hand it to the user alone. A new code for an existing user lets them
 enrol again after forgetting it -- losing access to whatever was shared
 with them until it is shared again. `user del` removes a user and every
 grant made to them, cutting them off within --identity-ttl.
@@ -62,6 +67,16 @@ del` removes it, a snapshot keeps every version of everything changed
 since, and the store holds at most 32. Taking and removing them needs a
 store administrator's account (e.g. --store-user admin), not the
 filesystem servers' own.
+
+Invite options (user add):
+  --invite-server <URL>
+                       a filesystem server's address, as users reach it
+                       (https://...). May be given more than once.
+  --invite-ca <PEM>    the CA certificate users' clients should trust for
+                       those servers.
+  --invite-server-name <NAME>
+                       the name to check the servers' certificates
+                       against, if not the addresses' hosts.
 
 Store options:
   --store-user <NAME>  the store account to work as; it needs write access
@@ -123,6 +138,9 @@ struct Args {
     store_key: Option<String>,
     store_server_name: Option<String>,
     identity_ttl: Option<Duration>,
+    invite_servers: Vec<String>,
+    invite_ca: Option<String>,
+    invite_server_name: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -155,6 +173,9 @@ fn parse_args() -> Args {
                 let secs = parse_number("--identity-ttl", &value("--identity-ttl"));
                 a.identity_ttl = Some(Duration::from_secs(secs.into()));
             }
+            "--invite-server" => a.invite_servers.push(value("--invite-server")),
+            "--invite-ca" => a.invite_ca = Some(value("--invite-ca")),
+            "--invite-server-name" => a.invite_server_name = Some(value("--invite-server-name")),
             flag if flag.starts_with("--") => usage(&format!("unknown option {flag}")),
             _ => a.positional.push(arg),
         }
@@ -233,11 +254,29 @@ async fn user_command(a: Args) {
         _ => usage("user takes add, del or list"),
     };
     let seeds = positional.cloned().collect();
+    // Checked before a code is issued, so a mistake here wastes none.
+    let invite_ca = invite_ca(&a);
     let client = store_client(&a, seeds).await;
     let result = match (command, name) {
         (Some("add"), Some(name)) => accounts::issue_code(&client, &name).await.map(|code| {
             println!("enrolment code for {name}: {code}");
-            println!("(they run `raft5fs-share --user {name} enrol {code} <server-address>...`)");
+            match invite_ca {
+                Some(ca) => {
+                    let invite = Invite {
+                        user: name.clone(),
+                        code,
+                        servers: a.invite_servers.clone(),
+                        tls_server_name: a.invite_server_name.clone(),
+                        ca,
+                    };
+                    println!("invitation for {name} (as secret as the code -- for {name} alone):");
+                    println!("{}", invite.encode());
+                    println!("(they run `raft5fs enrol '<invitation>'`)");
+                }
+                None => println!(
+                    "(they run `raft5fs enrol {code} --user {name} --ca <PEM> --server <URL>`)"
+                ),
+            }
         }),
         (Some("del"), Some(name)) => accounts::remove(&client, &name).await.map(|existed| {
             if !existed {
@@ -252,6 +291,32 @@ async fn user_command(a: Args) {
         }),
     };
     result.unwrap_or_else(|e| fail(e));
+}
+
+/// The invite options' CA certificate, DER, if invitations were asked
+/// for -- after checking they were asked for in full.
+fn invite_ca(a: &Args) -> Option<Vec<u8>> {
+    let asked = !a.invite_servers.is_empty() || a.invite_ca.is_some();
+    if !asked {
+        if a.invite_server_name.is_some() {
+            usage("--invite-server-name needs --invite-server and --invite-ca");
+        }
+        return None;
+    }
+    let Some(path) = &a.invite_ca else {
+        usage("an invitation needs --invite-ca");
+    };
+    if a.invite_servers.is_empty() {
+        usage("an invitation needs at least one --invite-server");
+    }
+    if let Some(plain) = a.invite_servers.iter().find(|s| !s.starts_with("https://")) {
+        usage(&format!(
+            "--invite-server {plain}: clients only use https:// addresses"
+        ));
+    }
+    let pem = String::from_utf8(read_file(path))
+        .unwrap_or_else(|_| fail(format!("{path} isn't a PEM certificate")));
+    Some(pem_to_der(&pem).unwrap_or_else(|e| fail(format!("{path}: {e}"))))
 }
 
 async fn snapshot_command(a: Args) {

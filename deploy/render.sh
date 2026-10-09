@@ -20,6 +20,7 @@ fill() {
         -e "s|@WG_IP@|$wg_ip|g" \
         -e "s|@SEEDS@|$(store_seeds)|g" \
         -e "s|@CHUNK_SIZE@|$CHUNK_SIZE|g" \
+        -e "s|@INVITE_SERVERS@|$(invite_servers)|g" \
         "$DEPLOY/templates/$1"
 }
 
@@ -41,6 +42,8 @@ render() {
     done
     cp "$SECRETS/jwt.secret" "$dir/raft5/"
     cp "$SECRETS/fs.pem" "$SECRETS/fs.key" "$SECRETS/token.key" "$dir/raft5fs/"
+    # Public: it goes into users' invitations.
+    cp "$SECRETS/fs-ca.pem" "$dir/raft5fs/"
     echo "RAFT5FS_STORE_PASSWORD=$(cat "$SECRETS/store.pw")" >"$dir/raft5fs/store.env"
 
     # Only the first node bootstraps the cluster, and only it ever needs

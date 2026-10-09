@@ -5,19 +5,15 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "raft5fs-fuse"
-path = "src/main.rs"
-
-[[bin]]
-name = "raft5fs-share"
-path = "src/bin/share.rs"
-
-[[bin]]
-name = "raft5fs-prune-keys"
-path = "src/bin/prune_keys.rs"
+name = "raft5fs"
+path = "src/bin/raft5fs.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 fuser = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "1"
 libc = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-proto = { workspace = true }

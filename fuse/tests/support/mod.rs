@@ -30,6 +30,8 @@ use raft5_server::{ClientApiTls, ServerConfig, serve_config};
 use raft5fs_core::{FsCore, accounts};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
+use raft5fs_fuse::prune_queue::PruneQueue;
+use raft5fs_fuse::pruner::PrunerConfig;
 use raft5fs_fuse::remote::{Credentials, Remote};
 use raft5fs_fuse::vault::KnownKeys;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
@@ -466,14 +468,35 @@ impl MountedFs {
     /// actually uses the mountpoint -- with the public keys in `known`
     /// pinned.
     pub fn mount_as(runtime: &Runtime, servers: Vec<String>, user: &str, known: KnownKeys) -> Self {
-        let fs = Raft5Fs::new(servers, credentials(user), runtime.handle().clone())
+        Self::mount_with(runtime, servers, user, known, None)
+    }
+
+    /// Like `mount_as`, working through `prune` in the background too.
+    pub fn mount_with(
+        runtime: &Runtime,
+        servers: Vec<String>,
+        user: &str,
+        known: KnownKeys,
+        prune: Option<PruneQueue>,
+    ) -> Self {
+        let mut fs = Raft5Fs::new(servers, credentials(user), runtime.handle().clone())
             .with_tls(fs_tls())
             .with_known_keys(known);
+        if let Some(queue) = prune {
+            // Quick about it, for tests.
+            let config = PrunerConfig {
+                poll: Duration::from_millis(50),
+                pace: Duration::from_millis(1),
+                backoff: Duration::from_millis(200),
+                max_backoff: Duration::from_secs(1),
+            };
+            fs = fs.with_prune_queue(queue, config);
+        }
         let path = temp_dir("mnt");
 
         let mut options = Config::default();
         options.mount_options = vec![MountOption::FSName("raft5fs-test".to_string())];
-        // Matches main.rs: writes commit synchronously now, so this is
+        // Matches `raft5fs mount`: writes commit synchronously now, so this is
         // what keeps one file's commit from stalling every other fuse
         // request in tests too.
         options.n_threads = Some(8);
@@ -627,6 +650,18 @@ impl Harness {
             self.addresses_from(1),
             user,
             self.known_keys(),
+        )
+    }
+
+    /// Another mount as `TESTER`, at the root, working through `queue` in
+    /// the background.
+    pub fn pruning_mount(&self, queue: PruneQueue) -> MountedFs {
+        MountedFs::mount_with(
+            &self.runtime,
+            self.addresses_from(1),
+            TESTER,
+            self.known_keys(),
+            Some(queue),
         )
     }
 
