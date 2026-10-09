@@ -11,7 +11,7 @@ raft5fs has three tiers:
   (raft5fs-server)   store.
 
   mounts             one per user per machine. Log in as a user, encrypt
-  (raft5fs-fuse)     and decrypt, buffer and cache, and use whichever
+  (raft5fs mount)    and decrypt, buffer and cache, and use whichever
                      server answers.
 
     user's mount --(TLS, user login)--> fs server --(mTLS, service login)--> raft5
@@ -48,9 +48,9 @@ The filesystem (from this repository):
 
   cd jmeisel_raft5_fuse
   cargo build --release
-  # -> target/release/raft5fs-server
-  # -> target/release/raft5fs-fuse
-  # -> target/release/raft5fs-share  (accounts and sharing)
+  # -> target/release/raft5fs-server  (a filesystem server, and its admin)
+  # -> target/release/raft5fs         (everything a user does: mount,
+  #                                    enrol, share, prune; `raft5fs help`)
 
 Mounting needs FUSE 3 (`fusermount3`), e.g. the `fuse3` package.
 
@@ -178,21 +178,33 @@ addresses): for throwaway setups only.
 5. ADD USERS
 -------------------------------------------------------------------------
 
-Adding a user issues a one-time code (with the store options from
-section 4):
+Adding a user issues an invitation (with the store options from section
+4, and how users reach the filesystem servers):
 
-  raft5fs-server user add alice $STORE https://127.0.0.1:27051
+  raft5fs-server user add alice --invite-server https://127.0.0.1:27060 \
+    --invite-ca cert.pem $STORE https://127.0.0.1:27051
 
-Hand the code to alice, who runs, on her own machine:
+The invitation is one line: alice's one-time enrolment code, the servers'
+addresses and the CA certificate to trust for them. It is as secret as
+the code -- whoever has it can enrol as alice -- so hand it to her alone.
+She runs, on her own machine:
 
-  raft5fs-share --user alice --ca cert.pem enrol <CODE> https://127.0.0.1:27060
+  raft5fs enrol 'raft5fs-invite:1:...'
 
 She chooses her password there: at least 12 characters, and it is worth
 more. Her machine makes her key pair, stores the private key on the
-server sealed under a key only her password yields, and prints the key's
-fingerprint. She should note it, and give it to the people she shares
-with: it is how they check that the server handed them her real key
-(7.3).
+server sealed under a key only her password yields, and saves a profile
+-- ~/.config/raft5fs/profiles/alice.toml, with the CA beside it -- so
+that no other command needs to be told the servers, the CA or her name.
+It prints her key's fingerprint, as twelve words (and in hex). She gives
+it to the people she shares with: it is how they check that the server
+handed them her real key (7.3). `raft5fs whoami` shows it again, worked
+out on her machine from her own key pair.
+
+(Without --invite-server and --invite-ca, `user add` prints only the
+code, and alice enrols with `raft5fs enrol <CODE> --user alice --ca
+cert.pem --server https://127.0.0.1:27060`, which saves the same
+profile.)
 
 Her password is stretched on her machine (Argon2id, 64 MiB, three
 passes) into a login secret, which is all a server ever gets. But a
@@ -201,7 +213,12 @@ secret, as fast as it can stretch them -- and everything shared with her
 comes down to her password -- so it should be one no one would guess.
 To change it -- everything shared with her stays readable:
 
-  raft5fs-share --user alice --ca cert.pem passwd https://127.0.0.1:27060
+  raft5fs passwd
+
+Every command uses her profile when it is the only one. With several,
+pick one with --profile; any option given (--user, --server, --ca,
+--known-keys...) wins over the profile's. `raft5fs profile list` and
+`raft5fs profile show` show them.
 
 A forgotten password can't be recovered: nothing on the servers opens
 her private key without it. `user add alice` again issues a new code; she
@@ -227,12 +244,13 @@ revoke their grants first.
 As the local user who will use the mount (not root):
 
   mkdir -p ~/raft5fs
-  raft5fs-fuse --user alice --ca cert.pem ~/raft5fs https://127.0.0.1:27060
+  raft5fs mount ~/raft5fs
 
 It asks for alice's password on the terminal, or reads it from the
 RAFT5FS_PASSWORD environment variable. It runs in the foreground; leave
-it running, and use ~/raft5fs from another shell. --ca is required (see
-section 4).
+it running, and use ~/raft5fs from another shell. (Without a profile:
+`raft5fs --user alice --ca cert.pem --server https://127.0.0.1:27060
+mount ~/raft5fs` -- --ca is required, see section 4.)
 
 The root of the mount isn't the filesystem's real root. It lists only
 what has been shared with alice, each under the name it was shared as,
@@ -256,22 +274,18 @@ does it. That is why the mount is only usable by the local user who
 mounted it. Each person mounts with their own login.
 
   --cache-size <SIZE>  memory for caching file data, decrypted (default
-                     64M, 0 disables). A cached chunk is checked with a
-                     server on every read -- a few bytes, not the chunk --
-                     so it is never stale.
-  --tls-server-name <NAME>  check the server certificate against NAME
-                     instead of the host in the address.
-  --known-keys <PATH>  where users' keys are pinned (7.3; by default
-                     ~/.config/raft5fs/known_keys, as for raft5fs-share).
-                     Only what is shared by someone pinned there can be
-                     written to.
+                     64M, 0 disables; or `cache_size` in the profile). A
+                     cached chunk is checked with a server on every read
+                     -- a few bytes, not the chunk -- so it is never stale.
   --no-write-buffer  store every write at once instead of buffering
                      small writes (slower; mostly for debugging).
+  --no-background-prune  don't work through the prune queue while
+                     mounted (7.2).
 
-Give several server addresses to fail over between them:
-
-  raft5fs-fuse --user alice --ca cert.pem ~/raft5fs \
-    https://fs1:27060 https://fs2:27060
+A mount fails over between every server in the profile (or given with
+--server, more than once). Shares from people not trusted yet are
+read-only (7.3); the mount says so on its terminal the first time it
+opens one.
 
 To unmount:
 
@@ -291,23 +305,20 @@ swapping two names (renameat2 RENAME_EXCHANGE).
 
 7.1 Grants
 
-Grants are of directories, and cover everything under them. With
-raft5fs-share, a path starts at an entry of the root, as the mount shows
-it:
+Grants are of directories, and cover everything under them. A path
+starts at an entry of the root, as the mount shows it:
 
-  raft5fs-share --user alice --ca cert.pem \
-    grant photos/2024 bob --ro --name from-alice \
-    --fingerprint '<bob's fingerprint>' https://127.0.0.1:27060
+  raft5fs grant photos/2024 bob --ro --name from-alice \
+    --fingerprint 'bob's twelve words'
 
 --fingerprint is needed the first time alice shares with bob: it is his
-key's, as he saw it when he enrolled (7.3). bob's root now shows
-from-alice. --ro makes the grant read-only, and
-writes under it then fail with "Read-only file system"; without it bob
-may change anything under it, and share it on. To share, alice needs a
-read-write grant of the directory -- which she has of every volume she
-made.
+key's, as he read it to her (7.3). bob's root now shows from-alice. --ro
+makes the grant read-only, and writes under it then fail with "Read-only
+file system"; without it bob may change anything under it, and share it
+on. To share, alice needs a read-write grant of the directory -- which
+she has of every volume she made.
 
-  raft5fs-share ... grants photos/2024 <server>     who holds it, and how
+  raft5fs grants photos/2024        who holds it, and how
 
 Grants alone decide access, and are checked on every request, so a grant
 taken back stops even files bob has open, at once.
@@ -318,7 +329,7 @@ where it went.
 
 7.2 Revoking
 
-  raft5fs-share ... revoke photos/2024 bob <server>
+  raft5fs revoke photos/2024 bob
 
 A revocation gives the directory a new key, and new keys for everything
 under it before anything new is written there: what is written after it
@@ -328,33 +339,57 @@ while he held the grant still show it to him (section 8). Revoking a grant of
 a directory needs a grant of the directory above it (its new key is
 sealed under that one's), except for a volume.
 
+What was written before stays sealed under the old keys -- which bob
+has -- until the directory is pruned: everything under it sealed again
+under the new keys, and the old ones dropped. That matters only if bob
+also gets hold of the raw store, but it is worth finishing. A revocation
+queues the directory for pruning (~/.local/state/raft5fs/, per account
+and filesystem), and returns at once. A running mount works through the
+queue in the background, a node at a time, leaving the store to what
+you are doing; or prune in the foreground:
+
+  raft5fs prune                  everything queued, now
+  raft5fs prune --status         what is queued, and how far each has got
+  raft5fs prune photos/2024      a directory, queued or not (--dry-run
+                                 counts what it would do; --all does
+                                 everything shared with you writably)
+
+A prune re-seals all of it, so a big tree takes as long as uploading it
+again. `revoke --no-prune` queues nothing.
+
 7.3 Whose key?
 
 Sharing with bob seals the directory's key to bob's public key, and only
 the server can say what that is: a server that wanted to read what alice
-shares could hand her its own key as bob's. So keys are pinned, in
-~/.config/raft5fs/known_keys (or --known-keys): the first grant to bob
-takes his fingerprint, checked with him, and pins his key; a different
-key for him is refused after that.
+shares could hand her its own key as bob's. So keys are pinned: the
+first grant to bob takes his fingerprint, checked with him, and pins his
+key; a different key for him is refused after that. Fingerprints are
+twelve words, read out the way bob's `raft5fs whoami` shows them, or 32
+hex digits.
 
 It works the other way too. bob's mount opens a grant with the key of
 whoever made it, which proves who that was -- but a server could make up
 a user, and a share from them, labelled like one bob expects. Until bob
 has pinned alice's key, what she shares with him is read-only: he can
 look, but nothing he writes could end up sealed under a key the server
-made. To pin her key without sharing anything with her:
+made.
 
-  raft5fs-share --user bob --ca cert.pem \
-    trust alice '<alice's fingerprint>' https://127.0.0.1:27060
+  raft5fs pending                what is shared with you by someone not
+                                 trusted yet, with their fingerprint as
+                                 the server has it
+  raft5fs trust alice <her twelve words>
+                                 pin her key, if she reads you the same
 
 A running mount takes the new pin the next time it writes there. If
 someone really did enrol again, check their new fingerprint with them,
 then:
 
-  raft5fs-share --user alice forget-key bob
+  raft5fs forget-key bob
 
-Pins are kept per user name, so keep a known-keys file per filesystem,
-and give mounts and raft5fs-share the same one.
+Pins live in ~/.config/raft5fs/filesystems/<id>/known_keys, where <id>
+comes from the CA certificate the profile trusts -- one file per
+filesystem, shared by every command and mount for it, and never chosen
+by a server. --known-keys puts them elsewhere.
 
 
 -------------------------------------------------------------------------
@@ -501,12 +536,19 @@ as seeds.
 
   "the server gave a different key for <user> than before"
       Either they enrolled again or the server is lying. Check their
-      fingerprint with them before `raft5fs-share forget-key <user>`.
+      fingerprint with them before `raft5fs forget-key <user>`.
 
   "Permission denied" writing under something shared with you, and
-  "... whose key isn't pinned here" from raft5fs-share
-      Whoever shared it isn't trusted yet (7.3): check their fingerprint
-      with them, then `raft5fs-share trust <user> <fingerprint>`.
+  "... whose key isn't pinned here"
+      Whoever shared it isn't trusted yet (7.3): `raft5fs pending` shows
+      who; check their fingerprint with them, then `raft5fs trust`.
+
+  "which profile?"
+      There is more than one: give --profile (`raft5fs profile list`).
+
+  "... known_keys is no longer read"
+      Pins used to be one file for every filesystem. Move each pin into
+      the file for its filesystem (7.3), then remove the old one.
 
   "the server's list of who it is granted to doesn't match the one
   sealed under its key"
