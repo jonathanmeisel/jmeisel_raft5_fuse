@@ -588,7 +588,7 @@ async fn bootstrap(
     // so keep asking until it answers.
     let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
     loop {
-        match admin.bootstrap(&first.id).await {
+        match admin.bootstrap(&first.id, None).await {
             Ok(()) => break,
             Err(raft5_client::Error::Unavailable(e)) if Instant::now() < deadline => {
                 tracing::debug!("{} not ready to bootstrap yet: {e}", first.id);

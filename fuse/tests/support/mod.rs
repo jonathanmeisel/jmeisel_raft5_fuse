@@ -220,7 +220,7 @@ impl TestCluster {
             // first attempt lands.
             let until = Instant::now() + DEADLINE;
             loop {
-                match admin.bootstrap(&id).await {
+                match admin.bootstrap(&id, None).await {
                     Ok(()) => break,
                     Err(_) if Instant::now() < until => tokio::time::sleep(RETRY_DELAY).await,
                     Err(e) => panic!("bootstrap never succeeded: {e}"),
