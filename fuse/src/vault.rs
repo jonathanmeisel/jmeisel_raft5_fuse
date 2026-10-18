@@ -85,8 +85,8 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode, Rotation,
-    SealedChunk, SealedMove, SetAttr, WriteError, check_username,
+    Attr, ChunkBody, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode,
+    Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError, check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
@@ -438,6 +438,20 @@ fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
         pos += n;
     }
     spans
+}
+
+/// A chunk's sealed bytes as a read sent them, `None` for a hole. This
+/// client doesn't fetch from object storage, so it never asks for chunks
+/// there (`objects_ok`); a server sending one anyway is an error.
+fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
+    match body {
+        ChunkBody::Hole => Ok(None),
+        ChunkBody::Inline(blob) => Ok(Some(blob)),
+        ChunkBody::Segment { .. } => Err(FsError::new(
+            libc::EIO,
+            format!("inode {ino}: the server sent a chunk in object storage, unasked"),
+        )),
+    }
 }
 
 fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
@@ -1639,7 +1653,7 @@ impl Vault {
         generation: u64,
         node: &mut Option<Arc<Node>>,
     ) -> Result<Arc<[u8]>, FsError> {
-        let plain: Arc<[u8]> = match &chunk.blob {
+        let plain: Arc<[u8]> = match sealed_blob(ino, &chunk.body)? {
             Some(blob) => {
                 let version = sealed_version(blob).map_err(|e| corrupt(ino, e))?;
                 let known = match node.take() {
@@ -1686,8 +1700,9 @@ impl Vault {
         while next <= last {
             let count = (last - next + 1).min(u64::from(u32::MAX)) as u32;
             let known = &known[(next - first) as usize..];
-            let (attr, got) = self.remote.read_chunks(ino, next, count, known).await?;
-            size = attr.size;
+            let read = self.remote.read_chunks(ino, next, count, known).await?;
+            let got = read.chunks;
+            size = read.attr.size;
             let Some(after) = got.last().map(|c| c.index + 1) else {
                 return Err(FsError::new(libc::EIO, "the server returned no chunks"));
             };
@@ -1700,7 +1715,11 @@ impl Vault {
     /// One chunk of `ino`, and the store's seq for it; `unchanged`, with
     /// no bytes, if it is still at `known` (0 for none).
     async fn fetch_one(&self, ino: u64, index: u64, known: u64) -> Result<SealedChunk, FsError> {
-        let (_, mut got) = self.remote.read_chunks(ino, index, 1, &[known]).await?;
+        let mut got = self
+            .remote
+            .read_chunks(ino, index, 1, &[known])
+            .await?
+            .chunks;
         got.pop()
             .filter(|c| c.index == index)
             .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
@@ -1725,7 +1744,7 @@ impl Vault {
             return Ok((data.to_vec(), version));
         }
         let chunk = self.fetch_one(ino, index, 0).await?;
-        let plain = match &chunk.blob {
+        let plain = match sealed_blob(ino, &chunk.body)? {
             Some(blob) => self.open(node, ino, index, blob)?,
             None => Vec::new(),
         };
@@ -1812,7 +1831,13 @@ impl Vault {
                 writes.push(ChunkWrite {
                     index,
                     expected_seq,
-                    blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
+                    body: WriteBody::Inline(seal_chunk(
+                        &node.key,
+                        node.record.version,
+                        ino,
+                        index,
+                        &plain,
+                    )),
                 });
                 plains.push((index, plain));
             }
@@ -1891,7 +1916,13 @@ impl Vault {
             let write = ChunkWrite {
                 index,
                 expected_seq: Some(seq),
-                blob: seal_chunk(&node.key, node.record.version, ino, index, &plain),
+                body: WriteBody::Inline(seal_chunk(
+                    &node.key,
+                    node.record.version,
+                    ino,
+                    index,
+                    &plain,
+                )),
             };
             let written = self.remote.write_chunks(ino, &[write], 0).await;
             // Whatever happened, the cached copy is superseded.

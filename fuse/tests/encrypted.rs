@@ -785,7 +785,7 @@ fn the_server_takes_no_mis_sealed_or_stale_data() {
     let wrong = raft5fs_core::ChunkWrite {
         index: 0,
         expected_seq: None,
-        blob,
+        body: raft5fs_core::WriteBody::Inline(blob),
     };
     assert_fs_errno(
         h.runtime.block_on(remote.write_chunks(file, &[wrong], 1)),
@@ -796,7 +796,7 @@ fn the_server_takes_no_mis_sealed_or_stale_data() {
     let stale = raft5fs_core::ChunkWrite {
         index: 0,
         expected_seq: Some(1),
-        blob,
+        body: raft5fs_core::WriteBody::Inline(blob),
     };
     assert_fs_errno(
         h.runtime.block_on(remote.write_chunks(file, &[stale], 1)),
@@ -820,6 +820,31 @@ fn stored_chunk(h: &support::Harness, ino: u64, index: u64) -> Vec<u8> {
     key.extend_from_slice(&ino.to_be_bytes());
     key.extend_from_slice(&index.to_be_bytes());
     h.read_key(&key).unwrap()
+}
+
+#[test]
+fn a_block_pointer_is_never_read_as_a_hole() {
+    let h = support::setup_root();
+    fs::create_dir(h.path().join("v")).unwrap();
+    let f = h.path().join("v/f");
+    fs::write(&f, b"sealed").unwrap();
+    let file = ino(&f);
+    // What a hybrid file keeps under a block's first chunk key: 32 bytes,
+    // starting with the key version, as a sealed chunk does.
+    let mut pointer = record(&h, file).version.to_be_bytes().to_vec();
+    pointer.resize(32, 7);
+    let mut key = vec![0x02];
+    key.extend_from_slice(&file.to_be_bytes());
+    key.extend_from_slice(&0u64.to_be_bytes());
+    h.write_key(&key, Some(&pointer));
+    // This client can't fetch from object storage, so says so, and the
+    // server refuses rather than handing it zeros.
+    let mine = vault(&h, support::TESTER);
+    assert_fs_errno(
+        h.runtime
+            .block_on(mine.remote().read_chunks(file, 0, 1, &[])),
+        libc::ENOTSUP,
+    );
 }
 
 /// A volume `v` holding `shared/sub/f` and `shared/sub/g`, each with some
@@ -876,7 +901,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     let write = raft5fs_core::ChunkWrite {
         index: 0,
         expected_seq: None,
-        blob,
+        body: raft5fs_core::WriteBody::Inline(blob),
     };
     assert_fs_errno(
         h.runtime

@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::{
-    Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, ResealedName, Rotation,
-    SealedMove, accounts, batch_bytes,
+    BlockUpload, Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, ResealedName,
+    Rotation, SealedMove, accounts, batch_bytes,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
@@ -28,10 +28,10 @@ use raft5fs_proto::pb::{
     EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
     HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
     ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest, NoArgs,
-    PreloginRequest, PreloginResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse,
-    ReadChunksRequest, ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest,
-    ResealNamesRequest, RotateRequest, Session, SetAttrRequest, SnapshotListResponse,
-    WriteChunksRequest, WriteChunksResponse,
+    PreloginRequest, PreloginResponse, PrepareUploadsRequest, PrepareUploadsResponse,
+    PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
+    ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
+    Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -180,6 +180,12 @@ fn live_only(snapshot: &str) -> Result<(), FsError> {
     }
 }
 
+/// The chunks a write or reseal carries, `EINVAL` if one can't mean
+/// anything.
+fn chunk_writes(chunks: Vec<raft5fs_proto::pb::ChunkWrite>) -> Result<Vec<ChunkWrite>, FsError> {
+    chunks.into_iter().map(ChunkWrite::try_from).collect()
+}
+
 #[tonic::async_trait]
 impl Fs for FsService {
     async fn hello(&self, _: Request<HelloRequest>) -> Result<Response<HelloResponse>, Status> {
@@ -187,6 +193,7 @@ impl Fs for FsService {
         Ok(Response::new(HelloResponse {
             chunk_size,
             batch_bytes: batch_bytes(chunk_size),
+            grid: None,
         }))
     }
 
@@ -508,6 +515,7 @@ impl Fs for FsService {
                 r.first,
                 r.count,
                 &r.known_seqs,
+                r.objects_ok,
                 at(&r.snapshot),
             )
             .await;
@@ -519,9 +527,26 @@ impl Fs for FsService {
         r: Request<WriteChunksRequest>,
     ) -> Result<Response<WriteChunksResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
-        let written = self.core.write_chunks(&caller, r.ino, &writes, r.end).await;
+        let written = async {
+            let writes = chunk_writes(r.chunks)?;
+            self.core.write_chunks(&caller, r.ino, &writes, r.end).await
+        }
+        .await;
         Ok(Response::new(written.into()))
+    }
+
+    async fn prepare_uploads(
+        &self,
+        r: Request<PrepareUploadsRequest>,
+    ) -> Result<Response<PrepareUploadsResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let blocks: Vec<BlockUpload> = r.blocks.into_iter().map(Into::into).collect();
+        Ok(Response::new(
+            self.core
+                .prepare_uploads(&caller, r.ino, &blocks)
+                .await
+                .into(),
+        ))
     }
 
     async fn grants_under(
@@ -552,12 +577,13 @@ impl Fs for FsService {
         r: Request<ResealChunksRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        let writes: Vec<ChunkWrite> = r.chunks.into_iter().map(Into::into).collect();
         Ok(Response::new(
-            self.core
-                .reseal_chunks(&caller, r.ino, &writes)
-                .await
-                .into(),
+            async {
+                let writes = chunk_writes(r.chunks)?;
+                self.core.reseal_chunks(&caller, r.ino, &writes).await
+            }
+            .await
+            .into(),
         ))
     }
 

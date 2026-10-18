@@ -61,13 +61,13 @@ use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
     EnrolRequest, GrantRequest, HelloRequest, InodeRequest, ListGrantsRequest, LoginRequest,
-    NameRequest, NoArgs, PreloginRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest,
-    RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest,
-    WriteChunksRequest,
+    NameRequest, NoArgs, PreloginRequest, PrepareUploadsRequest, PruneKeysRequest,
+    PublicKeyRequest, ReadChunksRequest, RenameRequest, ResealChunksRequest, ResealNamesRequest,
+    RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::types::{
-    Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode, ResealedName,
-    Rotation, SealedChunk, SealedMove, SetAttr, SnapshotInfo,
+    Attr, BlockUpload, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode,
+    ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr, SnapshotInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -158,6 +158,9 @@ pub struct Remote {
     current: AtomicUsize,
     chunk_size: u64,
     batch_bytes: u64,
+    /// How hybrid files group chunks into blocks, if the filesystem keeps
+    /// data in object storage.
+    grid: Option<ObjectGrid>,
     /// The snapshot this client reads at, or empty for the live
     /// filesystem. One at a snapshot only reads (see `at`).
     snapshot: String,
@@ -293,6 +296,7 @@ impl Remote {
             current: AtomicUsize::new(0),
             chunk_size: 0,
             batch_bytes: 0,
+            grid: None,
             snapshot: String::new(),
         };
         let hello = remote
@@ -303,6 +307,11 @@ impl Remote {
             .map_err(|e| e.message)?;
         remote.chunk_size = hello.chunk_size;
         remote.batch_bytes = hello.batch_bytes;
+        remote.grid = hello
+            .grid
+            .map(ObjectGrid::try_from)
+            .transpose()
+            .map_err(|e| e.message)?;
         Ok(remote)
     }
 
@@ -398,6 +407,7 @@ impl Remote {
             current: AtomicUsize::new(self.current.load(Ordering::Relaxed)),
             chunk_size: self.chunk_size,
             batch_bytes: self.batch_bytes,
+            grid: self.grid,
             snapshot: name.to_string(),
         }
     }
@@ -520,6 +530,10 @@ impl Remote {
 
     pub fn batch_bytes(&self) -> u64 {
         self.batch_bytes
+    }
+
+    pub fn grid(&self) -> Option<ObjectGrid> {
+        self.grid
     }
 
     /// Runs `request` against the current server, moving through the rest
@@ -900,24 +914,26 @@ impl Remote {
         first: u64,
         count: u32,
         known_seqs: &[u64],
-    ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+    ) -> Result<Chunks, FsError> {
         let req = ReadChunksRequest {
             ino,
             first,
             count,
             known_seqs: known_seqs.to_vec(),
             snapshot: self.snapshot.clone(),
+            // Not until this client can fetch from object storage.
+            objects_ok: false,
         };
-        let (attr, chunks) = self
+        let read = self
             .call(Retry::ReadOnly, |mut c| {
                 let req = req.clone();
                 async move { c.read_chunks(req).await }
             })
             .await?
             .into_result()?;
-        let sent = chunks.iter().filter(|c| !c.unchanged).count();
+        let sent = read.chunks.iter().filter(|c| !c.unchanged).count();
         self.chunk_reads.fetch_add(sent as u64, Ordering::Relaxed);
-        Ok((attr, chunks))
+        Ok(read)
     }
 
     /// Stores sealed chunks of `ino`, if each is as its `expected_seq`
@@ -939,6 +955,26 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.write_chunks(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Names and upload URLs for new blocks of `ino`, one per block in
+    /// `blocks`. Resending only mints names nothing uses, which garbage
+    /// collection removes.
+    pub async fn prepare_uploads(
+        &self,
+        ino: u64,
+        blocks: &[BlockUpload],
+    ) -> Result<Vec<PreparedUpload>, FsError> {
+        let req = PrepareUploadsRequest {
+            ino,
+            blocks: blocks.iter().copied().map(Into::into).collect(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.prepare_uploads(req).await }
         })
         .await?
         .into_result()

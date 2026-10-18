@@ -9,12 +9,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
 use crate::types::{
-    AccountKeys, Attr, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind,
-    ResealedName, Rotation, SealedChunk, SetAttr, SetTime, SnapshotInfo,
+    AccountKeys, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl, ChunkBody, ChunkWrite,
+    Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind, Layout, ObjectGrid,
+    PreparedUpload, ResealedName, Rotation, SealedChunk, SetAttr, SetTime, SnapshotInfo, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
     FsError::new(libc::EIO, format!("malformed response: no {what}"))
+}
+
+/// A request field that can't mean anything: what the server answers when
+/// a client sends one.
+fn invalid(what: &str) -> FsError {
+    FsError::new(libc::EINVAL, format!("malformed request: {what}"))
 }
 
 impl From<SystemTime> for pb::Timestamp {
@@ -53,6 +60,22 @@ fn kind(raw: i32) -> Kind {
     }
 }
 
+impl From<Layout> for pb::Layout {
+    fn from(l: Layout) -> Self {
+        match l {
+            Layout::Inline => Self::Inline,
+            Layout::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+fn layout(raw: i32) -> Layout {
+    match pb::Layout::try_from(raw) {
+        Ok(pb::Layout::Hybrid) => Layout::Hybrid,
+        _ => Layout::Inline,
+    }
+}
+
 impl From<Attr> for pb::Attr {
     fn from(a: Attr) -> Self {
         Self {
@@ -64,6 +87,7 @@ impl From<Attr> for pb::Attr {
             atime: Some(a.atime.into()),
             mtime: Some(a.mtime.into()),
             ctime: Some(a.ctime.into()),
+            layout: pb::Layout::from(a.layout).into(),
         }
     }
 }
@@ -79,8 +103,60 @@ impl From<pb::Attr> for Attr {
             atime: time(a.atime),
             mtime: time(a.mtime),
             ctime: time(a.ctime),
+            layout: layout(a.layout),
         }
     }
+}
+
+impl From<ObjectGrid> for pb::ObjectGrid {
+    fn from(g: ObjectGrid) -> Self {
+        Self {
+            from_index: g.from_index,
+            per_block: g.per_block,
+        }
+    }
+}
+
+impl TryFrom<pb::ObjectGrid> for ObjectGrid {
+    type Error = FsError;
+
+    fn try_from(g: pb::ObjectGrid) -> Result<Self, FsError> {
+        if g.per_block == 0 {
+            return Err(FsError::new(
+                libc::EIO,
+                "malformed response: an empty block",
+            ));
+        }
+        Ok(Self {
+            from_index: g.from_index,
+            per_block: g.per_block,
+        })
+    }
+}
+
+impl From<BlockRef> for pb::BlockRef {
+    fn from(b: BlockRef) -> Self {
+        Self {
+            version: b.version,
+            minted_ms: b.minted_ms,
+            random: b.random.to_vec(),
+            nseg: b.nseg,
+        }
+    }
+}
+
+fn random(bytes: &[u8]) -> Option<[u8; BLOCK_RANDOM_LEN]> {
+    bytes.try_into().ok()
+}
+
+/// A `BlockRef` off the wire, or `None` if its name is the wrong length.
+fn block_ref(b: pb::BlockRef) -> Option<BlockRef> {
+    Some(BlockRef {
+        version: b.version,
+        minted_ms: b.minted_ms,
+        random: random(&b.random)?,
+        nseg: b.nseg,
+    })
 }
 
 const AUTHORIZATION: &str = "authorization";
@@ -519,20 +595,36 @@ impl pb::PublicKeyResponse {
     }
 }
 
-impl From<Result<(Attr, Vec<SealedChunk>), FsError>> for pb::ReadChunksResponse {
-    fn from(r: Result<(Attr, Vec<SealedChunk>), FsError>) -> Self {
+impl From<Result<Chunks, FsError>> for pb::ReadChunksResponse {
+    fn from(r: Result<Chunks, FsError>) -> Self {
         use pb::read_chunks_response::Result as R;
+        use pb::sealed_chunk::Body;
         Self {
             result: Some(match r {
-                Ok((attr, chunks)) => R::List(pb::ChunkList {
-                    attr: Some(attr.into()),
-                    chunks: chunks
+                Ok(read) => R::List(pb::ChunkList {
+                    attr: Some(read.attr.into()),
+                    chunks: read
+                        .chunks
                         .into_iter()
                         .map(|c| pb::SealedChunk {
                             index: c.index,
                             seq: c.seq,
-                            blob: c.blob.unwrap_or_default(),
+                            body: match c.body {
+                                ChunkBody::Hole => None,
+                                ChunkBody::Inline(blob) => Some(Body::Blob(blob)),
+                                ChunkBody::Segment { block, segment } => {
+                                    Some(Body::Segment(pb::Segment { block, segment }))
+                                }
+                            },
                             unchanged: c.unchanged,
+                        })
+                        .collect(),
+                    blocks: read
+                        .blocks
+                        .into_iter()
+                        .map(|b| pb::BlockUrl {
+                            block: Some(b.block.into()),
+                            url: b.url,
                         })
                         .collect(),
                 }),
@@ -543,23 +635,58 @@ impl From<Result<(Attr, Vec<SealedChunk>), FsError>> for pb::ReadChunksResponse 
 }
 
 impl pb::ReadChunksResponse {
-    /// The file's attributes and the chunks read.
-    pub fn into_result(self) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+    /// The file's attributes, the chunks read and the blocks they are in.
+    /// Every segment names a block in the list.
+    pub fn into_result(self) -> Result<Chunks, FsError> {
         use pb::read_chunks_response::Result as R;
+        use pb::sealed_chunk::Body;
         match self.result {
             Some(R::List(l)) => {
                 let attr = l.attr.ok_or_else(|| malformed("attributes"))?.into();
+                let blocks = l
+                    .blocks
+                    .into_iter()
+                    .map(|b| {
+                        Ok(BlockUrl {
+                            block: b
+                                .block
+                                .and_then(block_ref)
+                                .ok_or_else(|| malformed("block"))?,
+                            url: b.url,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, FsError>>()?;
                 let chunks = l
                     .chunks
                     .into_iter()
-                    .map(|c| SealedChunk {
-                        index: c.index,
-                        seq: c.seq,
-                        blob: (!c.blob.is_empty()).then_some(c.blob),
-                        unchanged: c.unchanged,
+                    .map(|c| {
+                        let body = match c.body {
+                            // An empty blob was how a hole went before
+                            // `body` was a oneof.
+                            None => ChunkBody::Hole,
+                            Some(Body::Blob(blob)) if blob.is_empty() => ChunkBody::Hole,
+                            Some(Body::Blob(blob)) => ChunkBody::Inline(blob),
+                            Some(Body::Segment(s)) if (s.block as usize) < blocks.len() => {
+                                ChunkBody::Segment {
+                                    block: s.block,
+                                    segment: s.segment,
+                                }
+                            }
+                            Some(Body::Segment(_)) => return Err(malformed("such block")),
+                        };
+                        Ok(SealedChunk {
+                            index: c.index,
+                            seq: c.seq,
+                            body,
+                            unchanged: c.unchanged,
+                        })
                     })
-                    .collect();
-                Ok((attr, chunks))
+                    .collect::<Result<Vec<_>, FsError>>()?;
+                Ok(Chunks {
+                    attr,
+                    chunks,
+                    blocks,
+                })
             }
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("chunk list")),
@@ -598,20 +725,97 @@ impl pb::WriteChunksResponse {
 
 impl From<ChunkWrite> for pb::ChunkWrite {
     fn from(c: ChunkWrite) -> Self {
+        use pb::chunk_write::Body;
         Self {
             index: c.index,
             expected_seq: c.expected_seq,
-            blob: c.blob,
+            body: Some(match c.body {
+                WriteBody::Inline(blob) => Body::Blob(blob),
+                WriteBody::Block(block) => Body::Block(block.into()),
+            }),
         }
     }
 }
 
-impl From<pb::ChunkWrite> for ChunkWrite {
-    fn from(c: pb::ChunkWrite) -> Self {
-        Self {
+impl TryFrom<pb::ChunkWrite> for ChunkWrite {
+    type Error = FsError;
+
+    /// `EINVAL` for a block whose name is the wrong length. A write with
+    /// no body at all is an empty chunk, which nothing stores (its seal
+    /// is missing).
+    fn try_from(c: pb::ChunkWrite) -> Result<Self, FsError> {
+        use pb::chunk_write::Body;
+        Ok(Self {
             index: c.index,
             expected_seq: c.expected_seq,
-            blob: c.blob,
+            body: match c.body {
+                None => WriteBody::Inline(Vec::new()),
+                Some(Body::Blob(blob)) => WriteBody::Inline(blob),
+                Some(Body::Block(b)) => {
+                    WriteBody::Block(block_ref(b).ok_or_else(|| invalid("a block's name"))?)
+                }
+            },
+        })
+    }
+}
+
+impl From<BlockUpload> for pb::BlockUpload {
+    fn from(b: BlockUpload) -> Self {
+        Self {
+            index: b.index,
+            nseg: b.nseg,
+        }
+    }
+}
+
+impl From<pb::BlockUpload> for BlockUpload {
+    fn from(b: pb::BlockUpload) -> Self {
+        Self {
+            index: b.index,
+            nseg: b.nseg,
+        }
+    }
+}
+
+impl From<Result<Vec<PreparedUpload>, FsError>> for pb::PrepareUploadsResponse {
+    fn from(r: Result<Vec<PreparedUpload>, FsError>) -> Self {
+        use pb::prepare_uploads_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(uploads) => R::Uploads(pb::PreparedUploads {
+                    uploads: uploads
+                        .into_iter()
+                        .map(|u| pb::PreparedUpload {
+                            minted_ms: u.minted_ms,
+                            random: u.random.to_vec(),
+                            url: u.url,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::PrepareUploadsResponse {
+    /// One upload per block asked for, in the same order.
+    pub fn into_result(self) -> Result<Vec<PreparedUpload>, FsError> {
+        use pb::prepare_uploads_response::Result as R;
+        match self.result {
+            Some(R::Uploads(u)) => u
+                .uploads
+                .into_iter()
+                .map(|u| {
+                    Ok(PreparedUpload {
+                        minted_ms: u.minted_ms,
+                        random: random(&u.random).ok_or_else(|| malformed("object name"))?,
+                        url: u.url,
+                    })
+                })
+                .collect(),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("uploads")),
         }
     }
 }
@@ -747,8 +951,165 @@ mod tests {
             atime: t,
             mtime: t,
             ctime: t,
+            layout: Layout::Hybrid,
         };
         assert_eq!(Attr::from(pb::Attr::from(a)), a);
+    }
+
+    fn block() -> BlockRef {
+        BlockRef {
+            version: 3,
+            minted_ms: 1_760_000_000_000,
+            random: [7; BLOCK_RANDOM_LEN],
+            nseg: 16,
+        }
+    }
+
+    fn attr() -> Attr {
+        Attr {
+            ino: 9,
+            kind: Kind::File,
+            size: 1 << 30,
+            perm: 0o640,
+            nlink: 1,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            layout: Layout::Hybrid,
+        }
+    }
+
+    #[test]
+    fn a_chunk_list_round_trips() {
+        let read = Chunks {
+            attr: attr(),
+            chunks: vec![
+                SealedChunk {
+                    index: 0,
+                    seq: 5,
+                    body: ChunkBody::Inline(vec![1, 2, 3]),
+                    unchanged: false,
+                },
+                SealedChunk {
+                    index: 1,
+                    seq: 0,
+                    body: ChunkBody::Hole,
+                    unchanged: false,
+                },
+                SealedChunk {
+                    index: 10,
+                    seq: 8,
+                    body: ChunkBody::Segment {
+                        block: 0,
+                        segment: 0,
+                    },
+                    unchanged: false,
+                },
+                SealedChunk {
+                    index: 11,
+                    seq: 8,
+                    body: ChunkBody::Hole,
+                    unchanged: true,
+                },
+            ],
+            blocks: vec![BlockUrl {
+                block: block(),
+                url: "https://store/obj?sig".into(),
+            }],
+        };
+        let wire = pb::ReadChunksResponse::from(Ok(read.clone()));
+        assert_eq!(wire.into_result(), Ok(read));
+    }
+
+    #[test]
+    fn a_segment_must_name_a_block_in_the_list() {
+        let wire = pb::ReadChunksResponse {
+            result: Some(pb::read_chunks_response::Result::List(pb::ChunkList {
+                attr: Some(attr().into()),
+                chunks: vec![pb::SealedChunk {
+                    index: 10,
+                    seq: 1,
+                    body: Some(pb::sealed_chunk::Body::Segment(pb::Segment {
+                        block: 0,
+                        segment: 0,
+                    })),
+                    unchanged: false,
+                }],
+                blocks: vec![],
+            })),
+        };
+        assert_eq!(wire.into_result().unwrap_err().errno, libc::EIO);
+    }
+
+    #[test]
+    fn an_empty_blob_is_a_hole() {
+        // As an older server sends one.
+        let wire = pb::ReadChunksResponse {
+            result: Some(pb::read_chunks_response::Result::List(pb::ChunkList {
+                attr: Some(attr().into()),
+                chunks: vec![pb::SealedChunk {
+                    index: 0,
+                    seq: 0,
+                    body: Some(pb::sealed_chunk::Body::Blob(Vec::new())),
+                    unchanged: false,
+                }],
+                blocks: vec![],
+            })),
+        };
+        assert_eq!(wire.into_result().unwrap().chunks[0].body, ChunkBody::Hole);
+    }
+
+    #[test]
+    fn writes_round_trip() {
+        for body in [WriteBody::Inline(vec![9; 50]), WriteBody::Block(block())] {
+            let w = ChunkWrite {
+                index: 10,
+                expected_seq: Some(4),
+                body,
+            };
+            assert_eq!(ChunkWrite::try_from(pb::ChunkWrite::from(w.clone())), Ok(w));
+        }
+        let mut bad = pb::ChunkWrite::from(ChunkWrite {
+            index: 10,
+            expected_seq: None,
+            body: WriteBody::Block(block()),
+        });
+        if let Some(pb::chunk_write::Body::Block(b)) = &mut bad.body {
+            b.random.pop();
+        }
+        assert_eq!(ChunkWrite::try_from(bad).unwrap_err().errno, libc::EINVAL);
+    }
+
+    #[test]
+    fn uploads_round_trip() {
+        let uploads = vec![PreparedUpload {
+            minted_ms: 12,
+            random: [1; BLOCK_RANDOM_LEN],
+            url: "https://store/put".into(),
+        }];
+        let wire = pb::PrepareUploadsResponse::from(Ok(uploads.clone()));
+        assert_eq!(wire.into_result(), Ok(uploads));
+        let e = FsError::new(libc::ENOTSUP, "no object storage");
+        assert_eq!(
+            pb::PrepareUploadsResponse::from(Err(e.clone())).into_result(),
+            Err(e)
+        );
+    }
+
+    #[test]
+    fn a_grid_needs_blocks_of_something() {
+        let g = ObjectGrid {
+            from_index: 10,
+            per_block: 16,
+        };
+        assert_eq!(ObjectGrid::try_from(pb::ObjectGrid::from(g)), Ok(g));
+        assert!(
+            ObjectGrid::try_from(pb::ObjectGrid {
+                from_index: 10,
+                per_block: 0
+            })
+            .is_err()
+        );
     }
 
     #[test]

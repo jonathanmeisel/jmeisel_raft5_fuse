@@ -14,7 +14,8 @@ pub use layout::{
     STORE_FORMAT, batch_bytes, chunk_prefix, dirent_prefix, tombstone_key, validate_chunk_size,
 };
 pub use raft5fs_proto::types::{
-    AccountKeys, Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, NewNode, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
-    SetTime, SnapshotInfo,
+    AccountKeys, Attr, BlockRef, BlockUpload, BlockUrl, Caller, ChunkBody, ChunkWrite, Chunks,
+    DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind, Layout, NewNode, ObjectGrid,
+    PreparedUpload, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
+    SetTime, SnapshotInfo, WriteBody,
 };

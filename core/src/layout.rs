@@ -5,6 +5,9 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
+use raft5fs_crypto::data::CHUNK_OVERHEAD;
+use raft5fs_proto::types::{BLOCK_RANDOM_LEN, BlockRef};
+
 pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const COUNTER_KEY: &[u8] = b"\x04next_ino";
 
@@ -129,6 +132,20 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 // that was never written is simply absent and reads as zeros, so holes
 // cost nothing; end-of-file lives in the Entry, never in the chunks.
 //
+// A hybrid file (its Entry's layout, see `entry`) keeps its chunks from
+// the filesystem's `ObjectGrid::from_index` on in object storage, a block
+// of `per_block` chunks per object. A block's pointer is stored under its
+// first chunk's key; the other keys of the block are never written. So a
+// chunk key holds one of two values, told apart by length:
+//
+//   inline:  version(BE4) ++ AEAD                      >= CHUNK_OVERHEAD (44) bytes
+//   pointer: version(BE4) ++ minted_ms(BE8) ++ random(16) ++ nseg(BE4)   = POINTER_LEN (32)
+//
+// Both start with the key version they were sealed under, so everything
+// that checks versions (writes, pruning) reads either alike, and neither
+// needs the object fetched. Pointers stay under 0x02, so deleting and
+// scanning a file's chunks finds them with no change either.
+//
 // This layout is not compatible with the earlier one that held a whole
 // file under `0x02 ++ ino`. Those 9-byte keys are ignored (every scan
 // requires the full 17-byte chunk key), so an old database reads as a
@@ -176,6 +193,46 @@ pub fn chunk_prefix(ino: u64) -> Vec<u8> {
     let mut key = vec![0x02];
     key.extend_from_slice(&ino.to_be_bytes());
     key
+}
+
+/// How long a block pointer is: never as long as any sealed chunk, which
+/// is how a value says which it is.
+pub(crate) const POINTER_LEN: usize = 4 + 8 + BLOCK_RANDOM_LEN + 4;
+const _: () = assert!(POINTER_LEN < CHUNK_OVERHEAD);
+
+/// What a chunk key holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChunkValue {
+    /// A sealed chunk.
+    Inline(Vec<u8>),
+    /// A pointer to the block starting at this index.
+    Block(BlockRef),
+}
+
+impl ChunkValue {
+    pub(crate) fn decode(value: Vec<u8>) -> Self {
+        if value.len() != POINTER_LEN {
+            // Anything else is a sealed chunk, or garbage that won't open
+            // as one -- which the client finds, as it always has.
+            return ChunkValue::Inline(value);
+        }
+        let at = |range: std::ops::Range<usize>| &value[range];
+        ChunkValue::Block(BlockRef {
+            version: u32::from_be_bytes(at(0..4).try_into().unwrap()),
+            minted_ms: u64::from_be_bytes(at(4..12).try_into().unwrap()),
+            random: at(12..28).try_into().unwrap(),
+            nseg: u32::from_be_bytes(at(28..32).try_into().unwrap()),
+        })
+    }
+}
+
+pub(crate) fn encode_pointer(block: &BlockRef) -> Vec<u8> {
+    let mut value = Vec::with_capacity(POINTER_LEN);
+    value.extend_from_slice(&block.version.to_be_bytes());
+    value.extend_from_slice(&block.minted_ms.to_be_bytes());
+    value.extend_from_slice(&block.random);
+    value.extend_from_slice(&block.nseg.to_be_bytes());
+    value
 }
 
 pub(crate) fn chunk_key(ino: u64, index: u64) -> Vec<u8> {
@@ -248,6 +305,34 @@ mod tests {
             .map(|&i| chunk_key(9, i))
             .collect();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn a_pointer_round_trips_and_is_told_from_a_sealed_chunk() {
+        let block = BlockRef {
+            version: 0x0102_0304,
+            minted_ms: 1_760_000_000_000,
+            random: [9; BLOCK_RANDOM_LEN],
+            nseg: 16,
+        };
+        let value = encode_pointer(&block);
+        assert_eq!(value.len(), POINTER_LEN);
+        // It starts with its key version, as a sealed chunk does.
+        assert_eq!(
+            raft5fs_crypto::data::sealed_version(&value).unwrap(),
+            block.version
+        );
+        assert_eq!(ChunkValue::decode(value), ChunkValue::Block(block));
+
+        let key = raft5fs_crypto::Key::random();
+        for len in [0, 1, 4096] {
+            let sealed = raft5fs_crypto::data::seal_chunk(&key, 1, 9, 0, &vec![0; len]);
+            assert!(sealed.len() >= CHUNK_OVERHEAD);
+            assert_eq!(
+                ChunkValue::decode(sealed.clone()),
+                ChunkValue::Inline(sealed)
+            );
+        }
     }
 
     #[test]

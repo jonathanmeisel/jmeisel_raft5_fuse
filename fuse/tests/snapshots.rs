@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use raft5fs_core::ChunkWrite;
+use raft5fs_core::{ChunkWrite, WriteBody};
 use raft5fs_fuse::remote::Remote;
 use raft5fs_fuse::vault::Vault;
 
@@ -188,7 +188,7 @@ fn a_snapshot_is_read_only_whoever_asks() {
     let write = ChunkWrite {
         index: 0,
         expected_seq: None,
-        blob: Vec::new(),
+        body: WriteBody::Inline(Vec::new()),
     };
     assert_fs_errno(
         h.runtime.block_on(at.write_chunks(ino(&f), &[write], 0)),

@@ -17,7 +17,7 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, SnapshotInfo};
+use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SnapshotInfo};
 
 use crate::vault::{SNAPSHOT_DIR, Vault};
 
@@ -168,6 +168,7 @@ impl SnapshotTree {
             atime: at,
             mtime: at,
             ctime: at,
+            layout: Layout::Inline,
         }
     }
 

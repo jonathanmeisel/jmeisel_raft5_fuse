@@ -22,6 +22,75 @@ pub struct Attr {
     pub atime: SystemTime,
     pub mtime: SystemTime,
     pub ctime: SystemTime,
+    pub layout: Layout,
+}
+
+/// Where a file's data lives. Fixed when the file is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// Every chunk in the store. Every directory, and every file made
+    /// before object storage was turned on.
+    #[default]
+    Inline,
+    /// Chunks before the filesystem's `ObjectGrid::from_index` in the
+    /// store, the rest in blocks in object storage.
+    Hybrid,
+}
+
+/// How a hybrid file's chunks from `from_index` on are grouped into
+/// blocks, one object each: block `b` holds chunks `from_index + b *
+/// per_block` up to (not including) `from_index + (b + 1) * per_block`.
+/// Fixed for the filesystem's lifetime. The chunk grid itself doesn't
+/// change -- a block is just consecutive chunks stored together -- so a
+/// chunk's index, and everything keyed or sealed by it, means the same in
+/// either layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectGrid {
+    pub from_index: u64,
+    pub per_block: u32,
+}
+
+impl ObjectGrid {
+    /// Whether chunk `index` of a hybrid file is in a block.
+    pub fn in_blocks(&self, index: u64) -> bool {
+        index >= self.from_index
+    }
+
+    /// The first chunk index of the block chunk `index` is in, which is
+    /// the key the block's pointer is stored under. Only for an index
+    /// `in_blocks`.
+    pub fn block_start(&self, index: u64) -> u64 {
+        let per = u64::from(self.per_block);
+        self.from_index + (index - self.from_index) / per * per
+    }
+
+    /// Where in its block chunk `index` is. Only for an index `in_blocks`.
+    pub fn segment(&self, index: u64) -> u32 {
+        ((index - self.from_index) % u64::from(self.per_block)) as u32
+    }
+}
+
+/// The random part of an object's name.
+pub const BLOCK_RANDOM_LEN: usize = 16;
+
+/// An object holding one block of a file (see `ObjectGrid`): `nseg`
+/// chunks, each zero-padded to the chunk size and then sealed, back to
+/// back, all under key version `version`. Its name is the file's inode,
+/// `minted_ms` and `random`; the inode comes from where the pointer is
+/// stored, so a pointer can only name its own file's objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRef {
+    pub version: u32,
+    pub minted_ms: u64,
+    pub random: [u8; BLOCK_RANDOM_LEN],
+    pub nseg: u32,
+}
+
+/// A block a read refers to, and a presigned URL to fetch it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockUrl {
+    pub block: BlockRef,
+    pub url: String,
 }
 
 /// Who an operation is on behalf of: the account whose grants decide what
@@ -133,24 +202,70 @@ pub struct Rotation {
     pub sealed_grantees: Vec<u8>,
 }
 
-/// A file chunk as stored: sealed, with the store's sequence number for
-/// it. `blob` is `None` for a hole, or for a chunk `unchanged`.
+/// A file chunk as stored, with the store's sequence number for it (for
+/// a chunk in a block, the block's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedChunk {
     pub index: u64,
     pub seq: u64,
-    pub blob: Option<Vec<u8>>,
-    /// Still at the seq the client said it held, so `blob` wasn't sent.
+    pub body: ChunkBody,
+    /// Still at the seq the client said it held, so its body wasn't sent
+    /// (and is `Hole`).
     pub unchanged: bool,
 }
 
-/// A sealed chunk to store, if it is still at `expected_seq` (or whatever
-/// it holds, without one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkBody {
+    /// Never written: all zeros. Also what an `unchanged` chunk carries.
+    Hole,
+    /// The chunk, sealed.
+    Inline(Vec<u8>),
+    /// Segment `segment` of block `Chunks::blocks[block]`.
+    Segment { block: u32, segment: u32 },
+}
+
+/// What a read of chunks returns: the file's attributes (for its size),
+/// the chunks, and the blocks their segments are in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunks {
+    pub attr: Attr,
+    pub chunks: Vec<SealedChunk>,
+    pub blocks: Vec<BlockUrl>,
+}
+
+/// A chunk, or a block, to store, if what is there is still at
+/// `expected_seq` (or whatever it holds, without one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkWrite {
     pub index: u64,
     pub expected_seq: Option<u64>,
-    pub blob: Vec<u8>,
+    pub body: WriteBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteBody {
+    /// A sealed chunk.
+    Inline(Vec<u8>),
+    /// A block already uploaded through `prepare_uploads`, stored at its
+    /// first chunk index.
+    Block(BlockRef),
+}
+
+/// A block to be uploaded: its first chunk index, and how many segments
+/// it will hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockUpload {
+    pub index: u64,
+    pub nseg: u32,
+}
+
+/// Where to upload a block: the object's name, and a presigned PUT for
+/// exactly its length, usable once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedUpload {
+    pub minted_ms: u64,
+    pub random: [u8; BLOCK_RANDOM_LEN],
+    pub url: String,
 }
 
 /// What a create brings: the inode it reserved,
@@ -308,6 +423,28 @@ mod username_tests {
             &"a".repeat(65),
         ] {
             assert!(check_username(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_arithmetic() {
+        let g = ObjectGrid {
+            from_index: 10,
+            per_block: 4,
+        };
+        assert!(!g.in_blocks(9));
+        for (index, start, segment) in [(10, 10, 0), (13, 10, 3), (14, 14, 0), (21, 18, 3)] {
+            assert!(g.in_blocks(index));
+            assert_eq!(
+                (g.block_start(index), g.segment(index)),
+                (start, segment),
+                "{index}"
+            );
         }
     }
 }

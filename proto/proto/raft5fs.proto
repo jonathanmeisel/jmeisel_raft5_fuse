@@ -95,6 +95,12 @@ service Fs {
   // as the client read it -- otherwise nothing is, and the answer is
   // EAGAIN, for the client to read again and redo its change.
   rpc WriteChunks(WriteChunksRequest) returns (WriteChunksResponse);
+  // Names and upload URLs for new blocks of a file in object storage
+  // (see ObjectGrid), one per block asked for. The client seals each
+  // block, uploads it, then stores a BlockRef to it with WriteChunks.
+  // Needs a writable grant, like WriteChunks; ENOTSUP if the filesystem
+  // keeps no data in object storage.
+  rpc PrepareUploads(PrepareUploadsRequest) returns (PrepareUploadsResponse);
 
   // Every node at or under a directory that is granted to anyone, with
   // the path down to it and who holds the grants: what rotating the
@@ -165,6 +171,17 @@ message Attr {
   Timestamp atime = 8;
   Timestamp mtime = 9;
   Timestamp ctime = 10;
+  // Where the file's data lives; see ObjectGrid. Fixed at creation.
+  Layout layout = 11;
+}
+
+enum Layout {
+  // Every chunk in the store: all files made before object storage was
+  // turned on, and every directory.
+  LAYOUT_INLINE = 0;
+  // Chunks below the grid's `from_index` in the store, the rest in
+  // object-storage blocks.
+  LAYOUT_HYBRID = 1;
 }
 
 message HelloRequest {}
@@ -175,6 +192,17 @@ message HelloResponse {
   // How much contiguous data one write transaction stores: the client
   // buffers up to this much and aligns its batches to multiples of it.
   uint64 batch_bytes = 2;
+  // How hybrid-layout files split their data, fixed for the filesystem's
+  // lifetime; absent if no data lives in object storage.
+  ObjectGrid grid = 3;
+}
+
+// From chunk `from_index` on, a hybrid file's chunks are stored
+// `per_block` at a time as one object: block b holds chunks
+// [from_index + b * per_block, from_index + (b + 1) * per_block).
+message ObjectGrid {
+  uint64 from_index = 1;
+  uint32 per_block = 2;
 }
 
 message PreloginRequest {
@@ -467,24 +495,57 @@ message ReadChunksRequest {
   // A chunk still at it comes back `unchanged`, without its bytes.
   repeated uint64 known_seqs = 4;
   string snapshot = 5;
+  // The client can fetch chunks from object storage. Without it, a chunk
+  // that lives there is ENOTSUP rather than coming back as a hole.
+  bool objects_ok = 6;
 }
 
 message SealedChunk {
   uint64 index = 1;
   // The store's sequence number for the chunk as read: what a write of it
-  // expects, to be sure nothing changed it meanwhile.
+  // expects, to be sure nothing changed it meanwhile. For a chunk in a
+  // block, the block's.
   uint64 seq = 2;
-  // Empty for a chunk that was never written -- a hole, all zeros -- or
-  // one `unchanged`.
-  bytes blob = 3;
+  // Neither, for a chunk that was never written -- a hole, all zeros --
+  // or one `unchanged`.
+  oneof body {
+    // The chunk, sealed.
+    bytes blob = 3;
+    // Where in object storage the sealed chunk is.
+    Segment segment = 5;
+  }
   // Still at the seq the client said it held.
   bool unchanged = 4;
+}
+
+// Segment `segment` of the object `ChunkList.blocks[block]` names.
+message Segment {
+  uint32 block = 1;
+  uint32 segment = 2;
+}
+
+// An object holding one block: `nseg` sealed chunks, each zero-padded to
+// the chunk size before sealing, so segment j is at byte j * (chunk size
+// + sealing overhead). All sealed under key version `version`.
+message BlockRef {
+  uint32 version = 1;
+  uint64 minted_ms = 2;
+  bytes random = 3;
+  uint32 nseg = 4;
+}
+
+message BlockUrl {
+  BlockRef block = 1;
+  // A presigned GET for the object, good for any range of it.
+  string url = 2;
 }
 
 message ChunkList {
   // The file's attributes, for its size.
   Attr attr = 1;
   repeated SealedChunk chunks = 2;
+  // The blocks `chunks` refer to.
+  repeated BlockUrl blocks = 3;
 }
 
 message ReadChunksResponse {
@@ -498,7 +559,11 @@ message ChunkWrite {
   uint64 index = 1;
   // Absent for a chunk being replaced whole, whatever it held.
   optional uint64 expected_seq = 2;
-  bytes blob = 3;
+  oneof body {
+    bytes blob = 3;
+    // A block uploaded through PrepareUploads, at a block's first index.
+    BlockRef block = 4;
+  }
 }
 
 message WriteChunksRequest {
@@ -571,6 +636,37 @@ message Rotation {
 message RotateRequest {
   // Parents before children.
   repeated Rotation rotations = 1;
+}
+
+message PrepareUploadsRequest {
+  uint64 ino = 1;
+  repeated BlockUpload blocks = 2;
+}
+
+message BlockUpload {
+  // The block's first chunk index.
+  uint64 index = 1;
+  // How many segments the object will hold, which fixes its length.
+  uint32 nseg = 2;
+}
+
+message PreparedUpload {
+  // The object's name, for the BlockRef that stores it.
+  uint64 minted_ms = 1;
+  bytes random = 2;
+  // A presigned PUT, for exactly the block's length, usable once.
+  string url = 3;
+}
+
+message PreparedUploads {
+  repeated PreparedUpload uploads = 1;
+}
+
+message PrepareUploadsResponse {
+  oneof result {
+    PreparedUploads uploads = 1;
+    Error error = 2;
+  }
 }
 
 message ResealChunksRequest {

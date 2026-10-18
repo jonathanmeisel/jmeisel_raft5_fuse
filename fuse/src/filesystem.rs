@@ -22,7 +22,7 @@ use fuser::{
     INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, SetAttr, SetTime, WriteError};
+use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, SetTime, WriteError};
 use tokio::runtime::Handle;
 use tonic::transport::ClientTlsConfig;
 
@@ -209,6 +209,7 @@ impl Raft5Fs {
             atime: self.mounted_at,
             mtime: self.mounted_at,
             ctime: self.mounted_at,
+            layout: Layout::Inline,
         }
     }
 

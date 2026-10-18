@@ -12,8 +12,9 @@ use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, Caller, ChunkWrite, DirItem, FsError, Grant, GrantedNode, KeyPath, Kind, NewNode,
-    RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
+    Attr, BlockUpload, Caller, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
+    KeyPath, Kind, Layout, NewNode, PreparedUpload, RESEAL_NAMES_BATCH, ResealedName, Rotation,
+    SealedChunk, SealedMove, SetAttr, WriteBody,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -21,9 +22,9 @@ use crate::grants::{
     self, Reads, check_grantees_version, grantees_key, key_versions, node_keys_key, reservation_key,
 };
 use crate::layout::{
-    CHUNK_SIZE_KEY, COUNTER_KEY, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, STORE_FORMAT,
+    CHUNK_SIZE_KEY, COUNTER_KEY, ChunkValue, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, STORE_FORMAT,
     TOMBSTONE_PREFIX, attr_key, chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key,
-    dirent_prefix, dirent_sealed_name, dirent_value, is_chunk_key, tombstone_key,
+    dirent_prefix, dirent_sealed_name, dirent_value, encode_pointer, is_chunk_key, tombstone_key,
     validate_chunk_size,
 };
 use crate::snapshots;
@@ -108,6 +109,15 @@ async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError>
     Ok(txn.read(dirent).await?.value.map(|b| dirent_ino(&b)))
 }
 
+/// What a filesystem keeping no data in object storage answers anything
+/// that would need it.
+fn no_objects() -> FsError {
+    FsError::new(
+        libc::ENOTSUP,
+        "this filesystem keeps no data in object storage",
+    )
+}
+
 /// Stores `writes` to file `ino` inside `txn`: each sealed under the
 /// file's current key version (`EKEYEXPIRED` if not), and each with an
 /// `expected_seq` only if the chunk is still at it (`EAGAIN` if not).
@@ -120,7 +130,11 @@ async fn put_chunks(
 ) -> Result<Result<(), FsError>, KvError> {
     let (version, _) = decide!(key_versions(txn, ino).await?);
     for w in writes {
-        if sealed_version(&w.blob).ok() != Some(version) {
+        let sealed_under = match &w.body {
+            WriteBody::Inline(blob) => sealed_version(blob).ok(),
+            WriteBody::Block(block) => Some(block.version),
+        };
+        if sealed_under != Some(version) {
             return Ok(Err(FsError::new(
                 libc::EKEYEXPIRED,
                 format!("chunks of inode {ino} must be sealed under key version {version}"),
@@ -136,7 +150,11 @@ async fn put_chunks(
                 )));
             }
         }
-        txn.write(&key, Some(&w.blob)).await?;
+        let value = match &w.body {
+            WriteBody::Inline(blob) => blob.clone(),
+            WriteBody::Block(block) => encode_pointer(block),
+        };
+        txn.write(&key, Some(&value)).await?;
     }
     Ok(Ok(()))
 }
@@ -384,6 +402,7 @@ impl FsCore {
                     atime: now,
                     mtime: now,
                     ctime: now,
+                    layout: Layout::Inline,
                 },
                 parent: ROOT_INO,
             };
@@ -461,11 +480,17 @@ impl FsCore {
             ));
         }
         let largest = self.chunk_size as usize + CHUNK_OVERHEAD;
-        if writes.iter().any(|w| w.blob.len() > largest) {
-            return Err(FsError::new(
-                libc::EINVAL,
-                "a sealed chunk larger than a chunk",
-            ));
+        for w in writes {
+            match &w.body {
+                WriteBody::Inline(blob) if blob.len() > largest => {
+                    return Err(FsError::new(
+                        libc::EINVAL,
+                        "a sealed chunk larger than a chunk",
+                    ));
+                }
+                WriteBody::Inline(_) => {}
+                WriteBody::Block(_) => return Err(no_objects()),
+            }
         }
         Ok(())
     }
@@ -730,6 +755,7 @@ impl FsCore {
                     atime: now,
                     mtime: now,
                     ctime: now,
+                    layout: Layout::Inline,
                 },
                 // Files too: the walk up to a grant goes through it, and
                 // a file's only parent is the one directory naming it.
@@ -997,6 +1023,11 @@ impl FsCore {
     /// chunk `first + i` at (decrypted, in its cache). A chunk still at it
     /// comes back `unchanged`, without its bytes: the store is asked only
     /// for its version, which costs eight bytes however big the chunk is.
+    ///
+    /// `objects_ok` says the client can fetch from object storage. Without
+    /// it, a chunk there is `ENOTSUP`: an older client would otherwise
+    /// take the pointer it can't read for a hole, and see zeros.
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_chunks(
         &self,
         caller: &Caller,
@@ -1004,8 +1035,9 @@ impl FsCore {
         first: u64,
         count: u32,
         known: &[u64],
+        objects_ok: bool,
         at: Option<&[u8]>,
-    ) -> Result<(Attr, Vec<SealedChunk>), FsError> {
+    ) -> Result<Chunks, FsError> {
         let view = self.view(at).await?;
         self.guard_now(&view, caller, ino, false).await?;
         let attr = self.resolve(&view, ino).await?.attr;
@@ -1019,20 +1051,49 @@ impl FsCore {
                 chunks.push(SealedChunk {
                     index,
                     seq,
-                    blob: None,
+                    body: ChunkBody::Hole,
                     unchanged: true,
                 });
                 continue;
             }
             let read = view.read(&key).await?;
+            let body = match read.value.map(ChunkValue::decode) {
+                None => ChunkBody::Hole,
+                Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
+                Some(ChunkValue::Block(_)) if !objects_ok => {
+                    return Err(FsError::new(
+                        libc::ENOTSUP,
+                        format!(
+                            "inode {ino} keeps data in object storage, which this client can't read"
+                        ),
+                    ));
+                }
+                Some(ChunkValue::Block(_)) => return Err(no_objects()),
+            };
             chunks.push(SealedChunk {
                 index,
                 seq: read.seq,
-                blob: read.value,
+                body,
                 unchanged: false,
             });
         }
-        Ok((attr, chunks))
+        Ok(Chunks {
+            attr,
+            chunks,
+            blocks: Vec::new(),
+        })
+    }
+
+    /// Names and presigned upload URLs for new blocks of file `ino`, one
+    /// per block asked for. Needs a writable grant over `ino`.
+    pub async fn prepare_uploads(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        blocks: &[BlockUpload],
+    ) -> Result<Vec<PreparedUpload>, FsError> {
+        let _ = (caller, ino, blocks);
+        Err(no_objects())
     }
 
     /// Stores sealed chunks of `ino` -- all of them, or with any not as
@@ -1208,6 +1269,7 @@ impl FsCore {
                     atime: now,
                     mtime: now,
                     ctime: now,
+                    layout: Layout::Inline,
                 },
                 parent: ROOT_INO,
             };
@@ -1650,8 +1712,9 @@ fn operations_are_send(
     send(core.grants(caller, None));
     send(core.snapshots());
     send(core.public_key("u"));
-    send(core.read_chunks(caller, 1, 0, 1, &[], None));
+    send(core.read_chunks(caller, 1, 0, 1, &[], true, None));
     send(core.write_chunks(caller, 1, &[], 0));
+    send(core.prepare_uploads(caller, 1, &[]));
     send(core.grants_under(caller, 1));
     send(core.rotate(caller, &[]));
     send(core.reseal_chunks(caller, 1, &[]));

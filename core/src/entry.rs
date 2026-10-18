@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use raft5fs_proto::types::{Attr, Kind};
+use raft5fs_proto::types::{Attr, Kind, Layout};
 
 /// A directory's attributes plus its parent inode, so `readdir` can answer
 /// `..` without a separate lookup. Files leave `parent` at 0 (unused: we
@@ -48,9 +48,14 @@ pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
         Kind::File => 0,
     });
     buf.extend_from_slice(&a.perm.to_be_bytes());
-    // Where a uid and gid once went: kept, as zeros, so the record's
-    // layout -- and every field after them -- stays where it was.
-    buf.extend_from_slice(&[0; 8]);
+    // Where a uid and gid once went, kept so every field after them stays
+    // where it was: the first byte is now the file's data layout, which
+    // reads as 0 -- all inline -- in every record written before it.
+    buf.push(match a.layout {
+        Layout::Inline => 0,
+        Layout::Hybrid => 1,
+    });
+    buf.extend_from_slice(&[0; 7]);
     buf.extend_from_slice(&a.size.to_be_bytes());
     buf.extend_from_slice(&a.nlink.to_be_bytes());
     push_time(&mut buf, a.atime);
@@ -68,7 +73,11 @@ pub(crate) fn decode_entry(ino: u64, bytes: &[u8]) -> Entry {
         Kind::File
     };
     let (perm, rest) = rest.split_at(2);
-    let (_owners, rest) = rest.split_at(8);
+    let (reserved, rest) = rest.split_at(8);
+    let layout = match reserved[0] {
+        1 => Layout::Hybrid,
+        _ => Layout::Inline,
+    };
     let (size, rest) = rest.split_at(8);
     let (nlink, rest) = rest.split_at(4);
     let (atime, rest) = take_time(rest);
@@ -85,6 +94,7 @@ pub(crate) fn decode_entry(ino: u64, bytes: &[u8]) -> Entry {
         atime,
         mtime,
         ctime,
+        layout,
     };
     Entry { attr, parent }
 }
@@ -106,6 +116,7 @@ mod tests {
                 atime: t,
                 mtime: t + Duration::from_secs(1),
                 ctime: t + Duration::from_secs(2),
+                layout: Layout::Inline,
             },
             parent: 7,
         };
@@ -115,5 +126,32 @@ mod tests {
         let back = decode_entry(42, &bytes);
         assert_eq!(back.attr, entry.attr);
         assert_eq!(back.parent, 7);
+    }
+
+    #[test]
+    fn the_layout_takes_the_first_reserved_byte() {
+        let mut entry = decode_entry(
+            5,
+            &encode_entry(&Entry {
+                attr: Attr {
+                    ino: 5,
+                    kind: Kind::File,
+                    size: 1,
+                    perm: 0o600,
+                    nlink: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    layout: Layout::Inline,
+                },
+                parent: 0,
+            }),
+        );
+        // What a record from before layouts holds there: zeros.
+        assert_eq!(encode_entry(&entry)[3..11], [0; 8]);
+        entry.attr.layout = Layout::Hybrid;
+        let bytes = encode_entry(&entry);
+        assert_eq!(bytes[3..11], [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(decode_entry(5, &bytes).attr.layout, Layout::Hybrid);
     }
 }

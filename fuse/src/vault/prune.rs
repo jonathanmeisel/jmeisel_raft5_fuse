@@ -27,9 +27,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
 
 use raft5fs_crypto::data::{open_name, seal_chunk, sealed_version};
-use raft5fs_proto::types::{ChunkWrite, DirItem, FsError, Kind, RESEAL_NAMES_BATCH, ResealedName};
+use raft5fs_proto::types::{
+    ChunkWrite, DirItem, FsError, Kind, RESEAL_NAMES_BATCH, ResealedName, WriteBody,
+};
 
-use super::{CHANGE_RETRIES, Node, Vault, changed, corrupt, expired};
+use super::{CHANGE_RETRIES, Node, Vault, changed, corrupt, expired, sealed_blob};
 
 /// What pruning a tree did -- or, for a dry run, would do.
 #[derive(Debug, Default)]
@@ -259,14 +261,17 @@ impl Vault {
         let mut count = 0;
         let mut first = 0;
         loop {
-            let (attr, got) = self.remote.read_chunks(ino, first, per_batch, &[]).await?;
-            let end = attr.size.div_ceil(chunk_size);
+            let read = self.remote.read_chunks(ino, first, per_batch, &[]).await?;
+            let got = read.chunks;
+            let end = read.attr.size.div_ceil(chunk_size);
             let Some(next) = got.last().map(|c| c.index + 1) else {
                 break;
             };
             let mut writes = Vec::new();
             for chunk in got.iter().filter(|c| c.index < end) {
-                let Some(blob) = &chunk.blob else { continue };
+                let Some(blob) = sealed_blob(ino, &chunk.body)? else {
+                    continue;
+                };
                 if sealed_version(blob).map_err(|e| corrupt(ino, e))? >= target {
                     continue;
                 }
@@ -276,7 +281,13 @@ impl Vault {
                     writes.push(ChunkWrite {
                         index: chunk.index,
                         expected_seq: Some(chunk.seq),
-                        blob: seal_chunk(&node.key, version, ino, chunk.index, &plain),
+                        body: WriteBody::Inline(seal_chunk(
+                            &node.key,
+                            version,
+                            ino,
+                            chunk.index,
+                            &plain,
+                        )),
                     });
                 }
             }
