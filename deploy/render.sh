@@ -8,6 +8,14 @@
 . "$(dirname "$0")/lib.sh"
 
 [[ -f $SECRETS/internal-ca.pem ]] || die "no secrets yet: run ./certs.sh first"
+if [[ -n ${S3_BUCKET:-} ]]; then
+    [[ -f $SECRETS/s3.env ]] ||
+        die "S3_BUCKET is set: put the bucket's credentials in secrets/s3.env (README \"Large files\")"
+    for var in RAFT5FS_OBJECT_ACCESS_KEY RAFT5FS_OBJECT_SECRET_KEY; do
+        grep -q "^$var=" "$SECRETS/s3.env" || die "secrets/s3.env has no $var="
+    done
+    object_options >/dev/null
+fi
 for bin in raft5-server raft raft5fs-server; do
     [[ -x $OUT/bin/$bin ]] || die "no $OUT/bin/$bin: run ./build.sh first"
 done
@@ -21,6 +29,7 @@ fill() {
         -e "s|@SEEDS@|$(store_seeds)|g" \
         -e "s|@CHUNK_SIZE@|$CHUNK_SIZE|g" \
         -e "s|@INVITE_SERVERS@|$(invite_servers)|g" \
+        -e "s|@OBJECT_OPTIONS@|$(object_options)|g" \
         "$DEPLOY/templates/$1"
 }
 
@@ -45,6 +54,12 @@ render() {
     # Public: it goes into users' invitations.
     cp "$SECRETS/fs-ca.pem" "$dir/raft5fs/"
     echo "RAFT5FS_STORE_PASSWORD=$(cat "$SECRETS/store.pw")" >"$dir/raft5fs/store.env"
+    if [[ -n ${S3_BUCKET:-} ]]; then
+        grep -E '^RAFT5FS_OBJECT_(ACCESS|SECRET)_KEY=' "$SECRETS/s3.env" >>"$dir/raft5fs/store.env"
+        if [[ -f $SECRETS/s3-ca.pem ]]; then
+            cp "$SECRETS/s3-ca.pem" "$dir/raft5fs/"
+        fi
+    fi
 
     # Only the first node bootstraps the cluster, and only it ever needs
     # the first administrator's password (install.sh --bootstrap).

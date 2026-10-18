@@ -37,7 +37,8 @@ repository.
 | `backup.sh` | Copies a node's store database off the cluster. |
 | `templates/` | The systemd units, the scripts installed on the nodes, and the node-side installer. |
 
-`cluster.conf`, `secrets/`, `out/` and `backups/` are git-ignored.
+`cluster.conf`, `secrets/`, `out/` and `backups/` are git-ignored. With
+large files in a bucket (below), `secrets/s3.env` holds its credentials.
 **`secrets/` is the only copy of the CA keys and passwords: back it up
 somewhere safe and offline.**
 
@@ -174,6 +175,84 @@ WireGuard peers is applied in place (`wg syncconf`). A node's own
 WireGuard *address* can't be changed that way: changing it means
 re-bootstrapping that node's membership, so pick the addresses once.
 
+## Large files
+
+Optionally, files' data past `OBJECT_FROM` (10 MiB) can go to an
+S3-compatible bucket instead of the store, in objects of `OBJECT_BLOCK`
+(16 MiB) each. Small files, and the start of every file, stay in the
+store. The servers sign URLs for users' mounts after checking their
+grants, and the mounts read and upload objects directly, so bulk data no
+longer passes through the servers or the store. Everything in the bucket
+is sealed by the mounts, as everything in the store is. See SETUP.txt
+section 12 for how it works and what it costs.
+
+Only files created while it is on use the bucket. Files made before keep
+everything in the store, and stay readable whether it is on or off.
+
+**1. Make a bucket and a key for it.** The servers sign every URL with
+this key, so it needs reading, writing, deleting and listing, but only
+under the prefix. On AWS:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::BUCKET/raft5fs/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": { "StringLike": { "s3:prefix": "raft5fs/*" } }
+    }
+  ]
+}
+```
+
+Keep the bucket private: there is no public access to give, and no CORS
+to set up. The store must support conditional writes (`If-None-Match`),
+which AWS S3 and current MinIO do. That is what stops a URL from
+overwriting an object once it is there.
+
+**2. Turn on versioning, with a lifecycle rule** that expires noncurrent
+versions after at least as long as you keep backups (below). Garbage
+collection deletes objects nothing points at any more. A restored backup
+may point at some of them again, and versioning is what still has them.
+
+**3. Configure.** In `cluster.conf`, set `S3_BUCKET`, `S3_ENDPOINT` and
+`S3_REGION` (and `S3_PATH_STYLE=yes` for MinIO). Then put the key in
+`secrets/s3.env`:
+
+```sh
+RAFT5FS_OBJECT_ACCESS_KEY=AKIA...
+RAFT5FS_OBJECT_SECRET_KEY=...
+```
+
+For a store behind a private CA, put its certificate in
+`secrets/s3-ca.pem`. Users then need it too, as `object_ca` in their
+profile (SETUP.txt section 12).
+
+**4. Install:** `./install.sh --all`. The first server to start records
+`OBJECT_FROM` and `OBJECT_BLOCK` for the filesystem's lifetime.
+
+Users' machines must be able to reach `S3_ENDPOINT` directly. The nodes
+need nothing new: their firewall already allows outgoing connections.
+Every server with the bucket configured also collects garbage every
+`GC_INTERVAL` seconds, one at a time, and logs each sweep
+(`journalctl -u raft5fs-server`).
+
+**Choosing `OBJECT_BLOCK`.** Bigger blocks mean fewer objects, which means
+fewer requests and faster garbage collection. But a block is rewritten
+whole for any change inside it, and a mount buffers up to a block per file
+being written. 16 MiB suits files written front to back and read back,
+such as media, archives and backups. Use 4 MiB, or keep such files out of
+large-file filesystems, for databases and VM images, which make small
+random writes. `OBJECT_FROM` and `OBJECT_BLOCK` can't change once the
+first server has used them.
+
 ## Backups
 
 The cluster keeps three copies, which protects against a dead disk but
@@ -188,7 +267,9 @@ So also copy the store off it regularly:
 This stops that node's store for the duration of the copy while the
 other two carry on. Run it only with the whole cluster healthy (the
 script checks first). The copy holds only what the servers can see, so
-it's fine to keep it off-site, for example in object storage. Keep
+it's fine to keep it off-site, for example in object storage. It
+doesn't include the bucket's objects (see "Large files"): the bucket's
+versioning is what keeps those restorable. Keep
 `secrets/` separately, offline. With the copy alone, nobody can log in.
 
 **Restoring is untested.** A store database records the cluster's

@@ -63,6 +63,10 @@ for f in node.pem node.key internal-ca.pem fs.pem fs.key token.key; do
     put "raft5fs/$f" "/etc/raft5fs/$f" 0640 root:raft5fs raft5fs-server
 done
 put raft5fs/store.env /etc/raft5fs/store.env 0600 root:root raft5fs-server
+# The object store's CA, if it has a private one (cluster.conf's S3_*).
+if [ -f raft5fs/s3-ca.pem ]; then
+    put raft5fs/s3-ca.pem /etc/raft5fs/s3-ca.pem 0644 root:root raft5fs-server
+fi
 put raft5fs/fs-ca.pem /etc/raft5fs/fs-ca.pem 0644 root:root raft5fs-admin
 
 if $bootstrap; then

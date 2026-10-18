@@ -32,6 +32,23 @@ RAFT5_REPO=../../jmeisel_raft5
 # filesystem (see SETUP.txt section 4).
 CHUNK_SIZE=1M
 
+# Large files in an S3-compatible bucket (README "Large files"; SETUP.txt
+# section 12). Optional: leave S3_BUCKET empty to keep everything in the
+# store. The credentials go in secrets/s3.env, never here.
+S3_BUCKET=
+S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com
+S3_REGION=eu-west-1
+# yes for MinIO and most self-hosted stores (<endpoint>/<bucket>/ URLs).
+S3_PATH_STYLE=no
+S3_PREFIX=raft5fs/
+# Where in a file its data starts going to the bucket, and how much of it
+# each object holds (a whole number of chunks). Both are fixed by the
+# first server that uses them.
+OBJECT_FROM=10M
+OBJECT_BLOCK=16M
+# How often, in seconds, to delete objects nothing points at any more.
+GC_INTERVAL=3600
+
 # How long the certificates issued by certs.sh last, in days. The CAs
 # last ten years.
 CERT_DAYS=397

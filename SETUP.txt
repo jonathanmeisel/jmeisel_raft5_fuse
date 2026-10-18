@@ -162,6 +162,9 @@ The first server to start on an empty store creates the filesystem.
                 still exist before looking again (default 5): how long
                 removing a user takes to reach one who is mounted.
 
+To keep large files' data in an S3-compatible bucket rather than in the
+store, see section 12.
+
 A store made by an older raft5fs -- one that could make unencrypted
 filesystems, or one whose grants and names were sealed differently -- is
 refused: there is no migrating one.
@@ -449,6 +452,10 @@ They can see:
 
   - the shape of the tree, inode numbers, sizes, permission bits and
     times;
+  - with large files in a bucket (section 12), which of a file's blocks
+    are read and written, and when. Whoever runs the bucket sees as
+    much of that as the objects show: each object's size, the inode it
+    belongs to, and when it is read or written -- sealed contents only;
   - who is granted what, read-only or not, and who reads and writes
     which inodes, and when;
   - the names of snapshots, which are chosen in the clear;
@@ -486,6 +493,8 @@ What it costs:
     files the mount hasn't touched cost more; a smaller --chunk-size,
     chosen when the filesystem is created, helps.
   - Each chunk is stored 44 bytes larger.
+  - In a bucket (section 12), a block is replaced whole: a small write
+    into one uploads all of it again.
   - A revocation, a grant, and a move to another directory each scan
     every grant in the filesystem. Fine for hundreds; slow for very many.
   - A move to another directory gives what moved a new key, and
@@ -572,7 +581,104 @@ as seeds.
       don't match the store's (--store-ca, and --store-cert/--store-key
       if the store requires client certificates).
 
+  "Operation not supported" reading a large file
+      It keeps data in object storage (section 12), which this mount is
+      too old to read. Upgrade raft5fs on this machine.
+
+  "uploading a block" / "fetching a block: object store refused the
+  request (403)"
+      The bucket refused a URL a server signed: the servers' key lacks a
+      permission, or a server's clock is wrong, or the mount sat on the
+      URL too long. On the servers' side, check the key and NTP.
+
+  "... keeps data in object storage, which this server can't reach"
+      A server without the object options served a file whose data is in
+      the bucket. Give every server the same object options.
+
   A server that "did not answer"
       Over TLS this is often a refused handshake, not a dead server: a
       missing client certificate, or a certificate whose
       subjectAltName doesn't cover the address dialed.
+
+
+-------------------------------------------------------------------------
+12. LARGE FILES IN OBJECT STORAGE
+-------------------------------------------------------------------------
+
+The store keeps every byte on every node, and everything written goes
+through one leader. That suits small files. For large ones, the
+filesystem servers can keep each file's data past a point in an
+S3-compatible bucket instead:
+
+  export RAFT5FS_OBJECT_ACCESS_KEY='<the bucket key>'
+  export RAFT5FS_OBJECT_SECRET_KEY='<its secret>'
+  raft5fs-server ... \
+    --object-endpoint https://s3.eu-west-1.amazonaws.com \
+    --object-bucket <BUCKET> --object-region eu-west-1 \
+    $STORE https://127.0.0.1:27051
+
+The usage `raft5fs-server` prints with no options covers the rest:
+--object-path-style for MinIO, --object-prefix, --object-ca,
+--object-from, --object-block and --gc-interval.
+
+How it works. A file made through such a server is "hybrid":
+
+  - Its first --object-from (default 10M) stays in the store, as every
+    file's does. Past that, its data goes in blocks of --object-block
+    (default 16M), one object each, and the store keeps a 32-byte
+    pointer per block.
+  - To write a block, the mount seals each chunk of it (zero-padded to
+    a whole chunk) and asks a server for an upload URL. The server
+    checks the grant and signs a URL for exactly that many bytes,
+    usable once. The mount uploads the block, then stores the pointer.
+  - To read, a server hands the mount a URL for the block, and the
+    mount fetches only the chunks it needs.
+
+Every server of a filesystem should have the same object options. The
+first to start records --object-from and --object-block for good. Files
+made before keep everything in the store.
+
+Users' mounts must be able to reach the bucket's endpoint. For a bucket
+behind a private CA, add the CA to the profile:
+
+  object_ca = "/path/to/s3-ca.pem"
+
+An older mount, which can't read blocks, gets "Operation not supported"
+reading a hybrid file past --object-from. It never gets zeros in place
+of data.
+
+Garbage. Objects are never changed, only replaced. Every change to a
+block -- a write in it, a truncate into it, a prune -- uploads a new
+object, and the one it replaces is left behind. Each server with a
+bucket sweeps for those every --gc-interval (default 3600 s), one server
+at a time:
+
+  - It deletes an object once two sweeps at least --object-get-ttl plus
+    five minutes apart have found nothing pointing at it, live or in any
+    snapshot.
+  - It never deletes one minted too recently to be sure of, or anything
+    under the prefix that isn't one of its own object names.
+  - A sweep that fails part-way deletes nothing.
+
+A snapshot keeps its blocks for as long as it exists, as it keeps
+everything else.
+
+The bucket needs:
+
+  - conditional writes (If-None-Match), which AWS S3 and current MinIO
+    support: what stops an upload URL being used to overwrite an object;
+  - versioning, with noncurrent versions kept at least as long as
+    backups of the store: restoring an older store brings back pointers
+    to objects that garbage collection has since deleted;
+  - a key allowed to get, put, delete and list under the prefix, and
+    nothing else. Every URL the servers sign acts with its rights;
+  - the servers' clocks kept right (NTP): upload names carry the time
+    they were minted, and a commit too long after that is refused.
+
+What it costs. A block is replaced whole, so a small write into one
+fetches whatever of it isn't cached and uploads the whole block again.
+A mount also holds up to a block per file being written before it
+uploads it. Large files written front to back, and read back, are what
+this is for. Small random writes into large files (databases, VM images)
+do better with a smaller --object-block, or in a filesystem without a
+bucket.

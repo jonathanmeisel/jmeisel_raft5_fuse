@@ -54,6 +54,23 @@ invite_servers() {
     done
 }
 
+# raft5fs-server's object storage options, from cluster.conf: none unless
+# S3_BUCKET is set. Values may not contain spaces.
+object_options() {
+    if [[ -z ${S3_BUCKET:-} ]]; then
+        return 0
+    fi
+    [[ -n ${S3_ENDPOINT:-} ]] || die "S3_BUCKET is set but S3_ENDPOINT isn't, in cluster.conf"
+    printf -- '--object-endpoint %s --object-bucket %s ' "$S3_ENDPOINT" "$S3_BUCKET"
+    if [[ -n ${S3_REGION:-} ]]; then printf -- '--object-region %s ' "$S3_REGION"; fi
+    if [[ ${S3_PATH_STYLE:-no} == yes ]]; then printf -- '--object-path-style '; fi
+    if [[ -n ${S3_PREFIX:-} ]]; then printf -- '--object-prefix %s ' "$S3_PREFIX"; fi
+    if [[ -n ${OBJECT_FROM:-} ]]; then printf -- '--object-from %s ' "$OBJECT_FROM"; fi
+    if [[ -n ${OBJECT_BLOCK:-} ]]; then printf -- '--object-block %s ' "$OBJECT_BLOCK"; fi
+    if [[ -n ${GC_INTERVAL:-} ]]; then printf -- '--gc-interval %s ' "$GC_INTERVAL"; fi
+    if [[ -f $SECRETS/s3-ca.pem ]]; then printf -- '--object-ca /etc/raft5fs/s3-ca.pem '; fi
+}
+
 # The address users dial for node $1.
 public_address() {
     local name
