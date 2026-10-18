@@ -1,0 +1,27 @@
+[package]
+name = "raft5fs-objstore"
+description = "The object store large files' blocks live in: object names, presigned URLs, listing and deleting, and the HTTP client mounts fetch and upload with. An in-memory stand-in for tests behind `fake`."
+version.workspace = true
+edition.workspace = true
+
+[features]
+# An in-memory, signature-checking S3 stand-in, for tests (`fake::FakeStore`).
+fake = ["dep:axum", "dep:base64", "dep:md-5", "dep:tokio"]
+
+[dependencies]
+getrandom = "0.2"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+rusty-s3 = "0.10"
+url = "2"
+
+axum = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+md-5 = { version = "0.10", optional = true }
+tokio = { workspace = true, features = ["net", "sync"], optional = true }
+
+[dev-dependencies]
+raft5fs-objstore = { path = ".", features = ["fake"] }
+tokio = { workspace = true, features = ["macros", "net"] }
