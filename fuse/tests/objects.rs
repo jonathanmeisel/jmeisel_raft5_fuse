@@ -747,3 +747,144 @@ fn pruning_reseals_blocks_into_new_objects() {
     let again = h.runtime.block_on(mine.prune_tree(ino(&v), false));
     assert_eq!(again.chunks, 0, "{again:?}");
 }
+
+/// Past the commit window (a PUT URL's life, a transaction's, and clock
+/// skew), so nothing minted before a sweep then is too new to judge.
+const LATER: Duration = Duration::from_secs(3600);
+/// How long an object must go unreferenced between two sweeps.
+const WAIT: Duration = Duration::from_secs(
+    raft5fs_core::objects::DEFAULT_GET_TTL.as_secs() + raft5fs_core::gc::DELETE_MARGIN.as_secs(),
+);
+
+fn sweep(
+    h: &support::Harness,
+    core: &raft5fs_core::FsCore,
+    gc: &mut raft5fs_core::gc::Gc,
+    at: SystemTime,
+) -> raft5fs_core::gc::GcStats {
+    h.runtime.block_on(core.gc_once(gc, at)).unwrap()
+}
+
+/// A file `f` holding one block, rewritten in part: its first object now
+/// unreferenced.
+fn file_with_garbage(h: &support::Harness) -> std::path::PathBuf {
+    let f = h.path().join("f");
+    fs::write(&f, pattern(K * C + B)).unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    file.write_all_at(b"changed", K * C + 5).unwrap();
+    file.sync_all().unwrap();
+    f
+}
+
+#[test]
+fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
+    let h = support::setup_with_objects();
+    let f = file_with_garbage(&h);
+    let expected = fs::read(&f).unwrap();
+    // An upload no commit ever named, and something not ours at all.
+    let mine = vault(&h);
+    let file = ino(&f);
+    let node = h.runtime.block_on(mine.node(file)).unwrap();
+    upload(&h, mine.remote(), &node, file, K2, &[vec![1; 10]]);
+    h.store().insert("fs/not-ours", vec![1]);
+    assert_eq!(h.store().keys().len(), 4);
+
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let now = SystemTime::now();
+    // At once, the two unreferenced objects are too new to judge.
+    let s = sweep(&h, &core, &mut gc, now);
+    assert!(s.swept);
+    assert_eq!(
+        (s.referenced, s.listed, s.foreign, s.young, s.deleted),
+        (1, 4, 1, 2, 0)
+    );
+    // Later, they are candidates; not yet gone.
+    let first = now + LATER;
+    let s = sweep(&h, &core, &mut gc, first);
+    assert_eq!((s.waiting, s.deleted), (2, 0));
+    let s = sweep(&h, &core, &mut gc, first + WAIT - Duration::from_secs(60));
+    assert_eq!((s.waiting, s.deleted), (2, 0));
+    // Long enough after the first sweep to find them: gone.
+    let s = sweep(&h, &core, &mut gc, first + WAIT);
+    assert_eq!((s.waiting, s.deleted), (0, 2));
+    assert_eq!(h.store().keys().len(), 2);
+    assert!(h.store().object("fs/not-ours").is_some());
+    assert_eq!(read_afresh(&h, "f"), expected);
+    let s = sweep(&h, &core, &mut gc, first + WAIT * 2);
+    assert_eq!(s.deleted, 0);
+}
+
+#[test]
+fn what_a_snapshot_holds_stays_until_the_snapshot_goes() {
+    let h = support::setup_with_objects();
+    let f = h.path().join("f");
+    let data = pattern(K * C + B);
+    fs::write(&f, &data).unwrap();
+    let file = ino(&f);
+    h.snapshot("s");
+    fs::remove_file(&f).unwrap();
+    assert_eq!(h.store().keys().len(), 1);
+
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let first = SystemTime::now() + LATER;
+    for at in [first, first + WAIT, first + WAIT * 2] {
+        let s = sweep(&h, &core, &mut gc, at);
+        assert_eq!((s.snapshots, s.referenced, s.deleted), (1, 1, 0));
+    }
+    let then = vault(&h).at_snapshot("s", 1);
+    assert_eq!(
+        h.runtime.block_on(then.read(file, 0, data.len())).unwrap(),
+        data
+    );
+
+    h.drop_snapshot("s");
+    let after = first + WAIT * 3;
+    assert_eq!(sweep(&h, &core, &mut gc, after).deleted, 0);
+    assert_eq!(sweep(&h, &core, &mut gc, after + WAIT).deleted, 1);
+    assert!(h.store().keys().is_empty());
+}
+
+#[test]
+fn a_sweep_that_fails_deletes_nothing() {
+    let h = support::setup_with_objects();
+    file_with_garbage(&h);
+    let objects = h.store().keys().len();
+    // Can't list the bucket: its secret is wrong.
+    let broken = h.gc_core_with(|config| config.secret_key = "wrong".into());
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let first = SystemTime::now() + LATER;
+    for at in [first, first + WAIT, first + WAIT * 2] {
+        assert!(h.runtime.block_on(broken.gc_once(&mut gc, at)).is_err());
+    }
+    assert_eq!(h.store().keys().len(), objects);
+    assert_eq!(h.store().stats().deleted, 0);
+
+    // A working one, once the broken one's lease has run out, does.
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let later = first + WAIT * 2 + raft5fs_core::gc::LEASE_TTL;
+    assert_eq!(sweep(&h, &core, &mut gc, later).deleted, 0);
+    assert_eq!(sweep(&h, &core, &mut gc, later + WAIT).deleted, 1);
+}
+
+#[test]
+fn one_server_sweeps_at_a_time() {
+    let h = support::setup_with_objects();
+    let (a, b) = (h.gc_core(), h.gc_core());
+    let (mut ga, mut gb) = (
+        raft5fs_core::gc::Gc::default(),
+        raft5fs_core::gc::Gc::default(),
+    );
+    let now = SystemTime::now();
+    assert!(sweep(&h, &a, &mut ga, now).swept);
+    assert!(!sweep(&h, &b, &mut gb, now).swept);
+    // The holder keeps it by sweeping; the other waits it out.
+    let soon = now + Duration::from_secs(60);
+    assert!(sweep(&h, &a, &mut ga, soon).swept);
+    assert!(!sweep(&h, &b, &mut gb, soon).swept);
+    let expired = soon + raft5fs_core::gc::LEASE_TTL + Duration::from_secs(1);
+    assert!(sweep(&h, &b, &mut gb, expired).swept);
+    assert!(!sweep(&h, &a, &mut ga, expired).swept);
+}

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
+use raft5fs_core::gc::DEFAULT_GC_INTERVAL;
 use raft5fs_core::objects::{
     DEFAULT_GET_TTL, DEFAULT_OBJECT_BLOCK, DEFAULT_OBJECT_FROM, DEFAULT_PUT_TTL, ObjectSettings,
 };
@@ -84,6 +85,11 @@ server of one filesystem should have the same object options.
                        (defaults 600 and 900).
   --object-ca <PEM>    trust this CA for the object store, besides the
                        system's.
+  --gc-interval <SECS> how often to look for objects nothing points at
+                       any more, and delete them (default 3600; 0 never).
+                       Several servers can have it on: one sweeps at a
+                       time. An object goes only once two sweeps at least
+                       --object-get-ttl apart have found it unreferenced.
   The store's credentials are read from RAFT5FS_OBJECT_ACCESS_KEY and
   RAFT5FS_OBJECT_SECRET_KEY.
 
@@ -186,6 +192,7 @@ struct Args {
     object_put_ttl: Option<Duration>,
     object_get_ttl: Option<Duration>,
     object_ca: Option<String>,
+    gc_interval: Option<Duration>,
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
@@ -243,6 +250,10 @@ fn parse_args() -> Args {
                 a.object_get_ttl = Some(Duration::from_secs(secs.into()));
             }
             "--object-ca" => a.object_ca = Some(value("--object-ca")),
+            "--gc-interval" => {
+                let secs = parse_number("--gc-interval", &value("--gc-interval"));
+                a.gc_interval = Some(Duration::from_secs(secs.into()));
+            }
             "--invite-server" => a.invite_servers.push(value("--invite-server")),
             "--invite-ca" => a.invite_ca = Some(value("--invite-ca")),
             "--invite-server-name" => a.invite_server_name = Some(value("--invite-server-name")),
@@ -530,11 +541,12 @@ async fn serve_command(a: Args) {
         .await
         .unwrap_or_else(|e| usage(&format!("cannot listen on {listen}: {e}")));
     eprintln!("serving on {}", listener.local_addr().unwrap());
-    let fs = FsService::new(
-        Arc::new(core),
-        signer,
-        a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL),
-    );
+    let core = Arc::new(core);
+    let gc_interval = a.gc_interval.unwrap_or(DEFAULT_GC_INTERVAL);
+    if core.object_grid().is_some() && !gc_interval.is_zero() {
+        tokio::spawn(Arc::clone(&core).run_gc(gc_interval));
+    }
+    let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL));
     if let Err(e) = raft5fs_server::serve(fs, listener, tls, pending()).await {
         fail(format!("server stopped: {e}"));
     }

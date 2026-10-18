@@ -24,6 +24,9 @@ pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 /// once a server with object storage has opened the filesystem.
 pub(crate) const OBJECT_GRID_KEY: &[u8] = b"\x04object_grid";
 
+/// Who sweeps object storage for garbage, until when (see `gc`).
+pub(crate) const GC_LEASE_KEY: &[u8] = b"\x04gc_lease";
+
 /// Marks a store as holding a filesystem in this raft5fs's format (one
 /// byte, `STORE_FORMAT`). An older raft5fs's store has a root but no such
 /// key, or another byte here -- 0 for an unencrypted one, 1 for one whose

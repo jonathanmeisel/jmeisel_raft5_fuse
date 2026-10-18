@@ -325,14 +325,14 @@ fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
 }
 
 pub struct FsCore {
-    client: Client,
+    pub(crate) client: Client,
     chunk_size: u64,
     /// How hybrid files are laid out, if the filesystem has any: recorded
     /// by the first server that kept objects for it, and known to every
     /// server after, object storage or not.
-    grid: Option<ObjectGrid>,
+    pub(crate) grid: Option<ObjectGrid>,
     /// Where this server keeps data in object storage, if it does.
-    objects: Option<Objects>,
+    pub(crate) objects: Option<Objects>,
 }
 
 impl FsCore {

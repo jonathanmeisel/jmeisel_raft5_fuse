@@ -442,29 +442,7 @@ pub fn serve_if_requested() {
                 eprintln!("test server could not log in to the store: {e}");
                 std::process::exit(1);
             });
-        let objects = objects.map(|endpoint| {
-            let http = raft5fs_objstore::http::client(&HttpConfig {
-                allow_plaintext: true,
-                ..HttpConfig::default()
-            })
-            .expect("an HTTP client for the object store");
-            let config = S3Config {
-                endpoint,
-                bucket: TEST_BUCKET.into(),
-                region: fake::REGION.into(),
-                path_style: true,
-                access_key: fake::ACCESS_KEY.into(),
-                secret_key: fake::SECRET_KEY.into(),
-                prefix: TEST_OBJECT_PREFIX.into(),
-            };
-            ObjectSettings {
-                store: S3Store::new(&config, http).expect("the fake object store's settings"),
-                object_from: TEST_OBJECT_FROM_CHUNKS * chunk_size,
-                object_block: TEST_BLOCK_CHUNKS * chunk_size,
-                put_ttl: DEFAULT_PUT_TTL,
-                get_ttl: DEFAULT_GET_TTL,
-            }
-        });
+        let objects = objects.map(|endpoint| object_settings(endpoint, chunk_size, |_| {}));
         let core = FsCore::connect(client, chunk_size, objects)
             .await
             .unwrap_or_else(|why| {
@@ -491,6 +469,37 @@ pub fn serve_if_requested() {
         }
         std::process::exit(1);
     });
+}
+
+/// What a test server keeps objects with: the fake store at `endpoint`,
+/// on the test grid, its settings changed as `edit` says.
+fn object_settings(
+    endpoint: String,
+    chunk_size: u64,
+    edit: impl FnOnce(&mut S3Config),
+) -> ObjectSettings {
+    let http = raft5fs_objstore::http::client(&HttpConfig {
+        allow_plaintext: true,
+        ..HttpConfig::default()
+    })
+    .expect("an HTTP client for the object store");
+    let mut config = S3Config {
+        endpoint,
+        bucket: TEST_BUCKET.into(),
+        region: fake::REGION.into(),
+        path_style: true,
+        access_key: fake::ACCESS_KEY.into(),
+        secret_key: fake::SECRET_KEY.into(),
+        prefix: TEST_OBJECT_PREFIX.into(),
+    };
+    edit(&mut config);
+    ObjectSettings {
+        store: S3Store::new(&config, http).expect("the fake object store's settings"),
+        object_from: TEST_OBJECT_FROM_CHUNKS * chunk_size,
+        object_block: TEST_BLOCK_CHUNKS * chunk_size,
+        put_ttl: DEFAULT_PUT_TTL,
+        get_ttl: DEFAULT_GET_TTL,
+    }
 }
 
 fn start_servers(cluster: &TestCluster, chunk_size: u64, objects: Option<&str>) -> Vec<TestServer> {
@@ -654,6 +663,25 @@ impl Harness {
         self.objects
             .as_ref()
             .expect("this harness has no object store; use setup_with_objects")
+    }
+
+    /// A filesystem core in this process, over the same store and object
+    /// store as the servers: for tests to run garbage collection on
+    /// demand, at whatever time they say.
+    pub fn gc_core(&self) -> FsCore {
+        self.gc_core_with(|_| {})
+    }
+
+    /// `gc_core`, its object store settings changed as `edit` says.
+    pub fn gc_core_with(&self, edit: impl FnOnce(&mut S3Config)) -> FsCore {
+        let settings = object_settings(self.store().endpoint(), self.chunk_size, edit);
+        self.runtime
+            .block_on(FsCore::connect(
+                self.client.clone(),
+                self.chunk_size,
+                Some(settings),
+            ))
+            .expect("open the filesystem for garbage collection")
     }
 
     /// The servers' addresses, starting with the `first`th and wrapping.

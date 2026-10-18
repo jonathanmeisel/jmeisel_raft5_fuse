@@ -3,6 +3,7 @@
 pub mod accounts;
 mod entry;
 mod fs;
+pub mod gc;
 pub mod grants;
 mod layout;
 pub mod objects;

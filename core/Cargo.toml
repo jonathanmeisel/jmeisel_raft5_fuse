@@ -5,7 +5,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+getrandom = "0.2"
 libc = { workspace = true }
+tokio = { workspace = true }
 raft5-client = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true }
