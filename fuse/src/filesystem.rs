@@ -75,8 +75,11 @@ fn set_time(t: TimeOrNow) -> SetTime {
 /// What a committed run means for its caller: success, or the errno to
 /// report. A short write counts as failure here -- a buffered run is
 /// either stored or not, from the point of view of whoever is waiting.
-fn commit_result(result: Result<Attr, WriteError>) -> Result<(), Errno> {
-    result.map(|_| ()).map_err(|e| errno(&e.error))
+fn commit_result(ino: u64, start: u64, result: Result<Attr, WriteError>) -> Result<(), Errno> {
+    result.map(|_| ()).map_err(|e| {
+        eprintln!("write to inode {ino} at offset {start} failed: {}", e.error);
+        errno(&e.error)
+    })
 }
 
 pub struct Raft5Fs {
@@ -247,7 +250,11 @@ impl Raft5Fs {
         let Some((start, data)) = buf.take() else {
             return Ok(());
         };
-        let committed = commit_result(self.block(self.vault().write(buf.ino, start, &data)));
+        let committed = commit_result(
+            buf.ino,
+            start,
+            self.block(self.vault().write(buf.ino, start, &data)),
+        );
         if let Err(e) = committed {
             buf.err.get_or_insert(e);
         }
@@ -289,7 +296,7 @@ impl Raft5Fs {
                 return;
             };
             let stored = rt.block_on(vault.write(buf.ino, start, &data));
-            if let Err(e) = commit_result(stored) {
+            if let Err(e) = commit_result(buf.ino, start, stored) {
                 // No one is synchronously waiting on this commit, so the
                 // failure has nowhere to go but back into the buffer, for
                 // the next flush/fsync/write to report.
