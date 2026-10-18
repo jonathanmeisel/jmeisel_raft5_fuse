@@ -16,6 +16,7 @@ sha2 = "0.10"
 toml = "1"
 libc = { workspace = true }
 raft5fs-crypto = { workspace = true }
+raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true }
 tokio = { workspace = true }
 zeroize = "1"

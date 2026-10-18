@@ -54,6 +54,7 @@ use std::time::Duration;
 
 use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN};
 use raft5fs_crypto::password::{self, AUTH_LEN, KdfParams, PasswordKeys, new_salt, verifier};
+use raft5fs_objstore::http::{self, HttpConfig};
 use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
@@ -99,6 +100,10 @@ pub struct Credentials {
     /// Whether to talk to servers without TLS at all. Off unless asked:
     /// see the module doc.
     pub allow_plaintext: bool,
+    /// How to reach the object store large files' blocks are in, through
+    /// the URLs servers sign: which CAs to trust, and whether `http://`
+    /// will do (by default, it won't -- the URLs are bearer credentials).
+    pub objects: HttpConfig,
 }
 
 impl Credentials {
@@ -110,6 +115,7 @@ impl Credentials {
             password: password.into(),
             min_kdf: KdfParams::DEFAULT,
             allow_plaintext: false,
+            objects: HttpConfig::default(),
         }
     }
 }
@@ -161,6 +167,8 @@ pub struct Remote {
     /// How hybrid files group chunks into blocks, if the filesystem keeps
     /// data in object storage.
     grid: Option<ObjectGrid>,
+    /// What fetches blocks from object storage.
+    objects: http::Client,
     /// Whether reads say this client can fetch chunks from object storage
     /// (see `ReadChunksRequest.objects_ok`). Off only to test what a
     /// client that can't is told.
@@ -267,6 +275,7 @@ impl Remote {
                 ));
             }
         }
+        let objects = http::client(&credentials.objects).map_err(|e| e.to_string())?;
         let session = Session::default();
         let authorize = Authorize(Arc::clone(&session));
         let mut servers = Vec::new();
@@ -301,6 +310,7 @@ impl Remote {
             chunk_size: 0,
             batch_bytes: 0,
             grid: None,
+            objects,
             objects_ok: true,
             snapshot: String::new(),
         };
@@ -413,6 +423,7 @@ impl Remote {
             chunk_size: self.chunk_size,
             batch_bytes: self.batch_bytes,
             grid: self.grid,
+            objects: self.objects.clone(),
             objects_ok: self.objects_ok,
             snapshot: name.to_string(),
         }
@@ -540,6 +551,11 @@ impl Remote {
 
     pub fn grid(&self) -> Option<ObjectGrid> {
         self.grid
+    }
+
+    /// What fetches from object storage, through URLs the servers sign.
+    pub fn objects(&self) -> &http::Client {
+        &self.objects
     }
 
     /// This client, reading as one that can't fetch from object storage:

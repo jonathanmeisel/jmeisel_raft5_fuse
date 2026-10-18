@@ -20,6 +20,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use raft5fs_crypto::password::KdfParams;
+use raft5fs_objstore::http::HttpConfig;
 use raft5fs_proto::invite::pem_to_der;
 use raft5fs_proto::types::check_username;
 use serde::{Deserialize, Serialize};
@@ -177,8 +178,14 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_size: Option<String>,
     /// Talk to `http://` servers without TLS: throwaway setups only.
+    /// Allows an `http://` object store too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub insecure_plaintext: bool,
+    /// A CA certificate (PEM) to trust for the object store large files
+    /// are kept in, besides the system's: for a store behind a private
+    /// CA, such as a MinIO deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_ca: Option<PathBuf>,
 }
 
 impl Profile {
@@ -270,6 +277,9 @@ pub struct Context {
     /// Where pins are kept; `None` to keep them in memory only.
     pub known_keys: Option<PathBuf>,
     pub cache_size: Option<String>,
+    /// The object store's extra CA certificate, PEM, if the profile names
+    /// one.
+    pub object_ca: Option<Vec<u8>>,
 }
 
 impl Context {
@@ -342,6 +352,12 @@ impl Context {
             ca_id,
             known_keys,
             cache_size: profile.cache_size,
+            object_ca: profile
+                .object_ca
+                .map(|path| {
+                    std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+                })
+                .transpose()?,
         })
     }
 
@@ -376,6 +392,11 @@ impl Context {
         let mut credentials = Credentials::new(self.user.clone(), password);
         credentials.allow_plaintext = self.plaintext;
         credentials.min_kdf = KdfParams::DEFAULT;
+        credentials.objects = HttpConfig {
+            extra_roots_pem: self.object_ca.clone(),
+            allow_plaintext: self.plaintext,
+            ..HttpConfig::default()
+        };
         credentials
     }
 }

@@ -1,7 +1,7 @@
-//! The servers' side of object storage: hybrid files, upload URLs, block
-//! pointers and how they are checked, read and trimmed. Driven through
-//! `Remote` directly -- sealing and uploading blocks by hand -- since the
-//! mount's own reads and writes of blocks come later.
+//! Object storage: hybrid files, upload URLs, block pointers and how the
+//! servers check, read and trim them, and how mounts read blocks. Blocks
+//! are sealed and uploaded by hand here, through `Remote`, since mounts
+//! don't write them yet.
 
 mod support;
 
@@ -439,4 +439,132 @@ fn truncating_trims_the_block_the_end_falls_in() {
     truncate(K * C);
     assert_eq!(nseg(&h), None);
     assert!(bodies().iter().all(|b| *b == ChunkBody::Hole));
+}
+
+/// Commits `plains` as the block at chunk `first` of `ino`, growing the
+/// file to `end`.
+fn commit(
+    h: &support::Harness,
+    mine: &Vault,
+    node: &Node,
+    ino: u64,
+    first: u64,
+    plains: &[Vec<u8>],
+    end: u64,
+) {
+    let block = upload(h, mine.remote(), node, ino, first, plains);
+    h.runtime
+        .block_on(
+            mine.remote()
+                .write_chunks(ino, &[block_write(first, block)], end),
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_mount_reads_blocks() {
+    let h = support::setup_with_objects();
+    let mine = vault(&h);
+    let (file, node) = hybrid_file(&h, &mine);
+    let end = K2 * C + 50;
+    commit(
+        &h,
+        &mine,
+        &node,
+        file,
+        K,
+        &[vec![1; C as usize], vec![2; 100]],
+        end,
+    );
+    commit(&h, &mine, &node, file, K2, &[vec![3; 50]], end);
+
+    let mut expected = vec![0; end as usize];
+    expected[..4].copy_from_slice(b"head");
+    let at = |i: u64| i as usize;
+    expected[at(K * C)..at((K + 1) * C)].fill(1);
+    expected[at((K + 1) * C)..at((K + 1) * C + 100)].fill(2);
+    expected[at(K2 * C)..].fill(3);
+
+    // Through a vault of its own, which has cached none of it...
+    let reader = vault(&h);
+    let read = h
+        .runtime
+        .block_on(reader.read(file, 0, end as usize + 100))
+        .unwrap();
+    assert_eq!(read, expected);
+    // ...part-way into a block and out the other side...
+    let from = (K + 1) * C + 90;
+    let part = h
+        .runtime
+        .block_on(reader.read(file, from, (K2 * C + 10 - from) as usize))
+        .unwrap();
+    assert_eq!(part, expected[at(from)..at(K2 * C + 10)]);
+    // ...and through the kernel, on a mount with nothing cached.
+    let other = h.second_mount();
+    assert_eq!(fs::read(other.path.join("f")).unwrap(), expected);
+}
+
+#[test]
+fn a_read_fetches_only_the_segments_it_needs_once() {
+    let h = support::setup_with_objects();
+    let mine = vault(&h);
+    let (file, node) = hybrid_file(&h, &mine);
+    let full: Vec<Vec<u8>> = (0..TEST_BLOCK_CHUNKS)
+        .map(|j| vec![j as u8 + 1; C as usize])
+        .collect();
+    commit(&h, &mine, &node, file, K, &full, K2 * C);
+    let fetched = |since: &raft5fs_objstore::fake::Stats| {
+        let now = h.store().stats();
+        (now.gets - since.gets, now.bytes_read - since.bytes_read)
+    };
+
+    // A few bytes of the third segment: that segment, alone.
+    let reader = vault(&h);
+    let before = h.store().stats();
+    let got = h
+        .runtime
+        .block_on(reader.read(file, (K + 2) * C + 10, 20))
+        .unwrap();
+    assert_eq!(got, vec![3; 20]);
+    assert_eq!(fetched(&before), (1, S));
+
+    // The whole block, from a vault with nothing cached: one ranged GET.
+    let fresh = vault(&h);
+    let before = h.store().stats();
+    let got = h
+        .runtime
+        .block_on(fresh.read(file, K * C, (TEST_BLOCK_CHUNKS * C) as usize))
+        .unwrap();
+    assert_eq!(got.len() as u64, TEST_BLOCK_CHUNKS * C);
+    assert_eq!(fetched(&before), (1, TEST_BLOCK_CHUNKS * S));
+
+    // Again: all cached, confirmed with the server, nothing fetched.
+    let before = h.store().stats();
+    h.runtime
+        .block_on(fresh.read(file, K * C, (TEST_BLOCK_CHUNKS * C) as usize))
+        .unwrap();
+    assert_eq!(fetched(&before), (0, 0));
+
+    // Around a cached segment: the runs either side of it.
+    let before = h.store().stats();
+    h.runtime
+        .block_on(reader.read(file, K * C, (TEST_BLOCK_CHUNKS * C) as usize))
+        .unwrap();
+    assert_eq!(fetched(&before), (2, (TEST_BLOCK_CHUNKS - 1) * S));
+}
+
+#[test]
+fn a_snapshot_reads_the_blocks_it_was_taken_with() {
+    let h = support::setup_with_objects();
+    let mine = vault(&h);
+    let (file, node) = hybrid_file(&h, &mine);
+    let end = K * C + 10;
+    commit(&h, &mine, &node, file, K, &[vec![1; 10]], end);
+    h.snapshot("s");
+    commit(&h, &mine, &node, file, K, &[vec![2; 10]], end);
+
+    let then = mine.at_snapshot("s", 1);
+    let read = |v: &Vault| h.runtime.block_on(v.read(file, K * C, 10)).unwrap();
+    assert_eq!(read(&then), vec![1; 10]);
+    assert_eq!(read(&mine), vec![2; 10]);
 }

@@ -76,7 +76,7 @@ use std::time::Duration;
 
 use raft5fs_crypto::Key;
 use raft5fs_crypto::data::{
-    name_tag, open_chunk, open_name, seal_chunk, seal_name, sealed_version,
+    CHUNK_OVERHEAD, name_tag, open_chunk, open_name, seal_chunk, seal_name, sealed_version,
 };
 use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
 use raft5fs_crypto::identity::{
@@ -85,8 +85,8 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
-    Attr, ChunkBody, ChunkWrite, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath, NewNode,
-    Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError, check_username,
+    Attr, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
+    NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError, check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
@@ -440,15 +440,20 @@ fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
     spans
 }
 
-/// A chunk's sealed bytes as a read sent them, `None` for a hole. A chunk
-/// in object storage isn't fetched here yet, so is an error.
+/// How many ranges of objects one read fetches at once.
+const MAX_FETCHES: usize = 8;
+
+/// A chunk's sealed bytes as a read sent them, `None` for a hole. Every
+/// read here fetches segments in object storage first (`fetch_segments`),
+/// so one still there is an error -- as it is, for now, for a prune,
+/// which reads for itself.
 fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
     match body {
         ChunkBody::Hole => Ok(None),
         ChunkBody::Inline(blob) => Ok(Some(blob)),
         ChunkBody::Segment { .. } => Err(FsError::new(
             libc::EIO,
-            format!("inode {ino}: chunks in object storage can't be read here yet"),
+            format!("inode {ino}: a chunk in object storage, not fetched"),
         )),
     }
 }
@@ -1685,7 +1690,8 @@ impl Vault {
 
     /// Chunks `first..=last` of `ino`, in as many asks as the server's cap
     /// takes, and the file's size as of the last. `known[i]` is the seq
-    /// chunk `first + i` is cached at, or 0.
+    /// chunk `first + i` is cached at, or 0. Chunks in object storage come
+    /// back fetched, as if they were inline (see `fetch_segments`).
     async fn fetch(
         &self,
         ino: u64,
@@ -1693,35 +1699,102 @@ impl Vault {
         last: u64,
         known: &[u64],
     ) -> Result<(u64, Vec<SealedChunk>), FsError> {
-        let mut chunks = Vec::new();
+        let mut reads = Vec::new();
         let mut size = 0;
         let mut next = first;
         while next <= last {
             let count = (last - next + 1).min(u64::from(u32::MAX)) as u32;
             let known = &known[(next - first) as usize..];
             let read = self.remote.read_chunks(ino, next, count, known).await?;
-            let got = read.chunks;
             size = read.attr.size;
-            let Some(after) = got.last().map(|c| c.index + 1) else {
+            let Some(after) = read.chunks.last().map(|c| c.index + 1) else {
                 return Err(FsError::new(libc::EIO, "the server returned no chunks"));
             };
             next = after;
-            chunks.extend(got);
+            reads.push(read);
         }
-        Ok((size, chunks))
+        Ok((size, self.fetch_segments(ino, reads).await?))
     }
 
     /// One chunk of `ino`, and the store's seq for it; `unchanged`, with
     /// no bytes, if it is still at `known` (0 for none).
     async fn fetch_one(&self, ino: u64, index: u64, known: u64) -> Result<SealedChunk, FsError> {
-        let mut got = self
-            .remote
-            .read_chunks(ino, index, 1, &[known])
-            .await?
-            .chunks;
+        let read = self.remote.read_chunks(ino, index, 1, &[known]).await?;
+        let mut got = self.fetch_segments(ino, vec![read]).await?;
         got.pop()
             .filter(|c| c.index == index)
             .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
+    }
+
+    /// The chunks `reads` returned, with each one in object storage
+    /// fetched from it and put in its place as the sealed bytes it is --
+    /// so everything after reads it as it reads an inline chunk, opening
+    /// it at its own index.
+    ///
+    /// Consecutive segments of one block are fetched in one ranged GET, and
+    /// different runs at once, up to `MAX_FETCHES`. Every segment is the
+    /// same length (each was zero-padded to a whole chunk before sealing),
+    /// which is what lets a range be cut out of a block without reading
+    /// the rest of it.
+    async fn fetch_segments(
+        &self,
+        ino: u64,
+        reads: Vec<Chunks>,
+    ) -> Result<Vec<SealedChunk>, FsError> {
+        let segment_len = self.remote.chunk_size() + CHUNK_OVERHEAD as u64;
+        let mut chunks = Vec::new();
+        // Runs to fetch: the URL, the first segment, and where in `chunks`
+        // each segment of the run goes.
+        let mut runs: Vec<(String, u32, Vec<usize>)> = Vec::new();
+        for read in reads {
+            let mut wanted: Vec<(u32, u32, usize)> = Vec::new();
+            for chunk in read.chunks {
+                if let ChunkBody::Segment { block, segment } = chunk.body {
+                    wanted.push((block, segment, chunks.len()));
+                }
+                chunks.push(chunk);
+            }
+            wanted.sort_unstable();
+            for (block, segment, at) in wanted {
+                match runs.last_mut() {
+                    Some((url, start, ats))
+                        if *url == read.blocks[block as usize].url
+                            && *start + ats.len() as u32 == segment =>
+                    {
+                        ats.push(at)
+                    }
+                    _ => runs.push((read.blocks[block as usize].url.clone(), segment, vec![at])),
+                }
+            }
+        }
+
+        let mut fetching = tokio::task::JoinSet::new();
+        let mut runs = runs.into_iter();
+        loop {
+            while fetching.len() < MAX_FETCHES {
+                let Some((url, start, ats)) = runs.next() else {
+                    break;
+                };
+                let client = self.remote.objects().clone();
+                let range = u64::from(start) * segment_len
+                    ..(u64::from(start) + ats.len() as u64) * segment_len;
+                fetching.spawn(async move {
+                    let bytes = raft5fs_objstore::http::get_range(&client, &url, range).await;
+                    (bytes, ats)
+                });
+            }
+            let Some(done) = fetching.join_next().await else {
+                break;
+            };
+            let (bytes, ats) = done.map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
+            let bytes = bytes.map_err(|e| {
+                FsError::new(libc::EIO, format!("inode {ino}: fetching a block: {e}"))
+            })?;
+            for (sealed, at) in bytes.chunks(segment_len as usize).zip(ats) {
+                chunks[at].body = ChunkBody::Inline(sealed.to_vec());
+            }
+        }
+        Ok(chunks)
     }
 
     /// Opens a sealed chunk of `ino`, with whichever of its key versions

@@ -147,6 +147,11 @@ pub fn credentials(user: &str) -> Credentials {
 pub fn credentials_with(user: &str, password: &str) -> Credentials {
     Credentials {
         min_kdf: KdfParams::TESTING,
+        // The fake object store is plain HTTP on localhost.
+        objects: HttpConfig {
+            allow_plaintext: true,
+            ..HttpConfig::default()
+        },
         ..Credentials::new(user, password)
     }
 }
