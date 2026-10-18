@@ -4,7 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
+use raft5fs_core::objects::{
+    DEFAULT_GET_TTL, DEFAULT_OBJECT_BLOCK, DEFAULT_OBJECT_FROM, DEFAULT_PUT_TTL, ObjectSettings,
+};
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, snapshots, validate_chunk_size};
+use raft5fs_objstore::http::HttpConfig;
+use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_proto::invite::{Invite, pem_to_der};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
@@ -48,6 +53,39 @@ Serving:
                        creating a new filesystem: an existing one keeps
                        the size it was created with, since chunk
                        boundaries are baked into its keys.
+
+Object storage (large files): with --object-bucket, files made through
+this server keep their data from --object-from on in an S3-compatible
+bucket, in blocks of --object-block, rather than in the store. Clients
+read and write the blocks directly, through URLs this server signs once
+it has checked their grant; the bucket only ever sees sealed data. Every
+server of one filesystem should have the same object options.
+  --object-endpoint <URL>
+                       the store's base URL, e.g.
+                       https://s3.eu-west-1.amazonaws.com.
+  --object-bucket <NAME>
+  --object-region <NAME>
+                       (default us-east-1)
+  --object-path-style  address the bucket as <endpoint>/<bucket>/, as
+                       MinIO and most self-hosted stores need.
+  --object-prefix <PATH>
+                       what every object's key starts with, ending in '/'
+                       (default raft5fs/).
+  --object-from <SIZE> where in a file its data starts going to blocks
+                       (default 10M).
+  --object-block <SIZE>
+                       how much of a file one block holds, a whole number
+                       of chunks (default 16M). Bigger means fewer
+                       objects, and more to re-upload for a small write
+                       inside one. This and --object-from are fixed by
+                       the first server to use them on a filesystem.
+  --object-put-ttl <SECS>, --object-get-ttl <SECS>
+                       how long an upload and a read URL stay good
+                       (defaults 600 and 900).
+  --object-ca <PEM>    trust this CA for the object store, besides the
+                       system's.
+  The store's credentials are read from RAFT5FS_OBJECT_ACCESS_KEY and
+  RAFT5FS_OBJECT_SECRET_KEY.
 
 Users: `user add` prints a one-time code the user enrols with
 (`raft5fs enrol`), choosing their password; only their own machine ever
@@ -138,6 +176,16 @@ struct Args {
     store_key: Option<String>,
     store_server_name: Option<String>,
     identity_ttl: Option<Duration>,
+    object_endpoint: Option<String>,
+    object_bucket: Option<String>,
+    object_region: Option<String>,
+    object_path_style: bool,
+    object_prefix: Option<String>,
+    object_from: Option<u64>,
+    object_block: Option<u64>,
+    object_put_ttl: Option<Duration>,
+    object_get_ttl: Option<Duration>,
+    object_ca: Option<String>,
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
@@ -173,6 +221,28 @@ fn parse_args() -> Args {
                 let secs = parse_number("--identity-ttl", &value("--identity-ttl"));
                 a.identity_ttl = Some(Duration::from_secs(secs.into()));
             }
+            "--object-endpoint" => a.object_endpoint = Some(value("--object-endpoint")),
+            "--object-bucket" => a.object_bucket = Some(value("--object-bucket")),
+            "--object-region" => a.object_region = Some(value("--object-region")),
+            "--object-path-style" => a.object_path_style = true,
+            "--object-prefix" => a.object_prefix = Some(value("--object-prefix")),
+            "--object-from" => {
+                a.object_from =
+                    Some(parse_size(&value("--object-from")).unwrap_or_else(|why| usage(&why)));
+            }
+            "--object-block" => {
+                a.object_block =
+                    Some(parse_size(&value("--object-block")).unwrap_or_else(|why| usage(&why)));
+            }
+            "--object-put-ttl" => {
+                let secs = parse_number("--object-put-ttl", &value("--object-put-ttl"));
+                a.object_put_ttl = Some(Duration::from_secs(secs.into()));
+            }
+            "--object-get-ttl" => {
+                let secs = parse_number("--object-get-ttl", &value("--object-get-ttl"));
+                a.object_get_ttl = Some(Duration::from_secs(secs.into()));
+            }
+            "--object-ca" => a.object_ca = Some(value("--object-ca")),
             "--invite-server" => a.invite_servers.push(value("--invite-server")),
             "--invite-ca" => a.invite_ca = Some(value("--invite-ca")),
             "--invite-server-name" => a.invite_server_name = Some(value("--invite-server-name")),
@@ -213,6 +283,58 @@ fn store_tls(a: &Args) -> Option<ClientTls> {
         tls = tls.server_name(name);
     }
     Some(tls)
+}
+
+/// Where to keep large files' data, if the object options ask for it.
+fn object_settings(a: &Args) -> Option<ObjectSettings> {
+    let Some(bucket) = &a.object_bucket else {
+        if a.object_endpoint.is_some() {
+            usage("--object-endpoint needs --object-bucket");
+        }
+        return None;
+    };
+    let endpoint = a
+        .object_endpoint
+        .clone()
+        .unwrap_or_else(|| usage("--object-bucket needs --object-endpoint"));
+    let credential = |var: &str| {
+        env::var(var).unwrap_or_else(|_| usage(&format!("--object-bucket needs {var} set")))
+    };
+    let http = raft5fs_objstore::http::client(&HttpConfig {
+        extra_roots_pem: a.object_ca.as_deref().map(read_file),
+        allow_plaintext: endpoint.starts_with("http://"),
+        ..HttpConfig::default()
+    })
+    .unwrap_or_else(|e| fail(e));
+    if endpoint.starts_with("http://") {
+        eprintln!(
+            "warning: reaching the object store without TLS; the URLs it signs \
+             cross the network in the clear"
+        );
+    }
+    let store = S3Store::new(
+        &S3Config {
+            endpoint,
+            bucket: bucket.clone(),
+            region: a
+                .object_region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".into()),
+            path_style: a.object_path_style,
+            access_key: credential("RAFT5FS_OBJECT_ACCESS_KEY"),
+            secret_key: credential("RAFT5FS_OBJECT_SECRET_KEY"),
+            prefix: a.object_prefix.clone().unwrap_or_else(|| "raft5fs/".into()),
+        },
+        http,
+    )
+    .unwrap_or_else(|e| usage(&e.to_string()));
+    Some(ObjectSettings {
+        store,
+        object_from: a.object_from.unwrap_or(DEFAULT_OBJECT_FROM),
+        object_block: a.object_block.unwrap_or(DEFAULT_OBJECT_BLOCK),
+        put_ttl: a.object_put_ttl.unwrap_or(DEFAULT_PUT_TTL),
+        get_ttl: a.object_get_ttl.unwrap_or(DEFAULT_GET_TTL),
+    })
 }
 
 /// A client logged in as the store account.
@@ -380,8 +502,9 @@ async fn serve_command(a: Args) {
         usage(&why);
     }
 
+    let objects = object_settings(&a);
     let client = store_client(&a, a.positional.clone()).await;
-    let core = FsCore::connect(client, chunk_size)
+    let core = FsCore::connect(client, chunk_size, objects)
         .await
         .unwrap_or_else(|why| fail(format!("cannot open the filesystem: {why}")));
     if core.chunk_size() != chunk_size {
@@ -389,6 +512,12 @@ async fn serve_command(a: Args) {
             "note: this filesystem was created with a {}-byte chunk size; \
              using that rather than the requested {chunk_size}",
             core.chunk_size()
+        );
+    }
+    if let Some(grid) = core.object_grid() {
+        eprintln!(
+            "keeping hybrid files' data in object storage from chunk {} on, {} chunks to a block",
+            grid.from_index, grid.per_block
         );
     }
     let tls = identity(&a.tls_cert, &a.tls_key, "--tls-cert/--tls-key")

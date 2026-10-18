@@ -20,6 +20,10 @@ pub(crate) const DELETE_BATCH: usize = 256;
 /// adopt it rather than reinterpreting every chunk boundary.
 pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
+/// Records the object grid hybrid files are laid out by (see `objects`),
+/// once a server with object storage has opened the filesystem.
+pub(crate) const OBJECT_GRID_KEY: &[u8] = b"\x04object_grid";
+
 /// Marks a store as holding a filesystem in this raft5fs's format (one
 /// byte, `STORE_FORMAT`). An older raft5fs's store has a root but no such
 /// key, or another byte here -- 0 for an unencrypted one, 1 for one whose

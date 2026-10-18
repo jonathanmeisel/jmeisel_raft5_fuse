@@ -440,16 +440,15 @@ fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
     spans
 }
 
-/// A chunk's sealed bytes as a read sent them, `None` for a hole. This
-/// client doesn't fetch from object storage, so it never asks for chunks
-/// there (`objects_ok`); a server sending one anyway is an error.
+/// A chunk's sealed bytes as a read sent them, `None` for a hole. A chunk
+/// in object storage isn't fetched here yet, so is an error.
 fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
     match body {
         ChunkBody::Hole => Ok(None),
         ChunkBody::Inline(blob) => Ok(Some(blob)),
         ChunkBody::Segment { .. } => Err(FsError::new(
             libc::EIO,
-            format!("inode {ino}: the server sent a chunk in object storage, unasked"),
+            format!("inode {ino}: chunks in object storage can't be read here yet"),
         )),
     }
 }

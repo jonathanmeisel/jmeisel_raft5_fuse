@@ -830,20 +830,19 @@ fn a_block_pointer_is_never_read_as_a_hole() {
     fs::write(&f, b"sealed").unwrap();
     let file = ino(&f);
     // What a hybrid file keeps under a block's first chunk key: 32 bytes,
-    // starting with the key version, as a sealed chunk does.
+    // starting with the key version, as a sealed chunk does. This file is
+    // all inline, so it can only be corruption.
     let mut pointer = record(&h, file).version.to_be_bytes().to_vec();
     pointer.resize(32, 7);
     let mut key = vec![0x02];
     key.extend_from_slice(&file.to_be_bytes());
     key.extend_from_slice(&0u64.to_be_bytes());
     h.write_key(&key, Some(&pointer));
-    // This client can't fetch from object storage, so says so, and the
-    // server refuses rather than handing it zeros.
     let mine = vault(&h, support::TESTER);
     assert_fs_errno(
         h.runtime
             .block_on(mine.remote().read_chunks(file, 0, 1, &[])),
-        libc::ENOTSUP,
+        libc::EIO,
     );
 }
 

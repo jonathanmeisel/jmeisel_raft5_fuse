@@ -2307,6 +2307,7 @@ dependencies = [
  "libc",
  "raft5-client",
  "raft5fs-crypto",
+ "raft5fs-objstore",
  "raft5fs-proto",
 ]
 
@@ -2336,6 +2337,7 @@ dependencies = [
  "raft5-server",
  "raft5fs-core",
  "raft5fs-crypto",
+ "raft5fs-objstore",
  "raft5fs-proto",
  "raft5fs-server",
  "rcgen",
@@ -2388,6 +2390,7 @@ dependencies = [
  "raft5-client",
  "raft5fs-core",
  "raft5fs-crypto",
+ "raft5fs-objstore",
  "raft5fs-proto",
  "serde",
  "tokio",

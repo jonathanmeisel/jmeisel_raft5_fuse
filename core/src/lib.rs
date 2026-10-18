@@ -5,6 +5,7 @@ mod entry;
 mod fs;
 pub mod grants;
 mod layout;
+pub mod objects;
 pub mod snapshots;
 mod view;
 

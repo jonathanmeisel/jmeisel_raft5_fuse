@@ -13,6 +13,9 @@ use rustls::pki_types::pem::PemObject;
 
 use crate::{Error, status_error};
 
+/// The client the functions here take, as `client` builds it.
+pub use reqwest::Client;
+
 /// How a client reaches the object store.
 #[derive(Debug, Clone)]
 pub struct HttpConfig {

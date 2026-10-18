@@ -161,6 +161,10 @@ pub struct Remote {
     /// How hybrid files group chunks into blocks, if the filesystem keeps
     /// data in object storage.
     grid: Option<ObjectGrid>,
+    /// Whether reads say this client can fetch chunks from object storage
+    /// (see `ReadChunksRequest.objects_ok`). Off only to test what a
+    /// client that can't is told.
+    objects_ok: bool,
     /// The snapshot this client reads at, or empty for the live
     /// filesystem. One at a snapshot only reads (see `at`).
     snapshot: String,
@@ -297,6 +301,7 @@ impl Remote {
             chunk_size: 0,
             batch_bytes: 0,
             grid: None,
+            objects_ok: true,
             snapshot: String::new(),
         };
         let hello = remote
@@ -408,6 +413,7 @@ impl Remote {
             chunk_size: self.chunk_size,
             batch_bytes: self.batch_bytes,
             grid: self.grid,
+            objects_ok: self.objects_ok,
             snapshot: name.to_string(),
         }
     }
@@ -534,6 +540,13 @@ impl Remote {
 
     pub fn grid(&self) -> Option<ObjectGrid> {
         self.grid
+    }
+
+    /// This client, reading as one that can't fetch from object storage:
+    /// for tests of what such a client is told.
+    pub fn without_object_reads(mut self) -> Self {
+        self.objects_ok = false;
+        self
     }
 
     /// Runs `request` against the current server, moving through the rest
@@ -921,8 +934,7 @@ impl Remote {
             count,
             known_seqs: known_seqs.to_vec(),
             snapshot: self.snapshot.clone(),
-            // Not until this client can fetch from object storage.
-            objects_ok: false,
+            objects_ok: self.objects_ok,
         };
         let read = self
             .call(Retry::ReadOnly, |mut c| {

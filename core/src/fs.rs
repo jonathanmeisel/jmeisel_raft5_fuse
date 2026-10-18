@@ -11,10 +11,11 @@ use raft5_client::{Client, Error as KvError, Transaction};
 
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
+use raft5fs_objstore::ObjectName;
 use raft5fs_proto::types::{
-    Attr, BlockUpload, Caller, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
-    KeyPath, Kind, Layout, NewNode, PreparedUpload, RESEAL_NAMES_BATCH, ResealedName, Rotation,
-    SealedChunk, SealedMove, SetAttr, WriteBody,
+    Attr, BlockRef, BlockUpload, BlockUrl, Caller, ChunkBody, ChunkWrite, Chunks, DirItem, FsError,
+    Grant, GrantedNode, KeyPath, Kind, Layout, NewNode, ObjectGrid, PreparedUpload,
+    RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -26,6 +27,10 @@ use crate::layout::{
     TOMBSTONE_PREFIX, attr_key, chunk_key, chunk_prefix, chunks_per_batch, dirent_ino, dirent_key,
     dirent_prefix, dirent_sealed_name, dirent_value, encode_pointer, is_chunk_key, tombstone_key,
     validate_chunk_size,
+};
+use crate::objects::{
+    self, MAX_UPLOADS, ObjectSettings, Objects, check_minted, check_placement, object_name,
+    segment_len,
 };
 use crate::snapshots;
 use crate::view::View;
@@ -118,16 +123,30 @@ fn no_objects() -> FsError {
     )
 }
 
-/// Stores `writes` to file `ino` inside `txn`: each sealed under the
-/// file's current key version (`EKEYEXPIRED` if not), and each with an
-/// `expected_seq` only if the chunk is still at it (`EAGAIN` if not).
-/// With `existing`, every chunk must be there already, at its seq.
+/// Stores `writes` to file `entry` inside `txn`: each kept where the
+/// file's layout keeps it (see `objects::check_placement`), sealed under
+/// the file's current key version (`EKEYEXPIRED` if not), a block named
+/// recently enough to commit, and each with an `expected_seq` only if the
+/// chunk is still at it (`EAGAIN` if not). With `existing`, every chunk
+/// must be there already, at its seq.
 async fn put_chunks(
+    core: &FsCore,
     txn: &Transaction,
-    ino: u64,
+    entry: &Entry,
     writes: &[ChunkWrite],
     existing: bool,
 ) -> Result<Result<(), FsError>, KvError> {
+    let ino = entry.attr.ino;
+    let now = SystemTime::now();
+    for w in writes {
+        decide!(check_placement(ino, entry.attr.layout, core.grid, w));
+        if let WriteBody::Block(block) = &w.body {
+            let Some(objects) = &core.objects else {
+                return Ok(Err(no_objects()));
+            };
+            decide!(check_minted(block.minted_ms, now, objects.commit_window()));
+        }
+    }
     let (version, _) = decide!(key_versions(txn, ino).await?);
     for w in writes {
         let sealed_under = match &w.body {
@@ -308,18 +327,50 @@ fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
 pub struct FsCore {
     client: Client,
     chunk_size: u64,
+    /// How hybrid files are laid out, if the filesystem has any: recorded
+    /// by the first server that kept objects for it, and known to every
+    /// server after, object storage or not.
+    grid: Option<ObjectGrid>,
+    /// Where this server keeps data in object storage, if it does.
+    objects: Option<Objects>,
 }
 
 impl FsCore {
     /// Opens the filesystem in `client`'s store (see `check_store`),
-    /// settling its chunk size (see `resolve_chunk_size`), creating the
-    /// real root if the filesystem is new, and finishing any deletion an
-    /// earlier process left half done (see `reap_tombstones`).
-    pub async fn connect(client: Client, preferred_chunk_size: u64) -> Result<Self, String> {
+    /// settling its chunk size (see `resolve_chunk_size`) and, with
+    /// `objects`, its object grid, creating the real root if the
+    /// filesystem is new, and finishing any deletion an earlier process
+    /// left half done (see `reap_tombstones`).
+    pub async fn connect(
+        client: Client,
+        preferred_chunk_size: u64,
+        objects: Option<ObjectSettings>,
+    ) -> Result<Self, String> {
         // Before the root exists, which is how it tells a new filesystem.
         check_store(&client).await?;
         let chunk_size = resolve_chunk_size(&client, preferred_chunk_size).await?;
-        let core = Self { client, chunk_size };
+        let grid = match &objects {
+            Some(settings) => {
+                let wanted =
+                    objects::grid_for(chunk_size, settings.object_from, settings.object_block)?;
+                let grid = objects::resolve_grid(&client, wanted).await?;
+                if grid != wanted {
+                    eprintln!(
+                        "note: this filesystem keeps blocks of {} chunks from chunk {} on; \
+                         using that rather than the requested {} from {}",
+                        grid.per_block, grid.from_index, wanted.per_block, wanted.from_index
+                    );
+                }
+                Some(grid)
+            }
+            None => objects::recorded_grid(&client).await?,
+        };
+        let core = Self {
+            client,
+            chunk_size,
+            grid,
+            objects: objects.map(Objects::new),
+        };
         core.ensure_root()
             .await
             .map_err(|e| format!("could not create the root directory: {e}"))?;
@@ -333,6 +384,12 @@ impl FsCore {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    /// The object grid, if this server keeps data in object storage: what
+    /// a client needs to write hybrid files through it.
+    pub fn object_grid(&self) -> Option<ObjectGrid> {
+        self.objects.as_ref().and(self.grid)
     }
 
     /// The store client this filesystem works through.
@@ -489,7 +546,8 @@ impl FsCore {
                     ));
                 }
                 WriteBody::Inline(_) => {}
-                WriteBody::Block(_) => return Err(no_objects()),
+                WriteBody::Block(_) if self.objects.is_none() => return Err(no_objects()),
+                WriteBody::Block(_) => {}
             }
         }
         Ok(())
@@ -654,6 +712,7 @@ impl FsCore {
             }
             if let Some(new_size) = changes.size {
                 entry.attr.size = new_size;
+                decide!(self.trim_block(&txn, &entry, new_size).await?);
             }
             if let Some(atime) = changes.atime {
                 entry.attr.atime = atime.resolve();
@@ -755,7 +814,13 @@ impl FsCore {
                     atime: now,
                     mtime: now,
                     ctime: now,
-                    layout: Layout::Inline,
+                    // A file made through a server with object storage
+                    // can grow into it; one made without never will.
+                    layout: if kind == Kind::File && self.objects.is_some() {
+                        Layout::Hybrid
+                    } else {
+                        Layout::Inline
+                    },
                 },
                 // Files too: the walk up to a grant goes through it, and
                 // a file's only parent is the one directory naming it.
@@ -1041,38 +1106,109 @@ impl FsCore {
         let view = self.view(at).await?;
         self.guard_now(&view, caller, ino, false).await?;
         let attr = self.resolve(&view, ino).await?.attr;
-        let count = (count as usize).min(chunks_per_batch(self.chunk_size)) as u64;
+        let grid = match attr.layout {
+            Layout::Inline => None,
+            Layout::Hybrid => Some(self.grid.ok_or_else(|| {
+                FsError::new(
+                    libc::EIO,
+                    format!("inode {ino} is hybrid, but no object grid is recorded"),
+                )
+            })?),
+        };
+        // A block's chunks cost one read and a pointer between them, so a
+        // read in blocks may cover a whole one.
+        let mut cap = chunks_per_batch(self.chunk_size) as u64;
+        if let Some(g) = grid.filter(|g| g.in_blocks(first)) {
+            cap = cap.max(u64::from(g.per_block));
+        }
+        let count = u64::from(count).min(cap);
+
         let mut chunks = Vec::with_capacity(count as usize);
+        let mut blocks = Vec::new();
+        // Each block read so far, by its first index: its seq, and where
+        // it is in `blocks` with how many segments it holds (`None` if
+        // there is no block there).
+        let mut read_blocks: HashMap<u64, (u64, Option<(u32, u32)>)> = HashMap::new();
+        // And each block's seq looked up to confirm a cached chunk, so the
+        // rest of its chunks are confirmed without asking again.
+        let mut block_versions: HashMap<u64, u64> = HashMap::new();
         for (i, index) in (first..first.saturating_add(count)).enumerate() {
-            let key = chunk_key(ino, index);
-            if let Some(&seq) = known.get(i).filter(|&&seq| seq != 0)
-                && view.get_version(&key).await? == seq
-            {
+            let block_start = grid
+                .filter(|g| g.in_blocks(index))
+                .map(|g| g.block_start(index));
+            let key = chunk_key(ino, block_start.unwrap_or(index));
+            if let Some(&seq) = known.get(i).filter(|&&seq| seq != 0) {
+                let now = match block_start {
+                    Some(b) => match (read_blocks.get(&b), block_versions.get(&b)) {
+                        (Some(&(seq, _)), _) | (None, Some(&seq)) => seq,
+                        (None, None) => {
+                            let seq = view.get_version(&key).await?;
+                            block_versions.insert(b, seq);
+                            seq
+                        }
+                    },
+                    None => view.get_version(&key).await?,
+                };
+                if now == seq {
+                    chunks.push(SealedChunk {
+                        index,
+                        seq,
+                        body: ChunkBody::Hole,
+                        unchanged: true,
+                    });
+                    continue;
+                }
+            }
+            let Some(start) = block_start else {
+                let read = view.read(&key).await?;
+                let body = match read.value.map(ChunkValue::decode) {
+                    None => ChunkBody::Hole,
+                    Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
+                    Some(ChunkValue::Block(_)) => {
+                        return Err(FsError::new(
+                            libc::EIO,
+                            format!("inode {ino}: a block pointer where chunk {index} belongs"),
+                        ));
+                    }
+                };
                 chunks.push(SealedChunk {
                     index,
-                    seq,
-                    body: ChunkBody::Hole,
-                    unchanged: true,
+                    seq: read.seq,
+                    body,
+                    unchanged: false,
                 });
                 continue;
-            }
-            let read = view.read(&key).await?;
-            let body = match read.value.map(ChunkValue::decode) {
-                None => ChunkBody::Hole,
-                Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
-                Some(ChunkValue::Block(_)) if !objects_ok => {
-                    return Err(FsError::new(
-                        libc::ENOTSUP,
-                        format!(
-                            "inode {ino} keeps data in object storage, which this client can't read"
-                        ),
-                    ));
+            };
+            let (seq, block) = match read_blocks.get(&start) {
+                Some(&found) => found,
+                None => {
+                    let read = view.read(&key).await?;
+                    let block = match read.value.map(ChunkValue::decode) {
+                        None => None,
+                        Some(ChunkValue::Block(block)) => {
+                            let url = self.read_url(ino, &block, objects_ok)?;
+                            blocks.push(BlockUrl { block, url });
+                            Some((blocks.len() as u32 - 1, block.nseg))
+                        }
+                        Some(ChunkValue::Inline(_)) => {
+                            return Err(FsError::new(
+                                libc::EIO,
+                                format!("inode {ino}: a sealed chunk where block {start} belongs"),
+                            ));
+                        }
+                    };
+                    read_blocks.insert(start, (read.seq, block));
+                    (read.seq, block)
                 }
-                Some(ChunkValue::Block(_)) => return Err(no_objects()),
+            };
+            let segment = (index - start) as u32;
+            let body = match block {
+                Some((block, nseg)) if segment < nseg => ChunkBody::Segment { block, segment },
+                _ => ChunkBody::Hole,
             };
             chunks.push(SealedChunk {
                 index,
-                seq: read.seq,
+                seq,
                 body,
                 unchanged: false,
             });
@@ -1080,20 +1216,125 @@ impl FsCore {
         Ok(Chunks {
             attr,
             chunks,
-            blocks: Vec::new(),
+            blocks,
         })
     }
 
+    /// A presigned URL reading `block` of `ino`, for a client that said it
+    /// can (`objects_ok`). Without it, `ENOTSUP`: an older client would
+    /// take the pointer it can't read for a hole, and see zeros.
+    fn read_url(&self, ino: u64, block: &BlockRef, objects_ok: bool) -> Result<String, FsError> {
+        if !objects_ok {
+            return Err(FsError::new(
+                libc::ENOTSUP,
+                format!("inode {ino} keeps data in object storage, which this client can't read"),
+            ));
+        }
+        let Some(objects) = &self.objects else {
+            return Err(FsError::new(
+                libc::EIO,
+                format!("inode {ino} keeps data in object storage, which this server can't reach"),
+            ));
+        };
+        Ok(objects
+            .store
+            .presign_get(&object_name(ino, block), objects.get_ttl))
+    }
+
     /// Names and presigned upload URLs for new blocks of file `ino`, one
-    /// per block asked for. Needs a writable grant over `ino`.
+    /// per block asked for, each for exactly the length its segments take.
+    /// Needs a writable grant over `ino`, a hybrid file; each block must
+    /// start where the grid says one does. Minting stores nothing: an
+    /// upload nothing ever commits is garbage collection's to remove.
     pub async fn prepare_uploads(
         &self,
         caller: &Caller,
         ino: u64,
         blocks: &[BlockUpload],
     ) -> Result<Vec<PreparedUpload>, FsError> {
-        let _ = (caller, ino, blocks);
-        Err(no_objects())
+        let (Some(objects), Some(grid)) = (&self.objects, self.grid) else {
+            return Err(no_objects());
+        };
+        if blocks.len() > MAX_UPLOADS {
+            return Err(FsError::new(
+                libc::EINVAL,
+                format!("at most {MAX_UPLOADS} blocks at a time"),
+            ));
+        }
+        let live = self.live();
+        self.guard_now(&live, caller, ino, true).await?;
+        let entry = self.resolve(&live, ino).await?;
+        check_kind(&entry, Kind::File)?;
+        if entry.attr.layout != Layout::Hybrid {
+            return Err(FsError::new(
+                libc::EINVAL,
+                format!("inode {ino} keeps nothing in object storage"),
+            ));
+        }
+        let now = SystemTime::now();
+        blocks
+            .iter()
+            .map(|b| {
+                if !grid.in_blocks(b.index) || grid.block_start(b.index) != b.index {
+                    return Err(FsError::new(
+                        libc::EINVAL,
+                        format!("no block starts at chunk {}", b.index),
+                    ));
+                }
+                if b.nseg == 0 || b.nseg > grid.per_block {
+                    return Err(FsError::new(
+                        libc::EINVAL,
+                        format!(
+                            "a block holds 1 to {} segments, not {}",
+                            grid.per_block, b.nseg
+                        ),
+                    ));
+                }
+                let name = ObjectName::mint(ino, now);
+                let len = u64::from(b.nseg) * segment_len(self.chunk_size);
+                Ok(PreparedUpload {
+                    minted_ms: name.minted_ms,
+                    random: name.random,
+                    url: objects.store.presign_put(&name, len, objects.put_ttl),
+                })
+            })
+            .collect()
+    }
+
+    /// For a truncate to `new_size`: the block the new end falls in keeps
+    /// only the segments before it. Whole blocks past the end are gone
+    /// already (`delete_chunks_from`); this one stays, and its later
+    /// segments -- which the new end leaves past it -- must read as zeros
+    /// if the file grows again, not come back. The pointer is plaintext,
+    /// so that is a smaller `nseg`: no keys, no upload. A segment the end
+    /// cuts part-way through the client has rewritten already.
+    async fn trim_block(
+        &self,
+        txn: &Transaction,
+        entry: &Entry,
+        new_size: u64,
+    ) -> Result<Result<(), FsError>, KvError> {
+        let Some(grid) = self.grid.filter(|_| entry.attr.layout == Layout::Hybrid) else {
+            return Ok(Ok(()));
+        };
+        // The first chunk wholly past the new end.
+        let cut = new_size.div_ceil(self.chunk_size);
+        if cut == 0 || !grid.in_blocks(cut - 1) {
+            return Ok(Ok(()));
+        }
+        let start = grid.block_start(cut - 1);
+        let key = chunk_key(entry.attr.ino, start);
+        let Some(value) = txn.read(&key).await?.value else {
+            return Ok(Ok(()));
+        };
+        if let ChunkValue::Block(mut block) = ChunkValue::decode(value) {
+            let keep = (cut - start) as u32;
+            if block.nseg > keep {
+                block.nseg = keep;
+                txn.write(&key, Some(&encode_pointer(&block))).await?;
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// Stores sealed chunks of `ino` -- all of them, or with any not as
@@ -1121,7 +1362,7 @@ impl FsCore {
             // stored for an inode nothing could reach again.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            decide!(put_chunks(&txn, ino, writes, false).await?);
+            decide!(put_chunks(self, &txn, &entry, writes, false).await?);
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1404,7 +1645,7 @@ impl FsCore {
             // deletion has started.
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            decide!(put_chunks(&txn, ino, writes, true).await?);
+            decide!(put_chunks(self, &txn, &entry, writes, true).await?);
             txn.commit().await?;
             Ok(Ok(()))
         })
@@ -1722,5 +1963,5 @@ fn operations_are_send(
     send(core.prune_keys(caller, 1, 1, &[]));
     send(core.create_volume(caller, new, 0o755, &[], &[], &[]));
     send(core.delete_volume(caller, 1));
-    send(FsCore::connect(core.client.clone(), 4096));
+    send(FsCore::connect(core.client.clone(), 4096, None));
 }

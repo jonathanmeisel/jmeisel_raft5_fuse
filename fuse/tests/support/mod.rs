@@ -27,6 +27,7 @@ use fuser::{BackgroundSession, Config, MountOption};
 use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
+use raft5fs_core::objects::{DEFAULT_GET_TTL, DEFAULT_PUT_TTL, ObjectSettings};
 use raft5fs_core::{FsCore, accounts};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_fuse::filesystem::Raft5Fs;
@@ -34,6 +35,9 @@ use raft5fs_fuse::prune_queue::PruneQueue;
 use raft5fs_fuse::pruner::PrunerConfig;
 use raft5fs_fuse::remote::{Credentials, Remote};
 use raft5fs_fuse::vault::KnownKeys;
+use raft5fs_objstore::fake::{self, FakeStore};
+use raft5fs_objstore::http::HttpConfig;
+use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{FsService, Store};
 use tokio::runtime::Runtime;
@@ -52,6 +56,16 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 /// megabytes, while still exercising every boundary the real default
 /// would.
 pub const TEST_CHUNK_SIZE: u64 = 64 * 1024;
+
+/// With object storage (`setup_with_objects`): hybrid files' blocks start
+/// this many chunks in, and hold this many chunks each. Small, so a test
+/// crosses into blocks, and between them, with a few hundred kilobytes.
+pub const TEST_OBJECT_FROM_CHUNKS: u64 = 2;
+pub const TEST_BLOCK_CHUNKS: u64 = 4;
+/// The fake object store's bucket, and the prefix the servers keep
+/// objects under in it.
+pub const TEST_BUCKET: &str = "bucket";
+pub const TEST_OBJECT_PREFIX: &str = "fs/";
 
 /// The cluster's token secret and startup administrator.
 const STORE_SECRET: &[u8] = b"test store secret";
@@ -290,6 +304,8 @@ const SERVER_CLUSTER_ENV: &str = "RAFT5FS_TEST_SERVER_CLUSTER";
 const SERVER_CHUNK_ENV: &str = "RAFT5FS_TEST_SERVER_CHUNK_SIZE";
 const SERVER_LISTEN_ENV: &str = "RAFT5FS_TEST_SERVER_LISTEN";
 const SERVER_TOKEN_KEY_ENV: &str = "RAFT5FS_TEST_SERVER_TOKEN_KEY";
+/// The fake object store's endpoint, for a server that keeps objects.
+const SERVER_OBJECTS_ENV: &str = "RAFT5FS_TEST_SERVER_OBJECTS";
 /// The test that is really the server-mode entry point; see
 /// `serve_if_requested`.
 const SERVER_MODE_TEST: &str = "server_process_mode";
@@ -298,11 +314,17 @@ impl TestServer {
     /// Starts a server process over the cluster at `cluster_address` and
     /// waits until it is accepting connections. It opens the filesystem on
     /// the way (settling the chunk size, finishing interrupted deletions).
-    pub fn start(cluster_address: &str, chunk_size: u64) -> Self {
+    /// With `objects`, the endpoint of a (fake) object store, it keeps
+    /// hybrid files' blocks there.
+    pub fn start(cluster_address: &str, chunk_size: u64, objects: Option<&str>) -> Self {
         for _ in 0..20 {
-            if let Some(server) =
-                Self::try_start(cluster_address, chunk_size, free_local_addr(), TOKEN_KEY)
-            {
+            if let Some(server) = Self::try_start(
+                cluster_address,
+                chunk_size,
+                objects,
+                free_local_addr(),
+                TOKEN_KEY,
+            ) {
                 return server;
             }
         }
@@ -314,12 +336,17 @@ impl TestServer {
     fn try_start(
         cluster_address: &str,
         chunk_size: u64,
+        objects: Option<&str>,
         listen: SocketAddr,
         token_key: &str,
     ) -> Option<Self> {
         let exe = std::env::current_exe().expect("the test binary's own path");
         {
-            let mut child = std::process::Command::new(&exe)
+            let mut command = std::process::Command::new(&exe);
+            if let Some(endpoint) = objects {
+                command.env(SERVER_OBJECTS_ENV, endpoint);
+            }
+            let mut child = command
                 .args([
                     "--exact",
                     SERVER_MODE_TEST,
@@ -385,6 +412,7 @@ pub fn serve_if_requested() {
     let chunk_size: u64 = std::env::var(SERVER_CHUNK_ENV).unwrap().parse().unwrap();
     let listen: SocketAddr = std::env::var(SERVER_LISTEN_ENV).unwrap().parse().unwrap();
     let token_key = std::env::var(SERVER_TOKEN_KEY_ENV).unwrap();
+    let objects = std::env::var(SERVER_OBJECTS_ENV).ok();
 
     // Die with the test that started us, even if it never gets to kill us:
     // a panicking test unwinds past `Drop`s only so far.
@@ -409,7 +437,30 @@ pub fn serve_if_requested() {
                 eprintln!("test server could not log in to the store: {e}");
                 std::process::exit(1);
             });
-        let core = FsCore::connect(client, chunk_size)
+        let objects = objects.map(|endpoint| {
+            let http = raft5fs_objstore::http::client(&HttpConfig {
+                allow_plaintext: true,
+                ..HttpConfig::default()
+            })
+            .expect("an HTTP client for the object store");
+            let config = S3Config {
+                endpoint,
+                bucket: TEST_BUCKET.into(),
+                region: fake::REGION.into(),
+                path_style: true,
+                access_key: fake::ACCESS_KEY.into(),
+                secret_key: fake::SECRET_KEY.into(),
+                prefix: TEST_OBJECT_PREFIX.into(),
+            };
+            ObjectSettings {
+                store: S3Store::new(&config, http).expect("the fake object store's settings"),
+                object_from: TEST_OBJECT_FROM_CHUNKS * chunk_size,
+                object_block: TEST_BLOCK_CHUNKS * chunk_size,
+                put_ttl: DEFAULT_PUT_TTL,
+                get_ttl: DEFAULT_GET_TTL,
+            }
+        });
+        let core = FsCore::connect(client, chunk_size, objects)
             .await
             .unwrap_or_else(|why| {
                 eprintln!("test server could not open the filesystem: {why}");
@@ -437,9 +488,9 @@ pub fn serve_if_requested() {
     });
 }
 
-fn start_servers(cluster: &TestCluster, chunk_size: u64) -> Vec<TestServer> {
+fn start_servers(cluster: &TestCluster, chunk_size: u64, objects: Option<&str>) -> Vec<TestServer> {
     (0..SERVERS)
-        .map(|_| TestServer::start(&cluster.client_address, chunk_size))
+        .map(|_| TestServer::start(&cluster.client_address, chunk_size, objects))
         .collect()
 }
 
@@ -538,6 +589,8 @@ pub struct Harness {
     pub servers: Vec<TestServer>,
     pub client: Client,
     pub cluster: TestCluster,
+    /// The object store the servers keep blocks in, if they do.
+    pub objects: Option<FakeStore>,
     pub runtime: Runtime,
     pub chunk_size: u64,
     /// Whether `TESTER`'s mounts work in `VOLUME`, made at setup.
@@ -575,10 +628,27 @@ impl Harness {
     /// The old mount comes down while its servers are still up, so what it
     /// buffered is stored on the way out.
     pub fn remount(&mut self, chunk_size: u64) {
-        let servers = start_servers(&self.cluster, chunk_size);
+        let servers = start_servers(
+            &self.cluster,
+            chunk_size,
+            self.objects_endpoint().as_deref(),
+        );
         let addresses = servers.iter().map(|s| s.address.clone()).collect();
         self.mount = self.tester_mount(addresses);
         self.servers = servers;
+    }
+
+    /// Where the servers' object store is, if they have one.
+    fn objects_endpoint(&self) -> Option<String> {
+        self.objects.as_ref().map(FakeStore::endpoint)
+    }
+
+    /// The fake object store the servers keep blocks in. Only with
+    /// `setup_with_objects`.
+    pub fn store(&self) -> &FakeStore {
+        self.objects
+            .as_ref()
+            .expect("this harness has no object store; use setup_with_objects")
     }
 
     /// The servers' addresses, starting with the `first`th and wrapping.
@@ -715,6 +785,7 @@ impl Harness {
     /// mount that is every session it holds turning invalid at once, as an
     /// expiry or a key rotation would make them.
     pub fn restart_servers_with_key(&mut self, token_key: &str) {
+        let objects = self.objects_endpoint();
         for server in &mut self.servers {
             let listen = server.socket_addr();
             *server = TestServer {
@@ -726,6 +797,7 @@ impl Harness {
                 if let Some(s) = TestServer::try_start(
                     &self.cluster.client_address,
                     self.chunk_size,
+                    objects.as_deref(),
                     listen,
                     token_key,
                 ) {
@@ -749,19 +821,35 @@ pub fn setup() -> Harness {
 }
 
 pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
-    setup_with(chunk_size, true)
+    setup_with(chunk_size, true, false)
 }
 
 /// Like `setup`, but with nothing made: the mount works at `TESTER`'s
 /// root, which is empty.
 pub fn setup_root() -> Harness {
-    setup_with(TEST_CHUNK_SIZE, false)
+    setup_with(TEST_CHUNK_SIZE, false, false)
 }
 
-fn setup_with(chunk_size: u64, volume: bool) -> Harness {
+/// Like `setup`, with the servers keeping hybrid files' blocks in a fake
+/// object store (`Harness::store`), on the grid `TEST_OBJECT_FROM_CHUNKS`
+/// and `TEST_BLOCK_CHUNKS` make.
+pub fn setup_with_objects() -> Harness {
+    setup_with(TEST_CHUNK_SIZE, true, true)
+}
+
+fn setup_with(chunk_size: u64, volume: bool, with_objects: bool) -> Harness {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let (cluster, client) = TestCluster::start(&runtime);
-    let servers = start_servers(&cluster, chunk_size);
+    let objects = with_objects.then(|| {
+        runtime
+            .block_on(FakeStore::start(TEST_BUCKET))
+            .expect("start a fake object store")
+    });
+    let servers = start_servers(
+        &cluster,
+        chunk_size,
+        objects.as_ref().map(FakeStore::endpoint).as_deref(),
+    );
     let addresses: Vec<String> = servers.iter().map(|s| s.address.clone()).collect();
     let tester_key = enrol(&runtime, &client, &addresses, TESTER);
     let mut mount = MountedFs::mount(&runtime, addresses);
@@ -774,6 +862,7 @@ fn setup_with(chunk_size: u64, volume: bool) -> Harness {
         servers,
         client,
         cluster,
+        objects,
         runtime,
         chunk_size,
         volume,

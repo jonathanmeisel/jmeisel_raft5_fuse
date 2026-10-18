@@ -637,7 +637,7 @@ async fn start_fs_server(
         .login(SERVICE_USER, &read_trimmed(&dir.join(SERVICE_PASSWORD))?)
         .await
         .map_err(|e| format!("could not log in to the store as {SERVICE_USER}: {e}"))?;
-    let core = FsCore::connect(client, DEFAULT_CHUNK_SIZE)
+    let core = FsCore::connect(client, DEFAULT_CHUNK_SIZE, None)
         .await
         .map_err(|e| format!("could not open the filesystem: {e}"))?;
 

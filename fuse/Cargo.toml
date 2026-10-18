@@ -27,6 +27,7 @@ tonic = { workspace = true }
 raft5-client = { workspace = true }
 raft5-server = { workspace = true }
 raft5fs-core = { workspace = true }
+raft5fs-objstore = { workspace = true, features = ["fake"] }
 raft5fs-server = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }

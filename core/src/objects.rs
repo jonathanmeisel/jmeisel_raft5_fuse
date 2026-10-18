@@ -1,0 +1,318 @@
+//! The rules for data in object storage, past the size a hybrid file
+//! keeps in the store (see `layout` for how blocks are laid out, and
+//! `ObjectGrid` for which chunks are in them).
+//!
+//! The server never sees a block's contents -- the client seals each
+//! segment, uploads the object through a URL the server signed, and only
+//! then commits a pointer to it -- so what it checks is the pointer: that
+//! it sits where a block starts, is sealed under the file's current key
+//! version (which is what keeps `prune_keys` sound with no download), and
+//! names an object minted recently enough. That last one is what lets
+//! garbage collection treat an object minted long ago that nothing points
+//! at as never going to be: no commit naming it would be accepted.
+
+use std::time::{Duration, SystemTime};
+
+use raft5_client::Client;
+use raft5fs_crypto::data::CHUNK_OVERHEAD;
+use raft5fs_objstore::{ObjectName, S3Store, name::millis};
+use raft5fs_proto::types::{BlockRef, ChunkWrite, FsError, Layout, ObjectGrid, WriteBody};
+
+use crate::fs::{TXN_TTL, retrying};
+use crate::layout::OBJECT_GRID_KEY;
+
+pub const DEFAULT_OBJECT_FROM: u64 = 10 << 20;
+pub const DEFAULT_OBJECT_BLOCK: u64 = 16 << 20;
+/// The largest block: what a client may have to hold in memory to write
+/// one, and to re-upload for a small change inside it.
+pub const MAX_OBJECT_BLOCK: u64 = 256 << 20;
+pub const DEFAULT_PUT_TTL: Duration = Duration::from_secs(600);
+pub const DEFAULT_GET_TTL: Duration = Duration::from_secs(900);
+/// How far apart the servers' clocks may be. A name one server minted is
+/// judged by another's clock when committed.
+pub const CLOCK_SKEW: Duration = Duration::from_secs(120);
+
+/// The most blocks one `prepare_uploads` names.
+pub const MAX_UPLOADS: usize = 64;
+
+/// What a server needs to keep data in object storage.
+pub struct ObjectSettings {
+    pub store: S3Store,
+    /// Where hybrid files' blocks start, in bytes, and how big each is.
+    /// Both are fixed when the first server with object storage opens
+    /// the filesystem; later servers adopt what it recorded.
+    pub object_from: u64,
+    pub object_block: u64,
+    /// How long an upload URL, and a read URL, stays good.
+    pub put_ttl: Duration,
+    pub get_ttl: Duration,
+}
+
+pub(crate) struct Objects {
+    pub(crate) store: S3Store,
+    pub(crate) put_ttl: Duration,
+    pub(crate) get_ttl: Duration,
+}
+
+impl Objects {
+    pub(crate) fn new(settings: ObjectSettings) -> Self {
+        Objects {
+            store: settings.store,
+            put_ttl: settings.put_ttl,
+            get_ttl: settings.get_ttl,
+        }
+    }
+
+    /// How long after minting a name may still be committed: the upload
+    /// URL's life, and one transaction's for the commit that follows it.
+    pub(crate) fn commit_window(&self) -> Duration {
+        self.put_ttl + TXN_TTL
+    }
+}
+
+/// The grid `object_from` and `object_block` make at this chunk size.
+pub fn grid_for(
+    chunk_size: u64,
+    object_from: u64,
+    object_block: u64,
+) -> Result<ObjectGrid, String> {
+    if object_block < chunk_size || !object_block.is_multiple_of(chunk_size) {
+        return Err(format!(
+            "an object block must be a whole number of {chunk_size}-byte chunks, not {object_block} bytes"
+        ));
+    }
+    if object_block > MAX_OBJECT_BLOCK {
+        return Err(format!(
+            "an object block may be at most {MAX_OBJECT_BLOCK} bytes, not {object_block}"
+        ));
+    }
+    Ok(ObjectGrid {
+        from_index: object_from.div_ceil(chunk_size),
+        per_block: (object_block / chunk_size) as u32,
+    })
+}
+
+/// The grid recorded for the filesystem in `client`'s store, if one is.
+pub(crate) async fn recorded_grid(client: &Client) -> Result<Option<ObjectGrid>, String> {
+    let value = client
+        .read(OBJECT_GRID_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .value;
+    value.map(|v| decode_grid(&v)).transpose()
+}
+
+/// The grid in force: the one recorded, or -- for a filesystem no server
+/// has kept objects for yet -- `wanted`, which is then recorded. In one
+/// transaction, so two first servers at once agree.
+pub(crate) async fn resolve_grid(
+    client: &Client,
+    wanted: ObjectGrid,
+) -> Result<ObjectGrid, String> {
+    retrying(move || async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        if let Some(bytes) = txn.read(OBJECT_GRID_KEY).await?.value {
+            return Ok(decode_grid(&bytes));
+        }
+        txn.write(OBJECT_GRID_KEY, Some(&encode_grid(wanted)))
+            .await?;
+        txn.commit().await?;
+        Ok(Ok(wanted))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn encode_grid(g: ObjectGrid) -> Vec<u8> {
+    let mut v = g.from_index.to_be_bytes().to_vec();
+    v.extend_from_slice(&g.per_block.to_be_bytes());
+    v
+}
+
+fn decode_grid(bytes: &[u8]) -> Result<ObjectGrid, String> {
+    let bytes: [u8; 12] = bytes.try_into().map_err(|_| {
+        format!(
+            "this filesystem's recorded object grid is {} bytes long, not 12",
+            bytes.len()
+        )
+    })?;
+    let grid = ObjectGrid {
+        from_index: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        per_block: u32::from_be_bytes(bytes[8..].try_into().unwrap()),
+    };
+    if grid.per_block == 0 {
+        return Err("this filesystem records empty object blocks".into());
+    }
+    Ok(grid)
+}
+
+/// How many bytes one sealed segment of a block takes.
+pub(crate) fn segment_len(chunk_size: u64) -> u64 {
+    chunk_size + CHUNK_OVERHEAD as u64
+}
+
+pub(crate) fn object_name(ino: u64, block: &BlockRef) -> ObjectName {
+    ObjectName {
+        ino,
+        minted_ms: block.minted_ms,
+        random: block.random,
+    }
+}
+
+/// Whether `w` stores its index the way a file of `layout` keeps it: in
+/// a hybrid file, chunks before the grid's start inline and from it on
+/// as blocks at each block's first index; in any other, inline only.
+pub(crate) fn check_placement(
+    ino: u64,
+    layout: Layout,
+    grid: Option<ObjectGrid>,
+    w: &ChunkWrite,
+) -> Result<(), FsError> {
+    let invalid = |why: String| Err(FsError::new(libc::EINVAL, format!("inode {ino}: {why}")));
+    let grid = match (layout, grid) {
+        (Layout::Inline, _) => None,
+        (Layout::Hybrid, Some(grid)) => Some(grid),
+        (Layout::Hybrid, None) => {
+            return Err(FsError::new(
+                libc::EIO,
+                format!("inode {ino} is hybrid, but no object grid is recorded"),
+            ));
+        }
+    };
+    let in_blocks = grid.is_some_and(|g| g.in_blocks(w.index));
+    match (&w.body, grid) {
+        (WriteBody::Inline(_), _) if !in_blocks => Ok(()),
+        (WriteBody::Inline(_), _) => invalid(format!("chunk {} is kept in a block", w.index)),
+        (WriteBody::Block(_), Some(_)) if !in_blocks => {
+            invalid(format!("chunk {} is kept inline, not in a block", w.index))
+        }
+        (WriteBody::Block(_), None) => invalid("the file keeps nothing in blocks".into()),
+        (WriteBody::Block(block), Some(g)) => {
+            if g.block_start(w.index) != w.index {
+                return invalid(format!("no block starts at chunk {}", w.index));
+            }
+            if block.nseg == 0 || block.nseg > g.per_block {
+                return invalid(format!(
+                    "a block holds 1 to {} segments, not {}",
+                    g.per_block, block.nseg
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether a block named at `minted_ms` may still be committed at `now`.
+pub(crate) fn check_minted(
+    minted_ms: u64,
+    now: SystemTime,
+    window: Duration,
+) -> Result<(), FsError> {
+    let now = millis(now);
+    let oldest = now.saturating_sub(millis_of(window));
+    let newest = now.saturating_add(millis_of(CLOCK_SKEW));
+    if (oldest..=newest).contains(&minted_ms) {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EINVAL,
+            "the block's name wasn't minted recently enough to commit; upload it again",
+        ))
+    }
+}
+
+fn millis_of(d: Duration) -> u64 {
+    d.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: u64 = 64 * 1024;
+
+    fn grid() -> ObjectGrid {
+        grid_for(C, 2 * C, 4 * C).unwrap()
+    }
+
+    fn write(index: u64, body: WriteBody) -> ChunkWrite {
+        ChunkWrite {
+            index,
+            expected_seq: None,
+            body,
+        }
+    }
+
+    fn block(nseg: u32) -> WriteBody {
+        WriteBody::Block(BlockRef {
+            version: 1,
+            minted_ms: 0,
+            random: [0; 16],
+            nseg,
+        })
+    }
+
+    #[test]
+    fn grids() {
+        assert_eq!(
+            grid(),
+            ObjectGrid {
+                from_index: 2,
+                per_block: 4
+            }
+        );
+        // A start part-way into a chunk begins at the next one.
+        assert_eq!(grid_for(C, C + 1, C).unwrap().from_index, 2);
+        assert!(grid_for(C, 0, C / 2).is_err());
+        assert!(grid_for(C, 0, C * 3 / 2).is_err());
+        assert!(grid_for(C, 0, MAX_OBJECT_BLOCK * 2).is_err());
+        let g = grid();
+        assert_eq!(decode_grid(&encode_grid(g)), Ok(g));
+        assert!(decode_grid(&[0; 11]).is_err());
+    }
+
+    #[test]
+    fn placement() {
+        let g = Some(grid());
+        let ok = |layout, w| check_placement(9, layout, g, &w);
+        let errno = |layout, w| ok(layout, w).unwrap_err().errno;
+        let inline = || WriteBody::Inline(vec![0; 50]);
+
+        ok(Layout::Hybrid, write(1, inline())).unwrap();
+        ok(Layout::Hybrid, write(2, block(4))).unwrap();
+        ok(Layout::Hybrid, write(6, block(1))).unwrap();
+        ok(Layout::Inline, write(2, inline())).unwrap();
+
+        assert_eq!(errno(Layout::Hybrid, write(2, inline())), libc::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(1, block(1))), libc::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(3, block(1))), libc::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(2, block(5))), libc::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(2, block(0))), libc::EINVAL);
+        assert_eq!(errno(Layout::Inline, write(2, block(1))), libc::EINVAL);
+        assert_eq!(
+            check_placement(9, Layout::Hybrid, None, &write(0, inline()))
+                .unwrap_err()
+                .errno,
+            libc::EIO
+        );
+    }
+
+    #[test]
+    fn the_mint_window() {
+        let now = SystemTime::now();
+        let window = Duration::from_secs(600);
+        let at = |d: i64| {
+            let t = if d < 0 {
+                now - Duration::from_secs(d.unsigned_abs())
+            } else {
+                now + Duration::from_secs(d as u64)
+            };
+            check_minted(millis(t), now, window)
+        };
+        at(0).unwrap();
+        at(-599).unwrap();
+        at(119).unwrap();
+        assert!(at(-601).is_err());
+        assert!(at(121).is_err());
+    }
+}

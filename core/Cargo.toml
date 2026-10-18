@@ -8,4 +8,5 @@ edition.workspace = true
 libc = { workspace = true }
 raft5-client = { workspace = true }
 raft5fs-crypto = { workspace = true }
+raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true, features = ["raft5"] }

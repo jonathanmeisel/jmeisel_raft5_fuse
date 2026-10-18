@@ -193,7 +193,7 @@ impl Fs for FsService {
         Ok(Response::new(HelloResponse {
             chunk_size,
             batch_bytes: batch_bytes(chunk_size),
-            grid: None,
+            grid: self.core.object_grid().map(Into::into),
         }))
     }
 
