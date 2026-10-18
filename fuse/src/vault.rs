@@ -86,11 +86,14 @@ use raft5fs_crypto::identity::{
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{
     Attr, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError, check_username,
+    Layout, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError,
+    check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
+use blocks::{BlockEdit, Rewritten};
 
+mod blocks;
 mod prune;
 pub use prune::{GrantRoot, PruneStats};
 
@@ -425,9 +428,12 @@ fn from_hex(hex: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
 /// else changed the chunk under it, before giving up with `EAGAIN`.
 const CHANGE_RETRIES: usize = 32;
 
-/// The pieces of `[offset, offset + len)` by chunk: each chunk's index,
-/// where in the chunk the piece starts, and how long it is.
-fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<(u64, usize, usize)> {
+/// A piece of a write within one chunk: the chunk's index, where in the
+/// chunk the piece starts, and how long it is.
+type Span = (u64, usize, usize);
+
+/// The pieces of `[offset, offset + len)` by chunk (see `Span`).
+fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut pos = offset;
     let end = offset + len as u64;
@@ -490,6 +496,8 @@ pub struct Vault {
     /// its own `space` in it.
     cache: Arc<Mutex<ChunkCache>>,
     space: u64,
+    /// Each file's layout, once asked for (see `layout`).
+    layouts: Mutex<HashMap<u64, Layout>>,
 }
 
 /// How much decrypted file data a vault caches unless told otherwise.
@@ -521,6 +529,7 @@ impl Vault {
             roots: Mutex::new(Roots::default()),
             cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
             space: 0,
+            layouts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -549,6 +558,7 @@ impl Vault {
             roots: Mutex::new(Roots::default()),
             cache: Arc::clone(&self.cache),
             space,
+            layouts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1843,17 +1853,73 @@ impl Vault {
         let chunk_size = self.remote.chunk_size();
         let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as usize;
         let spans = spans(chunk_size, offset, data.len());
+        // A hybrid file's chunks past the grid's start go a block at a
+        // time; the rest, as every inline file's, a batch at a time.
+        let grid = match self.remote.grid() {
+            Some(grid)
+                if spans
+                    .last()
+                    .is_some_and(|&(index, ..)| grid.in_blocks(index)) =>
+            {
+                match self.layout(ino).await.map_err(|e| failed(0, e))? {
+                    Layout::Hybrid => Some(grid),
+                    Layout::Inline => None,
+                }
+            }
+            _ => None,
+        };
+        let block_of = |index: u64| {
+            grid.filter(|g| g.in_blocks(index))
+                .map(|g| g.block_start(index))
+        };
+        // Runs of spans stored together: in the block starting at the
+        // index given, or inline.
+        let mut groups: Vec<(Option<u64>, &[Span])> = Vec::new();
+        let mut rest = &spans[..];
+        while let Some(&(index, ..)) = rest.first() {
+            let block = block_of(index);
+            let len = rest
+                .iter()
+                .take_while(|&&(i, ..)| block_of(i) == block)
+                .count()
+                .min(if block.is_some() {
+                    usize::MAX
+                } else {
+                    per_batch
+                });
+            groups.push((block, &rest[..len]));
+            rest = &rest[len..];
+        }
+
         let mut attr = None;
         let mut cursor = 0;
-        for group in spans.chunks(per_batch) {
+        for (block, group) in groups {
             let bytes: usize = group.iter().map(|&(_, _, n)| n).sum();
             let end = offset + (cursor + bytes) as u64;
             let piece = &data[cursor..cursor + bytes];
-            let stored = match self.write_batch(&node, ino, group, piece, end).await {
+            let once = |node: Arc<Node>| async move {
+                match (block, grid) {
+                    (Some(start), Some(grid)) => {
+                        let edit = BlockEdit::Write {
+                            spans: group,
+                            data: piece,
+                            end,
+                        };
+                        match self.rewrite_block(&node, ino, grid, start, edit).await? {
+                            Rewritten::Stored {
+                                attr: Some(attr), ..
+                            } => Ok(attr),
+                            _ => Err(FsError::new(libc::EIO, "a write stored nothing")),
+                        }
+                    }
+                    _ => self.write_batch(&node, ino, group, piece, end).await,
+                }
+            };
+            let stored = match once(Arc::clone(&node)).await {
                 // A stale key, here or above: new keys, then again.
                 Err(e) if expired(&e) => {
                     node = self.freshen(ino).await.map_err(|e| failed(cursor, e))?;
-                    self.write_batch(&node, ino, group, piece, end).await
+                    once(Arc::clone(&node)).await
                 }
                 other => other,
             }
@@ -1979,6 +2045,16 @@ impl Vault {
         }
         let index = new_size / chunk_size;
         let node = self.fresh_node(ino).await?;
+        if let Some(grid) = self.remote.grid().filter(|g| g.in_blocks(index))
+            && self.layout(ino).await? == Layout::Hybrid
+        {
+            let start = grid.block_start(index);
+            let edit = BlockEdit::Truncate { index, keep };
+            return self
+                .rewrite_block(&node, ino, grid, start, edit)
+                .await
+                .map(drop);
+        }
         for _ in 0..CHANGE_RETRIES {
             let (mut plain, seq) = self.base(&node, ino, index).await?;
             if plain.len() <= keep {

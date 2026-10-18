@@ -366,7 +366,12 @@ impl Raft5Fs {
     /// success, or on a failed commit just the bytes from earlier in this
     /// same call whose own commit (if any) already succeeded.
     fn buffered_write(&self, ino: u64, mut offset: u64, mut data: &[u8]) -> Result<usize, Errno> {
-        let batch_bytes = self.remote().batch_bytes();
+        // The run of the file stored together with `offset`: a batch, or
+        // past a hybrid file's grid start, a block.
+        let batch_at = |offset| {
+            self.block(self.vault().batch_at(ino, offset))
+                .map_err(|e| errno(&e))
+        };
         let slot = self.write_slot(ino);
         let mut buf = slot.lock().unwrap();
         // Reported, not taken: until `fsync` (or the last close) takes it,
@@ -379,7 +384,8 @@ impl Raft5Fs {
             return Err(e);
         }
 
-        if data.len() as u64 >= batch_bytes {
+        let batch = batch_at(offset)?;
+        if data.len() as u64 >= batch.end - batch.start {
             // Committed directly, so whatever was buffered ahead of it has
             // to land first.
             self.commit_buf(&mut buf)?;
@@ -405,8 +411,13 @@ impl Raft5Fs {
             // Stepping to the batch grid rather than the chunk grid is
             // what lets a run span chunks, and keeps the batch it becomes
             // aligned: a sequential writer then fills every chunk of its
-            // batch completely, so storing it reads nothing back.
-            let room = (batch_bytes - offset % batch_bytes) as usize;
+            // batch completely, so storing it reads nothing back -- and a
+            // block it fills is uploaded once.
+            let batch = match batch_at(offset) {
+                Ok(batch) => batch,
+                Err(e) => return if written > 0 { Ok(written) } else { Err(e) },
+            };
+            let room = (batch.end - offset) as usize;
             let n = room.min(data.len());
             let idle = buf.is_empty();
             buf.append(offset, &data[..n]);
@@ -416,7 +427,7 @@ impl Raft5Fs {
             }
             offset += n as u64;
             data = &data[n..];
-            if offset.is_multiple_of(batch_bytes)
+            if offset == batch.end
                 && let Err(e) = self.commit_buf(&mut buf)
             {
                 // A batch that held only this call's bytes lost nothing

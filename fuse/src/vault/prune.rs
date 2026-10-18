@@ -21,16 +21,18 @@
 //! sealed under (`EBUSY`), so a write landing under an old version while
 //! the walk runs can't be lost: the node is visited again.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
 
 use raft5fs_crypto::data::{open_name, seal_chunk, sealed_version};
 use raft5fs_proto::types::{
-    ChunkWrite, DirItem, FsError, Kind, RESEAL_NAMES_BATCH, ResealedName, WriteBody,
+    ChunkBody, ChunkWrite, DirItem, FsError, Kind, Layout, RESEAL_NAMES_BATCH, ResealedName,
+    WriteBody,
 };
 
+use super::blocks::{BlockEdit, Rewritten};
 use super::{CHANGE_RETRIES, Node, Vault, changed, corrupt, expired, sealed_blob};
 
 /// What pruning a tree did -- or, for a dry run, would do.
@@ -258,17 +260,42 @@ impl Vault {
         let chunk_size = self.remote.chunk_size();
         let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as u32;
         let version = node.record.version;
+        let grid = match self.remote.grid() {
+            Some(grid) if self.layout(ino).await? == Layout::Hybrid => Some(grid),
+            _ => None,
+        };
+        // Blocks seen, by first index: each is resealed whole, once.
+        let mut blocks_seen = HashSet::new();
         let mut count = 0;
         let mut first = 0;
         loop {
             let read = self.remote.read_chunks(ino, first, per_batch, &[]).await?;
-            let got = read.chunks;
             let end = read.attr.size.div_ceil(chunk_size);
-            let Some(next) = got.last().map(|c| c.index + 1) else {
+            let Some(next) = read.chunks.last().map(|c| c.index + 1) else {
                 break;
             };
             let mut writes = Vec::new();
-            for chunk in got.iter().filter(|c| c.index < end) {
+            for chunk in read.chunks.iter().filter(|c| c.index < end) {
+                if let ChunkBody::Segment { block, .. } = chunk.body {
+                    let (Some(grid), Some(found)) = (grid, read.blocks.get(block as usize)) else {
+                        return Err(corrupt(ino, "a block where the file keeps none"));
+                    };
+                    let start = grid.block_start(chunk.index);
+                    if !blocks_seen.insert(start) || found.block.version >= target {
+                        continue;
+                    }
+                    if dry_run {
+                        count += found.block.nseg as usize;
+                        continue;
+                    }
+                    let edit = BlockEdit::Reseal { below: target };
+                    if let Rewritten::Stored { nseg, .. } =
+                        self.rewrite_block(node, ino, grid, start, edit).await?
+                    {
+                        count += nseg as usize;
+                    }
+                    continue;
+                }
                 let Some(blob) = sealed_blob(ino, &chunk.body)? else {
                     continue;
                 };

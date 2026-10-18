@@ -1,12 +1,14 @@
 //! Object storage: hybrid files, upload URLs, block pointers and how the
-//! servers check, read and trim them, and how mounts read blocks. Blocks
-//! are sealed and uploaded by hand here, through `Remote`, since mounts
-//! don't write them yet.
+//! servers check, read and trim them, and how mounts read and write
+//! blocks. The servers' side is driven through `Remote`, sealing and
+//! uploading blocks by hand; the mounts' through `std::fs`.
 
 mod support;
 
+use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -567,4 +569,181 @@ fn a_snapshot_reads_the_blocks_it_was_taken_with() {
     let read = |v: &Vault| h.runtime.block_on(v.read(file, K * C, 10)).unwrap();
     assert_eq!(read(&then), vec![1; 10]);
     assert_eq!(read(&mine), vec![2; 10]);
+}
+
+/// How much of a file one block holds.
+const B: u64 = TEST_BLOCK_CHUNKS * C;
+
+fn pattern(len: u64) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
+}
+
+/// How many segments the block at chunk `index` of `ino` holds, if
+/// there is one.
+fn nseg(h: &support::Harness, ino: u64, index: u64) -> Option<u32> {
+    stored(h, ino, index).map(|v| {
+        assert_eq!(v.len(), 32, "a block pointer");
+        u32::from_be_bytes(v[28..32].try_into().unwrap())
+    })
+}
+
+/// `path` as a mount that has cached none of it reads it.
+fn read_afresh(h: &support::Harness, name: &str) -> Vec<u8> {
+    let other = h.second_mount();
+    fs::read(other.path.join(name)).unwrap()
+}
+
+#[test]
+fn a_sequential_write_uploads_each_block_once() {
+    let h = support::setup_with_objects();
+    let data = pattern(K * C + 2 * B + C / 2);
+    let f = h.path().join("f");
+    fs::write(&f, &data).unwrap();
+    let file = ino(&f);
+
+    // Two whole blocks and the start of a third, one upload each.
+    assert_eq!(h.store().stats().puts, 3);
+    assert_eq!(h.store().keys().len(), 3);
+    assert_eq!(nseg(&h, file, K), Some(TEST_BLOCK_CHUNKS as u32));
+    assert_eq!(nseg(&h, file, K2), Some(TEST_BLOCK_CHUNKS as u32));
+    assert_eq!(nseg(&h, file, K2 + TEST_BLOCK_CHUNKS), Some(1));
+    // Nothing but pointers past the grid's start; the start, inline.
+    assert_eq!(stored(&h, file, K + 1), None);
+    assert!(stored(&h, file, K - 1).unwrap().len() > 32);
+
+    assert_eq!(fs::read(&f).unwrap(), data);
+    assert_eq!(read_afresh(&h, "f"), data);
+}
+
+#[test]
+fn a_small_write_into_a_block_keeps_the_rest_of_it() {
+    let h = support::setup_with_objects();
+    let mut data = pattern(K * C + B + 100);
+    let f = h.path().join("f");
+    fs::write(&f, &data).unwrap();
+    let objects = h.store().keys().len();
+
+    let at = (K + 1) * C + 100;
+    let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    file.write_all_at(&[0xee; 10], at).unwrap();
+    // And one spanning two segments.
+    file.write_all_at(&[0xdd; 20], (K + 3) * C - 10).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    data[at as usize..at as usize + 10].fill(0xee);
+    let from = ((K + 3) * C - 10) as usize;
+    data[from..from + 20].fill(0xdd);
+
+    assert_eq!(fs::read(&f).unwrap(), data);
+    assert_eq!(read_afresh(&h, "f"), data);
+    // A new object for the block; the old ones are garbage collection's.
+    assert!(h.store().keys().len() > objects);
+}
+
+#[test]
+fn a_sparse_write_past_the_threshold_leaves_holes() {
+    let h = support::setup_with_objects();
+    let f = h.path().join("f");
+    let mut file = fs::File::create(&f).unwrap();
+    file.seek(SeekFrom::Start(K2 * C + 5)).unwrap();
+    file.write_all(b"x").unwrap();
+    drop(file);
+    let file_ino = ino(&f);
+
+    assert_eq!(
+        nseg(&h, file_ino, K),
+        None,
+        "no block where nothing was written"
+    );
+    assert_eq!(nseg(&h, file_ino, K2), Some(1));
+    let mut expected = vec![0; (K2 * C + 6) as usize];
+    expected[(K2 * C + 5) as usize] = b'x';
+    assert_eq!(read_afresh(&h, "f"), expected);
+}
+
+#[test]
+fn truncating_into_a_segment_then_growing_reads_zeros() {
+    let h = support::setup_with_objects();
+    let data = pattern(K * C + B);
+    let f = h.path().join("f");
+    fs::write(&f, &data).unwrap();
+    let file_ino = ino(&f);
+
+    // On a segment's boundary: the servers trim the block, no upload.
+    let puts = h.store().stats().puts;
+    let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    file.set_len((K + 3) * C).unwrap();
+    assert_eq!(h.store().stats().puts, puts);
+    assert_eq!(nseg(&h, file_ino, K), Some(3));
+    // Part-way into one: the block is rewritten with that segment cut.
+    let cut = (K + 1) * C + 100;
+    file.set_len(cut).unwrap();
+    assert_eq!(h.store().stats().puts, puts + 1);
+    assert_eq!(nseg(&h, file_ino, K), Some(2));
+    // Grown again, what was cut reads as zeros.
+    file.set_len(K * C + B).unwrap();
+    drop(file);
+
+    let mut expected = data[..cut as usize].to_vec();
+    expected.resize((K * C + B) as usize, 0);
+    assert_eq!(fs::read(&f).unwrap(), expected);
+    assert_eq!(read_afresh(&h, "f"), expected);
+}
+
+#[test]
+fn a_block_synced_part_way_is_finished_by_later_writes() {
+    let h = support::setup_with_objects();
+    let data = pattern(K * C + B + C);
+    let f = h.path().join("f");
+    let mut file = fs::File::create(&f).unwrap();
+    let mid = (K * C + C + C / 2) as usize;
+    file.write_all(&data[..mid]).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(nseg(&h, ino(&f), K), Some(2));
+    file.write_all(&data[mid..]).unwrap();
+    drop(file);
+
+    assert_eq!(nseg(&h, ino(&f), K), Some(TEST_BLOCK_CHUNKS as u32));
+    assert_eq!(read_afresh(&h, "f"), data);
+}
+
+#[test]
+fn pruning_reseals_blocks_into_new_objects() {
+    let h = support::setup_with_objects();
+    let v = h.path().to_path_buf();
+    let data = pattern(K * C + B + 100);
+    fs::write(v.join("big"), &data).unwrap();
+    let big = ino(&v.join("big"));
+    // Granted and revoked: the volume's key rotates, big's is left stale.
+    h.add_user("alice");
+    let mine = vault(&h);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
+        .unwrap();
+    h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
+    let old_version = u32::from_be_bytes(stored(&h, big, K).unwrap()[..4].try_into().unwrap());
+
+    let dry = h.runtime.block_on(mine.prune_tree(ino(&v), true));
+    assert!(dry.skipped.is_empty(), "{:?}", dry.skipped);
+    assert!(dry.chunks as u64 > K + TEST_BLOCK_CHUNKS, "{dry:?}");
+    let objects = h.store().keys().len();
+    let stats = h.runtime.block_on(mine.prune_tree(ino(&v), false));
+    assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
+    assert_eq!(stats.chunks, dry.chunks);
+
+    // Each block is a new object, under the key big has now.
+    assert_eq!(h.store().keys().len(), objects + 2);
+    for start in [K, K2] {
+        let version = u32::from_be_bytes(stored(&h, big, start).unwrap()[..4].try_into().unwrap());
+        assert!(version > old_version);
+    }
+    let fresh = vault(&h);
+    assert_eq!(
+        h.runtime
+            .block_on(fresh.read(big, 0, data.len() + 10))
+            .unwrap(),
+        data
+    );
+    let again = h.runtime.block_on(mine.prune_tree(ino(&v), false));
+    assert_eq!(again.chunks, 0, "{again:?}");
 }
