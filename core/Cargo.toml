@@ -9,6 +9,7 @@ getrandom = "0.2"
 libc = { workspace = true }
 tokio = { workspace = true }
 raft5-client = { workspace = true }
+raft5-shared = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true, features = ["raft5"] }

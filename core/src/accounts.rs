@@ -22,6 +22,7 @@ use raft5fs_crypto::password::{
 
 use crate::fs::{TXN_TTL, retrying};
 use crate::layout::{ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX};
+use crate::view::ReadKeys;
 use raft5fs_proto::types::{AccountKeys, FsError};
 
 pub(crate) fn keys_key(user: &str) -> Vec<u8> {
@@ -114,10 +115,24 @@ fn validate(keys: &AccountKeys) -> Result<(), FsError> {
 
 /// `user`'s keys, if they have enrolled.
 pub async fn get(client: &Client, user: &str) -> Result<Option<AccountKeys>, FsError> {
-    match client.read(&keys_key(user)).await?.value {
+    match client.read_one(&keys_key(user)).await?.value {
         Some(bytes) => Ok(Some(decode(user, &bytes)?)),
         None => Ok(None),
     }
+}
+
+/// Every one of `users`' keys, in order, as `get` reads one.
+pub(crate) async fn get_many(
+    client: &Client,
+    users: &[&str],
+) -> Result<Vec<Option<AccountKeys>>, FsError> {
+    let keys: Vec<Vec<u8>> = users.iter().map(|user| keys_key(user)).collect();
+    let entries = client.read_many(&keys).await?;
+    users
+        .iter()
+        .zip(entries)
+        .map(|(user, entry)| entry.value.map(|bytes| decode(user, &bytes)).transpose())
+        .collect()
 }
 
 /// `user`'s keys, if `auth` is right for them. A wrong `auth` and an
@@ -171,14 +186,14 @@ pub async fn enrol(
         let (hash, encoded) = (&hash, &encoded);
         async move {
             let txn = client.transaction(TXN_TTL).await?;
-            let issued = txn.read(&code_key(user)).await?.value;
+            let issued = txn.read_one(&code_key(user)).await?.value;
             if issued.as_deref() != Some(hash.as_slice()) {
                 return Ok(Err(FsError::new(
                     libc::EACCES,
                     format!("no such enrolment code for {user}"),
                 )));
             }
-            if txn.read(&keys_key(user)).await?.value.is_some() {
+            if txn.read_one(&keys_key(user)).await?.value.is_some() {
                 for ino in granted_in(&txn, user).await? {
                     crate::grants::remove_grant(&txn, user, ino).await?;
                 }
@@ -224,7 +239,7 @@ pub async fn change_password(
         let encoded = &encoded;
         async move {
             let txn = client.transaction(TXN_TTL).await?;
-            let current = match txn.read(&keys_key(user)).await?.value {
+            let current = match txn.read_one(&keys_key(user)).await?.value {
                 Some(bytes) => match decode(user, &bytes) {
                     Ok(current) => Some(current),
                     Err(e) => return Ok(Err(e)),
@@ -270,8 +285,8 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     let granted = &granted;
     retrying(|| async move {
         let txn = client.transaction(TXN_TTL).await?;
-        let existed = txn.read(&keys_key(user)).await?.value.is_some()
-            || txn.read(&code_key(user)).await?.value.is_some()
+        let existed = txn.read_one(&keys_key(user)).await?.value.is_some()
+            || txn.read_one(&code_key(user)).await?.value.is_some()
             || !granted.is_empty();
         txn.write(&keys_key(user), None).await?;
         txn.write(&code_key(user), None).await?;

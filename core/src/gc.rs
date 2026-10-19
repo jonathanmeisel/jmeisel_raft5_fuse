@@ -46,7 +46,7 @@ use crate::entry::decode_entry;
 use crate::fs::{FsCore, TXN_TTL, retrying};
 use crate::layout::{ChunkValue, GC_LEASE_KEY, attr_key};
 use crate::objects::CLOCK_SKEW;
-use crate::view::View;
+use crate::view::{ReadKeys, View};
 
 /// How long one sweep may hold the lease before renewing it.
 pub const LEASE_TTL: Duration = Duration::from_secs(600);
@@ -54,6 +54,8 @@ pub const LEASE_TTL: Duration = Duration::from_secs(600);
 /// unreferenced before it is deleted: slack for clocks and slow reads.
 pub const DELETE_MARGIN: Duration = Duration::from_secs(300);
 pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(3600);
+/// How many block starts `mark` reads the pointers of at a time.
+const MARK_WINDOW: usize = 1024;
 
 /// One server's collector: its lease holder id, and what it found
 /// unreferenced, since when.
@@ -221,7 +223,7 @@ impl FsCore {
         let holder = gc.holder;
         retrying(move || async move {
             let txn = client.transaction(TXN_TTL).await?;
-            if let Some(value) = txn.read(GC_LEASE_KEY).await?.value
+            if let Some(value) = txn.read_one(GC_LEASE_KEY).await?.value
                 && let Some((other, expires_ms)) = decode_lease(&value)
                 && other != holder
                 && expires_ms > millis(now)
@@ -251,8 +253,10 @@ impl FsCore {
         referenced: &mut HashSet<ObjectName>,
     ) -> Result<(), KvError> {
         const CHUNKS: u8 = 0x02;
+        // Block starts, by inode, a window at a time: their files' Entries
+        // in one read, then the hybrid ones' pointers in another.
+        let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut iter = view.key_iterator(&[CHUNKS]);
-        let mut current: Option<(u64, bool)> = None;
         while let Some(key) = iter.next().await? {
             if key.first() != Some(&CHUNKS) {
                 break;
@@ -265,21 +269,40 @@ impl FsCore {
             if !grid.in_blocks(index) || grid.block_start(index) != index {
                 continue;
             }
-            let hybrid = match current {
-                Some((seen, hybrid)) if seen == ino => hybrid,
-                _ => {
-                    let hybrid = match view.read(&attr_key(ino)).await?.value {
-                        Some(bytes) => decode_entry(ino, &bytes).attr.layout == Layout::Hybrid,
-                        None => true,
-                    };
-                    current = Some((ino, hybrid));
-                    hybrid
-                }
-            };
-            if !hybrid {
-                continue;
+            window.push((ino, key));
+            if window.len() == MARK_WINDOW {
+                self.mark_window(view, &mut window, referenced).await?;
             }
-            if let Some(value) = view.read(&key).await?.value
+        }
+        self.mark_window(view, &mut window, referenced).await
+    }
+
+    /// `mark` for the block starts in `window`, which it empties.
+    async fn mark_window(
+        &self,
+        view: View<'_>,
+        window: &mut Vec<(u64, Vec<u8>)>,
+        referenced: &mut HashSet<ObjectName>,
+    ) -> Result<(), KvError> {
+        // Keys come in order, so each inode's are together.
+        let mut inos: Vec<u64> = window.iter().map(|&(ino, _)| ino).collect();
+        inos.dedup();
+        let attr_keys: Vec<Vec<u8>> = inos.iter().map(|&ino| attr_key(ino)).collect();
+        let hybrid: HashMap<u64, bool> = inos
+            .iter()
+            .zip(view.read_many(&attr_keys).await?)
+            .map(|(&ino, entry)| {
+                let hybrid = match entry.value {
+                    Some(bytes) => decode_entry(ino, &bytes).attr.layout == Layout::Hybrid,
+                    None => true,
+                };
+                (ino, hybrid)
+            })
+            .collect();
+        let (inos, keys): (Vec<u64>, Vec<Vec<u8>>) =
+            window.drain(..).filter(|(ino, _)| hybrid[ino]).unzip();
+        for (ino, entry) in inos.into_iter().zip(view.read_many(&keys).await?) {
+            if let Some(value) = entry.value
                 && let ChunkValue::Block(block) = ChunkValue::decode(value)
             {
                 referenced.insert(ObjectName {

@@ -260,6 +260,41 @@ fn a_block_round_trips() {
     assert!(again.chunks.iter().all(|c| c.unchanged));
     assert!(again.blocks.is_empty());
 
+    // Holding only some of the block's chunks fetches it once: what is
+    // held at its seq is still confirmed, the rest comes as segments.
+    let part = h
+        .runtime
+        .block_on(remote.read_chunks(file, K, 2, &[seq, 0]))
+        .unwrap();
+    assert!(part.chunks[0].unchanged);
+    assert_eq!(
+        part.chunks[1].body,
+        ChunkBody::Segment {
+            block: 0,
+            segment: 1
+        }
+    );
+    assert_eq!(part.blocks.len(), 1);
+
+    // A seq the block has moved past is answered afresh, not confirmed.
+    let stale = h
+        .runtime
+        .block_on(remote.read_chunks(file, K, 2, &[seq - 1, seq - 1]))
+        .unwrap();
+    assert!(stale.chunks.iter().all(|c| !c.unchanged && c.seq == seq));
+    assert_eq!(stale.blocks.len(), 1);
+
+    // Inline chunks and a block in one read, each answered as its own.
+    let mixed = h
+        .runtime
+        .block_on(remote.read_chunks(file, 0, 3, &[0, 0, seq]))
+        .unwrap();
+    assert_eq!(mixed.chunks.len(), 3);
+    assert!(matches!(mixed.chunks[0].body, ChunkBody::Inline(_)));
+    assert_eq!(mixed.chunks[1].body, ChunkBody::Hole);
+    assert!(mixed.chunks[2].unchanged);
+    assert!(mixed.blocks.is_empty());
+
     // The chunk before the blocks is still inline.
     let head = h
         .runtime

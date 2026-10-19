@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fuser::{BackgroundSession, Config, MountOption};
-use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
+use raft5_client::{Certificate, Client, ClientTls, Consistency, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
 use raft5fs_core::objects::{DEFAULT_GET_TTL, DEFAULT_PUT_TTL, ObjectSettings};
@@ -711,8 +711,10 @@ impl Harness {
 
     pub fn read_key(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.runtime
-            .block_on(self.client.read(key))
+            .block_on(self.client.read(&[key], Consistency::Stale))
             .expect("read failed")
+            .entries
+            .remove(0)
             .value
     }
 
@@ -721,8 +723,11 @@ impl Harness {
     /// test can tell which writes shared a commit.
     pub fn key_version(&self, key: &[u8]) -> u64 {
         self.runtime
-            .block_on(self.client.get_version(key))
-            .expect("get_version failed")
+            .block_on(self.client.read_versions(&[key], Consistency::Stale))
+            .expect("read_versions failed")
+            .entries
+            .remove(0)
+            .seq
     }
 
     pub fn write_key(&self, key: &[u8], value: Option<&[u8]>) {

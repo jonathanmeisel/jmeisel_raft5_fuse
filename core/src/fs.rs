@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime};
 
 use raft5_client::{Client, Error as KvError, Transaction};
+use raft5_shared::MAX_KEYS_PER_READ;
 
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
@@ -20,7 +21,8 @@ use raft5fs_proto::types::{
 
 use crate::entry::{Entry, decode_entry, encode_entry};
 use crate::grants::{
-    self, Reads, check_grantees_version, grantees_key, key_versions, node_keys_key, reservation_key,
+    self, Reads, check_grantees_version, grantees_key, key_versions, node_keys_key,
+    reservation_key, versions_of,
 };
 use crate::layout::{
     CHUNK_SIZE_KEY, COUNTER_KEY, ChunkValue, DELETE_BATCH, ENCRYPTED_KEY, ROOT_INO, STORE_FORMAT,
@@ -33,7 +35,7 @@ use crate::objects::{
     segment_len,
 };
 use crate::snapshots;
-use crate::view::View;
+use crate::view::{ReadKeys, View};
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
@@ -88,30 +90,41 @@ macro_rules! decide {
 /// `ino`'s Entry as `txn` sees it, which holds it against changes until
 /// `txn` ends. A missing or deleted inode is `ENOENT`.
 async fn live_entry(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
-    Ok(match txn.read(&attr_key(ino)).await?.value {
-        Some(bytes) => {
-            let entry = decode_entry(ino, &bytes);
-            if entry.is_deleted() {
-                Err(enoent())
-            } else {
-                Ok(entry)
-            }
-        }
-        None => Err(enoent()),
-    })
+    Ok(live(ino, txn.read_one(&attr_key(ino)).await?.value).ok_or_else(enoent))
+}
+
+/// Directory `ino`'s Entry from the value its key was read as, to add or
+/// remove names in, as `modifiable_dir` reads it.
+fn dir_entry(ino: u64, value: Option<Vec<u8>>) -> Result<Entry, FsError> {
+    let dir = live(ino, value).ok_or_else(enoent)?;
+    check_kind(&dir, Kind::Directory)?;
+    Ok(dir)
+}
+
+/// `ino`'s Entry from the value its key was read as, unless it is missing
+/// or its deletion has started.
+fn live(ino: u64, value: Option<Vec<u8>>) -> Option<Entry> {
+    value
+        .map(|bytes| decode_entry(ino, &bytes))
+        .filter(|entry| !entry.is_deleted())
 }
 
 /// Directory `ino`, to add or remove names in -- `caller` having been
 /// checked for a writable grant over it already.
 async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
-    let dir = decide!(live_entry(txn, ino).await?);
-    decide!(check_kind(&dir, Kind::Directory));
-    Ok(Ok(dir))
+    Ok(dir_entry(ino, txn.read_one(&attr_key(ino)).await?.value))
 }
 
 /// The inode a directory entry names, if it exists.
 async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError> {
-    Ok(txn.read(dirent).await?.value.map(|b| dirent_ino(&b)))
+    Ok(txn.read_one(dirent).await?.value.map(|b| dirent_ino(&b)))
+}
+
+/// The entries a read of a fixed number of keys gave, in order.
+fn each<const N: usize>(entries: Vec<raft5_client::Entry>) -> [raft5_client::Entry; N] {
+    entries
+        .try_into()
+        .expect("a read of every key answers each")
 }
 
 /// What a filesystem keeping no data in object storage answers anything
@@ -148,6 +161,15 @@ async fn put_chunks(
         }
     }
     let (version, _) = decide!(key_versions(txn, ino).await?);
+    // Every chunk's seq in one read, checked below in turn. Only seqs are
+    // compared, so only seqs are read -- and held, as a value read would
+    // hold them. 0 is a chunk with no value.
+    let checked_keys: Vec<Vec<u8>> = writes
+        .iter()
+        .filter(|w| w.expected_seq.is_some())
+        .map(|w| chunk_key(ino, w.index))
+        .collect();
+    let mut seqs = txn.read_versions_many(&checked_keys).await?.into_iter();
     for w in writes {
         let sealed_under = match &w.body {
             WriteBody::Inline(blob) => sealed_version(blob).ok(),
@@ -159,16 +181,16 @@ async fn put_chunks(
                 format!("chunks of inode {ino} must be sealed under key version {version}"),
             )));
         }
-        let key = chunk_key(ino, w.index);
         if let Some(expected) = w.expected_seq {
-            let read = txn.read(&key).await?;
-            if read.seq != expected || (existing && read.value.is_none()) {
+            let seq = seqs.next().expect("a seq read for every expected one");
+            if seq != expected || (existing && seq == 0) {
                 return Ok(Err(FsError::new(
                     libc::EAGAIN,
                     format!("chunk {} of inode {ino} changed meanwhile", w.index),
                 )));
             }
         }
+        let key = chunk_key(ino, w.index);
         let value = match &w.body {
             WriteBody::Inline(blob) => blob.clone(),
             WriteBody::Block(block) => encode_pointer(block),
@@ -228,7 +250,7 @@ async fn touch_dir(txn: &Transaction, dir: &mut Entry, now: SystemTime) -> Resul
 pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, String> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
-        if let Some(bytes) = txn.read(CHUNK_SIZE_KEY).await?.value {
+        if let Some(bytes) = txn.read_one(CHUNK_SIZE_KEY).await?.value {
             return Ok(decode_chunk_size(&bytes));
         }
         if let Err(why) = validate_chunk_size(preferred) {
@@ -257,7 +279,7 @@ pub async fn check_store(client: &Client) -> Result<(), String> {
                     .to_string(),
             ))
         };
-        if let Some(bytes) = txn.read(ENCRYPTED_KEY).await?.value {
+        if let Some(bytes) = txn.read_one(ENCRYPTED_KEY).await?.value {
             return if bytes.as_slice() == [STORE_FORMAT] {
                 Ok(Ok(()))
             } else {
@@ -265,7 +287,7 @@ pub async fn check_store(client: &Client) -> Result<(), String> {
             };
         }
         // No record but a root: from before there was a record.
-        if txn.read(&attr_key(ROOT_INO)).await?.value.is_some() {
+        if txn.read_one(&attr_key(ROOT_INO)).await?.value.is_some() {
             return refused();
         }
         txn.write(ENCRYPTED_KEY, Some(&[STORE_FORMAT])).await?;
@@ -297,7 +319,7 @@ async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
         let next = txn
-            .read(COUNTER_KEY)
+            .read_one(COUNTER_KEY)
             .await?
             .value
             .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
@@ -422,11 +444,7 @@ impl FsCore {
     /// whose deletion has started, which is gone as far as everything but
     /// the deletion itself is concerned.
     async fn read_entry(&self, view: &View<'_>, ino: u64) -> Result<Option<Entry>, FsError> {
-        let result = view.read(&attr_key(ino)).await?;
-        Ok(result
-            .value
-            .map(|bytes| decode_entry(ino, &bytes))
-            .filter(|entry| !entry.is_deleted()))
+        Ok(live(ino, view.read_one(&attr_key(ino)).await?.value))
     }
 
     async fn lookup_child(
@@ -435,7 +453,7 @@ impl FsCore {
         parent: u64,
         name: &OsStr,
     ) -> Result<Option<u64>, FsError> {
-        let result = view.read(&dirent_key(parent, name)).await?;
+        let result = view.read_one(&dirent_key(parent, name)).await?;
         Ok(result.value.map(|b| dirent_ino(&b)))
     }
 
@@ -445,7 +463,7 @@ impl FsCore {
     async fn ensure_root(&self) -> Result<(), KvError> {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
-            if txn.read(&attr_key(ROOT_INO)).await?.value.is_some() {
+            if txn.read_one(&attr_key(ROOT_INO)).await?.value.is_some() {
                 return Ok(());
             }
             let now = SystemTime::now();
@@ -584,11 +602,15 @@ impl FsCore {
     ) -> Result<(Attr, Vec<u8>), FsError> {
         let view = self.view(at).await?;
         self.guard_now(&view, caller, parent, false).await?;
-        let dir = self.resolve(&view, parent).await?;
+        let [dir, dirent] = each(
+            view.read_many(&[attr_key(parent), dirent_key(parent, name)])
+                .await?,
+        );
+        let dir = live(parent, dir.value).ok_or_else(enoent)?;
         if dir.attr.kind != Kind::Directory {
             return Err(FsError::errno(libc::ENOTDIR));
         }
-        let Some(bytes) = view.read(&dirent_key(parent, name)).await?.value else {
+        let Some(bytes) = dirent.value else {
             return Err(enoent());
         };
         let attr = self.resolve(&view, dirent_ino(&bytes)).await?.attr;
@@ -642,29 +664,34 @@ impl FsCore {
         ];
 
         let prefix = dirent_prefix(ino);
+        let mut keys = Vec::new();
         let mut iter = view.key_iterator(&prefix);
-        loop {
-            let key = match iter.next().await? {
-                Some(key) if key.starts_with(&prefix) => key,
-                _ => break,
-            };
-            let name = OsStr::from_bytes(&key[prefix.len()..]).to_os_string();
-            // A concurrent unlink/rmdir between the key_iterator batch and
-            // this read is the only way the value comes back empty; skip it.
-            let Some(bytes) = view.read(&key).await?.value else {
-                continue;
-            };
-            let child_ino = dirent_ino(&bytes);
-            let kind = self
-                .read_entry(&view, child_ino)
-                .await?
+        while let Some(key) = iter.next().await? {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            keys.push(key);
+        }
+        // A concurrent unlink/rmdir between the scan and this read is the
+        // only way a value comes back empty; skip it.
+        let dirents: Vec<(Vec<u8>, Vec<u8>)> = view
+            .read_many(&keys)
+            .await?
+            .into_iter()
+            .filter_map(|entry| Some((entry.key, entry.value?)))
+            .collect();
+        let children: Vec<u64> = dirents.iter().map(|(_, bytes)| dirent_ino(bytes)).collect();
+        let attr_keys: Vec<Vec<u8>> = children.iter().map(|&child| attr_key(child)).collect();
+        let entries = view.read_many(&attr_keys).await?;
+        for (((key, bytes), child_ino), entry) in dirents.iter().zip(children).zip(entries) {
+            let kind = live(child_ino, entry.value)
                 .map(|e| e.attr.kind)
                 .unwrap_or(Kind::File);
             items.push(DirItem {
                 ino: child_ino,
                 kind,
-                name,
-                sealed_name: dirent_sealed_name(&bytes).to_vec(),
+                name: OsStr::from_bytes(&key[prefix.len()..]).to_os_string(),
+                sealed_name: dirent_sealed_name(bytes).to_vec(),
             });
         }
         Ok(items)
@@ -697,7 +724,7 @@ impl FsCore {
 
         let attr = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
-            let Some(bytes) = txn.read(&attr_key(ino)).await?.value else {
+            let Some(bytes) = txn.read_one(&attr_key(ino)).await?.value else {
                 return Ok(Err(enoent()));
             };
             let mut entry = decode_entry(ino, &bytes);
@@ -796,11 +823,15 @@ impl FsCore {
             decide!(self.guard(&txn, caller, parent, true).await?);
             // The new node's key and name are sealed under the parent's.
             decide!(self.fresh(&txn, parent).await?);
-            let mut dir = decide!(modifiable_dir(&txn, parent).await?);
-            if txn.read(dirent).await?.value.is_some() {
+            let [dir, taken, record] = each(
+                txn.read_many(&[attr_key(parent), dirent.to_vec(), node_keys_key(parent)])
+                    .await?,
+            );
+            let mut dir = decide!(dir_entry(parent, dir.value));
+            if taken.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
             }
-            let (parent_version, _) = decide!(key_versions(&txn, parent).await?);
+            let (parent_version, _) = decide!(versions_of(parent, record.value));
             decide!(check_name_version(parent, &new.sealed_name, parent_version));
             decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
             let now = SystemTime::now();
@@ -846,14 +877,17 @@ impl FsCore {
         versions: (u32, u32),
     ) -> Result<Result<(), FsError>, KvError> {
         let user = caller.user.as_str();
-        let reserved = txn.read(&reservation_key(new.ino)).await?.value;
-        if reserved.as_deref() != Some(user.as_bytes()) {
+        let [reserved, existing] = each(
+            txn.read_many(&[reservation_key(new.ino), attr_key(new.ino)])
+                .await?,
+        );
+        if reserved.value.as_deref() != Some(user.as_bytes()) {
             return Ok(Err(FsError::new(
                 libc::EACCES,
                 format!("inode {} isn't reserved for {user}", new.ino),
             )));
         }
-        if txn.read(&attr_key(new.ino)).await?.value.is_some() {
+        if existing.value.is_some() {
             return Ok(Err(FsError::errno(libc::EEXIST)));
         }
         match NodeKeys::versions(&new.keys) {
@@ -974,18 +1008,34 @@ impl FsCore {
             if new_parent != parent {
                 decide!(self.guard(&txn, caller, new_parent, true).await?);
             }
-            let mut src_dir = decide!(modifiable_dir(&txn, parent).await?);
-            let mut dst_dir = if new_parent == parent {
-                None
+            // Both directories and both names in one read, then both
+            // inodes they name in another; checked in the order they
+            // would be read one at a time.
+            let moves = new_parent != parent;
+            let mut keys = vec![attr_key(parent), from.to_vec(), to.to_vec()];
+            if moves {
+                keys.push(attr_key(new_parent));
+            }
+            let mut found = txn.read_many(&keys).await?.into_iter().map(|e| e.value);
+            let mut next = move || found.next().expect("a read of every key answers each");
+            let (src_dir, from_value, to_value) = (next(), next(), next());
+            let mut src_dir = decide!(dir_entry(parent, src_dir));
+            let mut dst_dir = if moves {
+                Some(decide!(dir_entry(new_parent, next())))
             } else {
-                Some(decide!(modifiable_dir(&txn, new_parent).await?))
+                None
             };
 
-            let Some(ino) = named(&txn, from).await? else {
+            let Some(ino) = from_value.map(|b| dirent_ino(&b)) else {
                 return Ok(Err(enoent()));
             };
-            let mut moved = decide!(live_entry(&txn, ino).await?);
-            let target = named(&txn, to).await?;
+            let target = to_value.map(|b| dirent_ino(&b));
+            let victim_ino = target.filter(|&victim| victim != ino);
+            let mut keys = vec![attr_key(ino)];
+            keys.extend(victim_ino.map(attr_key));
+            let mut found = txn.read_many(&keys).await?.into_iter().map(|e| e.value);
+            let mut next = move || found.next().expect("a read of every key answers each");
+            let mut moved = decide!(live(ino, next()).ok_or_else(enoent));
             if target == Some(ino) {
                 // Two names for one inode: POSIX says do nothing. (With no
                 // hard links, only `rename(a, a)` gets here.)
@@ -993,11 +1043,11 @@ impl FsCore {
             }
 
             let now = SystemTime::now();
-            if let Some(victim_ino) = target {
+            if let Some(victim_ino) = victim_ino {
                 if noreplace {
                     return Ok(Err(FsError::errno(libc::EEXIST)));
                 }
-                let mut victim = decide!(live_entry(&txn, victim_ino).await?);
+                let mut victim = decide!(live(victim_ino, next()).ok_or_else(enoent));
                 decide!(check_kind(&victim, moved.attr.kind));
                 victim.mark_deleted();
                 victim.attr.ctime = now;
@@ -1020,16 +1070,21 @@ impl FsCore {
             // node mustn't come out of the move looking fresh.
             decide!(self.fresh(&txn, new_parent).await?);
             decide!(self.fresh(&txn, ino).await?);
-            let (dst_version, _) = decide!(key_versions(&txn, new_parent).await?);
+            let mut records = vec![node_keys_key(new_parent)];
+            if moves {
+                records.push(node_keys_key(ino));
+            }
+            let mut records = txn.get_many(&records).await?.into_iter();
+            let (dst_version, _) = decide!(versions_of(new_parent, records.next().flatten()));
             decide!(check_name_version(
                 new_parent,
                 &sealed.sealed_name,
                 dst_version
             ));
-            if new_parent != parent {
+            if moves {
                 // Its key moves with it, re-wrapped under the new parent's.
                 let keys = &sealed.node_keys;
-                let (version, _) = decide!(key_versions(&txn, ino).await?);
+                let (version, _) = decide!(versions_of(ino, records.next().flatten()));
                 if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                     return Ok(Err(FsError::new(
                         libc::EKEYEXPIRED,
@@ -1123,44 +1178,77 @@ impl FsCore {
         }
         let count = u64::from(count).min(cap);
 
+        // Each chunk is stored at its own index, or in a block, at the
+        // block's start: one key for a run of consecutive chunks. A run,
+        // with each chunk's index and the seq the client holds it at.
+        let mut runs: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        for (i, index) in (first..first.saturating_add(count)).enumerate() {
+            let stored = grid
+                .filter(|g| g.in_blocks(index))
+                .map_or(index, |g| g.block_start(index));
+            let held = known.get(i).copied().unwrap_or(0);
+            match runs.last_mut() {
+                Some((at, chunks)) if *at == stored => chunks.push((index, held)),
+                _ => runs.push((stored, vec![(index, held)])),
+            }
+        }
+        // Where the client holds every chunk of a run, its key's seq alone
+        // says whether they are still current -- eight bytes however big
+        // the value -- and all of those are asked in one read.
+        let held_runs: Vec<usize> = (0..runs.len())
+            .filter(|&r| runs[r].1.iter().all(|&(_, held)| held != 0))
+            .collect();
+        let held_keys: Vec<Vec<u8>> = held_runs
+            .iter()
+            .map(|&r| chunk_key(ino, runs[r].0))
+            .collect();
+        let mut current: Vec<Option<u64>> = vec![None; runs.len()];
+        for (&r, seq) in held_runs
+            .iter()
+            .zip(view.read_versions_many(&held_keys).await?)
+        {
+            if runs[r].1.iter().all(|&(_, held)| held == seq) {
+                current[r] = Some(seq);
+            }
+        }
+        // Every other run's value, in one read.
+        let fetched_runs: Vec<usize> = (0..runs.len()).filter(|&r| current[r].is_none()).collect();
+        let fetched_keys: Vec<Vec<u8>> = fetched_runs
+            .iter()
+            .map(|&r| chunk_key(ino, runs[r].0))
+            .collect();
+        let mut fetched: Vec<Option<raft5_client::Entry>> = vec![None; runs.len()];
+        for (&r, entry) in fetched_runs
+            .iter()
+            .zip(view.read_many(&fetched_keys).await?)
+        {
+            fetched[r] = Some(entry);
+        }
+
+        let unchanged = |index, seq| SealedChunk {
+            index,
+            seq,
+            body: ChunkBody::Hole,
+            unchanged: true,
+        };
         let mut chunks = Vec::with_capacity(count as usize);
         let mut blocks = Vec::new();
-        // Each block read so far, by its first index: its seq, and where
-        // it is in `blocks` with how many segments it holds (`None` if
-        // there is no block there).
-        let mut read_blocks: HashMap<u64, (u64, Option<(u32, u32)>)> = HashMap::new();
-        // And each block's seq looked up to confirm a cached chunk, so the
-        // rest of its chunks are confirmed without asking again.
-        let mut block_versions: HashMap<u64, u64> = HashMap::new();
-        for (i, index) in (first..first.saturating_add(count)).enumerate() {
-            let block_start = grid
-                .filter(|g| g.in_blocks(index))
-                .map(|g| g.block_start(index));
-            let key = chunk_key(ino, block_start.unwrap_or(index));
-            if let Some(&seq) = known.get(i).filter(|&&seq| seq != 0) {
-                let now = match block_start {
-                    Some(b) => match (read_blocks.get(&b), block_versions.get(&b)) {
-                        (Some(&(seq, _)), _) | (None, Some(&seq)) => seq,
-                        (None, None) => {
-                            let seq = view.get_version(&key).await?;
-                            block_versions.insert(b, seq);
-                            seq
-                        }
-                    },
-                    None => view.get_version(&key).await?,
-                };
-                if now == seq {
-                    chunks.push(SealedChunk {
-                        index,
-                        seq,
-                        body: ChunkBody::Hole,
-                        unchanged: true,
-                    });
+        for ((stored, run), (current, read)) in
+            runs.into_iter().zip(current.into_iter().zip(fetched))
+        {
+            if let Some(seq) = current {
+                chunks.extend(run.into_iter().map(|(index, _)| unchanged(index, seq)));
+                continue;
+            }
+            let read = read.expect("every run not current was read");
+            let is_current = |held: u64| held != 0 && held == read.seq;
+            if !grid.is_some_and(|g| g.in_blocks(stored)) {
+                // An inline chunk: its key is its own, so its run is one.
+                let (index, held) = run[0];
+                if is_current(held) {
+                    chunks.push(unchanged(index, held));
                     continue;
                 }
-            }
-            let Some(start) = block_start else {
-                let read = view.read(&key).await?;
                 let body = match read.value.map(ChunkValue::decode) {
                     None => ChunkBody::Hole,
                     Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
@@ -1178,40 +1266,38 @@ impl FsCore {
                     unchanged: false,
                 });
                 continue;
-            };
-            let (seq, block) = match read_blocks.get(&start) {
-                Some(&found) => found,
-                None => {
-                    let read = view.read(&key).await?;
-                    let block = match read.value.map(ChunkValue::decode) {
-                        None => None,
-                        Some(ChunkValue::Block(block)) => {
-                            let url = self.read_url(ino, &block, objects_ok)?;
-                            blocks.push(BlockUrl { block, url });
-                            Some((blocks.len() as u32 - 1, block.nseg))
-                        }
-                        Some(ChunkValue::Inline(_)) => {
-                            return Err(FsError::new(
-                                libc::EIO,
-                                format!("inode {ino}: a sealed chunk where block {start} belongs"),
-                            ));
-                        }
-                    };
-                    read_blocks.insert(start, (read.seq, block));
-                    (read.seq, block)
+            }
+            let block = match read.value.map(ChunkValue::decode) {
+                None => None,
+                Some(ChunkValue::Block(block)) => {
+                    let url = self.read_url(ino, &block, objects_ok)?;
+                    blocks.push(BlockUrl { block, url });
+                    Some((blocks.len() as u32 - 1, block.nseg))
+                }
+                Some(ChunkValue::Inline(_)) => {
+                    return Err(FsError::new(
+                        libc::EIO,
+                        format!("inode {ino}: a sealed chunk where block {stored} belongs"),
+                    ));
                 }
             };
-            let segment = (index - start) as u32;
-            let body = match block {
-                Some((block, nseg)) if segment < nseg => ChunkBody::Segment { block, segment },
-                _ => ChunkBody::Hole,
-            };
-            chunks.push(SealedChunk {
-                index,
-                seq,
-                body,
-                unchanged: false,
-            });
+            for (index, held) in run {
+                if is_current(held) {
+                    chunks.push(unchanged(index, held));
+                    continue;
+                }
+                let segment = (index - stored) as u32;
+                let body = match block {
+                    Some((block, nseg)) if segment < nseg => ChunkBody::Segment { block, segment },
+                    _ => ChunkBody::Hole,
+                };
+                chunks.push(SealedChunk {
+                    index,
+                    seq: read.seq,
+                    body,
+                    unchanged: false,
+                });
+            }
         }
         Ok(Chunks {
             attr,
@@ -1324,7 +1410,7 @@ impl FsCore {
         }
         let start = grid.block_start(cut - 1);
         let key = chunk_key(entry.attr.ino, start);
-        let Some(value) = txn.read(&key).await?.value else {
+        let Some(value) = txn.read_one(&key).await?.value else {
             return Ok(Ok(()));
         };
         if let ChunkValue::Block(mut block) = ChunkValue::decode(value) {
@@ -1436,7 +1522,7 @@ impl FsCore {
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::Directory));
             if txn
-                .read(&crate::accounts::keys_key(grantee))
+                .read_one(&crate::accounts::keys_key(grantee))
                 .await?
                 .value
                 .is_none()
@@ -1454,7 +1540,7 @@ impl FsCore {
                 )));
             }
             decide!(check_grantees_version(ino, sealed_grantees, version));
-            if txn.read(&grantees_key(ino)).await?.seq != expected_grantees_seq {
+            if txn.read_one(&grantees_key(ino)).await?.seq != expected_grantees_seq {
                 return Ok(Err(FsError::new(
                     libc::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
@@ -1494,7 +1580,7 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
-            if txn.read(dirent).await?.value.is_some() {
+            if txn.read_one(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
             }
             // No parent key: a volume's key only reaches people by grant.
@@ -1554,8 +1640,10 @@ impl FsCore {
             for r in rotations {
                 let ino = r.ino;
                 decide!(self.guard(&txn, caller, ino, true).await?);
-                let entry = decide!(live_entry(&txn, ino).await?);
-                let (version, wrapped_under) = decide!(key_versions(&txn, ino).await?);
+                let [entry, record] =
+                    each(txn.read_many(&[attr_key(ino), node_keys_key(ino)]).await?);
+                let entry = decide!(live(ino, entry.value).ok_or_else(enoent));
+                let (version, wrapped_under) = decide!(versions_of(ino, record.value));
                 if version != r.expected_version {
                     return changed(format!("inode {ino} has key version {version} now"));
                 }
@@ -1719,7 +1807,7 @@ impl FsCore {
             .map_err(|e| FsError::new(libc::EINVAL, format!("inode {ino}: {e}")))?;
         let before_bytes = self
             .client
-            .read(&node_keys_key(ino))
+            .read_one(&node_keys_key(ino))
             .await?
             .value
             .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino} has no key record")))?;
@@ -1752,7 +1840,7 @@ impl FsCore {
         let before_bytes = &before_bytes;
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
-            if txn.read(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
+            if txn.read_one(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
                 return Ok(Err(FsError::new(
                     libc::EAGAIN,
                     format!("inode {ino}'s key record changed meanwhile"),
@@ -1774,33 +1862,64 @@ impl FsCore {
         if kind == Kind::File {
             let prefix = chunk_prefix(ino);
             let mut iter = self.client.key_iterator(&prefix);
-            while let Some(key) = iter.next().await? {
-                if !key.starts_with(&prefix) {
-                    break;
-                }
-                if is_chunk_key(&key, &prefix)
-                    && let Some(blob) = self.client.read(&key).await?.value
-                    && below(&blob)
+            let mut window = Vec::new();
+            loop {
+                let key = iter.next().await?.filter(|key| key.starts_with(&prefix));
+                if let Some(key) = &key
+                    && is_chunk_key(key, &prefix)
                 {
-                    let index = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
-                    return Ok(Some(format!("chunk {index}")));
+                    window.push(key.clone());
+                }
+                if window.len() < MAX_KEYS_PER_READ && key.is_some() {
+                    continue;
+                }
+                // Each answer as it comes, rather than the window's whole
+                // worth of chunks at once.
+                let mut checked = 0;
+                while checked < window.len() {
+                    let entries = self.client.read_some(&window[checked..]).await?;
+                    checked += entries.len();
+                    for entry in entries {
+                        if entry.value.as_deref().is_some_and(below) {
+                            let index =
+                                u64::from_be_bytes(entry.key[prefix.len()..].try_into().unwrap());
+                            return Ok(Some(format!("chunk {index}")));
+                        }
+                    }
+                }
+                window.clear();
+                if key.is_none() {
+                    break;
                 }
             }
         } else {
             let prefix = dirent_prefix(ino);
+            let mut keys = Vec::new();
             let mut iter = self.client.key_iterator(&prefix);
             while let Some(key) = iter.next().await? {
                 if !key.starts_with(&prefix) {
                     break;
                 }
-                let Some(value) = self.client.read(&key).await?.value else {
-                    continue;
-                };
-                let child = dirent_ino(&value);
-                if below(dirent_sealed_name(&value)) {
+                keys.push(key);
+            }
+            let dirents: Vec<Vec<u8>> = self
+                .client
+                .get_many(&keys)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let records: Vec<Vec<u8>> = dirents
+                .iter()
+                .map(|value| node_keys_key(dirent_ino(value)))
+                .collect();
+            let records = self.client.get_many(&records).await?;
+            for (value, record) in dirents.iter().zip(records) {
+                let child = dirent_ino(value);
+                if below(dirent_sealed_name(value)) {
                     return Ok(Some(format!("the name of entry {child}")));
                 }
-                if let Ok((_, parent_version)) = key_versions(&self.client, child).await?
+                if let Ok((_, parent_version)) = versions_of(child, record)
                     && parent_version != 0
                     && parent_version < base
                 {
@@ -1808,18 +1927,22 @@ impl FsCore {
                 }
             }
         }
-        if let Some(sealed) = self.client.read(&grantees_key(ino)).await?.value
+        if let Some(sealed) = self.client.read_one(&grantees_key(ino)).await?.value
             && below(&sealed)
         {
             return Ok(Some("the grantee list".to_string()));
         }
         let prefix = grants::grant_prefix(ino);
+        let mut keys = Vec::new();
         let mut iter = self.client.key_iterator(&prefix);
         while let Some(key) = iter.next().await? {
             if !key.starts_with(&prefix) {
                 break;
             }
-            if let Some(bytes) = self.client.read(&key).await?.value
+            keys.push(key);
+        }
+        for (key, bytes) in keys.iter().zip(self.client.get_many(&keys).await?) {
+            if let Some(bytes) = bytes
                 && grants::decode_grant(ino, &bytes)?.key_version < base
             {
                 let user = String::from_utf8_lossy(&key[prefix.len()..]).into_owned();

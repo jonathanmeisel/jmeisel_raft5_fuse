@@ -20,6 +20,7 @@ use raft5fs_proto::types::{BlockRef, ChunkWrite, FsError, Layout, ObjectGrid, Wr
 
 use crate::fs::{TXN_TTL, retrying};
 use crate::layout::OBJECT_GRID_KEY;
+use crate::view::ReadKeys;
 
 pub const DEFAULT_OBJECT_FROM: u64 = 10 << 20;
 pub const DEFAULT_OBJECT_BLOCK: u64 = 16 << 20;
@@ -95,7 +96,7 @@ pub fn grid_for(
 /// The grid recorded for the filesystem in `client`'s store, if one is.
 pub(crate) async fn recorded_grid(client: &Client) -> Result<Option<ObjectGrid>, String> {
     let value = client
-        .read(OBJECT_GRID_KEY)
+        .read_one(OBJECT_GRID_KEY)
         .await
         .map_err(|e| e.to_string())?
         .value;
@@ -111,7 +112,7 @@ pub(crate) async fn resolve_grid(
 ) -> Result<ObjectGrid, String> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
-        if let Some(bytes) = txn.read(OBJECT_GRID_KEY).await?.value {
+        if let Some(bytes) = txn.read_one(OBJECT_GRID_KEY).await?.value {
             return Ok(decode_grid(&bytes));
         }
         txn.write(OBJECT_GRID_KEY, Some(&encode_grid(wanted)))

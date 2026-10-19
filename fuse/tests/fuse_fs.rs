@@ -1276,7 +1276,12 @@ fn users_cannot_reach_the_filesystems_keys_directly() {
             .login("alice", &support::password("alice"))
             .await
             .unwrap();
-        assert!(alice.read(CHUNK_SIZE_KEY).await.is_err());
+        assert!(
+            alice
+                .read(&[CHUNK_SIZE_KEY], raft5_client::Consistency::Stale)
+                .await
+                .is_err()
+        );
         assert!(alice.write(CHUNK_SIZE_KEY, Some(b"x")).await.is_err());
     });
     // Still there and unchanged, as the service account sees it.

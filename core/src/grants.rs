@@ -36,28 +36,33 @@ use crate::layout::{
     GRANT_INDEX_PREFIX, GRANTEES_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX,
     ROOT_INO, attr_key,
 };
-use crate::view::View;
+use crate::view::{ReadKeys, View};
 
 /// Deeper than any tree should get; a walk longer than this is a loop in
 /// the parent links, which only corruption could make.
 const MAX_DEPTH: usize = 4096;
 
-/// Reading a key, whether inside a transaction (taking its lock) or not.
-pub(crate) trait Reads: Sync {
-    fn get(&self, key: &[u8]) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send;
-}
+/// Reading keys' values, whether inside a transaction (taking their
+/// locks) or not.
+pub(crate) trait Reads: ReadKeys {
+    fn get(&self, key: &[u8]) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send {
+        async move { Ok(self.read_one(key).await?.value) }
+    }
 
-impl Reads for Client {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
-        Ok(self.read(key).await?.value)
+    /// Every one of `keys`' values, in order, in one call where the
+    /// store's limits allow.
+    fn get_many<K: AsRef<[u8]> + Sync>(
+        &self,
+        keys: &[K],
+    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, KvError>> + Send {
+        async move {
+            let entries = self.read_many(keys).await?;
+            Ok(entries.into_iter().map(|e| e.value).collect())
+        }
     }
 }
 
-impl Reads for Transaction {
-    async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
-        Ok(self.read(key).await?.value)
-    }
-}
+impl<T: ReadKeys> Reads for T {}
 
 pub(crate) fn grant_key(ino: u64, user: &str) -> Vec<u8> {
     let mut key = grant_prefix(ino);
@@ -175,14 +180,19 @@ pub(crate) async fn key_versions(
     r: &impl Reads,
     ino: u64,
 ) -> Result<Result<(u32, u32), FsError>, KvError> {
-    Ok(match r.get(&node_keys_key(ino)).await? {
+    Ok(versions_of(ino, r.get(&node_keys_key(ino)).await?))
+}
+
+/// The versions `ino`'s key record, as read, holds.
+pub(crate) fn versions_of(ino: u64, record: Option<Vec<u8>>) -> Result<(u32, u32), FsError> {
+    match record {
         Some(bytes) => NodeKeys::versions(&bytes)
             .map_err(|e| FsError::new(libc::EIO, format!("inode {ino}: {e}"))),
         None => Err(FsError::new(
             libc::EIO,
             format!("inode {ino} has no key record"),
         )),
-    })
+    }
 }
 
 /// The walk from `ino` up to the nearest directory granted to `user`:
@@ -215,7 +225,10 @@ async fn walk(
         if cur == ROOT_INO {
             return Ok(Err(refused()));
         }
-        let Some(bytes) = r.get(&attr_key(cur)).await? else {
+        // The grant is only looked at if the Entry is there, but read
+        // with it: one round trip a level.
+        let [entry, grant] = two(r.get_many(&[attr_key(cur), grant_key(cur, user)]).await?);
+        let Some(bytes) = entry else {
             return Ok(Err(gone(cur)));
         };
         let entry = decode_entry(cur, &bytes);
@@ -223,7 +236,7 @@ async fn walk(
             return Ok(Err(gone(cur)));
         }
         path.push(cur);
-        if let Some(bytes) = r.get(&grant_key(cur, user)).await? {
+        if let Some(bytes) = grant {
             return Ok(decode_grant(cur, &bytes).map(|grant| (grant, path)));
         }
         // A file from before files recorded their parent: no way up.
@@ -262,36 +275,47 @@ pub(crate) async fn authorize(
 /// raft5fs-crypto's `node`), so nothing new may be sealed under it, nor
 /// under anything below it, until it has a new one.
 pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), FsError>, KvError> {
+    // Each level reads a node's Entry and key record together. Its key
+    // version is what the node below it was to be wrapped under, so that
+    // is checked a level late, by `below`: the node, and the version of
+    // this one's key it is wrapped under.
+    let mut below: Option<(u64, u32)> = None;
     let mut cur = ino;
     for _ in 0..MAX_DEPTH {
         if cur == ROOT_INO {
-            return Ok(Ok(()));
+            // The real root has a key record but is no one's to check
+            // against an Entry: only the node below it needs comparing.
+            let Some(child) = below else {
+                return Ok(Ok(()));
+            };
+            return Ok(versions_of(cur, r.get(&node_keys_key(cur)).await?)
+                .and_then(|(version, _)| check_wrapped(child, version)));
         }
-        let Some(bytes) = r.get(&attr_key(cur)).await? else {
+        let [entry, keys] = two(r.get_many(&[attr_key(cur), node_keys_key(cur)]).await?);
+        // The node itself must exist before its key record matters; a
+        // parent's key record is checked against its child first, as when
+        // each was read in turn.
+        if below.is_none() && entry.is_none() {
             return Ok(Err(FsError::errno(libc::ENOENT)));
-        };
-        let parent = decode_entry(cur, &bytes).parent;
-        let (_, wrapped_under) = match key_versions(r, cur).await? {
+        }
+        let (version, wrapped_under) = match versions_of(cur, keys) {
             Ok(versions) => versions,
             Err(e) => return Ok(Err(e)),
+        };
+        if let Some(child) = below
+            && let Err(e) = check_wrapped(child, version)
+        {
+            return Ok(Err(e));
+        }
+        let Some(bytes) = entry else {
+            return Ok(Err(FsError::errno(libc::ENOENT)));
         };
         // A volume's root: no parent key wraps it.
         if wrapped_under == 0 {
             return Ok(Ok(()));
         }
-        let (parent_version, _) = match key_versions(r, parent).await? {
-            Ok(versions) => versions,
-            Err(e) => return Ok(Err(e)),
-        };
-        if wrapped_under != parent_version {
-            return Ok(Err(FsError::new(
-                libc::EKEYEXPIRED,
-                format!(
-                    "inode {cur} needs a new key: it is wrapped under an old one of its parent's"
-                ),
-            )));
-        }
-        cur = parent;
+        below = Some((cur, wrapped_under));
+        cur = decode_entry(cur, &bytes).parent;
     }
     Ok(Err(FsError::new(
         libc::EIO,
@@ -299,48 +323,76 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
     )))
 }
 
+/// Whether `child`, wrapped under the given version of its parent's key,
+/// is wrapped under `parent_version`, the current one.
+fn check_wrapped((child, wrapped_under): (u64, u32), parent_version: u32) -> Result<(), FsError> {
+    if wrapped_under == parent_version {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EKEYEXPIRED,
+            format!(
+                "inode {child} needs a new key: it is wrapped under an old one of its parent's"
+            ),
+        ))
+    }
+}
+
+/// The two values a read of two keys gave, in order.
+fn two(values: Vec<Option<Vec<u8>>>) -> [Option<Vec<u8>>; 2] {
+    values.try_into().expect("a read of two keys answers both")
+}
+
 /// Every node at or under `top` that is granted to anyone, with the path
 /// from `top` down to it and its grantees -- each with their public key as
 /// the server has it, empty for one who no longer has keys.
 pub async fn grants_under(client: &Client, top: u64) -> Result<Vec<GrantedNode>, FsError> {
-    let mut by_ino: BTreeMap<u64, Vec<(String, bool)>> = BTreeMap::new();
+    let mut keys = Vec::new();
     let mut iter = client.key_iterator(GRANTS_PREFIX);
     while let Some(key) = iter.next().await? {
         if !key.starts_with(GRANTS_PREFIX) {
             break;
         }
-        let Some(ino) = key
-            .get(1..9)
-            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
-        else {
-            continue;
-        };
-        let user = String::from_utf8_lossy(&key[9..]).into_owned();
+        if key.len() >= 9 {
+            keys.push(key);
+        }
+    }
+    let mut by_ino: BTreeMap<u64, Vec<(String, bool)>> = BTreeMap::new();
+    for (key, bytes) in keys.iter().zip(client.get_many(&keys).await?) {
         // Gone since the scan saw it: revoked meanwhile.
-        let Some(bytes) = client.read(&key).await?.value else {
+        let Some(bytes) = bytes else {
             continue;
         };
+        let ino = u64::from_be_bytes(key[1..9].try_into().unwrap());
+        let user = String::from_utf8_lossy(&key[9..]).into_owned();
         let writable = decode_grant(ino, &bytes)?.writable;
         by_ino.entry(ino).or_default().push((user, writable));
     }
-    let mut nodes = Vec::new();
+    let mut under = Vec::new();
     for (ino, grants) in by_ino {
-        let Some(path) = path_from(client, top, ino).await? else {
-            continue;
-        };
-        let mut grantees = Vec::with_capacity(grants.len());
-        for (user, writable) in grants {
-            let public_key = crate::accounts::get(client, &user)
-                .await?
-                .map(|keys| keys.public_key)
-                .unwrap_or_default();
-            grantees.push(Grantee {
-                user,
-                public_key,
-                writable,
-            });
+        if let Some(path) = path_from(client, top, ino).await? {
+            under.push((ino, path, grants));
         }
-        let listed = client.read(&grantees_key(ino)).await?;
+    }
+
+    let users: Vec<&str> = under
+        .iter()
+        .flat_map(|(_, _, grants)| grants.iter().map(|(user, _)| user.as_str()))
+        .collect();
+    let mut accounts = crate::accounts::get_many(client, &users).await?.into_iter();
+    let listed_keys: Vec<Vec<u8>> = under.iter().map(|&(ino, ..)| grantees_key(ino)).collect();
+    let listed = client.read_many(&listed_keys).await?;
+    let mut nodes = Vec::with_capacity(under.len());
+    for ((ino, path, grants), listed) in under.into_iter().zip(listed) {
+        let grantees = grants
+            .into_iter()
+            .zip(accounts.by_ref())
+            .map(|((user, writable), keys)| Grantee {
+                user,
+                public_key: keys.map(|keys| keys.public_key).unwrap_or_default(),
+                writable,
+            })
+            .collect();
         nodes.push(GrantedNode {
             ino,
             path,
@@ -365,7 +417,7 @@ async fn path_from(client: &Client, top: u64, ino: u64) -> Result<Option<Vec<u64
         if cur == ROOT_INO {
             return Ok(None);
         }
-        let Some(bytes) = client.read(&attr_key(cur)).await?.value else {
+        let Some(bytes) = client.read_one(&attr_key(cur)).await?.value else {
             return Ok(None);
         };
         cur = decode_entry(cur, &bytes).parent;
@@ -393,8 +445,8 @@ pub(crate) async fn grants_of(
         keys.push(key);
     }
     let mut grants = BTreeMap::new();
-    for key in keys {
-        if let Some(bytes) = txn.read(&key).await?.value
+    for (key, bytes) in keys.iter().zip(txn.get_many(&keys).await?) {
+        if let Some(bytes) = bytes
             && let Ok(grant) = decode_grant(ino, &bytes)
         {
             grants.insert(
@@ -416,14 +468,13 @@ pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Res
 /// key records from the granted directory down to `ino`, as `view` has
 /// them.
 pub(crate) async fn key_path(view: &View<'_>, user: &str, ino: u64) -> Result<KeyPath, FsError> {
-    let (grant, path) = walk(view, user, ino).await??;
+    let (grant, mut path) = walk(view, user, ino).await??;
+    path.reverse();
+    let records: Vec<Vec<u8>> = path.iter().map(|&node| node_keys_key(node)).collect();
     let mut nodes = Vec::with_capacity(path.len());
-    for &node in path.iter().rev() {
-        let keys = view
-            .read(&node_keys_key(node))
-            .await?
-            .value
-            .ok_or_else(|| FsError::new(libc::EIO, format!("inode {node} has no key record")))?;
+    for (node, keys) in path.into_iter().zip(view.get_many(&records).await?) {
+        let keys =
+            keys.ok_or_else(|| FsError::new(libc::EIO, format!("inode {node} has no key record")))?;
         nodes.push((node, keys));
     }
     Ok(KeyPath { grant, nodes })
@@ -442,10 +493,11 @@ pub(crate) async fn list(view: &View<'_>, user: &str) -> Result<Vec<Grant>, FsEr
             inos.push(u64::from_be_bytes(ino));
         }
     }
+    let keys: Vec<Vec<u8>> = inos.iter().map(|&ino| grant_key(ino, user)).collect();
     let mut grants = Vec::with_capacity(inos.len());
-    for ino in inos {
+    for (ino, bytes) in inos.into_iter().zip(view.get_many(&keys).await?) {
         // Gone between the scan and here: revoked meanwhile.
-        if let Some(bytes) = view.read(&grant_key(ino, user)).await?.value {
+        if let Some(bytes) = bytes {
             grants.push(decode_grant(ino, &bytes)?);
         }
     }
