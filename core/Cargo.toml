@@ -13,3 +13,7 @@ raft5-shared = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true, features = ["raft5"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }

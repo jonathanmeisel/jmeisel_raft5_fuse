@@ -43,6 +43,7 @@ use crate::layout::{
     GRANT_INDEX_PREFIX, GRANTEES_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX,
     ROOT_INO, attr_key,
 };
+use crate::timing::next_key;
 use crate::view::{ReadKeys, View};
 
 /// Deeper than any tree should get; a walk longer than this is a loop in
@@ -448,7 +449,7 @@ fn two(values: Vec<Option<Vec<u8>>>) -> [Option<Vec<u8>>; 2] {
 pub async fn grants_under(client: &Client, top: u64) -> Result<Vec<GrantedNode>, FsError> {
     let mut keys = Vec::new();
     let mut iter = client.key_iterator(GRANTS_PREFIX);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(GRANTS_PREFIX) {
             break;
         }
@@ -537,7 +538,7 @@ pub(crate) async fn grants_of(
     let prefix = grant_prefix(ino);
     let mut keys = Vec::new();
     let mut iter = txn.key_iterator(&prefix);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
         }
@@ -589,7 +590,7 @@ pub(crate) async fn list(view: &View<'_>, user: &str) -> Result<Vec<Grant>, FsEr
     let prefix = index_prefix(user);
     let mut inos = Vec::new();
     let mut iter = view.key_iterator(&prefix);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
         }
@@ -621,7 +622,7 @@ pub(crate) async fn forget_inode(txn: &Transaction, ino: u64) -> Result<(), KvEr
     let prefix = grant_prefix(ino);
     let mut users = Vec::new();
     let mut iter = txn.key_iterator(&prefix);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
         }

@@ -13,6 +13,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use raft5_client::Client;
 use raft5fs_proto::types::{FsError, SnapshotInfo};
 
+use crate::timing;
+
 /// Whether `name` can be a snapshot's: what raft5 takes as an id, and what
 /// can be a file name besides -- not `.` or `..`.
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -46,8 +48,7 @@ fn info(s: raft5_client::SnapshotInfo) -> Option<SnapshotInfo> {
 /// Every snapshot, oldest first. One whose id can't be a file name -- taken
 /// some other way than `create` -- isn't listed: no path could reach it.
 pub async fn list(client: &Client) -> Result<Vec<SnapshotInfo>, FsError> {
-    let mut snapshots: Vec<_> = client
-        .list_snapshots()
+    let mut snapshots: Vec<_> = timing::other("snapshot list", client.list_snapshots())
         .await?
         .into_iter()
         .filter_map(info)

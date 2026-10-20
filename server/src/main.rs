@@ -1,5 +1,6 @@
 use std::env;
 use std::future::pending;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +135,19 @@ Store options:
   --store-server-name <NAME>
                        check the store's certificate against this name
                        instead of the host in each address.
+
+Finding out where time goes, when serving:
+  RAFT5FS_LOG=<FILTER> log through `tracing`, filtered as RUST_LOG would
+                       be: raft5fs_server=info is a line per request
+                       saying how long it took to handle and how much of
+                       that went on the store; raft5fs_core=debug adds a
+                       line per store call, under the request it was for.
+  RAFT5FS_TIMING=1     answer every request with how long it took to
+                       handle and what it spent on the store, for clients
+                       (also with RAFT5FS_TIMING=1) to set against how
+                       long it took from where they are. Off by default:
+                       it says a little about what a request found, even
+                       to callers who aren't logged in.
 
 Any number of servers can serve one store at once.";
 
@@ -491,7 +505,22 @@ async fn snapshot_command(a: Args) {
     result.unwrap_or_else(|e| fail(e));
 }
 
+/// Logs through `tracing` as RAFT5FS_LOG says, if it says anything.
+fn init_logging() {
+    let Ok(filter) = env::var("RAFT5FS_LOG") else {
+        return;
+    };
+    let filter = tracing_subscriber::EnvFilter::try_new(&filter)
+        .unwrap_or_else(|e| usage(&format!("RAFT5FS_LOG: {e}")));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+}
+
 async fn serve_command(a: Args) {
+    init_logging();
     let listen = a
         .listen
         .clone()
@@ -546,7 +575,8 @@ async fn serve_command(a: Args) {
     if core.object_grid().is_some() && !gc_interval.is_zero() {
         tokio::spawn(Arc::clone(&core).run_gc(gc_interval));
     }
-    let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL));
+    let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL))
+        .with_timing_header(env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
     if let Err(e) = raft5fs_server::serve(fs, listener, tls, pending()).await {
         fail(format!("server stopped: {e}"));
     }

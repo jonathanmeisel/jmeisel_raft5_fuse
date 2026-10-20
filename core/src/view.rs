@@ -14,6 +14,8 @@ use raft5_client::{
 };
 use raft5_shared::MAX_KEYS_PER_READ;
 
+use crate::timing;
+
 /// Reading the store, any number of keys at a time. `read_some` and
 /// `read_versions_some` are one call each, as the store answers it;
 /// everything else is built on them.
@@ -91,30 +93,32 @@ fn seqs(versions: Vec<Version>) -> Vec<u64> {
 /// Possibly-stale reads of the live store.
 impl ReadKeys for Client {
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
-        Ok(self.read(keys, Consistency::Stale).await?.entries)
+        let read = self.read(keys, Consistency::Stale);
+        Ok(timing::read(keys.len(), false, read).await?.entries)
     }
 
     async fn read_versions_some<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
     ) -> Result<Vec<u64>, KvError> {
-        Ok(seqs(
-            self.read_versions(keys, Consistency::Stale).await?.entries,
-        ))
+        let read = self.read_versions(keys, Consistency::Stale);
+        Ok(seqs(timing::read(keys.len(), true, read).await?.entries))
     }
 }
 
 /// Reads that hold every key for the rest of the transaction.
 impl ReadKeys for Transaction {
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
-        Ok(self.read(keys).await?.entries)
+        let read = self.read(keys);
+        Ok(timing::read(keys.len(), false, read).await?.entries)
     }
 
     async fn read_versions_some<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
     ) -> Result<Vec<u64>, KvError> {
-        Ok(seqs(self.read_versions(keys).await?.entries))
+        let read = self.read_versions(keys);
+        Ok(seqs(timing::read(keys.len(), true, read).await?.entries))
     }
 }
 
@@ -165,14 +169,15 @@ impl ReadKeys for View<'_> {
     }
 
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
-        Ok(self.client.read(keys, self.consistency()).await?.entries)
+        let read = self.client.read(keys, self.consistency());
+        Ok(timing::read(keys.len(), false, read).await?.entries)
     }
 
     async fn read_versions_some<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
     ) -> Result<Vec<u64>, KvError> {
-        let read = self.client.read_versions(keys, self.consistency()).await?;
-        Ok(seqs(read.entries))
+        let read = self.client.read_versions(keys, self.consistency());
+        Ok(seqs(timing::read(keys.len(), true, read).await?.entries))
     }
 }

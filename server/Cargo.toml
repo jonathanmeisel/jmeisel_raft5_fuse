@@ -20,3 +20,5 @@ tonic = { workspace = true }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 serde = { version = "1", features = ["derive"] }
 libc = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

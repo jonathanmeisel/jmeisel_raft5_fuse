@@ -2312,6 +2312,7 @@ dependencies = [
  "raft5fs-objstore",
  "raft5fs-proto",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2335,6 +2336,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fuser",
+ "http-body",
  "libc",
  "raft5-client",
  "raft5-server",
@@ -2399,6 +2401,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

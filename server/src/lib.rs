@@ -10,6 +10,7 @@
 //! (see `auth`).
 
 pub mod auth;
+pub mod timing;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -42,6 +43,7 @@ use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
 
 use crate::auth::Signer;
+use crate::timing::Timed;
 
 /// The largest request the server accepts: one write batch, which is at
 /// most one maximum-size chunk, plus room for framing. Above tonic's 4 MiB
@@ -78,6 +80,8 @@ pub struct FsService {
     /// When each account was last seen enrolled.
     enrolled: Mutex<HashMap<String, Instant>>,
     identity_ttl: Duration,
+    /// Whether answers say where their time went (see `timing`).
+    timing_header: bool,
 }
 
 impl FsService {
@@ -90,7 +94,16 @@ impl FsService {
             signer,
             enrolled: Mutex::new(HashMap::new()),
             identity_ttl,
+            timing_header: false,
         }
+    }
+
+    /// Answers every request with `raft5fs_proto::timing::HEADER`: how
+    /// long it took to handle, and how much of that went on the store.
+    /// Off by default -- see that module for why.
+    pub fn with_timing_header(mut self, on: bool) -> Self {
+        self.timing_header = on;
+        self
     }
 
     /// Who `request` is from, per its session, and its message.
@@ -147,7 +160,7 @@ pub fn service(fs: FsService) -> FsServer<FsService> {
 }
 
 /// Serves on `listener` until `shutdown` completes, over TLS if `tls` is
-/// given.
+/// given, timing every request (see `timing`).
 pub async fn serve(
     fs: FsService,
     listener: TcpListener,
@@ -158,8 +171,9 @@ pub async fn serve(
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
+    let header = fs.timing_header;
     builder
-        .add_service(service(fs))
+        .add_service(Timed::new(service(fs), header))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
 }

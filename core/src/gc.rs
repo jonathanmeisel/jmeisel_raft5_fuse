@@ -46,6 +46,7 @@ use crate::entry::decode_entry;
 use crate::fs::{FsCore, TXN_TTL, retrying};
 use crate::layout::{ChunkValue, GC_LEASE_KEY, attr_key};
 use crate::objects::CLOCK_SKEW;
+use crate::timing::next_key;
 use crate::view::{ReadKeys, View};
 
 /// How long one sweep may hold the lease before renewing it.
@@ -257,7 +258,7 @@ impl FsCore {
         // in one read, then the hybrid ones' pointers in another.
         let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut iter = view.key_iterator(&[CHUNKS]);
-        while let Some(key) = iter.next().await? {
+        while let Some(key) = next_key(&mut iter).await? {
             if key.first() != Some(&CHUNKS) {
                 break;
             }

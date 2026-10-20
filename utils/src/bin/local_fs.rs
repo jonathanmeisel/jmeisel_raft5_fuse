@@ -645,7 +645,10 @@ async fn start_fs_server(
     let listener = tokio::net::TcpListener::bind(manifest.fs_addr())
         .await
         .map_err(|e| format!("could not listen on {}: {e}", manifest.fs_addr()))?;
-    let fs = FsService::new(Arc::new(core), signer, DEFAULT_IDENTITY_TTL);
+    // As raft5fs-server: RAFT5FS_TIMING=1 tells the mount where its
+    // requests' time went.
+    let fs = FsService::new(Arc::new(core), signer, DEFAULT_IDENTITY_TTL)
+        .with_timing_header(std::env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
     let server_tls = ServerTlsConfig::new().identity(tls.identity.clone());
     let cancel = stack.fs_cancel.clone();
     stack.tasks.spawn(async move {

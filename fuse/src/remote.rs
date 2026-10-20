@@ -75,6 +75,8 @@ use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+use crate::timing::Timed;
+
 /// The largest message the client sends: one write batch, which is at most
 /// one maximum-size chunk (8 MiB), plus framing.
 const MAX_MESSAGE_BYTES: usize = 9 << 20;
@@ -140,7 +142,7 @@ impl Interceptor for Authorize {
     }
 }
 
-type Client = FsClient<InterceptedService<Channel, Authorize>>;
+type Client = FsClient<InterceptedService<Timed<Channel>, Authorize>>;
 
 /// What a login presents: the password, until the first login has turned
 /// it into `auth`.
@@ -294,6 +296,7 @@ impl Remote {
                 .keep_alive_timeout(KEEPALIVE_TIMEOUT)
                 .keep_alive_while_idle(true)
                 .connect_lazy();
+            let channel = Timed::new(channel, address);
             let client = FsClient::with_interceptor(channel, authorize.clone())
                 .max_encoding_message_size(MAX_MESSAGE_BYTES);
             servers.push((address.clone(), client));

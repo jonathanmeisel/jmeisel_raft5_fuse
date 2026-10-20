@@ -35,6 +35,7 @@ use crate::objects::{
     segment_len,
 };
 use crate::snapshots;
+use crate::timing::{self, next_key};
 use crate::view::{ReadKeys, View};
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
@@ -68,7 +69,7 @@ where
     Fut: std::future::Future<Output = Result<T, KvError>>,
 {
     loop {
-        match attempt().await {
+        match timing::attempt(attempt()).await {
             Err(KvError::Aborted { .. }) => continue,
             other => return other,
         }
@@ -227,7 +228,7 @@ fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), 
 async fn is_empty_dir(txn: &Transaction, ino: u64) -> Result<bool, KvError> {
     let prefix = dirent_prefix(ino);
     let mut iter = txn.key_iterator(&prefix);
-    Ok(!matches!(iter.next().await?, Some(key) if key.starts_with(&prefix)))
+    Ok(!matches!(next_key(&mut iter).await?, Some(key) if key.starts_with(&prefix)))
 }
 
 async fn write_entry(txn: &Transaction, entry: &Entry) -> Result<(), KvError> {
@@ -670,7 +671,7 @@ impl FsCore {
         let prefix = dirent_prefix(ino);
         let mut keys = Vec::new();
         let mut iter = view.key_iterator(&prefix);
-        while let Some(key) = iter.next().await? {
+        while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -795,9 +796,9 @@ impl FsCore {
     pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
         let user = caller.user.as_str();
         let ino = allocate_inode(&self.client).await?;
-        self.client
-            .write(&reservation_key(ino), Some(user.as_bytes()))
-            .await?;
+        let key = reservation_key(ino);
+        let write = self.client.write(&key, Some(user.as_bytes()));
+        timing::other("write", write).await?;
         Ok(ino)
     }
 
@@ -1868,7 +1869,9 @@ impl FsCore {
             let mut iter = self.client.key_iterator(&prefix);
             let mut window = Vec::new();
             loop {
-                let key = iter.next().await?.filter(|key| key.starts_with(&prefix));
+                let key = next_key(&mut iter)
+                    .await?
+                    .filter(|key| key.starts_with(&prefix));
                 if let Some(key) = &key
                     && is_chunk_key(key, &prefix)
                 {
@@ -1900,7 +1903,7 @@ impl FsCore {
             let prefix = dirent_prefix(ino);
             let mut keys = Vec::new();
             let mut iter = self.client.key_iterator(&prefix);
-            while let Some(key) = iter.next().await? {
+            while let Some(key) = next_key(&mut iter).await? {
                 if !key.starts_with(&prefix) {
                     break;
                 }
@@ -1939,7 +1942,7 @@ impl FsCore {
         let prefix = grants::grant_prefix(ino);
         let mut keys = Vec::new();
         let mut iter = self.client.key_iterator(&prefix);
-        while let Some(key) = iter.next().await? {
+        while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -2002,7 +2005,7 @@ impl FsCore {
     async fn reap_tombstones(&self) -> Result<usize, FsError> {
         let mut inos = Vec::new();
         let mut iter = self.client.key_iterator(TOMBSTONE_PREFIX);
-        while let Some(key) = iter.next().await? {
+        while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(TOMBSTONE_PREFIX) {
                 break;
             }
@@ -2026,7 +2029,7 @@ impl FsCore {
             let mut iter = self.client.key_iterator(&chunk_key(ino, first_index));
             let mut batch = Vec::new();
             while batch.len() < DELETE_BATCH {
-                match iter.next().await? {
+                match next_key(&mut iter).await? {
                     // `key_iterator` runs to the end of the keyspace, so
                     // leaving this inode's chunks is the end of the walk.
                     Some(key) if !key.starts_with(&prefix) => break,

@@ -6,5 +6,6 @@ pub mod prune_queue;
 pub mod pruner;
 pub mod remote;
 mod snapshot_tree;
+mod timing;
 pub mod vault;
 pub mod write_buffer;

@@ -22,6 +22,7 @@ use raft5fs_crypto::password::{
 
 use crate::fs::{TXN_TTL, retrying};
 use crate::layout::{ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX};
+use crate::timing::next_key;
 use crate::view::ReadKeys;
 use raft5fs_proto::types::{AccountKeys, FsError};
 
@@ -213,7 +214,7 @@ async fn granted_in(txn: &Transaction, user: &str) -> Result<Vec<u64>, KvError> 
     let prefix = crate::grants::index_prefix(user);
     let mut granted = Vec::new();
     let mut iter = txn.key_iterator(&prefix);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
         }
@@ -274,7 +275,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     let prefix = crate::grants::index_prefix(user);
     let mut granted = Vec::new();
     let mut iter = client.key_iterator(&prefix);
-    while let Some(key) = iter.next().await? {
+    while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
         }
@@ -305,7 +306,7 @@ pub async fn list(client: &Client) -> Result<Vec<(String, bool)>, FsError> {
     let mut accounts = std::collections::BTreeMap::new();
     for (prefix, enrolled) in [(ACCOUNT_KEYS_PREFIX, true), (ENROLMENT_PREFIX, false)] {
         let mut iter = client.key_iterator(prefix);
-        while let Some(key) = iter.next().await? {
+        while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(prefix) {
                 break;
             }

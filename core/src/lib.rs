@@ -8,6 +8,7 @@ pub mod grants;
 mod layout;
 pub mod objects;
 pub mod snapshots;
+pub mod timing;
 mod view;
 
 pub use fs::{FsCore, check_store, resolve_chunk_size};

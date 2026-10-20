@@ -456,7 +456,7 @@ pub fn serve_if_requested() {
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
         // Look accounts up on every request, so a test that removes one
         // sees it at once.
-        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO);
+        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO).with_timing_header(true);
         if let Err(e) = raft5fs_server::serve(
             fs,
             listener,

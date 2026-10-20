@@ -3,6 +3,7 @@
 
 pub mod convert;
 pub mod invite;
+pub mod timing;
 pub mod types;
 
 /// Generated wire types and the tonic client and server.
