@@ -3,8 +3,11 @@
 //! Stateless by design, so any number can run against one store and a
 //! client can use any of them: nothing here outlives a request except the
 //! account cache, which remembers that an account is still enrolled for at
-//! most `identity_ttl`. Write buffering and the chunk cache live in the
-//! client; sessions live in signed tokens the client holds (see `auth`).
+//! most `identity_ttl`, and the core's paths up to grants, which only say
+//! what to read and are checked against the store every time (see
+//! `raft5fs_core`'s `grants::Paths`). Write buffering and the chunk cache
+//! live in the client; sessions live in signed tokens the client holds
+//! (see `auth`).
 
 pub mod auth;
 

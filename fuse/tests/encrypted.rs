@@ -857,6 +857,44 @@ fn shared_tree(h: &support::Harness) -> std::path::PathBuf {
 }
 
 #[test]
+fn a_nearer_grant_decides_even_below_a_path_the_server_knows() {
+    let h = support::setup_root();
+    let v = shared_tree(&h);
+    h.add_user("alice");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v), "alice", true, OsStr::new("v")))
+        .unwrap();
+    let alice = h.mount_as("alice");
+    let hers = alice.path.join("v/shared/sub/f");
+    // Walked from f up to v, which the server now knows the way of.
+    fs::write(&hers, b"by alice").unwrap();
+
+    h.runtime
+        .block_on(mine.grant(ino(&v.join("shared")), "alice", false, OsStr::new("shared")))
+        .unwrap();
+    assert_errno(fs::write(&hers, b"again"), libc::EROFS);
+    assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"by alice");
+}
+
+#[test]
+fn a_node_moved_from_under_a_grant_is_cut_off_though_its_path_was_known() {
+    let h = support::setup_root();
+    let v = shared_tree(&h);
+    let f = ino(&v.join("shared/sub/f"));
+    h.add_user("alice");
+    let mine = vault(&h, support::TESTER);
+    h.runtime
+        .block_on(mine.grant(ino(&v.join("shared")), "alice", true, OsStr::new("shared")))
+        .unwrap();
+    let remote = connect(&h, "alice", &support::password("alice")).unwrap();
+    h.runtime.block_on(remote.getattr(f)).unwrap();
+
+    fs::rename(v.join("shared/sub"), v.join("sub")).unwrap();
+    assert_fs_errno(h.runtime.block_on(remote.getattr(f)), libc::EACCES);
+}
+
+#[test]
 fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     let h = support::setup_root();
     let v = shared_tree(&h);

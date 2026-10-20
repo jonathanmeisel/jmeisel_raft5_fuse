@@ -355,6 +355,9 @@ pub struct FsCore {
     pub(crate) grid: Option<ObjectGrid>,
     /// Where this server keeps data in object storage, if it does.
     pub(crate) objects: Option<Objects>,
+    /// Where walks up to grants have gone, for the next to check rather
+    /// than retrace (see `grants::Paths`).
+    paths: grants::Paths,
 }
 
 impl FsCore {
@@ -392,6 +395,7 @@ impl FsCore {
             chunk_size,
             grid,
             objects: objects.map(Objects::new),
+            paths: grants::Paths::default(),
         };
         core.ensure_root()
             .await
@@ -505,7 +509,7 @@ impl FsCore {
         ino: u64,
         write: bool,
     ) -> Result<Result<(), FsError>, KvError> {
-        Ok(grants::authorize(r, &caller.user, ino, write)
+        Ok(grants::authorize(r, &self.paths, &caller.user, ino, write)
             .await?
             .map(|_| ()))
     }
@@ -1472,7 +1476,7 @@ impl FsCore {
         at: Option<&[u8]>,
     ) -> Result<KeyPath, FsError> {
         let view = self.view(at).await?;
-        grants::key_path(&view, &caller.user, ino).await
+        grants::key_path(&view, &self.paths, &caller.user, ino).await
     }
 
     /// Every grant made to `caller`, as of snapshot `at` if one is given.

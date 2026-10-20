@@ -12,6 +12,12 @@
 //! between the check and the change. (A transaction's reads take shared
 //! locks, so walks don't conflict with each other.)
 //!
+//! A server remembers where each walk went (`Paths`), and the next from
+//! the same inode reads that whole path at once, checking it is still the
+//! way a walk would go, instead of a level at a time. What is remembered
+//! never decides anything: a grant taken back, or a node moved, fails the
+//! check, and the walk goes on as if nothing had been remembered.
+//!
 //! Every inode also has a key record (raft5fs-crypto's `NodeKeys`), which
 //! the server stores and hands out but can't open; it reads only the two
 //! version numbers at its front. A grant holds the granted directory's key
@@ -24,8 +30,9 @@
 //! sealed under the node's current key version, and `grants_under` hands
 //! it out with the grants, for a rotating client to check them against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::sync::Mutex;
 
 use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::node::NodeKeys;
@@ -41,6 +48,52 @@ use crate::view::{ReadKeys, View};
 /// Deeper than any tree should get; a walk longer than this is a loop in
 /// the parent links, which only corruption could make.
 const MAX_DEPTH: usize = 4096;
+
+/// How many paths `Paths` holds before it forgets them all and starts
+/// again.
+const MAX_PATHS: usize = 1 << 16;
+
+/// Where walks have gone: for a user and an inode, live or at a snapshot,
+/// the path the last walk from it took up to the user's grant.
+///
+/// Only ever a guess at which keys to read. A walk that finds one checks
+/// every condition it would have checked on its way up against the store,
+/// in one read (see `follows`), and walks on as usual if any fails -- so
+/// a path out of date, after a grant is revoked or made or a node moves
+/// or goes, costs a read and decides nothing. Nothing here needs telling
+/// about a change, and each server keeps its own.
+#[derive(Default)]
+pub(crate) struct Paths {
+    known: Mutex<HashMap<PathKey, Vec<u64>>>,
+}
+
+/// A snapshot (`None` for the live store), a user and an inode.
+type PathKey = (Option<Vec<u8>>, String, u64);
+
+impl Paths {
+    fn get(&self, at: Option<&[u8]>, user: &str, ino: u64) -> Option<Vec<u64>> {
+        let key = (at.map(<[u8]>::to_vec), user.to_string(), ino);
+        self.known.lock().unwrap().get(&key).cloned()
+    }
+
+    /// Records `path`, a walk's from its first node to the grant, for each
+    /// node on it: what is left of it is that node's own way up.
+    fn remember(&self, at: Option<&[u8]>, user: &str, path: &[u64]) {
+        let mut known = self.known.lock().unwrap();
+        if known.len() + path.len() > MAX_PATHS {
+            known.clear();
+        }
+        for i in 0..path.len() {
+            let key = (at.map(<[u8]>::to_vec), user.to_string(), path[i]);
+            known.insert(key, path[i..].to_vec());
+        }
+    }
+
+    fn forget(&self, at: Option<&[u8]>, user: &str, ino: u64) {
+        let key = (at.map(<[u8]>::to_vec), user.to_string(), ino);
+        self.known.lock().unwrap().remove(&key);
+    }
+}
 
 /// Reading keys' values, whether inside a transaction (taking their
 /// locks) or not.
@@ -199,11 +252,16 @@ pub(crate) fn versions_of(ino: u64, record: Option<Vec<u8>>) -> Result<(u32, u32
 /// that grant, and the inodes passed on the way, starting with `ino` and
 /// ending with the granted directory. `ENOENT` if `ino` itself doesn't
 /// exist; `EACCES` if nothing above it is granted to `user`.
+///
+/// One read a level, except where `paths` knows the way on from a node:
+/// then the rest is checked in one read, and walked only if it fails.
 async fn walk(
     r: &impl Reads,
+    paths: &Paths,
     user: &str,
     ino: u64,
 ) -> Result<Result<(Grant, Vec<u64>), FsError>, KvError> {
+    let at = r.snapshot();
     let refused = || {
         FsError::new(
             libc::EACCES,
@@ -225,6 +283,14 @@ async fn walk(
         if cur == ROOT_INO {
             return Ok(Err(refused()));
         }
+        if let Some(known) = paths.get(at, user, cur) {
+            if let Some(grant) = follows(r, user, &known).await? {
+                path.extend_from_slice(&known);
+                paths.remember(at, user, &path);
+                return Ok(Ok((grant, path)));
+            }
+            paths.forget(at, user, cur);
+        }
         // The grant is only looked at if the Entry is there, but read
         // with it: one round trip a level.
         let [entry, grant] = two(r.get_many(&[attr_key(cur), grant_key(cur, user)]).await?);
@@ -237,7 +303,11 @@ async fn walk(
         }
         path.push(cur);
         if let Some(bytes) = grant {
-            return Ok(decode_grant(cur, &bytes).map(|grant| (grant, path)));
+            let grant = decode_grant(cur, &bytes);
+            if grant.is_ok() {
+                paths.remember(at, user, &path);
+            }
+            return Ok(grant.map(|grant| (grant, path)));
         }
         // A file from before files recorded their parent: no way up.
         if entry.parent == 0 {
@@ -251,15 +321,44 @@ async fn walk(
     )))
 }
 
+/// The grant at the top of `path` if a walk from its first node would
+/// take `path` to it now -- every node there and not being deleted, each
+/// the child of the next, none granted to `user` but the last, and that
+/// one granted -- read in one go, the very keys the walk would read.
+/// `None` if anything is otherwise, for the walk to find out what.
+async fn follows(r: &impl Reads, user: &str, path: &[u64]) -> Result<Option<Grant>, KvError> {
+    let keys: Vec<Vec<u8>> = path
+        .iter()
+        .flat_map(|&node| [attr_key(node), grant_key(node, user)])
+        .collect();
+    let values = r.get_many(&keys).await?;
+    for (i, (&node, level)) in path.iter().zip(values.chunks_exact(2)).enumerate() {
+        let Some(bytes) = &level[0] else {
+            return Ok(None);
+        };
+        let entry = decode_entry(node, bytes);
+        if node == ROOT_INO || entry.is_deleted() {
+            return Ok(None);
+        }
+        match (&level[1], path.get(i + 1)) {
+            (Some(grant), None) => return Ok(decode_grant(node, grant).ok()),
+            (None, Some(&next)) if entry.parent == next && next != 0 => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 /// The grant through which `user` reaches `ino` -- `EACCES` if none does,
 /// `EROFS` if `write` is asked of a read-only one.
 pub(crate) async fn authorize(
     r: &impl Reads,
+    paths: &Paths,
     user: &str,
     ino: u64,
     write: bool,
 ) -> Result<Result<Grant, FsError>, KvError> {
-    Ok(match walk(r, user, ino).await? {
+    Ok(match walk(r, paths, user, ino).await? {
         Ok((grant, _)) if write && !grant.writable => Err(FsError::new(
             libc::EROFS,
             format!("inode {ino} is shared with {user} read-only"),
@@ -467,8 +566,13 @@ pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Res
 /// What `user` needs to unwrap `ino`'s key: their grant over it and the
 /// key records from the granted directory down to `ino`, as `view` has
 /// them.
-pub(crate) async fn key_path(view: &View<'_>, user: &str, ino: u64) -> Result<KeyPath, FsError> {
-    let (grant, mut path) = walk(view, user, ino).await??;
+pub(crate) async fn key_path(
+    view: &View<'_>,
+    paths: &Paths,
+    user: &str,
+    ino: u64,
+) -> Result<KeyPath, FsError> {
+    let (grant, mut path) = walk(view, paths, user, ino).await??;
     path.reverse();
     let records: Vec<Vec<u8>> = path.iter().map(|&node| node_keys_key(node)).collect();
     let mut nodes = Vec::with_capacity(path.len());

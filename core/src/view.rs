@@ -66,6 +66,11 @@ pub(crate) trait ReadKeys: Sync {
         }
     }
 
+    /// The snapshot these reads are at, or `None` for the live store.
+    fn snapshot(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// One key's entry: its value, and the seq it was written at (0 and
     /// no value if it has none).
     fn read_one(&self, key: &[u8]) -> impl Future<Output = Result<Entry, KvError>> + Send {
@@ -155,6 +160,10 @@ impl<'a> View<'a> {
 }
 
 impl ReadKeys for View<'_> {
+    fn snapshot(&self) -> Option<&[u8]> {
+        self.at
+    }
+
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
         Ok(self.client.read(keys, self.consistency()).await?.entries)
     }
