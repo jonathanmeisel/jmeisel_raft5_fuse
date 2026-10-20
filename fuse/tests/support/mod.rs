@@ -311,6 +311,16 @@ const SERVER_LISTEN_ENV: &str = "RAFT5FS_TEST_SERVER_LISTEN";
 const SERVER_TOKEN_KEY_ENV: &str = "RAFT5FS_TEST_SERVER_TOKEN_KEY";
 /// The fake object store's endpoint, for a server that keeps objects.
 const SERVER_OBJECTS_ENV: &str = "RAFT5FS_TEST_SERVER_OBJECTS";
+/// Set for a server that leaves every unreferenced object to the sweeps.
+const SERVER_NO_PROMPT_DELETE_ENV: &str = "RAFT5FS_TEST_SERVER_NO_PROMPT_DELETE";
+
+/// Where a server keeps objects, and whether it deletes one as soon as
+/// nothing points at it (see `ObjectSettings::prompt_delete`).
+#[derive(Debug, Clone)]
+pub struct ServerObjects {
+    pub endpoint: String,
+    pub prompt_delete: bool,
+}
 /// The test that is really the server-mode entry point; see
 /// `serve_if_requested`.
 const SERVER_MODE_TEST: &str = "server_process_mode";
@@ -319,9 +329,9 @@ impl TestServer {
     /// Starts a server process over the cluster at `cluster_address` and
     /// waits until it is accepting connections. It opens the filesystem on
     /// the way (settling the chunk size, finishing interrupted deletions).
-    /// With `objects`, the endpoint of a (fake) object store, it keeps
-    /// hybrid files' blocks there.
-    pub fn start(cluster_address: &str, chunk_size: u64, objects: Option<&str>) -> Self {
+    /// With `objects`, a (fake) object store, it keeps hybrid files'
+    /// blocks there.
+    pub fn start(cluster_address: &str, chunk_size: u64, objects: Option<&ServerObjects>) -> Self {
         for _ in 0..20 {
             if let Some(server) = Self::try_start(
                 cluster_address,
@@ -341,15 +351,18 @@ impl TestServer {
     fn try_start(
         cluster_address: &str,
         chunk_size: u64,
-        objects: Option<&str>,
+        objects: Option<&ServerObjects>,
         listen: SocketAddr,
         token_key: &str,
     ) -> Option<Self> {
         let exe = std::env::current_exe().expect("the test binary's own path");
         {
             let mut command = std::process::Command::new(&exe);
-            if let Some(endpoint) = objects {
-                command.env(SERVER_OBJECTS_ENV, endpoint);
+            if let Some(objects) = objects {
+                command.env(SERVER_OBJECTS_ENV, &objects.endpoint);
+                if !objects.prompt_delete {
+                    command.env(SERVER_NO_PROMPT_DELETE_ENV, "1");
+                }
             }
             let mut child = command
                 .args([
@@ -418,6 +431,7 @@ pub fn serve_if_requested() {
     let listen: SocketAddr = std::env::var(SERVER_LISTEN_ENV).unwrap().parse().unwrap();
     let token_key = std::env::var(SERVER_TOKEN_KEY_ENV).unwrap();
     let objects = std::env::var(SERVER_OBJECTS_ENV).ok();
+    let prompt_delete = std::env::var(SERVER_NO_PROMPT_DELETE_ENV).is_err();
 
     // Die with the test that started us, even if it never gets to kill us:
     // a panicking test unwinds past `Drop`s only so far.
@@ -442,7 +456,8 @@ pub fn serve_if_requested() {
                 eprintln!("test server could not log in to the store: {e}");
                 std::process::exit(1);
             });
-        let objects = objects.map(|endpoint| object_settings(endpoint, chunk_size, |_| {}));
+        let objects =
+            objects.map(|endpoint| object_settings(endpoint, chunk_size, prompt_delete, |_| {}));
         let core = FsCore::connect(client, chunk_size, objects)
             .await
             .unwrap_or_else(|why| {
@@ -476,6 +491,7 @@ pub fn serve_if_requested() {
 fn object_settings(
     endpoint: String,
     chunk_size: u64,
+    prompt_delete: bool,
     edit: impl FnOnce(&mut S3Config),
 ) -> ObjectSettings {
     let http = raft5fs_objstore::http::client(&HttpConfig {
@@ -499,10 +515,15 @@ fn object_settings(
         object_block: TEST_BLOCK_CHUNKS * chunk_size,
         put_ttl: DEFAULT_PUT_TTL,
         get_ttl: DEFAULT_GET_TTL,
+        prompt_delete,
     }
 }
 
-fn start_servers(cluster: &TestCluster, chunk_size: u64, objects: Option<&str>) -> Vec<TestServer> {
+fn start_servers(
+    cluster: &TestCluster,
+    chunk_size: u64,
+    objects: Option<&ServerObjects>,
+) -> Vec<TestServer> {
     (0..SERVERS)
         .map(|_| TestServer::start(&cluster.client_address, chunk_size, objects))
         .collect()
@@ -605,6 +626,9 @@ pub struct Harness {
     pub cluster: TestCluster,
     /// The object store the servers keep blocks in, if they do.
     pub objects: Option<FakeStore>,
+    /// Whether the servers delete an object as soon as nothing points at
+    /// it, or leave it for garbage collection.
+    pub prompt_delete: bool,
     pub runtime: Runtime,
     pub chunk_size: u64,
     /// Whether `TESTER`'s mounts work in `VOLUME`, made at setup.
@@ -642,19 +666,18 @@ impl Harness {
     /// The old mount comes down while its servers are still up, so what it
     /// buffered is stored on the way out.
     pub fn remount(&mut self, chunk_size: u64) {
-        let servers = start_servers(
-            &self.cluster,
-            chunk_size,
-            self.objects_endpoint().as_deref(),
-        );
+        let servers = start_servers(&self.cluster, chunk_size, self.server_objects().as_ref());
         let addresses = servers.iter().map(|s| s.address.clone()).collect();
         self.mount = self.tester_mount(addresses);
         self.servers = servers;
     }
 
-    /// Where the servers' object store is, if they have one.
-    fn objects_endpoint(&self) -> Option<String> {
-        self.objects.as_ref().map(FakeStore::endpoint)
+    /// The servers' object store, if they have one.
+    fn server_objects(&self) -> Option<ServerObjects> {
+        self.objects.as_ref().map(|store| ServerObjects {
+            endpoint: store.endpoint(),
+            prompt_delete: self.prompt_delete,
+        })
     }
 
     /// The fake object store the servers keep blocks in. Only with
@@ -667,14 +690,15 @@ impl Harness {
 
     /// A filesystem core in this process, over the same store and object
     /// store as the servers: for tests to run garbage collection on
-    /// demand, at whatever time they say.
+    /// demand, at whatever time they say. It deletes nothing but by
+    /// sweeping.
     pub fn gc_core(&self) -> FsCore {
         self.gc_core_with(|_| {})
     }
 
     /// `gc_core`, its object store settings changed as `edit` says.
     pub fn gc_core_with(&self, edit: impl FnOnce(&mut S3Config)) -> FsCore {
-        let settings = object_settings(self.store().endpoint(), self.chunk_size, edit);
+        let settings = object_settings(self.store().endpoint(), self.chunk_size, false, edit);
         self.runtime
             .block_on(FsCore::connect(
                 self.client.clone(),
@@ -823,7 +847,7 @@ impl Harness {
     /// mount that is every session it holds turning invalid at once, as an
     /// expiry or a key rotation would make them.
     pub fn restart_servers_with_key(&mut self, token_key: &str) {
-        let objects = self.objects_endpoint();
+        let objects = self.server_objects();
         for server in &mut self.servers {
             let listen = server.socket_addr();
             *server = TestServer {
@@ -835,7 +859,7 @@ impl Harness {
                 if let Some(s) = TestServer::try_start(
                     &self.cluster.client_address,
                     self.chunk_size,
-                    objects.as_deref(),
+                    objects.as_ref(),
                     listen,
                     token_key,
                 ) {
@@ -859,23 +883,29 @@ pub fn setup() -> Harness {
 }
 
 pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
-    setup_with(chunk_size, true, false)
+    setup_with(chunk_size, true, false, true)
 }
 
 /// Like `setup`, but with nothing made: the mount works at `TESTER`'s
 /// root, which is empty.
 pub fn setup_root() -> Harness {
-    setup_with(TEST_CHUNK_SIZE, false, false)
+    setup_with(TEST_CHUNK_SIZE, false, false, true)
 }
 
 /// Like `setup`, with the servers keeping hybrid files' blocks in a fake
 /// object store (`Harness::store`), on the grid `TEST_OBJECT_FROM_CHUNKS`
 /// and `TEST_BLOCK_CHUNKS` make.
 pub fn setup_with_objects() -> Harness {
-    setup_with(TEST_CHUNK_SIZE, true, true)
+    setup_with(TEST_CHUNK_SIZE, true, true, true)
 }
 
-fn setup_with(chunk_size: u64, volume: bool, with_objects: bool) -> Harness {
+/// Like `setup_with_objects`, with the servers leaving every object
+/// nothing points at to garbage collection: for tests of the sweep.
+pub fn setup_with_objects_no_prompt_delete() -> Harness {
+    setup_with(TEST_CHUNK_SIZE, true, true, false)
+}
+
+fn setup_with(chunk_size: u64, volume: bool, with_objects: bool, prompt_delete: bool) -> Harness {
     let runtime = Runtime::new().expect("failed to start tokio runtime");
     let (cluster, client) = TestCluster::start(&runtime);
     let objects = with_objects.then(|| {
@@ -883,11 +913,11 @@ fn setup_with(chunk_size: u64, volume: bool, with_objects: bool) -> Harness {
             .block_on(FakeStore::start(TEST_BUCKET))
             .expect("start a fake object store")
     });
-    let servers = start_servers(
-        &cluster,
-        chunk_size,
-        objects.as_ref().map(FakeStore::endpoint).as_deref(),
-    );
+    let server_objects = objects.as_ref().map(|store| ServerObjects {
+        endpoint: store.endpoint(),
+        prompt_delete,
+    });
+    let servers = start_servers(&cluster, chunk_size, server_objects.as_ref());
     let addresses: Vec<String> = servers.iter().map(|s| s.address.clone()).collect();
     let tester_key = enrol(&runtime, &client, &addresses, TESTER);
     let mut mount = MountedFs::mount(&runtime, addresses);
@@ -901,6 +931,7 @@ fn setup_with(chunk_size: u64, volume: bool, with_objects: bool) -> Harness {
         client,
         cluster,
         objects,
+        prompt_delete,
         runtime,
         chunk_size,
         volume,

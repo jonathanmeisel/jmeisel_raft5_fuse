@@ -240,9 +240,12 @@ profile (SETUP.txt section 12).
 
 Users' machines must be able to reach `S3_ENDPOINT` directly. The nodes
 need nothing new: their firewall already allows outgoing connections.
-Every server with the bucket configured also collects garbage every
-`GC_INTERVAL` seconds, one at a time, and logs each sweep
-(`journalctl -u raft5fs-server`).
+A server deletes an object as soon as a change (a rewrite, a truncate,
+a removal) stops pointing at it, unless a snapshot still holds it. That
+is only an attempt; what it misses (a failure, a restart mid-way) is left
+for garbage collection: every server with the bucket configured also
+collects garbage every `GC_INTERVAL` seconds, one at a time, and logs each
+sweep (`journalctl -u raft5fs-server`).
 
 **Choosing `OBJECT_BLOCK`.** Bigger blocks mean fewer objects, which means
 fewer requests and faster garbage collection. But a block is rewritten

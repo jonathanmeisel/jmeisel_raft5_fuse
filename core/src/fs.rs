@@ -31,8 +31,8 @@ use crate::layout::{
     validate_chunk_size,
 };
 use crate::objects::{
-    self, MAX_UPLOADS, ObjectSettings, Objects, check_minted, check_placement, object_name,
-    segment_len,
+    self, Dropped, MAX_UPLOADS, ObjectSettings, Objects, check_minted, check_placement,
+    object_name, segment_len,
 };
 use crate::snapshots;
 use crate::timing::{self, next_key};
@@ -142,14 +142,15 @@ fn no_objects() -> FsError {
 /// the file's current key version (`EKEYEXPIRED` if not), a block named
 /// recently enough to commit, and each with an `expected_seq` only if the
 /// chunk is still at it (`EAGAIN` if not). With `existing`, every chunk
-/// must be there already, at its seq.
+/// must be there already, at its seq. Returns the objects the blocks it
+/// stored replaced, for `discard` once the transaction has committed.
 async fn put_chunks(
     core: &FsCore,
     txn: &Transaction,
     entry: &Entry,
     writes: &[ChunkWrite],
     existing: bool,
-) -> Result<Result<(), FsError>, KvError> {
+) -> Result<Result<Vec<Dropped>, FsError>, KvError> {
     let ino = entry.attr.ino;
     let now = SystemTime::now();
     for w in writes {
@@ -162,16 +163,39 @@ async fn put_chunks(
         }
     }
     let (version, _) = decide!(key_versions(txn, ino).await?);
-    // Every chunk's seq in one read, checked below in turn. Only seqs are
-    // compared, so only seqs are read -- and held, as a value read would
-    // hold them. 0 is a chunk with no value.
+    // Every inline chunk's seq in one read, checked below in turn. Only
+    // seqs are compared, so only seqs are read -- and held, as a value read
+    // would hold them. 0 is a chunk with no value. A block's pointer is
+    // read whole, seq and all: it is small, and names the object a new one
+    // replaces.
+    let block = |w: &&ChunkWrite| matches!(w.body, WriteBody::Block(_));
     let checked_keys: Vec<Vec<u8>> = writes
         .iter()
-        .filter(|w| w.expected_seq.is_some())
+        .filter(|w| w.expected_seq.is_some() && !block(w))
         .map(|w| chunk_key(ino, w.index))
         .collect();
     let mut seqs = txn.read_versions_many(&checked_keys).await?.into_iter();
+    let block_keys: Vec<Vec<u8>> = writes
+        .iter()
+        .filter(block)
+        .map(|w| chunk_key(ino, w.index))
+        .collect();
+    let mut pointers = txn.read_many(&block_keys).await?.into_iter();
+    let mut dropped = Vec::new();
     for w in writes {
+        let seq = if let WriteBody::Block(new) = &w.body {
+            let old = pointers.next().expect("a read of every block's pointer");
+            if let Some(value) = old.value
+                && let ChunkValue::Block(old) = ChunkValue::decode(value)
+                && (old.minted_ms, old.random) != (new.minted_ms, new.random)
+            {
+                dropped.push(Dropped::new(ino, w.index, &old));
+            }
+            w.expected_seq.map(|_| old.seq)
+        } else {
+            w.expected_seq
+                .map(|_| seqs.next().expect("a seq read for every expected one"))
+        };
         let sealed_under = match &w.body {
             WriteBody::Inline(blob) => sealed_version(blob).ok(),
             WriteBody::Block(block) => Some(block.version),
@@ -182,14 +206,13 @@ async fn put_chunks(
                 format!("chunks of inode {ino} must be sealed under key version {version}"),
             )));
         }
-        if let Some(expected) = w.expected_seq {
-            let seq = seqs.next().expect("a seq read for every expected one");
-            if seq != expected || (existing && seq == 0) {
-                return Ok(Err(FsError::new(
-                    libc::EAGAIN,
-                    format!("chunk {} of inode {ino} changed meanwhile", w.index),
-                )));
-            }
+        if let (Some(expected), Some(seq)) = (w.expected_seq, seq)
+            && (seq != expected || (existing && seq == 0))
+        {
+            return Ok(Err(FsError::new(
+                libc::EAGAIN,
+                format!("chunk {} of inode {ino} changed meanwhile", w.index),
+            )));
         }
         let key = chunk_key(ino, w.index);
         let value = match &w.body {
@@ -198,7 +221,7 @@ async fn put_chunks(
         };
         txn.write(&key, Some(&value)).await?;
     }
-    Ok(Ok(()))
+    Ok(Ok(dropped))
 }
 
 /// Whether `sealed_name` is sealed under directory `dir`'s current key
@@ -722,9 +745,10 @@ impl FsCore {
             // transaction below, so the caller's right to truncate is
             // checked before it as well as in it.
             self.guard_now(&self.live(), caller, ino, true).await?;
-            self.resolve(&self.live(), ino).await?;
-            self.delete_chunks_from(ino, new_size.div_ceil(self.chunk_size))
-                .await?;
+            let layout = self.resolve(&self.live(), ino).await?.attr.layout;
+            let first = new_size.div_ceil(self.chunk_size);
+            // Gone whatever the transaction below does.
+            self.discard(self.delete_chunks_from(ino, first, layout).await?);
         }
 
         let attr = retrying(move || async move {
@@ -1442,7 +1466,7 @@ impl FsCore {
         end: u64,
     ) -> Result<(Attr, u64), FsError> {
         self.check_chunk_writes(writes)?;
-        let attr = retrying(move || async move {
+        let (attr, dropped) = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
@@ -1453,7 +1477,7 @@ impl FsCore {
             // stored for an inode nothing could reach again.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            decide!(put_chunks(self, &txn, &entry, writes, false).await?);
+            let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1462,9 +1486,10 @@ impl FsCore {
             entry.attr.ctime = now;
             write_entry(&txn, &entry).await?;
             let seq = txn.commit().await?;
-            Ok(Ok((entry.attr, seq)))
+            Ok(Ok(((entry.attr, seq), dropped)))
         })
         .await??;
+        self.discard(dropped);
         Ok(attr)
     }
 
@@ -1730,7 +1755,7 @@ impl FsCore {
                 "a re-sealed chunk must say the seq it was read at",
             ));
         }
-        retrying(move || async move {
+        let dropped = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
@@ -1738,11 +1763,13 @@ impl FsCore {
             // deletion has started.
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            decide!(put_chunks(self, &txn, &entry, writes, true).await?);
+            let dropped = decide!(put_chunks(self, &txn, &entry, writes, true).await?);
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(Ok(dropped))
         })
-        .await?
+        .await??;
+        self.discard(dropped);
+        Ok(())
     }
 
     /// Seals entry names in directory `dir` again under its current key
@@ -1985,7 +2012,14 @@ impl FsCore {
     /// tombstone together. Idempotent, so it is safe for several processes
     /// to finish the same deletion at once.
     async fn finish_removal(&self, ino: u64) -> Result<(), FsError> {
-        self.delete_chunks_from(ino, 0).await?;
+        // The Entry, marked deleted, stays until the chunks are gone. With
+        // none, an earlier finish got that far: whatever chunks are left
+        // the sweep can have.
+        let layout = match self.client.read_one(&attr_key(ino)).await?.value {
+            Some(bytes) => decode_entry(ino, &bytes).attr.layout,
+            None => Layout::Inline,
+        };
+        let dropped = self.delete_chunks_from(ino, 0, layout).await?;
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
@@ -1996,6 +2030,7 @@ impl FsCore {
             Ok(())
         })
         .await?;
+        self.discard(dropped);
         Ok(())
     }
 
@@ -2022,9 +2057,18 @@ impl FsCore {
     /// Deletes every chunk of `ino` from `first_index` on, in bounded
     /// batches. Scanning rather than walking `0..=size/chunk_size` skips
     /// holes, collects anything an interrupted truncate left behind, and
-    /// needs no trust in the recorded size.
-    async fn delete_chunks_from(&self, ino: u64, first_index: u64) -> Result<(), KvError> {
+    /// needs no trust in the recorded size. Returns the objects the
+    /// pointers it deleted named, if the file is `layout` hybrid: only
+    /// then are block starts' values read.
+    async fn delete_chunks_from(
+        &self,
+        ino: u64,
+        first_index: u64,
+        layout: Layout,
+    ) -> Result<Vec<Dropped>, KvError> {
         let prefix = chunk_prefix(ino);
+        let grid = self.grid.filter(|_| layout == Layout::Hybrid);
+        let mut dropped = Vec::new();
         loop {
             let mut iter = self.client.key_iterator(&chunk_key(ino, first_index));
             let mut batch = Vec::new();
@@ -2039,19 +2083,39 @@ impl FsCore {
                 }
             }
             if batch.is_empty() {
-                return Ok(());
+                return Ok(dropped);
             }
 
             let batch = &batch;
-            retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
-                for key in batch {
-                    txn.write(key, None).await?;
-                }
-                txn.commit().await?;
-                Ok(())
-            })
-            .await?;
+            let starts: &Vec<(u64, &Vec<u8>)> = &batch
+                .iter()
+                .filter_map(|key| {
+                    let grid = grid?;
+                    let index = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+                    (grid.in_blocks(index) && grid.block_start(index) == index)
+                        .then_some((index, key))
+                })
+                .collect();
+            dropped.extend(
+                retrying(move || async move {
+                    let txn = self.client.transaction(TXN_TTL).await?;
+                    let keys: Vec<&Vec<u8>> = starts.iter().map(|&(_, key)| key).collect();
+                    let mut found = Vec::new();
+                    for (&(index, _), entry) in starts.iter().zip(txn.read_many(&keys).await?) {
+                        if let Some(value) = entry.value
+                            && let ChunkValue::Block(block) = ChunkValue::decode(value)
+                        {
+                            found.push(Dropped::new(ino, index, &block));
+                        }
+                    }
+                    for key in batch {
+                        txn.write(key, None).await?;
+                    }
+                    txn.commit().await?;
+                    Ok(found)
+                })
+                .await?,
+            );
         }
     }
 }

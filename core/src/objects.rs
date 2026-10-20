@@ -11,6 +11,7 @@
 //! garbage collection treat an object minted long ago that nothing points
 //! at as never going to be: no commit naming it would be accepted.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use raft5_client::Client;
@@ -19,7 +20,7 @@ use raft5fs_objstore::{ObjectName, S3Store, name::millis};
 use raft5fs_proto::types::{BlockRef, ChunkWrite, FsError, Layout, ObjectGrid, WriteBody};
 
 use crate::fs::{TXN_TTL, retrying};
-use crate::layout::OBJECT_GRID_KEY;
+use crate::layout::{OBJECT_GRID_KEY, chunk_key};
 use crate::view::ReadKeys;
 
 pub const DEFAULT_OBJECT_FROM: u64 = 10 << 20;
@@ -47,20 +48,27 @@ pub struct ObjectSettings {
     /// How long an upload URL, and a read URL, stays good.
     pub put_ttl: Duration,
     pub get_ttl: Duration,
+    /// Whether to try deleting an object as soon as a change drops the
+    /// last pointer to it, rather than leaving it all to garbage
+    /// collection (see `FsCore::discard`).
+    pub prompt_delete: bool,
 }
 
 pub(crate) struct Objects {
-    pub(crate) store: S3Store,
+    /// Shared with the deletions `FsCore::discard` sets going.
+    pub(crate) store: Arc<S3Store>,
     pub(crate) put_ttl: Duration,
     pub(crate) get_ttl: Duration,
+    pub(crate) prompt_delete: bool,
 }
 
 impl Objects {
     pub(crate) fn new(settings: ObjectSettings) -> Self {
         Objects {
-            store: settings.store,
+            store: Arc::new(settings.store),
             put_ttl: settings.put_ttl,
             get_ttl: settings.get_ttl,
+            prompt_delete: settings.prompt_delete,
         }
     }
 
@@ -157,6 +165,23 @@ pub(crate) fn object_name(ino: u64, block: &BlockRef) -> ObjectName {
         ino,
         minted_ms: block.minted_ms,
         random: block.random,
+    }
+}
+
+/// An object a change just stopped pointing at, from the chunk key that
+/// pointed at it -- the only key that ever can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dropped {
+    pub(crate) key: Vec<u8>,
+    pub(crate) name: ObjectName,
+}
+
+impl Dropped {
+    pub(crate) fn new(ino: u64, index: u64, block: &BlockRef) -> Self {
+        Dropped {
+            key: chunk_key(ino, index),
+            name: object_name(ino, block),
+        }
     }
 }
 

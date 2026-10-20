@@ -1,12 +1,13 @@
 //! Garbage collection of object storage: deleting the objects nothing
 //! points at any more.
 //!
-//! Every change to a block makes a new object (objects are written once),
-//! and nothing deletes the one it replaced -- nor one uploaded for a
-//! commit that then failed or never came, nor any of a file's when the
-//! file goes. The KV store side of every one of those is just a key
-//! removed or rewritten, as it always was. This finds what that left
-//! behind, by mark and sweep:
+//! Every change to a block makes a new object (objects are written once).
+//! The KV store side of a change is just a key removed or rewritten, as it
+//! always was; the object it stopped pointing at a server tries to delete
+//! at once (`discard`), but only tries -- nothing records the attempt, so
+//! a failure or a crash leaves it behind, as does an upload for a commit
+//! that then failed or never came. This finds what is left, by mark and
+//! sweep:
 //!
 //! 1. Mark: every block pointer in the live store, then in every
 //!    snapshot. Live first: a snapshot taken while the live scan runs is
@@ -37,15 +38,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use raft5_client::Error as KvError;
-use raft5fs_objstore::ObjectName;
+use raft5_client::{Client, Error as KvError};
 use raft5fs_objstore::name::millis;
+use raft5fs_objstore::{ObjectName, S3Store};
 use raft5fs_proto::types::{Layout, ObjectGrid};
 
 use crate::entry::decode_entry;
 use crate::fs::{FsCore, TXN_TTL, retrying};
 use crate::layout::{ChunkValue, GC_LEASE_KEY, attr_key};
-use crate::objects::CLOCK_SKEW;
+use crate::objects::{CLOCK_SKEW, Dropped, object_name};
 use crate::timing::next_key;
 use crate::view::{ReadKeys, View};
 
@@ -315,6 +316,71 @@ impl FsCore {
         }
         Ok(())
     }
+}
+
+impl FsCore {
+    /// Tries, in the background, to delete the objects in `dropped`, which
+    /// a change that has committed stopped pointing at -- unless the store
+    /// still points at one, live or in a snapshot. The change is done
+    /// whatever this does: what it fails to delete, or never gets to, the
+    /// sweep finds.
+    pub(crate) fn discard(&self, dropped: Vec<Dropped>) {
+        let Some(objects) = self.objects.as_ref().filter(|o| o.prompt_delete) else {
+            return;
+        };
+        if dropped.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let store = Arc::clone(&objects.store);
+        tokio::spawn(async move {
+            let count = dropped.len();
+            if let Err(why) = discard_now(&client, &store, dropped).await {
+                eprintln!("object prompt delete: {count} objects left for gc: {why}");
+            }
+        });
+    }
+}
+
+/// `discard`'s work. A snapshot taken after the change committed can't
+/// point at what it dropped, so the snapshots listed after it are every
+/// one that can. The live store is read too: a commit resent within its
+/// mint window could have put a pointer back.
+async fn discard_now(
+    client: &Client,
+    store: &S3Store,
+    mut dropped: Vec<Dropped>,
+) -> Result<(), String> {
+    let snapshots = client
+        .list_snapshots()
+        .await
+        .map_err(|e| format!("listing snapshots: {e}"))?;
+    let views = std::iter::once(View::live(client))
+        .chain(snapshots.iter().map(|s| View::at(client, &s.id)));
+    for view in views {
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<&[u8]> = dropped.iter().map(|d| d.key.as_slice()).collect();
+        let entries = view
+            .read_many(&keys)
+            .await
+            .map_err(|e| format!("checking what still points at them: {e}"))?;
+        let held: HashSet<ObjectName> = dropped
+            .iter()
+            .zip(entries)
+            .filter_map(|(d, entry)| match ChunkValue::decode(entry.value?) {
+                ChunkValue::Block(block) => Some(object_name(d.name.ino, &block)),
+                ChunkValue::Inline(_) => None,
+            })
+            .collect();
+        dropped.retain(|d| !held.contains(&d.name));
+    }
+    let names: Vec<ObjectName> = dropped.into_iter().map(|d| d.name).collect();
+    store
+        .delete(&names)
+        .await
+        .map_err(|e| format!("deleting them: {e}"))
 }
 
 fn decode_lease(value: &[u8]) -> Option<([u8; 16], u64)> {

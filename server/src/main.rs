@@ -91,6 +91,8 @@ server of one filesystem should have the same object options.
                        Several servers can have it on: one sweeps at a
                        time. An object goes only once two sweeps at least
                        --object-get-ttl apart have found it unreferenced.
+  --no-prompt-delete   don't try deleting an object as soon as a change
+                       stops pointing at it; leave it all to the sweeps.
   The store's credentials are read from RAFT5FS_OBJECT_ACCESS_KEY and
   RAFT5FS_OBJECT_SECRET_KEY.
 
@@ -207,6 +209,7 @@ struct Args {
     object_get_ttl: Option<Duration>,
     object_ca: Option<String>,
     gc_interval: Option<Duration>,
+    no_prompt_delete: bool,
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
@@ -268,6 +271,7 @@ fn parse_args() -> Args {
                 let secs = parse_number("--gc-interval", &value("--gc-interval"));
                 a.gc_interval = Some(Duration::from_secs(secs.into()));
             }
+            "--no-prompt-delete" => a.no_prompt_delete = true,
             "--invite-server" => a.invite_servers.push(value("--invite-server")),
             "--invite-ca" => a.invite_ca = Some(value("--invite-ca")),
             "--invite-server-name" => a.invite_server_name = Some(value("--invite-server-name")),
@@ -359,6 +363,7 @@ fn object_settings(a: &Args) -> Option<ObjectSettings> {
         object_block: a.object_block.unwrap_or(DEFAULT_OBJECT_BLOCK),
         put_ttl: a.object_put_ttl.unwrap_or(DEFAULT_PUT_TTL),
         get_ttl: a.object_get_ttl.unwrap_or(DEFAULT_GET_TTL),
+        prompt_delete: !a.no_prompt_delete,
     })
 }
 

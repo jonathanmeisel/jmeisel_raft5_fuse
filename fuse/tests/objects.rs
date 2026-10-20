@@ -147,6 +147,16 @@ fn stored(h: &support::Harness, ino: u64, index: u64) -> Option<Vec<u8>> {
     h.read_key(&key)
 }
 
+/// Waits for the servers' prompt deletions (see `FsCore::discard`), which
+/// run in the background, to leave `n` objects in the store.
+fn objects_settle_at(h: &support::Harness, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while h.store().keys().len() != n && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.store().keys().len(), n, "{:?}", h.store().keys());
+}
+
 #[test]
 fn the_servers_say_how_blocks_are_laid_out() {
     let h = support::setup_with_objects();
@@ -461,12 +471,13 @@ fn truncating_trims_the_block_the_end_falls_in() {
     };
 
     // Into the block's second segment: two segments stay, the next block
-    // goes, and no new object is made.
-    let objects = h.store().keys().len();
+    // goes, with its object, and no new object is made.
+    let puts = h.store().stats().puts;
     truncate((K + 1) * C + 10);
     assert_eq!(nseg(&h), Some(2));
     assert_eq!(stored(&h, file, K2), None);
-    assert_eq!(h.store().keys().len(), objects);
+    objects_settle_at(&h, 1);
+    assert_eq!(h.store().stats().puts, puts);
     // Grown again, the segments cut off read as holes, not as they were.
     truncate(K2 * C);
     assert_eq!(nseg(&h), Some(2));
@@ -476,6 +487,7 @@ fn truncating_trims_the_block_the_end_falls_in() {
     truncate(K * C);
     assert_eq!(nseg(&h), None);
     assert!(bodies().iter().all(|b| *b == ChunkBody::Hole));
+    objects_settle_at(&h, 0);
 }
 
 /// Commits `plains` as the block at chunk `first` of `ino`, growing the
@@ -657,6 +669,7 @@ fn a_small_write_into_a_block_keeps_the_rest_of_it() {
     let f = h.path().join("f");
     fs::write(&f, &data).unwrap();
     let objects = h.store().keys().len();
+    let puts = h.store().stats().puts;
 
     let at = (K + 1) * C + 100;
     let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
@@ -671,8 +684,9 @@ fn a_small_write_into_a_block_keeps_the_rest_of_it() {
 
     assert_eq!(fs::read(&f).unwrap(), data);
     assert_eq!(read_afresh(&h, "f"), data);
-    // A new object for the block; the old ones are garbage collection's.
-    assert!(h.store().keys().len() > objects);
+    // A new object for the block, and the ones it replaced deleted.
+    assert!(h.store().stats().puts > puts);
+    objects_settle_at(&h, objects);
 }
 
 #[test]
@@ -766,8 +780,10 @@ fn pruning_reseals_blocks_into_new_objects() {
     assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
     assert_eq!(stats.chunks, dry.chunks);
 
-    // Each block is a new object, under the key big has now.
-    assert_eq!(h.store().keys().len(), objects + 2);
+    // Each block is a new object, under the key big has now, and the old
+    // ones are deleted.
+    objects_settle_at(&h, objects);
+    assert_eq!(h.store().stats().deleted, 2);
     for start in [K, K2] {
         let version = u32::from_be_bytes(stored(&h, big, start).unwrap()[..4].try_into().unwrap());
         assert!(version > old_version);
@@ -781,6 +797,59 @@ fn pruning_reseals_blocks_into_new_objects() {
     );
     let again = h.runtime.block_on(mine.prune_tree(ino(&v), false));
     assert_eq!(again.chunks, 0, "{again:?}");
+}
+
+#[test]
+fn an_unlinked_files_objects_are_deleted_promptly() {
+    let h = support::setup_with_objects();
+    let f = h.path().join("f");
+    fs::write(&f, pattern(K * C + 2 * B)).unwrap();
+    assert_eq!(h.store().keys().len(), 2);
+    fs::remove_file(&f).unwrap();
+    objects_settle_at(&h, 0);
+    assert_eq!(h.store().stats().deleted, 2);
+}
+
+#[test]
+fn a_file_replaced_by_a_rename_has_its_objects_deleted() {
+    let h = support::setup_with_objects();
+    let (a, b) = (h.path().join("a"), h.path().join("b"));
+    fs::write(&a, pattern(K * C + B)).unwrap();
+    fs::write(&b, pattern(K * C + 10)).unwrap();
+    assert_eq!(h.store().keys().len(), 2);
+    fs::rename(&b, &a).unwrap();
+    objects_settle_at(&h, 1);
+    assert_eq!(read_afresh(&h, "a"), pattern(K * C + 10));
+}
+
+#[test]
+fn a_snapshot_keeps_what_prompt_deletion_would_take() {
+    let h = support::setup_with_objects();
+    let f = h.path().join("f");
+    let data = pattern(K * C + B);
+    fs::write(&f, &data).unwrap();
+    let file = ino(&f);
+    h.snapshot("s");
+    // Rewritten -- the truncate dropping the block the snapshot holds --
+    // and then removed: of the three objects, only the snapshot's stays.
+    let mut grown = data.clone();
+    grown.extend(pattern(B));
+    fs::write(&f, &grown).unwrap();
+    fs::remove_file(&f).unwrap();
+    objects_settle_at(&h, 1);
+
+    let then = vault(&h).at_snapshot("s", 1);
+    assert_eq!(
+        h.runtime.block_on(then.read(file, 0, data.len())).unwrap(),
+        data
+    );
+    // Once the snapshot goes, the sweep can have it.
+    h.drop_snapshot("s");
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let first = SystemTime::now() + LATER;
+    sweep(&h, &core, &mut gc, first);
+    assert_eq!(sweep(&h, &core, &mut gc, first + WAIT).deleted, 1);
 }
 
 /// Past the commit window (a PUT URL's life, a transaction's, and clock
@@ -813,7 +882,7 @@ fn file_with_garbage(h: &support::Harness) -> std::path::PathBuf {
 
 #[test]
 fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
-    let h = support::setup_with_objects();
+    let h = support::setup_with_objects_no_prompt_delete();
     let f = file_with_garbage(&h);
     let expected = fs::read(&f).unwrap();
     // An upload no commit ever named, and something not ours at all.
@@ -852,7 +921,7 @@ fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
 
 #[test]
 fn what_a_snapshot_holds_stays_until_the_snapshot_goes() {
-    let h = support::setup_with_objects();
+    let h = support::setup_with_objects_no_prompt_delete();
     let f = h.path().join("f");
     let data = pattern(K * C + B);
     fs::write(&f, &data).unwrap();
@@ -883,7 +952,7 @@ fn what_a_snapshot_holds_stays_until_the_snapshot_goes() {
 
 #[test]
 fn a_sweep_that_fails_deletes_nothing() {
-    let h = support::setup_with_objects();
+    let h = support::setup_with_objects_no_prompt_delete();
     file_with_garbage(&h);
     let objects = h.store().keys().len();
     // Can't list the bucket: its secret is wrong.
