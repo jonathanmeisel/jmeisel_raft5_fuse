@@ -1,4 +1,4 @@
-use fuser::Errno;
+use raft5fs_proto::types::FsError;
 
 /// Bytes accepted by `write` but not yet committed: one contiguous run,
 /// which may span several chunks (the caller bounds it to what one
@@ -15,7 +15,7 @@ pub struct WriteBuf {
     /// been reported written. Every `write`, `flush` and `fsync` reports
     /// it; only `fsync`, or the release of the file's last descriptor,
     /// clears it.
-    pub err: Option<Errno>,
+    pub err: Option<FsError>,
     /// The inode the run belongs to.
     pub ino: u64,
 }
@@ -50,7 +50,7 @@ impl WriteBuf {
 
     /// Drops the buffered bytes and forgets any pending error (the file is
     /// gone). The caller already holds this buffer's lock, which by itself
-    /// waits out any commit in progress -- see `Raft5Fs::discard_ino`.
+    /// waits out any commit in progress -- see `Session::discard_ino`.
     pub fn discard(&mut self) {
         self.data.clear();
         self.err = None;
@@ -87,7 +87,7 @@ mod tests {
     fn discard_clears_data_and_error() {
         let mut b = WriteBuf::default();
         b.append(0, b"abc");
-        b.err = Some(Errno::EIO);
+        b.err = Some(FsError::errno(libc::EIO));
         b.discard();
         assert!(b.is_empty());
         assert_eq!(b.err, None);

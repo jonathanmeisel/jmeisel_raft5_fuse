@@ -13,6 +13,7 @@ raft5-client = { workspace = true }
 raft5-server = { workspace = true }
 raft5fs-core = { workspace = true }
 raft5fs-crypto = { workspace = true }
+raft5fs-client = { workspace = true }
 raft5fs-fuse = { workspace = true }
 raft5fs-server = { workspace = true }
 fuser = { workspace = true }

@@ -1,7 +1,9 @@
-//! `raft5fs`: see `raft5fs_fuse::commands`.
+//! `raft5fs`: see `commands`.
 
 use clap::Parser;
-use raft5fs_fuse::commands::{Cli, run};
+use commands::{Cli, run};
+
+mod commands;
 
 fn main() {
     std::process::exit(run(Cli::parse()));

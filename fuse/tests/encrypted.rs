@@ -11,11 +11,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use raft5fs_client::remote::{Credentials, Remote};
+use raft5fs_client::vault::Vault;
 use raft5fs_core::{ENCRYPTED_KEY, NewNode, SealedMove, accounts, check_store};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::KdfParams;
-use raft5fs_fuse::remote::{Credentials, Remote};
-use raft5fs_fuse::vault::Vault;
 
 /// Not really a test: the entry point that lets the harness run a
 /// filesystem server as a separate process (see `support::TestServer`).
@@ -1692,19 +1692,19 @@ fn a_name_that_could_break_a_line_is_no_account() {
 // ------------------------------------------------- shares and the pruner
 
 /// A prune queue of its own, in a fresh temporary directory.
-fn temp_queue(name: &str) -> raft5fs_fuse::prune_queue::PruneQueue {
+fn temp_queue(name: &str) -> raft5fs_client::prune_queue::PruneQueue {
     let dir = std::env::temp_dir().join(format!(
         "raft5fs-test-queue-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    raft5fs_fuse::prune_queue::PruneQueue::at(dir)
+    raft5fs_client::prune_queue::PruneQueue::at(dir)
 }
 
 #[test]
 fn shares_say_whose_they_are_and_whether_trusted() {
-    use raft5fs_fuse::vault::ShareTrust;
+    use raft5fs_client::vault::ShareTrust;
     let h = support::setup_root();
     let v = shared_tree(&h);
     h.add_user("alice");
@@ -1769,7 +1769,7 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
             }
         })
     };
-    let queue = raft5fs_fuse::prune_queue::PruneQueue::at(dir);
+    let queue = raft5fs_client::prune_queue::PruneQueue::at(dir);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !queue.entries().unwrap().is_empty() {
         assert!(
@@ -1804,7 +1804,7 @@ fn a_prune_that_skips_anything_stays_queued() {
     let queue = temp_queue("skips");
     queue.add(ino(&v), "v").unwrap();
     let hers = vault(&h, "alice");
-    let stats = h.runtime.block_on(raft5fs_fuse::pruner::prune_entry(
+    let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
         &hers,
         &queue,
         ino(&v),
@@ -1816,7 +1816,7 @@ fn a_prune_that_skips_anything_stays_queued() {
     assert!(status.starts_with("incomplete"), "{status}");
 
     // The tester can, which empties it.
-    let stats = h.runtime.block_on(raft5fs_fuse::pruner::prune_entry(
+    let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
         &mine,
         &queue,
         ino(&v),

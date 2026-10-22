@@ -1,0 +1,22 @@
+[package]
+name = "raft5fs-client"
+description = "The client library: logging in, sealing and opening what goes to and comes from the filesystem servers, caching and buffering -- everything a front end (FUSE, WebDAV) shares."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+http-body = "1"
+libc = { workspace = true }
+raft5fs-crypto = { workspace = true }
+raft5fs-objstore = { workspace = true }
+raft5fs-proto = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tokio = { workspace = true, features = ["sync"] }
+toml = "1"
+tonic = { workspace = true }
+zeroize = "1"
+
+# The session's tests run against a real store and servers.
+[dev-dependencies]
+raft5fs-testkit = { workspace = true }

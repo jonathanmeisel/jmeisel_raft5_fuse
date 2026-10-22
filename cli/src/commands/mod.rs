@@ -3,20 +3,24 @@
 //! with any of it overridden on the command line.
 
 mod account;
+#[cfg(feature = "fuse")]
 mod mount;
 mod profile;
 mod prune;
 mod share;
+#[cfg(feature = "webdav")]
+mod webdav;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
+use raft5fs_client::cli::{Context, Overrides, parse_size, password_from};
+use raft5fs_client::pruner::PrunerConfig;
+use raft5fs_client::remote::Remote;
+use raft5fs_client::session::SessionConfig;
+use raft5fs_client::vault::Vault;
 use tokio::runtime::Runtime;
-
-use crate::cli::{Context, Overrides};
-use crate::remote::Remote;
-use crate::vault::Vault;
 
 #[derive(Parser)]
 #[command(
@@ -84,7 +88,12 @@ impl ConnectArgs {
 #[derive(Subcommand)]
 pub enum Command {
     /// Mount the filesystem, in the foreground, as the profile's account.
+    #[cfg(feature = "fuse")]
     Mount(mount::MountArgs),
+    /// Serve the filesystem over WebDAV, on this machine only, in the
+    /// foreground, as the profile's account.
+    #[cfg(feature = "webdav")]
+    Webdav(webdav::WebdavArgs),
     /// Set up an account from an invitation (or a bare enrolment code),
     /// choosing its password; saves a profile for it.
     Enrol(account::EnrolArgs),
@@ -118,7 +127,10 @@ pub enum Command {
 /// Runs the command line, returning the process's exit status.
 pub fn run(cli: Cli) -> i32 {
     let result = match cli.command {
+        #[cfg(feature = "fuse")]
         Command::Mount(args) => mount::run(&cli.connect, args),
+        #[cfg(feature = "webdav")]
+        Command::Webdav(args) => webdav::run(&cli.connect, args),
         Command::Enrol(args) => account::enrol(&cli.connect, args),
         Command::Passwd => account::passwd(&cli.connect),
         Command::Whoami => account::whoami(&cli.connect),
@@ -143,6 +155,49 @@ pub fn run(cli: Cli) -> i32 {
 /// What a subcommand comes to: an exit status, or why it failed.
 type Outcome = Result<i32, String>;
 
+/// How a mount or a WebDAV server keeps its session.
+#[derive(Args)]
+pub struct SessionArgs {
+    /// Memory for caching file data this machine has read or written,
+    /// decrypted: a byte count, or with a K/M suffix (default 64M; 0
+    /// disables). A cached chunk is still checked with a server on every
+    /// read, at the cost of a few bytes, so it is never stale.
+    #[arg(long)]
+    pub cache_size: Option<String>,
+    /// Store every write at once instead of buffering small sequential
+    /// writes until a batch fills, the file is closed, or fsync is called.
+    #[arg(long)]
+    pub no_write_buffer: bool,
+    /// Don't work through this account's prune queue (see `raft5fs prune`)
+    /// in the background while running.
+    #[arg(long)]
+    pub no_background_prune: bool,
+}
+
+impl SessionArgs {
+    /// The session these say to open as `ctx`'s account, asking for its
+    /// password (or reading it from RAFT5FS_PASSWORD).
+    #[cfg_attr(not(any(feature = "fuse", feature = "webdav")), allow(dead_code))]
+    fn config(&self, ctx: &Context) -> Result<SessionConfig, String> {
+        let cache = self.cache_size.clone().or(ctx.cache_size.clone());
+        let cache_bytes = cache.as_deref().map(parse_size).transpose()?;
+        let known_keys = ctx.known_keys()?;
+        let password = password_from("RAFT5FS_PASSWORD", &format!("password for {}: ", ctx.user))
+            .map_err(|e| format!("cannot read a password: {e}"))?;
+        let mut config = SessionConfig::new(ctx.servers.clone(), ctx.credentials(password));
+        config.tls = ctx.tls.clone();
+        config.known_keys = Some(known_keys);
+        config.write_buffering = !self.no_write_buffer;
+        if let Some(bytes) = cache_bytes {
+            config.cache_bytes = bytes;
+        }
+        if !self.no_background_prune {
+            config.prune_queue = Some((ctx.prune_queue(), PrunerConfig::default()));
+        }
+        Ok(config)
+    }
+}
+
 fn runtime() -> Runtime {
     Runtime::new().expect("failed to start tokio runtime")
 }
@@ -150,9 +205,8 @@ fn runtime() -> Runtime {
 /// Logs in as `ctx`'s account -- asking for the password, or reading it
 /// from RAFT5FS_PASSWORD -- and opens its keys, with its pins.
 fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
-    let password =
-        crate::cli::password_from("RAFT5FS_PASSWORD", &format!("password for {}: ", ctx.user))
-            .map_err(|e| format!("cannot read a password: {e}"))?;
+    let password = password_from("RAFT5FS_PASSWORD", &format!("password for {}: ", ctx.user))
+        .map_err(|e| format!("cannot read a password: {e}"))?;
     let remote = runtime
         .block_on(Remote::connect(
             &ctx.servers,

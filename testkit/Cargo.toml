@@ -1,0 +1,20 @@
+[package]
+name = "raft5fs-testkit"
+description = "For tests: a real store, and filesystem servers over it, for any front end to run on."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+libc = { workspace = true }
+raft5-client = { workspace = true }
+raft5-server = { workspace = true }
+raft5fs-client = { workspace = true }
+raft5fs-core = { workspace = true }
+raft5fs-crypto = { workspace = true }
+raft5fs-objstore = { workspace = true, features = ["fake"] }
+raft5fs-server = { workspace = true }
+rcgen = "0.14"
+tokio = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true }
+tonic = { workspace = true }

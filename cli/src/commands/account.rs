@@ -6,10 +6,10 @@ use raft5fs_proto::invite::{Invite, der_to_pem};
 use raft5fs_proto::types::check_username;
 
 use super::{ConnectArgs, Outcome, runtime, show_fingerprint};
-use crate::cli::{
+use raft5fs_client::cli::{
     Context, Profile, config_dir, password_from, prompt_password, tls_from_pem, write_new_private,
 };
-use crate::remote::{Credentials, Remote};
+use raft5fs_client::remote::{Credentials, Remote};
 
 #[derive(Args)]
 pub struct EnrolArgs {

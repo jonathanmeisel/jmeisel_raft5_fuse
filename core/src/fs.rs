@@ -202,7 +202,7 @@ async fn put_chunks(
         };
         if sealed_under != Some(version) {
             return Ok(Err(FsError::new(
-                libc::EKEYEXPIRED,
+                raft5fs_proto::errno::EKEYEXPIRED,
                 format!("chunks of inode {ino} must be sealed under key version {version}"),
             )));
         }
@@ -232,7 +232,7 @@ fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), 
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EKEYEXPIRED,
+            raft5fs_proto::errno::EKEYEXPIRED,
             format!("names in inode {dir} must be sealed under key version {version}"),
         ))
     }
@@ -925,7 +925,7 @@ impl FsCore {
             // key, which fetching it again cures.
             _ => {
                 return Ok(Err(FsError::new(
-                    libc::EKEYEXPIRED,
+                    raft5fs_proto::errno::EKEYEXPIRED,
                     format!(
                         "a new node's key record must be version {} under parent version {}",
                         versions.0, versions.1
@@ -1116,7 +1116,7 @@ impl FsCore {
                 let (version, _) = decide!(versions_of(ino, records.next().flatten()));
                 if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                     return Ok(Err(FsError::new(
-                        libc::EKEYEXPIRED,
+                        raft5fs_proto::errno::EKEYEXPIRED,
                         "the moved node's key record must keep its version, under the new parent's",
                     )));
                 }
@@ -1565,7 +1565,7 @@ impl FsCore {
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(
-                    libc::EKEYEXPIRED,
+                    raft5fs_proto::errno::EKEYEXPIRED,
                     format!("a grant must hold the current key version, {version}"),
                 )));
             }

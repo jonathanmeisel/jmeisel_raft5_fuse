@@ -181,7 +181,7 @@ pub fn session_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<
 impl From<FsError> for pb::Error {
     fn from(e: FsError) -> Self {
         Self {
-            errno: e.errno,
+            errno: crate::errno::to_wire(e.errno),
             message: e.message,
         }
     }
@@ -189,7 +189,7 @@ impl From<FsError> for pb::Error {
 
 impl From<pb::Error> for FsError {
     fn from(e: pb::Error) -> Self {
-        Self::new(e.errno, e.message)
+        Self::new(crate::errno::from_wire(e.errno), e.message)
     }
 }
 

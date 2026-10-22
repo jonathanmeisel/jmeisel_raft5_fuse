@@ -108,6 +108,14 @@ pub fn state_dir() -> PathBuf {
     home_dir("XDG_STATE_HOME", ".local/state")
 }
 
+/// `$XDG_RUNTIME_DIR/raft5fs`, or `state_dir()` where there is none (as
+/// on macOS): what lasts only as long as a running mount or server does.
+pub fn runtime_dir() -> PathBuf {
+    env::var_os("XDG_RUNTIME_DIR")
+        .map(|dir| PathBuf::from(dir).join("raft5fs"))
+        .unwrap_or_else(|| state_dir().join("run"))
+}
+
 /// Makes `dir` and those above it, readable by their owner only.
 pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()

@@ -228,7 +228,7 @@ impl Node {
 const ROTATION_ROUNDS: usize = 16;
 
 fn expired(e: &FsError) -> bool {
-    e.errno == libc::EKEYEXPIRED
+    e.errno == raft5fs_proto::errno::EKEYEXPIRED
 }
 
 fn changed(e: &FsError) -> bool {

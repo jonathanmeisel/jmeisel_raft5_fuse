@@ -1213,7 +1213,7 @@ fn connect_as(h: &support::Harness, user: &str, password: &str) -> Result<(), St
     let addresses: Vec<String> = h.servers.iter().map(|s| s.address.clone()).collect();
     let credentials = support::credentials_with(user, password);
     h.runtime
-        .block_on(raft5fs_fuse::remote::Remote::connect(
+        .block_on(raft5fs_client::remote::Remote::connect(
             &addresses,
             credentials,
             Some(support::fs_tls()),

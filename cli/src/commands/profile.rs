@@ -3,7 +3,7 @@
 use clap::Subcommand;
 
 use super::Outcome;
-use crate::cli::{Profile, config_dir};
+use raft5fs_client::cli::{Profile, config_dir};
 
 #[derive(Subcommand)]
 pub enum ProfileCommand {

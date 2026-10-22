@@ -1,0 +1,25 @@
+[package]
+name = "raft5fs-webdav"
+description = "WebDAV front end: HTTP requests to the client library's session, served on loopback only."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+dav-server = { version = "0.11", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "tokio"] }
+libc = { workspace = true }
+raft5fs-client = { workspace = true }
+raft5fs-proto = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync"] }
+
+# The end-to-end tests serve real HTTP over a real store and servers.
+[dev-dependencies]
+raft5fs-testkit = { workspace = true }
+reqwest = { version = "0.13", default-features = false }

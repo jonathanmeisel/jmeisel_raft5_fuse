@@ -36,14 +36,14 @@ use fuser::{BackgroundSession, Config, MountOption};
 use raft5_client::{Certificate, Client, ClientTls, Identity, Principal, Right};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, PeerTls, ServerConfig, serve_config};
+use raft5fs_client::cli;
+use raft5fs_client::pruner::PrunerConfig;
+use raft5fs_client::remote::{Credentials, Remote};
+use raft5fs_client::vault::KnownKeys;
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts};
 use raft5fs_crypto::identity::fingerprint;
 use raft5fs_crypto::password::KdfParams;
-use raft5fs_fuse::cli;
 use raft5fs_fuse::filesystem::Raft5Fs;
-use raft5fs_fuse::pruner::PrunerConfig;
-use raft5fs_fuse::remote::{Credentials, Remote};
-use raft5fs_fuse::vault::KnownKeys;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
 use rcgen::{

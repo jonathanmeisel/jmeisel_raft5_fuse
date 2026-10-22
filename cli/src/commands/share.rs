@@ -10,8 +10,8 @@ use clap::Args;
 use raft5fs_crypto::identity::fingerprint_words;
 
 use super::{ConnectArgs, Outcome, log_in, runtime, show_fingerprint};
-use crate::cli::Context;
-use crate::vault::ShareTrust;
+use raft5fs_client::cli::Context;
+use raft5fs_client::vault::ShareTrust;
 
 #[derive(Args)]
 pub struct GrantArgs {

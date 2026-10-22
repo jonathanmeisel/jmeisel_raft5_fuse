@@ -166,7 +166,7 @@ pub(crate) fn check_grantees_version(ino: u64, sealed: &[u8], version: u32) -> R
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EKEYEXPIRED,
+            raft5fs_proto::errno::EKEYEXPIRED,
             format!("inode {ino}'s grantee list must be sealed under key version {version}"),
         ))
     }
@@ -430,7 +430,7 @@ fn check_wrapped((child, wrapped_under): (u64, u32), parent_version: u32) -> Res
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EKEYEXPIRED,
+            raft5fs_proto::errno::EKEYEXPIRED,
             format!(
                 "inode {child} needs a new key: it is wrapped under an old one of its parent's"
             ),

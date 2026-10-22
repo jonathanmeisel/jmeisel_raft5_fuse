@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "crypto", "fuse", "objstore", "proto", "server", "utils"]
+members = ["cli", "client", "core", "crypto", "fuse", "objstore", "proto", "server", "testkit", "utils", "webdav"]
 resolver = "3"
 
 [workspace.package]
@@ -11,8 +11,11 @@ raft5fs-core = { path = "core" }
 raft5fs-crypto = { path = "crypto" }
 raft5fs-proto = { path = "proto" }
 raft5fs-server = { path = "server" }
+raft5fs-client = { path = "client" }
 raft5fs-fuse = { path = "fuse" }
 raft5fs-objstore = { path = "objstore" }
+raft5fs-testkit = { path = "testkit" }
+raft5fs-webdav = { path = "webdav" }
 fuser = "0.18.0"
 libc = "0.2"
 raft5-client = { git = "https://github.com/jonathanmeisel/jmeisel_raft5", version = "0.1.0" }

@@ -6,9 +6,9 @@ use clap::Args;
 use raft5fs_proto::types::{FsError, Kind};
 
 use super::{ConnectArgs, Outcome, log_in, runtime};
-use crate::cli::Context;
-use crate::pruner::{describe, prune_entry};
-use crate::vault::PruneStats;
+use raft5fs_client::cli::Context;
+use raft5fs_client::pruner::{describe, prune_entry};
+use raft5fs_client::vault::PruneStats;
 
 /// Seals everything still under an old version of a key again under the
 /// current one, then drops the old versions from the key's history. A key

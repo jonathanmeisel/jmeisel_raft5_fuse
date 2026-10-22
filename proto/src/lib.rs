@@ -2,6 +2,7 @@
 //! server and the client.
 
 pub mod convert;
+pub mod errno;
 pub mod invite;
 pub mod timing;
 pub mod types;

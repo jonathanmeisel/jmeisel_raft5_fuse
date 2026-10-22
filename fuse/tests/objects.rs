@@ -13,12 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use raft5fs_client::remote::Remote;
+use raft5fs_client::vault::{Node, Vault};
 use raft5fs_core::{
     BlockRef, BlockUpload, ChunkBody, ChunkWrite, FsError, Layout, ObjectGrid, SetAttr, WriteBody,
 };
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, open_chunk, seal_chunk};
-use raft5fs_fuse::remote::Remote;
-use raft5fs_fuse::vault::{Node, Vault};
 use raft5fs_objstore::http::{self, HttpConfig};
 use support::{TEST_BLOCK_CHUNKS, TEST_CHUNK_SIZE, TEST_OBJECT_FROM_CHUNKS};
 

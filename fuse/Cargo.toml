@@ -1,26 +1,15 @@
 [package]
 name = "raft5fs-fuse"
-description = "FUSE client: kernel requests over gRPC to any of several servers, with client-side write buffering."
+description = "FUSE front end: kernel requests to the client library's session."
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "raft5fs"
-path = "src/bin/raft5fs.rs"
-
 [dependencies]
-clap = { version = "4", features = ["derive"] }
 fuser = { workspace = true }
-http-body = "1"
-serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
-toml = "1"
 libc = { workspace = true }
-raft5fs-crypto = { workspace = true }
-raft5fs-objstore = { workspace = true }
+raft5fs-client = { workspace = true }
 raft5fs-proto = { workspace = true }
 tokio = { workspace = true }
-zeroize = "1"
 tonic = { workspace = true }
 
 # The end-to-end tests run the whole stack in-process: a raft5 cluster,
@@ -29,8 +18,10 @@ tonic = { workspace = true }
 raft5-client = { workspace = true }
 raft5-server = { workspace = true }
 raft5fs-core = { workspace = true }
+raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true, features = ["fake"] }
 raft5fs-server = { workspace = true }
+raft5fs-testkit = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 rcgen = "0.14"

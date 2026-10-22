@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use raft5fs_client::remote::Remote;
+use raft5fs_client::vault::Vault;
 use raft5fs_core::{ChunkWrite, WriteBody};
-use raft5fs_fuse::remote::Remote;
-use raft5fs_fuse::vault::Vault;
 
 /// Not really a test: the entry point that lets the harness run a
 /// filesystem server as a separate process (see `support::TestServer`).

@@ -1,0 +1,29 @@
+[package]
+name = "raft5fs"
+description = "The `raft5fs` command: mounting (FUSE) or serving (WebDAV) a filesystem, accounts, sharing and pruning."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "raft5fs"
+path = "src/main.rs"
+
+[features]
+default = ["fuse", "webdav"]
+# `raft5fs mount`. Needs FUSE (libfuse, or macFUSE) to build; leave it out
+# where there is none, as on a Mac without macFUSE.
+fuse = ["dep:raft5fs-fuse", "dep:fuser"]
+# `raft5fs webdav`.
+webdav = ["dep:raft5fs-webdav", "tokio/net", "tokio/signal"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fuser = { workspace = true, optional = true }
+libc = { workspace = true }
+raft5fs-client = { workspace = true }
+raft5fs-crypto = { workspace = true }
+raft5fs-fuse = { workspace = true, optional = true }
+raft5fs-proto = { workspace = true }
+raft5fs-webdav = { workspace = true, optional = true }
+tokio = { workspace = true }
+toml = "1"
