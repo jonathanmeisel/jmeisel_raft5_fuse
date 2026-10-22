@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "client", "core", "crypto", "fuse", "objstore", "proto", "server", "testkit", "utils", "webdav"]
+members = ["cli", "client", "core", "crypto", "fuse", "objstore", "proto", "server", "testkit", "webdav"]
 resolver = "3"
 
 [workspace.package]

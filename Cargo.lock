@@ -2583,32 +2583,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "raft5fs-utils"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "fuser",
- "getrandom 0.4.3",
- "libc",
- "raft5-client",
- "raft5-server",
- "raft5fs-client",
- "raft5fs-core",
- "raft5fs-crypto",
- "raft5fs-fuse",
- "raft5fs-server",
- "rcgen",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "raft5fs-webdav"
 version = "0.1.0"
 dependencies = [
