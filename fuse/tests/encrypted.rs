@@ -1,6 +1,7 @@
-//! Encryption and access by grant, end to end: enrolment, logins whose password
-//! never reaches a server, password changes, and access by grant -- the
-//! virtual root, volumes, and what each user can and can't reach.
+//! Tests encryption and access by grant end to end: enrolment, logins where
+//! the password never reaches a server, password changes, and access by
+//! grant (the virtual root, volumes, and what each user can and cannot
+//! reach).
 
 mod support;
 
@@ -17,9 +18,9 @@ use raft5fs_core::{ENCRYPTED_KEY, NewNode, SealedMove, accounts, check_store};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::KdfParams;
 
-/// Not really a test: the entry point that lets the harness run a
-/// filesystem server as a separate process (see `support::TestServer`).
-/// Returns at once in a normal run.
+/// Not a real test: the entry point that lets the harness run a filesystem
+/// server as a separate process (see `support::TestServer`). Returns at
+/// once in a normal run.
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
@@ -34,7 +35,7 @@ fn connect(h: &support::Harness, user: &str, password: &str) -> Result<Remote, S
     ))
 }
 
-/// `user`'s vault: logged in afresh, so it knows no keys yet -- but with
+/// `user`'s vault, logged in again, so it knows no keys yet, but with
 /// `TESTER`'s public key pinned (see `Harness::known_keys`).
 fn vault(h: &support::Harness, user: &str) -> Vault {
     let remote = connect(h, user, &support::password(user)).unwrap();
@@ -146,8 +147,8 @@ fn enrolling_again_drops_the_old_key_pairs_grants() {
     let before = connect(&h, "alice", &support::password("alice")).unwrap();
     assert_eq!(h.runtime.block_on(before.list_grants()).unwrap().len(), 1);
 
-    // Whoever enrols with a new code gets a new key pair and nothing
-    // else: not the right to delete or overwrite what they can't read.
+    // A user who enrols with a new code gets a new key pair and nothing
+    // else, not the right to delete or overwrite what they cannot read.
     h.enrol("alice");
     let after = connect(&h, "alice", &support::password("alice")).unwrap();
     assert!(h.runtime.block_on(after.list_grants()).unwrap().is_empty());
@@ -160,8 +161,8 @@ fn enrolling_again_drops_the_old_key_pairs_grants() {
 #[test]
 fn a_login_refuses_weaker_key_stretching_than_it_accepts() {
     let h = support::setup_root();
-    // Enrolled with `KdfParams::TESTING`, which is what Prelogin now hands
-    // out for her -- as a server trying to cheapen her `auth` would.
+    // Enrolled with `KdfParams::TESTING`, which Prelogin then gives out for
+    // her, as a server that tries to weaken her `auth` would.
     h.add_user("alice");
     let credentials = Credentials::new("alice", support::password("alice"));
     let refused = h
@@ -222,8 +223,8 @@ fn a_mount_logs_in_again_without_its_password() {
     let mut h = support::setup_root();
     fs::create_dir(h.path().join("vol")).unwrap();
     fs::write(h.path().join("vol/before"), b"x").unwrap();
-    // Every session the mount holds is now refused, so its next request
-    // logs in again -- from the `auth` it kept, the password long gone.
+    // Every session that the mount has is now refused, so its next request
+    // logs in again, from the `auth` it kept. The password is long gone.
     h.restart_servers_with_key("another key, also at least 32 bytes");
     fs::write(h.path().join("vol/after"), b"y").unwrap();
     assert_eq!(fs::read(h.path().join("vol/before")).unwrap(), b"x");
@@ -234,9 +235,9 @@ fn a_store_from_an_older_raft5fs_is_refused() {
     let h = support::setup_root();
     let check = || h.runtime.block_on(check_store(&h.client));
     check().unwrap();
-    // Recorded unencrypted, in the format before grants, names and
-    // grantee lists were sealed as now, or from before anything was
-    // recorded.
+    // Store format records this version refuses: unencrypted (0), a format
+    // whose grants, names, and grantee lists are not sealed as this version
+    // seals them (1), and no record at all.
     for old in [Some(&[0u8][..]), Some(&[1u8][..]), None] {
         h.write_key(ENCRYPTED_KEY, old);
         assert!(check().unwrap_err().contains("older raft5fs"), "{old:?}");
@@ -261,7 +262,7 @@ fn removing_a_user_cuts_them_off_and_drops_their_grants() {
             .block_on(accounts::remove(&h.client, "alice"))
             .unwrap()
     );
-    // Her mount's next request is refused, and so is logging in again.
+    // Her mount's next request is refused, and so is a new login.
     assert!(fs::read(alice.path.join("v/f")).is_err());
     assert!(connect(&h, "alice", &support::password("alice")).is_err());
     let mut index = vec![0x09];
@@ -282,7 +283,7 @@ fn the_root_lists_grants_and_mkdir_there_makes_a_volume() {
     assert_eq!(names(root), ["docs"]);
     assert_eq!(fs::read(root.join("docs/a")).unwrap(), b"x");
 
-    // Only volumes go in the root.
+    // Only volumes can be in the root.
     assert_errno(fs::write(root.join("loose"), b"x"), libc::EPERM);
     assert_errno(fs::rename(root.join("docs/a"), root.join("a")), libc::EPERM);
     assert_errno(fs::create_dir(root.join("docs")), libc::EEXIST);
@@ -305,7 +306,7 @@ fn nothing_ungranted_is_reachable() {
     let alice = h.mount_as("alice");
     assert!(names(&alice.path).is_empty());
 
-    // Straight to the servers, inode numbers in hand: still nothing.
+    // Directly to the servers, with the inode numbers: still nothing.
     let remote = connect(&h, "alice", &support::password("alice")).unwrap();
     let run = |f| h.runtime.block_on(f);
     assert_fs_errno(run(remote.getattr(volume)), libc::EACCES);
@@ -318,13 +319,13 @@ fn nothing_ungranted_is_reachable() {
     );
     assert_fs_errno(h.runtime.block_on(remote.access(file, 4)), libc::EACCES);
     assert_fs_errno(h.runtime.block_on(remote.key_path(file)), libc::EACCES);
-    // The real root is no one's, not even the volumes' owners'.
+    // The real root belongs to no one, not even the volumes' owners.
     assert_fs_errno(run(remote.getattr(1)), libc::EACCES);
     assert_fs_errno(h.runtime.block_on(remote.readdir(1)), libc::EACCES);
     let tester = connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
     assert_fs_errno(h.runtime.block_on(tester.readdir(1)), libc::EACCES);
 
-    // Nor can alice make anything there, keys or no keys.
+    // alice cannot make anything there either, with or without keys.
     let alices = Vault::new(Arc::new(remote)).unwrap();
     assert_fs_errno(
         h.runtime
@@ -385,7 +386,7 @@ fn a_writable_grant_shares_both_ways() {
     fs::write(alice.path.join("team/from-alice/hello"), b"hi").unwrap();
     assert_eq!(fs::read(team.join("from-alice/hello")).unwrap(), b"hi");
 
-    // Keys alice made unwrap for the volume's owner, from scratch.
+    // Keys that alice made unwrap for the volume's owner, from the start.
     let fresh = vault(&h, support::TESTER);
     let hers = ino(&team.join("from-alice/hello"));
     let theirs = vault(&h, "alice");
@@ -418,7 +419,7 @@ fn a_moved_node_gets_a_new_key_under_its_new_parent() {
     fs::rename(v.join("a/sub"), v.join("b/sub")).unwrap();
 
     // Only b is shared, so alice reaches them only through their new
-    // parent's key -- which works only if the move re-wrapped them.
+    // parent's key. That works only if the move wrapped them again.
     h.add_user("alice");
     h.runtime
         .block_on(before.grant(ino(&v.join("b")), "alice", false, OsStr::new("b")))
@@ -428,13 +429,13 @@ fn a_moved_node_gets_a_new_key_under_its_new_parent() {
         h.runtime.block_on(alices.node(f)).unwrap(),
         h.runtime.block_on(alices.node(sub)).unwrap(),
     );
-    // New keys: whoever held a's -- and so f's and sub's old ones --
-    // holds nothing that opens what is written to them from now on.
+    // New keys: a user who had a's key (and so f's and sub's old keys) has
+    // nothing that opens what is written to them from now on.
     assert_ne!(f_now.key, f_key);
     assert_ne!(sub_now.key, sub_key);
     assert!(record(&h, f).open(f, &a_key).is_err());
     assert!(record(&h, f).name_key(f, &f_key).is_err());
-    // What was written before still reads, through the history.
+    // Data written before is still readable, through the history.
     assert_eq!(f_now.record.older(f, &f_now.key, 1).unwrap(), f_key);
     let alice = h.mount_as("alice");
     assert_eq!(fs::read(alice.path.join("b/f")).unwrap(), b"x");
@@ -448,8 +449,8 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     let mine = vault(&h, support::TESTER);
     let remote = mine.remote();
     let parent = h.runtime.block_on(mine.node(v)).unwrap();
-    // A create as an honest client would send it, but for `ino` and its
-    // key record claiming `parent_version`.
+    // A create as an honest client would send it, but for `ino`, with a key
+    // record that claims `parent_version`.
     let create = |name: &str, ino: u64, parent_version: u32| {
         let (record, _) = NodeKeys::create(ino, Some((&parent.key, parent_version)));
         let tag = parent.tag(OsStr::new(name));
@@ -473,8 +474,9 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     assert_fs_errno(bare, libc::EACCES);
     assert_fs_errno(create("unreserved", 1_000_000, version), libc::EACCES);
 
-    // A reserved inode, but a record claiming the wrong parent version:
-    // what a client with an out-of-date key sends, told to fetch it again.
+    // A reserved inode, but a record that claims the wrong parent version:
+    // what a client with an old key sends. It is told to fetch the key
+    // again.
     let reserved = h.runtime.block_on(remote.allocate_inode()).unwrap();
     assert_fs_errno(
         create("wrong-version", reserved, version + 1),
@@ -482,7 +484,7 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     );
     create("right", reserved, version).unwrap();
 
-    // Someone else's reservation won't do either.
+    // Another user's reservation does not work either.
     h.add_user("alice");
     let alice = connect(&h, "alice", &support::password("alice")).unwrap();
     let hers = h.runtime.block_on(alice.allocate_inode()).unwrap();
@@ -530,7 +532,7 @@ fn every_inode_has_a_key_record() {
 
 // ------------------------------------------------------------------ names
 
-/// Asserts `marker` appears in no key or value in the store.
+/// Asserts that `marker` is in no key or value in the store.
 #[track_caller]
 fn assert_nowhere_in_store(h: &support::Harness, marker: &[u8]) {
     for key in h.keys_with_prefix(&[]) {
@@ -606,7 +608,7 @@ fn a_plain_name_is_refused() {
     let remote = mine.remote();
     let parent = h.runtime.block_on(mine.node(v)).unwrap();
 
-    // Everything right but the name, which goes as itself.
+    // Everything is correct except the name, which is sent as plain text.
     let reserved = h.runtime.block_on(remote.allocate_inode()).unwrap();
     let (record, _) = NodeKeys::create(reserved, Some((&parent.key, parent.record.version)));
     let name = OsStr::new("in-the-clear");
@@ -646,7 +648,7 @@ fn an_entry_filed_under_another_name_is_left_out() {
         key.extend_from_slice(dir.tag(OsStr::new(name)).as_bytes());
         key
     };
-    // What a server could do: file a's entry, sealed name and all, under
+    // What a server could do: file a's entry, with its sealed name, under
     // b's tag too.
     let a = h.read_key(&dirent("a")).unwrap();
     h.write_key(&dirent("b"), Some(&a));
@@ -666,8 +668,8 @@ fn an_entry_filed_under_another_name_is_left_out() {
 
 const CHUNK: usize = support::TEST_CHUNK_SIZE as usize;
 
-/// Position-dependent bytes, as in `fuse_fs`, so data landing at the wrong
-/// offset fails loudly.
+/// Bytes that depend on their position, as in `fuse_fs`, so data at the
+/// wrong offset fails clearly.
 fn pattern(len: usize, salt: u8) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8 ^ salt).collect()
 }
@@ -678,7 +680,7 @@ fn no_data_reaches_the_store() {
     fs::create_dir(h.path().join("v")).unwrap();
     let f = h.path().join("v/f");
     let marker = b"zebra-stripes-";
-    // Whole chunks, a partial one, and a patch in the middle of one.
+    // Whole chunks, a partial chunk, and a patch in the middle of a chunk.
     let mut data: Vec<u8> = marker
         .iter()
         .copied()
@@ -706,7 +708,7 @@ fn data_reads_back_through_overwrites_holes_and_truncation() {
     fs::write(&f, &model).unwrap();
 
     let mut file = fs::OpenOptions::new().write(true).open(&f).unwrap();
-    // A patch straddling a chunk boundary.
+    // A patch across a chunk boundary.
     let patch = pattern(300, 0x55);
     let at = CHUNK - 100;
     file.seek(SeekFrom::Start(at as u64)).unwrap();
@@ -721,7 +723,8 @@ fn data_reads_back_through_overwrites_holes_and_truncation() {
     file.sync_all().unwrap();
     assert_eq!(fs::read(&f).unwrap(), model);
 
-    // Cut mid-chunk, then grow again: what was cut reads as zeros.
+    // Cut in the middle of a chunk, then grow again: what was cut reads as
+    // zeros.
     let cut = 2 * CHUNK + 10;
     file.set_len(cut as u64).unwrap();
     model.truncate(cut);
@@ -748,8 +751,8 @@ fn concurrent_writes_to_one_chunk_lose_nothing() {
     let file = ino(&f);
     let a = vault(&h, support::TESTER);
     let b = vault(&h, support::TESTER);
-    // Each writes its own bytes of the same chunk, over and over; every
-    // write is a read-modify-write of the whole chunk.
+    // Each writer writes its own bytes of the same chunk, again and again.
+    // Every write is a read-modify-write of the whole chunk.
     h.runtime.block_on(async {
         let left = async {
             for i in 0..20u8 {
@@ -779,7 +782,7 @@ fn the_server_takes_no_mis_sealed_or_stale_data() {
     let mine = vault(&h, support::TESTER);
     let remote = mine.remote();
 
-    // A chunk sealed under a key version the file doesn't have.
+    // A chunk sealed under a key version that the file does not have.
     let node = h.runtime.block_on(mine.node(file)).unwrap();
     let blob = raft5fs_crypto::data::seal_chunk(&node.key, node.record.version + 1, file, 0, b"x");
     let wrong = raft5fs_core::ChunkWrite {
@@ -829,9 +832,9 @@ fn a_block_pointer_is_never_read_as_a_hole() {
     let f = h.path().join("v/f");
     fs::write(&f, b"sealed").unwrap();
     let file = ino(&f);
-    // What a hybrid file keeps under a block's first chunk key: 32 bytes,
-    // starting with the key version, as a sealed chunk does. This file is
-    // all inline, so it can only be corruption.
+    // What a hybrid file keeps under a block's first chunk key: 32 bytes
+    // that start with the key version, as a sealed chunk does. This file is
+    // all inline, so this can only be corruption.
     let mut pointer = record(&h, file).version.to_be_bytes().to_vec();
     pointer.resize(32, 7);
     let mut key = vec![0x02];
@@ -846,7 +849,7 @@ fn a_block_pointer_is_never_read_as_a_hole() {
     );
 }
 
-/// A volume `v` holding `shared/sub/f` and `shared/sub/g`, each with some
+/// A volume `v` with `shared/sub/f` and `shared/sub/g`, each with some
 /// bytes in it.
 fn shared_tree(h: &support::Harness) -> std::path::PathBuf {
     let v = h.path().join("v");
@@ -867,7 +870,7 @@ fn a_nearer_grant_decides_even_below_a_path_the_server_knows() {
         .unwrap();
     let alice = h.mount_as("alice");
     let hers = alice.path.join("v/shared/sub/f");
-    // Walked from f up to v, which the server now knows the way of.
+    // Walked from f up to v, so the server now knows the path.
     fs::write(&hers, b"by alice").unwrap();
 
     h.runtime
@@ -908,7 +911,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
-    // Everything alice could ever learn: the keys as they are now.
+    // Everything that alice could ever learn: the keys as they are now.
     let hers = vault(&h, "alice");
     let her_sub_key = h.runtime.block_on(hers.node(sub)).unwrap().key.clone();
     let her_f_key = h.runtime.block_on(hers.node(f)).unwrap().key.clone();
@@ -920,7 +923,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
 
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
 
-    // Cut off at once, open mount and all.
+    // Access ends at once, even on her open mount.
     assert!(names(&alice.path).is_empty());
     let remote = hers.remote();
     assert_fs_errno(h.runtime.block_on(remote.getattr(f)), libc::EACCES);
@@ -929,10 +932,11 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
         libc::EACCES,
     );
 
-    // The volume has a new key; what is under it is stale until written.
+    // The volume has a new key. What is below it is stale until it is
+    // written.
     assert_eq!(record(&h, ino(&v)).version, 2);
     assert_eq!(record(&h, sub).version, 1);
-    // A write sealed under f's old key is refused, stale as it is.
+    // A write sealed under f's old key is refused, because f is stale.
     let old = h.runtime.block_on(mine.node(f)).unwrap();
     let blob = raft5fs_crypto::data::seal_chunk(&old.key, old.record.version, f, 0, b"leaky");
     let write = raft5fs_core::ChunkWrite {
@@ -946,7 +950,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
         libc::EKEYEXPIRED,
     );
 
-    // Writing through the mount rotates the stale path on the way.
+    // A write through the mount rotates the stale path on the way.
     fs::write(v.join("shared/sub/f"), b"after").unwrap();
     fs::write(v.join("shared/sub/new"), b"new").unwrap();
     assert_eq!(record(&h, ino(&v.join("shared"))).version, 2);
@@ -954,14 +958,14 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     assert_eq!(record(&h, f).version, 2);
     assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"after");
 
-    // None of it opens with what alice had.
+    // None of it opens with the keys that alice had.
     let chunk = stored_chunk(&h, f, 0);
     assert!(raft5fs_crypto::data::open_chunk(&her_f_key, f, 0, &chunk).is_err());
     let new = ino(&v.join("shared/sub/new"));
     assert!(record(&h, new).open(new, &her_sub_key).is_err());
     assert!(record(&h, sub).name_key(sub, &her_sub_key).is_err());
 
-    // What was written before is still readable, through the history.
+    // Data written before is still readable, through the history.
     let fresh = vault(&h, support::TESTER);
     assert_eq!(
         h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
@@ -986,8 +990,8 @@ fn a_revocation_keeps_the_grants_below_it_usable() {
 
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
 
-    // Bob's grant -- and the path down to it -- has new keys already: bob
-    // can't reach above his grant to rotate anything there himself.
+    // Bob's grant, and the path down to it, already have new keys: bob
+    // cannot reach above his grant to rotate anything there himself.
     assert_eq!(record(&h, sub).version, 2);
     assert_eq!(record(&h, ino(&v.join("shared"))).version, 2);
     let bobs = vault(&h, "bob");
@@ -1015,7 +1019,7 @@ fn revoking_takes_the_key_above_unless_it_is_a_volume() {
         .block_on(hers.grant(shared, "bob", false, OsStr::new("shared")))
         .unwrap();
 
-    // Alice can't reach `v`, so she can't wrap a new key for `shared`.
+    // Alice cannot reach `v`, so she cannot wrap a new key for `shared`.
     assert_fs_errno(h.runtime.block_on(hers.revoke(shared, "bob")), libc::EACCES);
     assert_fs_errno(
         h.runtime.block_on(mine.revoke(shared, "carol")),
@@ -1029,7 +1033,7 @@ fn revoking_takes_the_key_above_unless_it_is_a_volume() {
             .unwrap()
             .is_empty()
     );
-    // Alice's own grant came through re-sealed.
+    // Alice's own grant was sealed again.
     let alice = h.mount_as("alice");
     assert_eq!(
         fs::read(alice.path.join("shared/sub/f")).unwrap(),
@@ -1075,7 +1079,8 @@ fn a_changed_public_key_is_refused_until_forgotten() {
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
 
-    // Alice enrols again -- or the server says she did, with its own key.
+    // Alice enrols again, or the server says that she did, with its own
+    // key.
     let second = h.enrol("alice");
     assert_ne!(first, second);
     let shared = ino(&v.join("shared"));
@@ -1083,8 +1088,8 @@ fn a_changed_public_key_is_refused_until_forgotten() {
         .runtime
         .block_on(mine.grant(shared, "alice", false, OsStr::new("shared")));
     assert_fs_errno(refused, libc::EPERM);
-    // Nor does a rotation re-seal a grant made to the new key by someone
-    // who never pinned the old one.
+    // A rotation also does not seal again a grant made to the new key by a
+    // user who never pinned the old key.
     h.add_user("bob");
     h.runtime
         .block_on(mine.grant(ino(&v), "bob", true, OsStr::new("v")))
@@ -1106,7 +1111,7 @@ fn a_changed_public_key_is_refused_until_forgotten() {
 
 // ---------------------------------------------------------------- pruning
 
-/// `dir` and everything under it, parents first.
+/// `dir` and everything below it, parents first.
 fn tree(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = vec![dir.to_path_buf()];
     let mut i = 0;
@@ -1133,9 +1138,9 @@ fn values_under(h: &support::Harness, prefix: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// That nothing under `dir` is sealed under anything but its node's
-/// current key, nor wrapped under anything but its parent's, and that no
-/// key history is left.
+/// Asserts that nothing below `dir` is sealed under anything except its
+/// node's current key, or wrapped under anything except its parent's
+/// current key, and that no key history is left.
 #[track_caller]
 fn assert_fully_pruned(h: &support::Harness, dir: &Path) {
     use raft5fs_crypto::data::sealed_version;
@@ -1157,9 +1162,9 @@ fn assert_fully_pruned(h: &support::Harness, dir: &Path) {
     }
 }
 
-/// `shared_tree` with a multi-chunk file in it too, granted to alice and
-/// revoked again, then partly written: some of it rotated since, some of
-/// it stale. Returns the volume, and the key alice held for `g`.
+/// `shared_tree`, also with a multi-chunk file, granted to alice and
+/// revoked again, then partly written: some of it rotated since, and some
+/// of it stale. Returns the volume, and the key that alice had for `g`.
 fn revoked_tree(h: &support::Harness) -> (std::path::PathBuf, raft5fs_crypto::Key) {
     let v = shared_tree(h);
     let big: Vec<u8> = (0..h.chunk_size * 5 / 2).map(|i| i as u8).collect();
@@ -1177,7 +1182,7 @@ fn revoked_tree(h: &support::Harness) -> (std::path::PathBuf, raft5fs_crypto::Ke
         .key
         .clone();
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
-    // Rotates v/shared, sub and f on the way, leaving g and big stale.
+    // Rotates v/shared, sub, and f on the way, and leaves g and big stale.
     fs::write(v.join("shared/sub/f"), b"after").unwrap();
     (v, her_g_key)
 }
@@ -1209,8 +1214,8 @@ fn pruning_reseals_everything_and_drops_every_old_version() {
     );
     assert_fully_pruned(&h, &v);
 
-    // Everything reads as before, through a fresh login and the mount,
-    // and nothing's times moved.
+    // Everything reads as before, through a new login and the mount, and no
+    // times changed.
     assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"after");
     assert_eq!(fs::read(v.join("shared/sub/g")).unwrap(), b"untouched");
     assert_eq!(fs::read(v.join("shared/sub/big")).unwrap(), big);
@@ -1223,7 +1228,7 @@ fn pruning_reseals_everything_and_drops_every_old_version() {
         h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
         b"untouched"
     );
-    // And what alice held no longer opens any of it.
+    // The keys that alice had no longer open any of it.
     let chunk = stored_chunk(&h, g, 0);
     assert!(raft5fs_crypto::data::open_chunk(&her_g_key, g, 0, &chunk).is_err());
 
@@ -1244,7 +1249,7 @@ fn a_prune_is_refused_while_anything_is_under_a_version_it_drops() {
     let sub = ino(&v.join("shared/sub"));
     let mine = vault(&h, support::TESTER);
     let remote = mine.remote();
-    // A new key for g, its chunk still sealed under the old one.
+    // A new key for g, with its chunk still sealed under the old key.
     h.runtime.block_on(mine.freshen(g)).unwrap();
     let rec = record(&h, g);
     assert_eq!(rec.base(), 1);
@@ -1260,7 +1265,7 @@ fn a_prune_is_refused_while_anything_is_under_a_version_it_drops() {
             .block_on(remote.prune_keys(sub, rec.version, rec.pruned(rec.version).encode())),
         libc::EBUSY,
     );
-    // v's child `shared` is fresh, but its name in v isn't.
+    // v's child `shared` is fresh, but its name in v is not.
     let top = ino(&v);
     let rec = record(&h, top);
     assert_fs_errno(
@@ -1268,7 +1273,7 @@ fn a_prune_is_refused_while_anything_is_under_a_version_it_drops() {
             .block_on(remote.prune_keys(top, rec.version, rec.pruned(rec.version).encode())),
         libc::EBUSY,
     );
-    // Only cutting a history short is a prune.
+    // Only a cut of a history is a prune.
     let rec = record(&h, g);
     assert_fs_errno(
         h.runtime
@@ -1379,9 +1384,9 @@ fn a_small_write_into_a_cached_chunk_fetches_nothing() {
 
     run(0, &[1; 100]);
     let after_first = remote.chunk_reads();
-    // What it wrote it cached, so changing a few bytes of it -- a
-    // read-modify-write of the whole chunk -- needs nothing from the
-    // server, and neither does reading it back.
+    // It cached what it wrote, so a change of a few bytes (a
+    // read-modify-write of the whole chunk) needs nothing from the server,
+    // and nor does a read of it.
     run(10, &[2; 5]);
     run(50, &[3; 5]);
     let read = h.runtime.block_on(mine.read(file, 0, 100)).unwrap();
@@ -1405,8 +1410,8 @@ fn a_cached_chunk_is_never_served_stale() {
     h.runtime.block_on(writer.write(file, 0, &[9; 4])).unwrap();
     assert_eq!(h.runtime.block_on(reader.read(file, 0, 4)).unwrap(), [9; 4]);
 
-    // And a write based on a stale cached copy is refused by its seq, and
-    // redone on fresh bytes: the other writer's change survives.
+    // A write based on a stale cached copy is refused by its seq, and done
+    // again on new bytes, so the other writer's change stays.
     h.runtime
         .block_on(writer.write(file, 100, &[8; 4]))
         .unwrap();
@@ -1420,13 +1425,13 @@ fn a_cached_chunk_is_never_served_stale() {
 
 // ------------------------------------------------------- a malicious store
 
-/// Plants a grant of `ino` to `user` straight in the store, as a server
-/// that wanted the next rotation to seal `ino`'s new key to `user` would.
+/// Puts a grant of `ino` to `user` directly in the store, as a server would
+/// if it wanted the next rotation to seal `ino`'s new key to `user`.
 fn plant_grant(h: &support::Harness, ino: u64, user: &str) {
     let mut row = vec![0x07];
     row.extend_from_slice(&ino.to_be_bytes());
     row.extend_from_slice(user.as_bytes());
-    // Read-only, version 1, an empty sealed key and an empty label.
+    // Read-only, version 1, an empty sealed key, and an empty label.
     let value = [0u8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
     h.write_key(&row, Some(&value));
     let mut index = vec![0x09];
@@ -1450,10 +1455,10 @@ fn a_rotation_seals_to_no_grantee_the_server_made_up() {
 
     let revoked = h.runtime.block_on(mine.revoke(ino(&v), "alice"));
     assert_fs_errno(revoked, libc::EPERM);
-    // Whatever eve's grant holds, it isn't the volume's key.
+    // Whatever eve's grant holds, it is not the volume's key.
     let eves = vault(&h, "eve");
     assert!(h.runtime.block_on(eves.node(ino(&v))).is_err());
-    // Nor does sharing on seal anything to her.
+    // Sharing further does not seal anything to her either.
     h.add_user("bob");
     assert_fs_errno(
         h.runtime
@@ -1461,8 +1466,8 @@ fn a_rotation_seals_to_no_grantee_the_server_made_up() {
         libc::EPERM,
     );
 
-    // Revoking her own made-up grant takes no one's say-so -- and then
-    // the rest goes ahead, sealed beyond her.
+    // Revoking her made-up grant needs no approval, and then the rest
+    // continues, sealed beyond her reach.
     h.runtime.block_on(mine.revoke(ino(&v), "eve")).unwrap();
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
     assert!(h.runtime.block_on(eves.node(ino(&v))).is_err());
@@ -1488,7 +1493,7 @@ fn grants_made_at_once_both_stay_on_the_sealed_list() {
             granted.unwrap();
         }
     });
-    // Every one of them is on the list a revocation checks against.
+    // Every one of them is on the list that a revocation checks against.
     let mine = vault(&h, support::TESTER);
     let mut names: Vec<_> = h
         .runtime
@@ -1502,7 +1507,7 @@ fn grants_made_at_once_both_stay_on_the_sealed_list() {
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
 }
 
-/// The store row of `user`'s grant index entry for `ino`.
+/// The store key of `user`'s grant index entry for `ino`.
 fn grant_index_key(user: &str, ino: u64) -> Vec<u8> {
     let mut key = vec![0x09];
     key.extend_from_slice(user.as_bytes());
@@ -1516,8 +1521,8 @@ fn a_share_from_someone_unpinned_is_read_only_until_trusted() {
     let h = support::setup_root();
     fs::create_dir(h.root().join("photos")).unwrap();
     let real = ino(&h.root().join("photos"));
-    // Mallory -- or a server making her up -- shares a volume of her own
-    // with the tester, called what the tester's own volume is called...
+    // Mallory (or a server that makes her up) shares a volume of her own
+    // with the tester, with the same name as the tester's own volume...
     let mallory_key = h.enrol("mallory");
     let hers = vault(&h, "mallory");
     let fake = h
@@ -1531,8 +1536,8 @@ fn a_share_from_someone_unpinned_is_read_only_until_trusted() {
     // ...and the server stops listing the real one.
     h.write_key(&grant_index_key(support::TESTER, real), None);
 
-    // The tester's mount shows hers as "photos", and reads it, but writes
-    // nothing there: it would be the server's to read.
+    // The tester's mount shows hers as "photos" and reads it, but writes
+    // nothing there, because the server could read it.
     let mount = h.second_mount();
     assert_eq!(names(&mount.root), ["photos"]);
     assert_eq!(ino(&mount.root.join("photos")), fake);
@@ -1549,7 +1554,7 @@ fn a_share_from_someone_unpinned_is_read_only_until_trusted() {
         libc::EACCES,
     );
 
-    // Trusting her takes her key's real fingerprint.
+    // To trust her, the tester needs her key's real fingerprint.
     let wrong = raft5fs_crypto::identity::fingerprint(&h.tester_key);
     assert_fs_errno(
         h.runtime.block_on(mine.trust("mallory", &wrong)),
@@ -1583,7 +1588,7 @@ fn an_entry_pointed_at_another_inode_is_refused() {
         key
     };
     // What a server could do: keep each entry's sealed name, but point it
-    // at the other's inode -- so that what is written to "a" lands in b.
+    // at the other entry's inode, so that what is written to "a" goes to b.
     let mut a = h.read_key(&dirent("a")).unwrap();
     let mut b = h.read_key(&dirent("b")).unwrap();
     let a_ino: [u8; 8] = a[..8].try_into().unwrap();
@@ -1635,8 +1640,8 @@ fn a_key_record_rolled_back_is_refused() {
         2
     );
 
-    // The server hands back the record and grant from before, whose key
-    // alice holds: nothing new may be sealed under that.
+    // The server returns the old record and grant, whose key alice has.
+    // Nothing new may be sealed under that key.
     h.write_key(&record_key, Some(&old_record));
     h.write_key(&grant_key, Some(&old_grant));
     assert_fs_errno(h.runtime.block_on(mine.freshen(v_ino)).map(drop), libc::EIO);
@@ -1658,7 +1663,7 @@ fn a_login_without_tls_is_refused_unless_asked_for() {
         Some(support::fs_tls()),
     ));
     assert!(http.err().unwrap().contains("only https://"));
-    // Allowed, it gets as far as the (missing) server.
+    // When it is allowed, it gets as far as the (missing) server.
     let allowed = Credentials {
         allow_plaintext: true,
         ..credentials
@@ -1691,7 +1696,7 @@ fn a_name_that_could_break_a_line_is_no_account() {
 
 // ------------------------------------------------- shares and the pruner
 
-/// A prune queue of its own, in a fresh temporary directory.
+/// Its own prune queue, in a new temporary directory.
 fn temp_queue(name: &str) -> raft5fs_client::prune_queue::PruneQueue {
     let dir = std::env::temp_dir().join(format!(
         "raft5fs-test-queue-{name}-{}-{:?}",
@@ -1740,7 +1745,7 @@ fn shares_say_whose_they_are_and_whether_trusted() {
         ShareTrust::Untrusted { key } => assert_eq!(*key, mallory_key),
         other => panic!("{other:?}"),
     }
-    // Trusting her, by the words she would read out, changes that.
+    // Trusting her, by the words that she would read out, changes that.
     let words = raft5fs_crypto::identity::fingerprint_words(&mallory_key);
     h.runtime.block_on(alices.trust("mallory", &words)).unwrap();
     let shares = h.runtime.block_on(alices.shares()).unwrap();
@@ -1760,7 +1765,7 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
     queue.add(ino(&v), "v (revoked alice)").unwrap();
     let dir = queue.dir().to_path_buf();
     let _mount = h.pruning_mount(queue);
-    // Writes through the first mount go on meanwhile.
+    // Writes through the first mount continue in the meantime.
     let writer = {
         let f = f.clone();
         std::thread::spawn(move || {
@@ -1799,8 +1804,8 @@ fn a_prune_that_skips_anything_stays_queued() {
     }
     h.runtime.block_on(mine.revoke(ino(&v), "bob")).unwrap();
 
-    // Alice can't prune what she may only read: it stays queued, saying
-    // why, for someone who can.
+    // Alice cannot prune what she can only read. It stays in the queue,
+    // with the reason, for a user who can.
     let queue = temp_queue("skips");
     queue.add(ino(&v), "v").unwrap();
     let hers = vault(&h, "alice");
@@ -1815,7 +1820,7 @@ fn a_prune_that_skips_anything_stays_queued() {
     let status = &queue.statuses().unwrap()[&ino(&v)];
     assert!(status.starts_with("incomplete"), "{status}");
 
-    // The tester can, which empties it.
+    // The tester can, which empties the queue.
     let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
         &mine,
         &queue,

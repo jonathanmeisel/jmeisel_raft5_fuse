@@ -1,14 +1,15 @@
-//! Paths, for front ends that work by them (WebDAV) rather than by inode:
-//! resolved a name at a time from the virtual root, through
-//! `Session::lookup`, so the volumes' labels and `/.snapshot` resolve as
-//! they do in a mount.
+//! Paths, for front ends that use paths and not inodes (WebDAV). A path is
+//! resolved one name at a time from the virtual root, through
+//! `Session::lookup`, so volume labels and `/.snapshot` resolve as they do
+//! in a mount.
 //!
-//! Every name along a path would be a round trip, so each one resolved is
-//! remembered for `DENTRY_TTL` -- what the kernel's dentry cache does for
-//! a mount, for as long as FUSE's own TTL. Changes made through the
-//! session forget what they change at once; another client's changes show
-//! once the TTL is up. The last name of a path is always asked about
-//! afresh, so its attributes are never stale.
+//! - Each name on a path would be a round trip, so each resolved name is
+//!   kept for `DENTRY_TTL`. The kernel's dentry cache does the same for a
+//!   mount, for FUSE's own TTL.
+//! - Changes made through the session forget what they change at once.
+//!   Another client's changes show after the TTL.
+//! - The last name of a path is always looked up again, so its attributes
+//!   are never stale.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -24,10 +25,11 @@ use crate::vault::VIRTUAL_ROOT;
 /// How long a resolved name is trusted for.
 const DENTRY_TTL: Duration = Duration::from_secs(1);
 
-/// How many resolved names are kept before expired ones are swept out.
+/// How many resolved names to keep before expired ones are removed.
 const MAX_DENTRIES: usize = 16 * 1024;
 
-/// Resolved names: the inode each `(directory, name)` was, and when.
+/// Resolved names: the inode for each `(directory, name)`, and when it was
+/// resolved.
 #[derive(Default)]
 pub(crate) struct Dentries(Mutex<HashMap<(u64, OsString), (u64, Instant)>>);
 
@@ -50,7 +52,7 @@ impl Dentries {
         map.insert((parent, name.to_os_string()), (ino, Instant::now()));
     }
 
-    /// Forgets `name` in `parent`, which the session has just changed.
+    /// Forgets `name` in `parent`, which the session just changed.
     pub(crate) fn forget(&self, parent: u64, name: &OsStr) {
         self.0
             .lock()
@@ -63,8 +65,8 @@ impl Dentries {
     }
 }
 
-/// `path`'s names, `/`-separated, with empty ones and `.` left out. `..`
-/// is refused: a front end has already resolved those against the path
+/// `path`'s names, separated by `/`, without empty names and `.`. `..` is
+/// refused, because a front end has already resolved it against the path
 /// itself, as an HTTP server does.
 fn components(path: &[u8]) -> Result<Vec<&OsStr>, FsError> {
     let mut names = Vec::new();
@@ -80,12 +82,12 @@ fn components(path: &[u8]) -> Result<Vec<&OsStr>, FsError> {
 
 impl Session {
     /// The attributes of what `path` names, from the virtual root: `/` is
-    /// the root itself, `/<label>` a volume, and so on down.
+    /// the root itself, `/<label>` is a volume, and so on down.
     pub async fn resolve(&self, path: &[u8]) -> Result<Attr, FsError> {
         let names = components(path)?;
         match self.walk(&names, true).await {
-            // A name remembered from before may be what has since gone:
-            // look again, all of it afresh.
+            // A remembered name could be the one that is now gone. Look up
+            // the whole path again.
             Err(e) if e.errno == libc::ENOENT => {
                 self.dentries.clear();
                 self.walk(&names, false).await
@@ -94,9 +96,9 @@ impl Session {
         }
     }
 
-    /// The directory `path` would be made in, and the name it would have
-    /// there: for creating, removing and renaming by path. The root has
-    /// no parent (`EPERM`).
+    /// The directory that `path` would be made in, and its name there, for
+    /// create, remove, and rename by path. The root has no parent
+    /// (`EPERM`).
     pub async fn resolve_parent(&self, path: &[u8]) -> Result<(u64, OsString), FsError> {
         let names = components(path)?;
         let Some((name, above)) = names.split_last() else {
@@ -115,8 +117,9 @@ impl Session {
         Ok((parent.ino, name.to_os_string()))
     }
 
-    /// Resolves `names` from the root, trusting remembered names along
-    /// the way if `cached`, and returns the last one's attributes, fresh.
+    /// Resolves `names` from the root and returns the last name's
+    /// attributes, fresh. If `cached`, it uses remembered names along the
+    /// way.
     async fn walk(&self, names: &[&OsStr], cached: bool) -> Result<Attr, FsError> {
         let Some((last, above)) = names.split_last() else {
             return self.getattr(VIRTUAL_ROOT).await;

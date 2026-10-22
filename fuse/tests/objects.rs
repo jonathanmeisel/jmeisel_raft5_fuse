@@ -1,7 +1,7 @@
-//! Object storage: hybrid files, upload URLs, block pointers and how the
-//! servers check, read and trim them, and how mounts read and write
-//! blocks. The servers' side is driven through `Remote`, sealing and
-//! uploading blocks by hand; the mounts' through `std::fs`.
+//! Tests object storage: hybrid files, upload URLs, block pointers and how
+//! the servers check, read, and trim them, and how mounts read and write
+//! blocks. The servers' side is tested through `Remote`, with blocks sealed
+//! and uploaded by hand. The mounts' side is tested through `std::fs`.
 
 mod support;
 
@@ -23,15 +23,15 @@ use raft5fs_objstore::http::{self, HttpConfig};
 use support::{TEST_BLOCK_CHUNKS, TEST_CHUNK_SIZE, TEST_OBJECT_FROM_CHUNKS};
 
 const C: u64 = TEST_CHUNK_SIZE;
-/// The first chunk index in blocks, and the second block's.
+/// The first chunk index in blocks, and the second block's first index.
 const K: u64 = TEST_OBJECT_FROM_CHUNKS;
 const K2: u64 = K + TEST_BLOCK_CHUNKS;
-/// What one sealed segment takes in an object.
+/// The size of one sealed segment in an object.
 const S: u64 = C + CHUNK_OVERHEAD as u64;
 
-/// Not really a test: the entry point that lets the harness run a
-/// filesystem server as a separate process (see `support::TestServer`).
-/// Returns at once in a normal run.
+/// Not a real test: the entry point that lets the harness run a filesystem
+/// server as a separate process (see `support::TestServer`). Returns at
+/// once in a normal run.
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
@@ -74,8 +74,8 @@ fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, FsError>, errno: i32) {
     }
 }
 
-/// A file `v/f` in a harness with object storage, with a few inline bytes
-/// in it, and its key.
+/// A file `v/f` with a few inline bytes, in a harness with object storage,
+/// and its key.
 fn hybrid_file(h: &support::Harness, mine: &Vault) -> (u64, Arc<Node>) {
     let f = h.path().join("f");
     fs::write(&f, b"head").unwrap();
@@ -84,8 +84,8 @@ fn hybrid_file(h: &support::Harness, mine: &Vault) -> (u64, Arc<Node>) {
     (file, node)
 }
 
-/// Block `plains` of `ino` from chunk `first` on, as a client seals one:
-/// each segment zero-padded to a whole chunk, then sealed at its index.
+/// Seals block `plains` of `ino` from chunk `first`, as a client does: each
+/// segment is padded with zeros to a whole chunk, then sealed at its index.
 fn seal_block(node: &Node, ino: u64, first: u64, plains: &[Vec<u8>]) -> Vec<u8> {
     let mut body = Vec::new();
     for (j, plain) in plains.iter().enumerate() {
@@ -102,7 +102,7 @@ fn seal_block(node: &Node, ino: u64, first: u64, plains: &[Vec<u8>]) -> Vec<u8> 
     body
 }
 
-/// Uploads `plains` as the block at chunk `first`, through a URL the
+/// Uploads `plains` as the block at chunk `first`, through a URL that the
 /// servers mint, and returns the pointer that would commit it.
 fn upload(
     h: &support::Harness,
@@ -140,15 +140,15 @@ fn block_write(index: u64, block: BlockRef) -> ChunkWrite {
     }
 }
 
-/// What the store holds under chunk `index` of `ino`.
+/// The value that the store holds under chunk `index` of `ino`.
 fn stored(h: &support::Harness, ino: u64, index: u64) -> Option<Vec<u8>> {
     let mut key = raft5fs_core::chunk_prefix(ino);
     key.extend_from_slice(&index.to_be_bytes());
     h.read_key(&key)
 }
 
-/// Waits for the servers' prompt deletions (see `FsCore::discard`), which
-/// run in the background, to leave `n` objects in the store.
+/// Waits until the servers' prompt deletions (see `FsCore::discard`), which
+/// run in the background, leave `n` objects in the store.
 fn objects_settle_at(h: &support::Harness, n: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while h.store().keys().len() != n && std::time::Instant::now() < deadline {
@@ -169,7 +169,7 @@ fn the_servers_say_how_blocks_are_laid_out() {
     );
     let plain = support::setup();
     assert_eq!(connect(&plain).grid(), None);
-    // Without object storage there is nothing to upload to.
+    // Without object storage, there is nothing to upload to.
     fs::write(plain.path().join("f"), b"x").unwrap();
     let file = ino(&plain.path().join("f"));
     assert_fs_errno(
@@ -213,7 +213,7 @@ fn a_block_round_trips() {
         .unwrap();
     assert_eq!(attr.size, end);
 
-    // One 32-byte pointer, at the block's first index only; one object.
+    // One 32-byte pointer, at the block's first index only, and one object.
     assert_eq!(stored(&h, file, K).unwrap().len(), 32);
     assert_eq!(stored(&h, file, K + 1), None);
     let keys = h.store().keys();
@@ -245,7 +245,7 @@ fn a_block_round_trips() {
     assert_eq!(read.blocks.len(), 1);
     assert_eq!(read.blocks[0].block, block);
 
-    // Each segment opens on its own, from a ranged read.
+    // Each segment opens alone, from a ranged read.
     let http = plaintext_http();
     for (j, plain) in plains.iter().enumerate() {
         let j = j as u64;
@@ -262,7 +262,7 @@ fn a_block_round_trips() {
         assert!(opened[plain.len()..].iter().all(|&b| b == 0));
     }
 
-    // What the client holds at the block's seq is confirmed, not resent.
+    // What the client has at the block's seq is confirmed, not sent again.
     let again = h
         .runtime
         .block_on(remote.read_chunks(file, K, 2, &[seq, seq]))
@@ -270,8 +270,9 @@ fn a_block_round_trips() {
     assert!(again.chunks.iter().all(|c| c.unchanged));
     assert!(again.blocks.is_empty());
 
-    // Holding only some of the block's chunks fetches it once: what is
-    // held at its seq is still confirmed, the rest comes as segments.
+    // If the client has only some of the block's chunks, the block is
+    // fetched once: the chunks it has at the block's seq are confirmed, and
+    // the rest come as segments.
     let part = h
         .runtime
         .block_on(remote.read_chunks(file, K, 2, &[seq, 0]))
@@ -286,7 +287,8 @@ fn a_block_round_trips() {
     );
     assert_eq!(part.blocks.len(), 1);
 
-    // A seq the block has moved past is answered afresh, not confirmed.
+    // A seq that the block has moved past gets a new answer, not a
+    // confirmation.
     let stale = h
         .runtime
         .block_on(remote.read_chunks(file, K, 2, &[seq - 1, seq - 1]))
@@ -294,7 +296,7 @@ fn a_block_round_trips() {
     assert!(stale.chunks.iter().all(|c| !c.unchanged && c.seq == seq));
     assert_eq!(stale.blocks.len(), 1);
 
-    // Inline chunks and a block in one read, each answered as its own.
+    // Inline chunks and a block in one read, each answered separately.
     let mixed = h
         .runtime
         .block_on(remote.read_chunks(file, 0, 3, &[0, 0, seq]))
@@ -335,7 +337,7 @@ fn commits_are_checked() {
             .block_on(remote.prepare_uploads(file, &[BlockUpload { index, nseg }]))
     };
 
-    // Names only where a block starts, for a block's worth of segments.
+    // Names only where a block starts, for one block of segments.
     for (index, nseg) in [
         (K + 1, 1),
         (K - 1, 1),
@@ -347,7 +349,8 @@ fn commits_are_checked() {
     prepare(K2, TEST_BLOCK_CHUNKS as u32).unwrap();
 
     let block = upload(&h, remote, &node, file, K, &[vec![1; 10]]);
-    // A block anywhere but at a block's start, or inline data in a block.
+    // A block anywhere except at a block's start, or inline data in a
+    // block.
     assert_fs_errno(write(block_write(K + 1, block)), libc::EINVAL);
     assert_fs_errno(write(block_write(K - 1, block)), libc::EINVAL);
     let inline = seal_chunk(&node.key, node.record.version, file, K, b"x");
@@ -370,7 +373,7 @@ fn commits_are_checked() {
         )),
         libc::EINVAL,
     );
-    // Sealed under a version the file doesn't have.
+    // Sealed under a version that the file does not have.
     assert_fs_errno(
         write(block_write(
             K,
@@ -381,7 +384,7 @@ fn commits_are_checked() {
         )),
         libc::EKEYEXPIRED,
     );
-    // Named too long ago to commit, or not yet.
+    // Named too long ago to commit, or in the future.
     let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     for minted in [
         SystemTime::now() - Duration::from_secs(3600),
@@ -420,7 +423,7 @@ fn a_client_that_cant_read_blocks_is_refused_not_given_zeros() {
         h.runtime.block_on(old.read_chunks(file, K, 1, &[])),
         libc::ENOTSUP,
     );
-    // What it can read, it still can.
+    // It can still read what it could read before.
     let head = h
         .runtime
         .block_on(old.read_chunks(file, 0, 1, &[]))
@@ -471,26 +474,27 @@ fn truncating_trims_the_block_the_end_falls_in() {
     };
 
     // Into the block's second segment: two segments stay, the next block
-    // goes, with its object, and no new object is made.
+    // and its object are removed, and no new object is made.
     let puts = h.store().stats().puts;
     truncate((K + 1) * C + 10);
     assert_eq!(nseg(&h), Some(2));
     assert_eq!(stored(&h, file, K2), None);
     objects_settle_at(&h, 1);
     assert_eq!(h.store().stats().puts, puts);
-    // Grown again, the segments cut off read as holes, not as they were.
+    // After the file grows again, the segments that were cut read as holes,
+    // not as they were.
     truncate(K2 * C);
     assert_eq!(nseg(&h), Some(2));
     assert!(matches!(bodies()[1], ChunkBody::Segment { .. }));
     assert_eq!(bodies()[2..], [ChunkBody::Hole, ChunkBody::Hole]);
-    // To the block's start: the block goes.
+    // To the block's start: the block is removed.
     truncate(K * C);
     assert_eq!(nseg(&h), None);
     assert!(bodies().iter().all(|b| *b == ChunkBody::Hole));
     objects_settle_at(&h, 0);
 }
 
-/// Commits `plains` as the block at chunk `first` of `ino`, growing the
+/// Commits `plains` as the block at chunk `first` of `ino`, and grows the
 /// file to `end`.
 fn commit(
     h: &support::Harness,
@@ -534,14 +538,14 @@ fn a_mount_reads_blocks() {
     expected[at((K + 1) * C)..at((K + 1) * C + 100)].fill(2);
     expected[at(K2 * C)..].fill(3);
 
-    // Through a vault of its own, which has cached none of it...
+    // Through its own vault, which has nothing cached...
     let reader = vault(&h);
     let read = h
         .runtime
         .block_on(reader.read(file, 0, end as usize + 100))
         .unwrap();
     assert_eq!(read, expected);
-    // ...part-way into a block and out the other side...
+    // ...part way into a block and out the other side...
     let from = (K + 1) * C + 90;
     let part = h
         .runtime
@@ -567,7 +571,7 @@ fn a_read_fetches_only_the_segments_it_needs_once() {
         (now.gets - since.gets, now.bytes_read - since.bytes_read)
     };
 
-    // A few bytes of the third segment: that segment, alone.
+    // A few bytes of the third segment: only that segment.
     let reader = vault(&h);
     let before = h.store().stats();
     let got = h
@@ -587,14 +591,14 @@ fn a_read_fetches_only_the_segments_it_needs_once() {
     assert_eq!(got.len() as u64, TEST_BLOCK_CHUNKS * C);
     assert_eq!(fetched(&before), (1, TEST_BLOCK_CHUNKS * S));
 
-    // Again: all cached, confirmed with the server, nothing fetched.
+    // Again: all cached, confirmed with the server, and nothing fetched.
     let before = h.store().stats();
     h.runtime
         .block_on(fresh.read(file, K * C, (TEST_BLOCK_CHUNKS * C) as usize))
         .unwrap();
     assert_eq!(fetched(&before), (0, 0));
 
-    // Around a cached segment: the runs either side of it.
+    // Around a cached segment: the runs on each side of it.
     let before = h.store().stats();
     h.runtime
         .block_on(reader.read(file, K * C, (TEST_BLOCK_CHUNKS * C) as usize))
@@ -625,8 +629,8 @@ fn pattern(len: u64) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
 }
 
-/// How many segments the block at chunk `index` of `ino` holds, if
-/// there is one.
+/// How many segments the block at chunk `index` of `ino` holds, if there is
+/// a block.
 fn nseg(h: &support::Harness, ino: u64, index: u64) -> Option<u32> {
     stored(h, ino, index).map(|v| {
         assert_eq!(v.len(), 32, "a block pointer");
@@ -634,7 +638,7 @@ fn nseg(h: &support::Harness, ino: u64, index: u64) -> Option<u32> {
     })
 }
 
-/// `path` as a mount that has cached none of it reads it.
+/// Reads `path` as a mount with nothing cached.
 fn read_afresh(h: &support::Harness, name: &str) -> Vec<u8> {
     let other = h.second_mount();
     fs::read(other.path.join(name)).unwrap()
@@ -654,7 +658,7 @@ fn a_sequential_write_uploads_each_block_once() {
     assert_eq!(nseg(&h, file, K), Some(TEST_BLOCK_CHUNKS as u32));
     assert_eq!(nseg(&h, file, K2), Some(TEST_BLOCK_CHUNKS as u32));
     assert_eq!(nseg(&h, file, K2 + TEST_BLOCK_CHUNKS), Some(1));
-    // Nothing but pointers past the grid's start; the start, inline.
+    // Only pointers after the grid's start, and the start itself inline.
     assert_eq!(stored(&h, file, K + 1), None);
     assert!(stored(&h, file, K - 1).unwrap().len() > 32);
 
@@ -674,7 +678,7 @@ fn a_small_write_into_a_block_keeps_the_rest_of_it() {
     let at = (K + 1) * C + 100;
     let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
     file.write_all_at(&[0xee; 10], at).unwrap();
-    // And one spanning two segments.
+    // And one write that spans two segments.
     file.write_all_at(&[0xdd; 20], (K + 3) * C - 10).unwrap();
     file.sync_all().unwrap();
     drop(file);
@@ -684,7 +688,7 @@ fn a_small_write_into_a_block_keeps_the_rest_of_it() {
 
     assert_eq!(fs::read(&f).unwrap(), data);
     assert_eq!(read_afresh(&h, "f"), data);
-    // A new object for the block, and the ones it replaced deleted.
+    // A new object for the block, and the objects it replaced are deleted.
     assert!(h.store().stats().puts > puts);
     objects_settle_at(&h, objects);
 }
@@ -718,18 +722,19 @@ fn truncating_into_a_segment_then_growing_reads_zeros() {
     fs::write(&f, &data).unwrap();
     let file_ino = ino(&f);
 
-    // On a segment's boundary: the servers trim the block, no upload.
+    // On a segment's boundary: the servers trim the block, with no upload.
     let puts = h.store().stats().puts;
     let file = fs::OpenOptions::new().write(true).open(&f).unwrap();
     file.set_len((K + 3) * C).unwrap();
     assert_eq!(h.store().stats().puts, puts);
     assert_eq!(nseg(&h, file_ino, K), Some(3));
-    // Part-way into one: the block is rewritten with that segment cut.
+    // Part way into a segment: the block is rewritten with that segment
+    // cut.
     let cut = (K + 1) * C + 100;
     file.set_len(cut).unwrap();
     assert_eq!(h.store().stats().puts, puts + 1);
     assert_eq!(nseg(&h, file_ino, K), Some(2));
-    // Grown again, what was cut reads as zeros.
+    // After the file grows again, what was cut reads as zeros.
     file.set_len(K * C + B).unwrap();
     drop(file);
 
@@ -763,7 +768,8 @@ fn pruning_reseals_blocks_into_new_objects() {
     let data = pattern(K * C + B + 100);
     fs::write(v.join("big"), &data).unwrap();
     let big = ino(&v.join("big"));
-    // Granted and revoked: the volume's key rotates, big's is left stale.
+    // Granted and revoked: the volume's key rotates, and big's key is
+    // stale.
     h.add_user("alice");
     let mine = vault(&h);
     h.runtime
@@ -780,8 +786,8 @@ fn pruning_reseals_blocks_into_new_objects() {
     assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
     assert_eq!(stats.chunks, dry.chunks);
 
-    // Each block is a new object, under the key big has now, and the old
-    // ones are deleted.
+    // Each block is a new object, under big's new key, and the old objects
+    // are deleted.
     objects_settle_at(&h, objects);
     assert_eq!(h.store().stats().deleted, 2);
     for start in [K, K2] {
@@ -830,8 +836,8 @@ fn a_snapshot_keeps_what_prompt_deletion_would_take() {
     fs::write(&f, &data).unwrap();
     let file = ino(&f);
     h.snapshot("s");
-    // Rewritten -- the truncate dropping the block the snapshot holds --
-    // and then removed: of the three objects, only the snapshot's stays.
+    // Rewritten (the truncate drops the block that the snapshot holds),
+    // then removed: of the three objects, only the snapshot's stays.
     let mut grown = data.clone();
     grown.extend(pattern(B));
     fs::write(&f, &grown).unwrap();
@@ -843,7 +849,7 @@ fn a_snapshot_keeps_what_prompt_deletion_would_take() {
         h.runtime.block_on(then.read(file, 0, data.len())).unwrap(),
         data
     );
-    // Once the snapshot goes, the sweep can have it.
+    // After the snapshot is removed, the sweep can delete it.
     h.drop_snapshot("s");
     let core = h.gc_core();
     let mut gc = raft5fs_core::gc::Gc::default();
@@ -852,10 +858,11 @@ fn a_snapshot_keeps_what_prompt_deletion_would_take() {
     assert_eq!(sweep(&h, &core, &mut gc, first + WAIT).deleted, 1);
 }
 
-/// Past the commit window (a PUT URL's life, a transaction's, and clock
-/// skew), so nothing minted before a sweep then is too new to judge.
+/// Past the commit window (a PUT URL's lifetime, a transaction's lifetime,
+/// and clock skew), so nothing minted before a sweep at this time is too
+/// new to judge.
 const LATER: Duration = Duration::from_secs(3600);
-/// How long an object must go unreferenced between two sweeps.
+/// How long an object must have no pointer between two sweeps.
 const WAIT: Duration = Duration::from_secs(
     raft5fs_core::objects::DEFAULT_GET_TTL.as_secs() + raft5fs_core::gc::DELETE_MARGIN.as_secs(),
 );
@@ -869,8 +876,8 @@ fn sweep(
     h.runtime.block_on(core.gc_once(gc, at)).unwrap()
 }
 
-/// A file `f` holding one block, rewritten in part: its first object now
-/// unreferenced.
+/// A file `f` with one block, partly rewritten, so its first object has no
+/// pointer.
 fn file_with_garbage(h: &support::Harness) -> std::path::PathBuf {
     let f = h.path().join("f");
     fs::write(&f, pattern(K * C + B)).unwrap();
@@ -885,7 +892,7 @@ fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
     let h = support::setup_with_objects_no_prompt_delete();
     let f = file_with_garbage(&h);
     let expected = fs::read(&f).unwrap();
-    // An upload no commit ever named, and something not ours at all.
+    // An upload that no commit named, and an object that is not ours.
     let mine = vault(&h);
     let file = ino(&f);
     let node = h.runtime.block_on(mine.node(file)).unwrap();
@@ -896,20 +903,20 @@ fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
     let core = h.gc_core();
     let mut gc = raft5fs_core::gc::Gc::default();
     let now = SystemTime::now();
-    // At once, the two unreferenced objects are too new to judge.
+    // At first, the two objects with no pointer are too new to judge.
     let s = sweep(&h, &core, &mut gc, now);
     assert!(s.swept);
     assert_eq!(
         (s.referenced, s.listed, s.foreign, s.young, s.deleted),
         (1, 4, 1, 2, 0)
     );
-    // Later, they are candidates; not yet gone.
+    // Later, they are candidates, but not yet deleted.
     let first = now + LATER;
     let s = sweep(&h, &core, &mut gc, first);
     assert_eq!((s.waiting, s.deleted), (2, 0));
     let s = sweep(&h, &core, &mut gc, first + WAIT - Duration::from_secs(60));
     assert_eq!((s.waiting, s.deleted), (2, 0));
-    // Long enough after the first sweep to find them: gone.
+    // Long enough after the first sweep to find them: deleted.
     let s = sweep(&h, &core, &mut gc, first + WAIT);
     assert_eq!((s.waiting, s.deleted), (0, 2));
     assert_eq!(h.store().keys().len(), 2);
@@ -955,7 +962,7 @@ fn a_sweep_that_fails_deletes_nothing() {
     let h = support::setup_with_objects_no_prompt_delete();
     file_with_garbage(&h);
     let objects = h.store().keys().len();
-    // Can't list the bucket: its secret is wrong.
+    // It cannot list the bucket, because its secret is wrong.
     let broken = h.gc_core_with(|config| config.secret_key = "wrong".into());
     let mut gc = raft5fs_core::gc::Gc::default();
     let first = SystemTime::now() + LATER;
@@ -965,7 +972,7 @@ fn a_sweep_that_fails_deletes_nothing() {
     assert_eq!(h.store().keys().len(), objects);
     assert_eq!(h.store().stats().deleted, 0);
 
-    // A working one, once the broken one's lease has run out, does.
+    // A working collector can sweep after the broken one's lease runs out.
     let core = h.gc_core();
     let mut gc = raft5fs_core::gc::Gc::default();
     let later = first + WAIT * 2 + raft5fs_core::gc::LEASE_TTL;
@@ -984,7 +991,8 @@ fn one_server_sweeps_at_a_time() {
     let now = SystemTime::now();
     assert!(sweep(&h, &a, &mut ga, now).swept);
     assert!(!sweep(&h, &b, &mut gb, now).swept);
-    // The holder keeps it by sweeping; the other waits it out.
+    // The holder keeps the lease by sweeping, and the other collector waits
+    // for it to expire.
     let soon = now + Duration::from_secs(60);
     assert!(sweep(&h, &a, &mut ga, soon).swept);
     assert!(!sweep(&h, &b, &mut gb, soon).swept);

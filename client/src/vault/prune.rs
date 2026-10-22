@@ -1,25 +1,28 @@
-//! Pruning: sealing everything still under an old version of a node's key
-//! again under the current one, then dropping the old versions from the
+//! Pruning: seals everything still under an old version of a node's key
+//! again under the current version, then removes the old versions from the
 //! node's key history (raft5fs-crypto's `NodeKeys::pruned`).
 //!
-//! A rotation leaves what was sealed before it under the old version --
-//! readable, given the ciphertext, by whoever the rotation was meant to
-//! shut out. Pruning a tree puts it all under keys they never had.
+//! A rotation leaves data sealed before it under the old version. A user
+//! that the rotation was meant to shut out can still read it, if they have
+//! the ciphertext. Pruning a tree puts all of it under keys that they never
+//! had.
 //!
-//! Every node is pruned against its own key: a file's chunks are sealed
-//! under the file's key, a directory's entry names under the directory's.
-//! A directory's key also wraps its children's, and a stale child -- one
-//! still wrapped under an old version of its parent's key -- can only be
-//! opened through the parent's history. So a directory's stale children
-//! get new keys of their own (a rotation, never a re-wrap: whoever the
-//! parent's rotation shut out knows the child's key too) before the
-//! directory's history is cut. Each rotation adds an entry to that child's
-//! history, which the child's own visit then drops: the walk goes top
-//! down, so one pass over a tree is enough.
+//! - Each node is pruned against its own key: a file's chunks are sealed
+//!   under the file's key, and a directory's entry names under the
+//!   directory's key.
+//! - A directory's key also wraps its children's keys. A stale child (still
+//!   wrapped under an old version of its parent's key) can only be opened
+//!   through the parent's history. So the directory's stale children get
+//!   their own new keys before the directory's history is cut. This must be
+//!   a rotation, never a re-wrap, because a user shut out by the parent's
+//!   rotation also knows the child's key.
+//! - Each rotation adds an entry to the child's history, which the child's
+//!   own visit then removes. The walk goes from the top down, so one pass
+//!   over a tree is enough.
 //!
-//! The server refuses a prune that would drop a version anything is still
-//! sealed under (`EBUSY`), so a write landing under an old version while
-//! the walk runs can't be lost: the node is visited again.
+//! The server refuses a prune that would remove a version that anything is
+//! still sealed under (`EBUSY`). So a write under an old version during the
+//! walk is not lost: the node is visited again.
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -35,7 +38,7 @@ use raft5fs_proto::types::{
 use super::blocks::{BlockEdit, Rewritten};
 use super::{CHANGE_RETRIES, Node, Vault, changed, corrupt, expired, sealed_blob};
 
-/// What pruning a tree did -- or, for a dry run, would do.
+/// What pruning a tree did, or for a dry run, would do.
 #[derive(Debug, Default)]
 pub struct PruneStats {
     /// Nodes visited.
@@ -46,10 +49,10 @@ pub struct PruneStats {
     pub names: usize,
     /// Stale children given new keys.
     pub rotated: usize,
-    /// Key versions dropped from histories.
+    /// Key versions removed from histories.
     pub dropped: usize,
-    /// Nodes left as they were, and why. A directory skipped takes
-    /// everything under it with it.
+    /// Nodes not changed, and why. A skipped directory also skips
+    /// everything below it.
     pub skipped: Vec<(u64, FsError)>,
 }
 
@@ -64,7 +67,7 @@ impl PruneStats {
     }
 }
 
-/// A node for the walk to visit. `rotates`: a dry run's note that its
+/// A node for the walk to visit. `rotates` is a dry run's note that its
 /// parent's visit would have given it a new key.
 #[derive(Clone, Copy)]
 struct Visit {
@@ -73,8 +76,8 @@ struct Visit {
     rotates: bool,
 }
 
-/// A grant this account holds: what it shows up as, and whether it lets
-/// this account write -- which pruning takes.
+/// A grant that this account has: its label, and whether it lets this
+/// account write, which pruning needs.
 #[derive(Debug, Clone)]
 pub struct GrantRoot {
     pub label: OsString,
@@ -101,17 +104,17 @@ impl Vault {
             .collect())
     }
 
-    /// Prunes directory `top` and everything under it, top down. A node
-    /// that can't be pruned is skipped, with everything under it, and the
-    /// walk goes on. With `dry_run`, only counts what it would do.
+    /// Prunes directory `top` and everything below it, from the top down. A
+    /// node that cannot be pruned is skipped, with everything below it, and
+    /// the walk continues. With `dry_run`, it only counts what it would do.
     pub async fn prune_tree(&self, top: u64, dry_run: bool) -> PruneStats {
         self.prune_tree_paced(top, dry_run, Duration::ZERO, &mut |_| {})
             .await
     }
 
-    /// `prune_tree`, waiting `pace` after each node -- so that a prune in
-    /// the background leaves the store to whatever else is going on -- and
-    /// telling `progress` how far it has got after each.
+    /// `prune_tree` that waits `pace` after each node, so a background
+    /// prune leaves the store free for other work. After each node, it
+    /// tells `progress` how far it got.
     pub async fn prune_tree_paced(
         &self,
         top: u64,
@@ -132,7 +135,7 @@ impl Vault {
                     stats.add(node_stats);
                     queue.extend(children);
                 }
-                // Removed while the walk was on its way to it.
+                // Removed before the walk got to it.
                 Err(e) if e.errno == libc::ENOENT => {}
                 Err(e) => stats.skipped.push((ino, e)),
             }
@@ -144,9 +147,9 @@ impl Vault {
         stats
     }
 
-    /// Prunes one node, returning what it did and the node's children to
-    /// visit next. Done over from the start when something changed under
-    /// it -- a write, a rotation, a new entry under an old key.
+    /// Prunes one node, and returns what it did and the node's children to
+    /// visit next. It starts again if something changed under it: a write,
+    /// a rotation, or a new entry under an old key.
     async fn prune_node(
         &self,
         visit: Visit,
@@ -177,14 +180,14 @@ impl Vault {
         let node = if dry_run {
             self.refresh(ino).await?
         } else {
-            // Whatever above it is stale gets new keys first, this too.
+            // Stale nodes above it, and this node, get new keys first.
             let node = self.freshen(ino).await?;
             node.sealable(ino)?;
             node
         };
-        // A dry run rotates nothing, so it reckons with the rotation its
-        // parent's visit would have given this node: a version on, with
-        // everything sealed so far under an old one.
+        // A dry run rotates nothing, so it counts the rotation that its
+        // parent's visit would have given this node: one version higher,
+        // with everything sealed so far under an old version.
         let imagined = dry_run && visit.rotates;
         let target = node.record.version + u32::from(imagined);
         let mut children = Vec::new();
@@ -230,8 +233,8 @@ impl Vault {
             Kind::File => stats.chunks = self.reseal_chunks(ino, &node, target, dry_run).await?,
         }
 
-        // The record as it is now, which a rotation of a child may have
-        // left newer than `node` -- the server says if it no longer is.
+        // Read the record as it is now. A child's rotation may have made it
+        // newer than `node`. The server says if it changed.
         self.nodes.lock().unwrap().remove(&ino);
         let current = self.node(ino).await?;
         let record = &current.record;
@@ -246,10 +249,10 @@ impl Vault {
         Ok((stats, children))
     }
 
-    /// Seals every chunk of file `ino` under a version of its key before
-    /// `target` again under the current one, `node`'s, a write batch at a
-    /// time. Returns how many there were. (Only a dry run's `target` is
-    /// ever past the current version: see `prune_node_once`.)
+    /// Seals every chunk of file `ino` that is under a key version before
+    /// `target` again under the current version (`node`'s), one write batch
+    /// at a time. Returns how many chunks there were. Only a dry run's
+    /// `target` can be past the current version (see `prune_node_once`).
     async fn reseal_chunks(
         &self,
         ino: u64,
@@ -264,7 +267,8 @@ impl Vault {
             Some(grid) if self.layout(ino).await? == Layout::Hybrid => Some(grid),
             _ => None,
         };
-        // Blocks seen, by first index: each is resealed whole, once.
+        // Blocks seen, by first index. Each block is sealed again whole,
+        // one time.
         let mut blocks_seen = HashSet::new();
         let mut count = 0;
         let mut first = 0;
@@ -320,7 +324,7 @@ impl Vault {
             }
             if !writes.is_empty() {
                 self.remote.reseal_chunks(ino, &writes).await?;
-                // The same bytes, but at a new seq.
+                // The same bytes, at a new seq.
                 let mut cache = self.cache.lock().unwrap();
                 for w in &writes {
                     cache.invalidate(self.space, ino, w.index..=w.index);
@@ -335,9 +339,9 @@ impl Vault {
     }
 }
 
-/// Entry `item` of directory `dir` -- as the server lists it, by tag --
-/// its name, sealed under an older version of `node`'s key, opened and
-/// sealed again under the current one.
+/// Opens the name of entry `item` of directory `dir` (as the server lists
+/// it, by tag), sealed under an older version of `node`'s key, and seals it
+/// again under the current version.
 fn reseal_name(node: &Node, dir: u64, item: &DirItem) -> Result<ResealedName, FsError> {
     let version = sealed_version(&item.sealed_name).map_err(|e| corrupt(dir, e))?;
     let key = node.key_at(dir, version)?;

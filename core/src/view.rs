@@ -1,11 +1,10 @@
-//! Reading the store as it is now, or as it was at a snapshot.
-//!
-//! A snapshot (see `snapshots`) pins a moment of the whole store, and the
-//! read-only operations can be asked of it instead of the present: every
-//! read they make -- the Entry, the dirents, the chunks, and the grants and
-//! key records access is decided by -- goes through a `View`, so one asked
-//! at a snapshot sees the filesystem exactly as it stood then, consistent
-//! with itself whatever has changed since.
+//! Reads the store as it is now, or as it was at a snapshot. A snapshot
+//! (see `snapshots`) keeps one moment of the whole store. The read-only
+//! operations can read a snapshot in place of the present. Every read they
+//! make goes through a `View`: the Entry, the dirents, the chunks, and the
+//! grants and key records that control access. So a read at a snapshot sees
+//! the filesystem exactly as it was then, consistent with itself, whatever
+//! changed after.
 
 use std::future::Future;
 
@@ -16,29 +15,31 @@ use raft5_shared::MAX_KEYS_PER_READ;
 
 use crate::timing;
 
-/// Reading the store, any number of keys at a time. `read_some` and
-/// `read_versions_some` are one call each, as the store answers it;
-/// everything else is built on them.
+/// Reads the store, any number of keys at a time. `read_some` and
+/// `read_versions_some` are each one store call. Everything else is built
+/// on them.
 pub(crate) trait ReadKeys: Sync {
-    /// Up to `MAX_KEYS_PER_READ` keys' entries, in order, all as of one
-    /// moment -- possibly only a prefix of them, never an empty one, when
-    /// the values would pass the store's budget for one answer.
+    /// Reads up to `MAX_KEYS_PER_READ` keys' entries, in order, all from
+    /// one moment. If the values would go over the store's limit for one
+    /// answer, it can return only the first part of them, but never
+    /// nothing.
     fn read_some<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
     ) -> impl Future<Output = Result<Vec<Entry>, KvError>> + Send;
 
-    /// Up to `MAX_KEYS_PER_READ` keys' seqs (0 for one with no value), in
-    /// order. Never cut short: no value is read.
+    /// Reads up to `MAX_KEYS_PER_READ` keys' seqs (0 for a key with no
+    /// value), in order. It reads no values, so it is never cut short.
     fn read_versions_some<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
     ) -> impl Future<Output = Result<Vec<u64>, KvError>> + Send;
 
-    /// Every one of `keys`' entries, in order, in as few calls as the
-    /// store's limits allow. Each call is one moment, but a read needing
-    /// several is several moments unless it is in a transaction or at a
-    /// snapshot -- no weaker than reading the keys one at a time.
+    /// Reads every one of `keys`' entries, in order, in as few calls as the
+    /// store's limits allow. Each call reads one moment. A read that needs
+    /// several calls reads several moments, unless it is in a transaction
+    /// or at a snapshot. That is no weaker than reading the keys one at a
+    /// time.
     fn read_many<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
@@ -54,7 +55,8 @@ pub(crate) trait ReadKeys: Sync {
         }
     }
 
-    /// Every one of `keys`' seqs, in order, as `read_many` reads values.
+    /// Reads every one of `keys`' seqs, in order, as `read_many` reads
+    /// values.
     fn read_versions_many<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
@@ -73,15 +75,15 @@ pub(crate) trait ReadKeys: Sync {
         None
     }
 
-    /// One key's entry: its value, and the seq it was written at (0 and
-    /// no value if it has none).
+    /// Reads one key's entry: its value, and the seq it was written at (0
+    /// and no value if it has none).
     fn read_one(&self, key: &[u8]) -> impl Future<Output = Result<Entry, KvError>> + Send {
         async move { Ok(only(self.read_some(&[key]).await?)) }
     }
 }
 
-/// The one entry a read of one key answers with. The client refuses an
-/// empty answer to a non-empty read, so there always is one.
+/// The one entry that a read of one key returns. The client refuses an
+/// empty answer to a read that is not empty, so there is always one.
 fn only<T>(mut entries: Vec<T>) -> T {
     entries.pop().expect("a read of one key answers it")
 }
@@ -90,7 +92,7 @@ fn seqs(versions: Vec<Version>) -> Vec<u64> {
     versions.into_iter().map(|v| v.seq).collect()
 }
 
-/// Possibly-stale reads of the live store.
+/// Reads of the live store, which can be stale.
 impl ReadKeys for Client {
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
         let read = self.read(keys, Consistency::Stale);
@@ -106,7 +108,7 @@ impl ReadKeys for Client {
     }
 }
 
-/// Reads that hold every key for the rest of the transaction.
+/// Reads that hold every key until the transaction ends.
 impl ReadKeys for Transaction {
     async fn read_some<K: AsRef<[u8]> + Sync>(&self, keys: &[K]) -> Result<Vec<Entry>, KvError> {
         let read = self.read(keys);
@@ -134,9 +136,9 @@ impl<'a> View<'a> {
         Self { client, at: None }
     }
 
-    /// Snapshot `id`, which the caller has checked exists: the store
-    /// retries a read at an unknown one until its deadline, rather than
-    /// saying so.
+    /// Reads at snapshot `id`. The caller must first check that it exists,
+    /// because the store retries a read at an unknown snapshot until its
+    /// deadline and does not report it.
     pub(crate) fn at(client: &'a Client, id: &'a [u8]) -> Self {
         Self {
             client,

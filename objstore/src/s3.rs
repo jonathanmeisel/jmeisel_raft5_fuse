@@ -1,5 +1,5 @@
-//! The filesystem servers' side of the object store: signing what mounts
-//! may do, and listing and deleting for garbage collection.
+//! The filesystem servers' side of the object store: it signs what mounts
+//! can do, and lists and deletes objects for garbage collection.
 
 use std::time::Duration;
 
@@ -9,27 +9,29 @@ use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use crate::name::{ObjectName, validate_prefix};
 use crate::{Error, status_error};
 
-/// How long the URLs for the server's own requests (listing, deleting)
-/// stay valid: they are used at once, so this only has to absorb clock
-/// skew between the server and the store.
+/// How long the URLs for the server's own requests (list, delete) stay
+/// valid. The server uses them at once, so this only needs to allow for
+/// clock differences between the server and the store.
 const CONTROL_TTL: Duration = Duration::from_secs(300);
 
-/// The most keys one `DeleteObjects` request may carry, S3's limit.
+/// The most keys that one `DeleteObjects` request can send. This is S3's
+/// limit.
 const DELETE_BATCH: usize = 1000;
 
 /// Where a filesystem's objects are, and the credentials to sign with.
 #[derive(Clone)]
 pub struct S3Config {
-    /// The store's base URL, e.g. `https://s3.eu-west-1.amazonaws.com`.
+    /// The store's base URL, for example
+    /// `https://s3.eu-west-1.amazonaws.com`.
     pub endpoint: String,
     pub bucket: String,
     pub region: String,
-    /// Address the bucket as `endpoint/bucket/` rather than
-    /// `bucket.endpoint/`: what MinIO and most self-hosted stores need.
+    /// Address the bucket as `endpoint/bucket/`, not `bucket.endpoint/`.
+    /// MinIO and most self-hosted stores need this.
     pub path_style: bool,
     pub access_key: String,
     pub secret_key: String,
-    /// What every object key starts with (see `name::validate_prefix`).
+    /// The start of every object key (see `name::validate_prefix`).
     pub prefix: String,
 }
 
@@ -46,8 +48,8 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
-/// One object a listing found. `name` is `None` for a key under the
-/// prefix that isn't one of ours, which nothing here will delete.
+/// One object that a listing found. `name` is `None` for a key under the
+/// prefix that is not one of ours. Nothing here deletes such a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     pub key: String,
@@ -72,7 +74,7 @@ impl std::fmt::Debug for S3Store {
 }
 
 impl S3Store {
-    /// `http` makes the server's own requests (see `http::client`).
+    /// `http` sends the server's own requests (see `http::client`).
     pub fn new(config: &S3Config, http: reqwest::Client) -> Result<Self, Error> {
         validate_prefix(&config.prefix)?;
         let endpoint = config
@@ -103,7 +105,7 @@ impl S3Store {
         &self.prefix
     }
 
-    /// A URL reading `name`'s object, any range of it, for `ttl`.
+    /// A URL that reads any range of `name`'s object, valid for `ttl`.
     pub fn presign_get(&self, name: &ObjectName, ttl: Duration) -> String {
         let key = name.key(&self.prefix);
         self.bucket
@@ -112,11 +114,11 @@ impl S3Store {
             .into()
     }
 
-    /// A URL creating `name`'s object, exactly `len` bytes of it, for
-    /// `ttl`. It signs the length and `If-None-Match: *`, so the store
-    /// refuses any other size and any second upload: an object, once
-    /// there, is the one its name will always mean. `http::put` sends
-    /// both headers.
+    /// A URL that creates `name`'s object, exactly `len` bytes long, valid
+    /// for `ttl`. It signs the length and `If-None-Match: *`, so the store
+    /// refuses any other size and any second upload. So after an object is
+    /// stored, its name always means that object. `http::put` sends both
+    /// headers.
     pub fn presign_put(&self, name: &ObjectName, len: u64, ttl: Duration) -> String {
         let key = name.key(&self.prefix);
         let mut action = self.bucket.put_object(Some(&self.credentials), &key);
@@ -157,9 +159,10 @@ impl S3Store {
         }
     }
 
-    /// Deletes the objects `names` name. Only names: a key under the
-    /// prefix that doesn't parse as one isn't ours to delete. Deleting
-    /// an object that isn't there succeeds, so this is safe to repeat.
+    /// Deletes the objects that `names` name. It takes only names: a key
+    /// under the prefix that does not parse as a name is not ours to
+    /// delete. Deleting an object that is not there succeeds, so this is
+    /// safe to repeat.
     pub async fn delete(&self, names: &[ObjectName]) -> Result<(), Error> {
         let mut failures = Vec::new();
         for batch in names.chunks(DELETE_BATCH) {
@@ -168,7 +171,7 @@ impl S3Store {
                 .map(|n| ObjectIdentifier::new(n.key(&self.prefix)))
                 .collect();
             let mut action = DeleteObjects::new(&self.bucket, Some(&self.credentials), ids.iter());
-            // Answer with failures only.
+            // Ask the store to report only failures.
             action.set_quiet(true);
             let url = action.sign(CONTROL_TTL);
             let (body, md5) = action.body_with_md5();

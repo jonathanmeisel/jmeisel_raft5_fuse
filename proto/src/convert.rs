@@ -1,7 +1,7 @@
-//! Between the shared types and their wire form. Kept beside both so the
-//! server and the client convert the same way. A response missing the
-//! field it must carry decodes as `EIO`: the server always sets one, so
-//! that only happens across incompatible versions.
+//! Converts between the shared types and their wire form. The code is next
+//! to both, so the server and the client convert the same way. A response
+//! without a required field decodes as `EIO`. The server always sets the
+//! field, so this happens only between versions that do not work together.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -18,8 +18,8 @@ fn malformed(what: &str) -> FsError {
     FsError::new(libc::EIO, format!("malformed response: no {what}"))
 }
 
-/// A request field that can't mean anything: what the server answers when
-/// a client sends one.
+/// The error that the server returns for a request field with no valid
+/// meaning.
 fn invalid(what: &str) -> FsError {
     FsError::new(libc::EINVAL, format!("malformed request: {what}"))
 }
@@ -149,7 +149,7 @@ fn random(bytes: &[u8]) -> Option<[u8; BLOCK_RANDOM_LEN]> {
     bytes.try_into().ok()
 }
 
-/// A `BlockRef` off the wire, or `None` if its name is the wrong length.
+/// Decodes a `BlockRef`. Returns `None` if its name has the wrong length.
 fn block_ref(b: pb::BlockRef) -> Option<BlockRef> {
     Some(BlockRef {
         version: b.version,
@@ -162,14 +162,15 @@ fn block_ref(b: pb::BlockRef) -> Option<BlockRef> {
 const AUTHORIZATION: &str = "authorization";
 const BEARER: &str = "Bearer ";
 
-/// Records a session token in a request's metadata.
+/// Puts a session token in a request's metadata.
 pub fn session_to_metadata(token: &str, metadata: &mut tonic::metadata::MetadataMap) {
     if let Ok(value) = format!("{BEARER}{token}").parse() {
         metadata.insert(AUTHORIZATION, value);
     }
 }
 
-/// The session token `session_to_metadata` recorded, if any.
+/// The session token that `session_to_metadata` put in the metadata, if
+/// any.
 pub fn session_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
     metadata
         .get(AUTHORIZATION)?
@@ -254,13 +255,13 @@ impl From<pb::DirItem> for DirItem {
     }
 }
 
-/// A name as it travels.
+/// A name in its wire form.
 pub fn name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     name.as_bytes().to_vec()
 }
 
-// -- responses: server side builds them from results, client side takes
-// -- them apart again.
+// -- Responses: the server builds them from results, and the client takes
+// them apart again. --
 
 impl From<Result<Attr, FsError>> for pb::AttrResponse {
     fn from(r: Result<Attr, FsError>) -> Self {
@@ -635,8 +636,8 @@ impl From<Result<Chunks, FsError>> for pb::ReadChunksResponse {
 }
 
 impl pb::ReadChunksResponse {
-    /// The file's attributes, the chunks read and the blocks they are in.
-    /// Every segment names a block in the list.
+    /// The file's attributes, the chunks read, and the blocks that hold
+    /// them. Every segment names a block in the list.
     pub fn into_result(self) -> Result<Chunks, FsError> {
         use pb::read_chunks_response::Result as R;
         use pb::sealed_chunk::Body;
@@ -661,8 +662,8 @@ impl pb::ReadChunksResponse {
                     .into_iter()
                     .map(|c| {
                         let body = match c.body {
-                            // An empty blob was how a hole went before
-                            // `body` was a oneof.
+                            // An older server sends a hole as an empty
+                            // blob, with no `body`.
                             None => ChunkBody::Hole,
                             Some(Body::Blob(blob)) if blob.is_empty() => ChunkBody::Hole,
                             Some(Body::Blob(blob)) => ChunkBody::Inline(blob),
@@ -710,7 +711,7 @@ impl From<Result<(Attr, u64), FsError>> for pb::WriteChunksResponse {
 }
 
 impl pb::WriteChunksResponse {
-    /// The file's attributes, and the seq the chunks written are now at.
+    /// The file's attributes, and the seq of the chunks written.
     pub fn into_result(self) -> Result<(Attr, u64), FsError> {
         use pb::write_chunks_response::Result as R;
         match self.result {
@@ -740,9 +741,9 @@ impl From<ChunkWrite> for pb::ChunkWrite {
 impl TryFrom<pb::ChunkWrite> for ChunkWrite {
     type Error = FsError;
 
-    /// `EINVAL` for a block whose name is the wrong length. A write with
-    /// no body at all is an empty chunk, which nothing stores (its seal
-    /// is missing).
+    /// Returns `EINVAL` for a block whose name has the wrong length. A
+    /// write with no body is an empty chunk, which nothing stores, because
+    /// it has no seal.
     fn try_from(c: pb::ChunkWrite) -> Result<Self, FsError> {
         use pb::chunk_write::Body;
         Ok(Self {
@@ -799,7 +800,7 @@ impl From<Result<Vec<PreparedUpload>, FsError>> for pb::PrepareUploadsResponse {
 }
 
 impl pb::PrepareUploadsResponse {
-    /// One upload per block asked for, in the same order.
+    /// One upload for each block asked for, in the same order.
     pub fn into_result(self) -> Result<Vec<PreparedUpload>, FsError> {
         use pb::prepare_uploads_response::Result as R;
         match self.result {
@@ -1043,7 +1044,7 @@ mod tests {
 
     #[test]
     fn an_empty_blob_is_a_hole() {
-        // As an older server sends one.
+        // A response as an older server sends it.
         let wire = pb::ReadChunksResponse {
             result: Some(pb::read_chunks_response::Result::List(pb::ChunkList {
                 attr: Some(attr().into()),

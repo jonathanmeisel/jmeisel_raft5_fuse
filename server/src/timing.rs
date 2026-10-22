@@ -1,11 +1,9 @@
-//! Timing every request: how long it took to handle, and how much of
-//! that went on the store (see `raft5fs_core::timing`).
-//!
-//! Each request runs in an `rpc` span named for its method, so whatever
-//! core logs while handling it says which request it was for, and ends
-//! with one `info` line saying where its time went. The same goes back
-//! to the client in `raft5fs_proto::timing::HEADER`, if the server is
-//! told to send it.
+//! Times every request: how long it took to handle, and how much of that
+//! went to the store (see `raft5fs_core::timing`). Each request runs in an
+//! `rpc` span named for its method, so all core logs during the request say
+//! which request they are for. The span ends with one `info` line that says
+//! where the time went. If the server is told to, it also sends this to the
+//! client in `raft5fs_proto::timing::HEADER`.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -20,11 +18,11 @@ use tonic::codegen::http::{HeaderValue, Request, Response};
 use tonic::server::NamedService;
 use tracing::Instrument;
 
-/// `S`, with every request it answers timed.
+/// Wraps `S` and times every request that it answers.
 #[derive(Clone)]
 pub struct Timed<S> {
     inner: S,
-    /// Whether answers carry the timing back to the client.
+    /// Whether responses send the timing back to the client.
     header: bool,
 }
 
@@ -52,7 +50,7 @@ where
     }
 
     fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
-        // `/raft5fs.Fs/Lookup` is `Lookup`.
+        // The span name for `/raft5fs.Fs/Lookup` is `Lookup`.
         let path = request.uri().path();
         let method = path.rsplit('/').next().unwrap_or(path).to_string();
         let span = tracing::info_span!("rpc", method);

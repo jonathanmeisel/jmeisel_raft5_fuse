@@ -1,12 +1,12 @@
-//! The FUSE front end: turns kernel requests into calls to the session
-//! (see `raft5fs_client::session`), which holds everything a front end
-//! shares -- the write buffers, the virtual root, `/.snapshot`. What stays
-//! here is what belongs to the kernel's side: attributes as the kernel
-//! wants them, open flags and access masks, rename flags, and errnos.
+//! The FUSE front end: turns kernel requests into calls to the session (see
+//! `raft5fs_client::session`). The session holds everything that front ends
+//! share: the write buffers, the virtual root, and `/.snapshot`. This
+//! module keeps what belongs to the kernel's side: attributes in the
+//! kernel's form, open flags and access masks, rename flags, and errnos.
 //!
-//! There are no owners in the filesystem: access goes by grants. A mount
-//! shows the local user who made it as the owner of everything, and
-//! refuses to give anything to anyone else.
+//! The filesystem has no owners: grants control access. A mount shows the
+//! local user who made it as the owner of everything, and refuses to give
+//! anything to anyone else.
 
 use std::ffi::OsStr;
 use std::sync::{Arc, OnceLock};
@@ -29,20 +29,20 @@ use tonic::transport::ClientTlsConfig;
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// The block size `statfs` counts in.
+/// The block size that `statfs` counts in.
 const BLOCK_SIZE: u32 = 4096;
 
 fn errno(e: &FsError) -> Errno {
-    // Not a kernel's errno: the session retries on it, and it should
-    // never get this far.
+    // Not a kernel errno: the session retries on it, so it should never get
+    // here.
     if e.errno == raft5fs_proto::errno::EKEYEXPIRED {
         return Errno::EIO;
     }
     Errno::from_i32(e.errno)
 }
 
-/// The access an open with `flags` asks for, as an access(2) mask.
-/// `O_TRUNC` needs write access even on a read-only open.
+/// The access that an open with `flags` asks for, as an access(2) mask.
+/// `O_TRUNC` needs write access, even on a read-only open.
 fn open_mask(flags: OpenFlags) -> u32 {
     let mut mask = match flags.0 & libc::O_ACCMODE {
         libc::O_RDONLY => libc::R_OK,
@@ -69,11 +69,11 @@ fn set_time(t: TimeOrNow) -> SetTime {
     }
 }
 
-/// Whether a rename with `flags` must not replace its target, or `None`
-/// if it asks for something unsupported. Only Linux has flags to give.
+/// Whether a rename with `flags` must not replace its target, or `None` if
+/// it asks for something not supported. Only Linux has flags to give.
 #[cfg(target_os = "linux")]
 fn noreplace(flags: RenameFlags) -> Option<bool> {
-    // Exchanging two names isn't supported.
+    // Exchanging two names is not supported.
     (flags - RenameFlags::RENAME_NOREPLACE)
         .is_empty()
         .then(|| flags.contains(RenameFlags::RENAME_NOREPLACE))
@@ -86,11 +86,11 @@ fn noreplace(flags: RenameFlags) -> Option<bool> {
 
 pub struct Raft5Fs {
     rt: Handle,
-    /// How `init` opens the session; taken when it does.
+    /// How `init` opens the session. `init` takes it.
     config: Option<SessionConfig>,
     /// Opened by `init`, before the kernel sends any other request.
     session: OnceLock<Arc<Session>>,
-    /// Who everything seems to belong to: the local user who mounted it.
+    /// The owner that everything shows: the local user who mounted it.
     uid: u32,
     gid: u32,
 }
@@ -100,7 +100,7 @@ impl Raft5Fs {
         Self::with_config(SessionConfig::new(servers, credentials), rt)
     }
 
-    /// A mount of the session `config` opens.
+    /// A mount of the session that `config` opens.
     pub fn with_config(config: SessionConfig, rt: Handle) -> Self {
         Self {
             rt,
@@ -115,21 +115,21 @@ impl Raft5Fs {
         self.config.as_mut().expect("configured before init")
     }
 
-    /// Reaches the servers over TLS, as `tls` says.
+    /// Connects to the servers over TLS, as `tls` says.
     pub fn with_tls(mut self, tls: ClientTlsConfig) -> Self {
         self.config().tls = Some(tls);
         self
     }
 
-    /// Pins public keys in `known` -- whose pins also decide which grants
-    /// this mount trusts enough to write under -- rather than in memory.
+    /// Pins public keys in `known`, not in memory. The pins also decide
+    /// which grants this mount trusts enough to write under.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.config().known_keys = Some(known);
         self
     }
 
-    /// Works through `queue` in the background while mounted, as `config`
-    /// paces it (see `pruner`).
+    /// Works through `queue` in the background while mounted, at the pace
+    /// that `config` sets (see `pruner`).
     pub fn with_prune_queue(mut self, queue: PruneQueue, config: PrunerConfig) -> Self {
         self.config().prune_queue = Some((queue, config));
         self
@@ -142,7 +142,7 @@ impl Raft5Fs {
     }
 
     /// Caches up to `bytes` of decrypted file data (`DEFAULT_CACHE_BYTES`
-    /// unless told otherwise; 0 caches none).
+    /// by default; 0 disables the cache).
     pub fn with_cache_size(mut self, bytes: usize) -> Self {
         self.config().cache_bytes = bytes;
         self
@@ -154,9 +154,9 @@ impl Raft5Fs {
             .expect("the kernel sends no request before init")
     }
 
-    /// Runs `fut` to completion on this fuse thread. Blocks it for the
-    /// round trips -- fine (that's what `n_threads` > 1 is for: an
-    /// unrelated file's operations don't queue up behind it).
+    /// Runs `fut` to completion on this fuse thread. It blocks the thread
+    /// for the round trips. That is acceptable, because `n_threads` > 1
+    /// means that operations on other files do not wait behind it.
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
         self.rt.block_on(fut)
     }
@@ -181,9 +181,10 @@ impl Raft5Fs {
         }
     }
 
-    /// Whether `uid`/`gid` would hand something to someone other than the
-    /// mount's user, which can't be done: there are no owners to change.
-    /// Asking for the mount's own user changes nothing, and is fine.
+    /// Whether `uid`/`gid` would give something to a user other than the
+    /// mount's user. That is not possible, because there are no owners to
+    /// change. Asking for the mount's own user changes nothing, and is
+    /// allowed.
     fn foreign_owner(&self, uid: Option<u32>, gid: Option<u32>) -> bool {
         uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid)
     }
@@ -218,9 +219,9 @@ fn reply_opened(reply: ReplyOpen, result: Result<(), FsError>) {
 }
 
 impl Filesystem for Raft5Fs {
-    /// Opens the session -- connecting, logging in and opening the
-    /// account's keys -- before any other method runs: this is the one
-    /// call with `&mut self`.
+    /// Opens the session (connects, logs in, and opens the account's keys)
+    /// before any other method runs. This is the only call with `&mut
+    /// self`.
     fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
         let config = self.config.take().expect("init runs once");
         let session = self.block(Session::open(config)).map_err(|e| {
@@ -304,8 +305,8 @@ impl Filesystem for Raft5Fs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // `EINVAL` is what the kernel expects from a filesystem without
-        // what the flags ask for.
+        // The kernel expects `EINVAL` from a filesystem that does not
+        // support what the flags ask for.
         let Some(noreplace) = noreplace(flags) else {
             return reply.error(Errno::EINVAL);
         };
@@ -315,7 +316,7 @@ impl Filesystem for Raft5Fs {
         reply_empty(reply, self.block(renamed));
     }
 
-    /// No handle is needed: nothing checks the mode -- grants decide.
+    /// No handle is needed: nothing checks the mode, because grants decide.
     fn create(
         &self,
         _req: &Request,
@@ -346,7 +347,7 @@ impl Filesystem for Raft5Fs {
         );
     }
 
-    /// As `open`, for `opendir(3)`.
+    /// Same as `open`, for `opendir(3)`.
     fn opendir(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         reply_opened(
             reply,
@@ -354,9 +355,9 @@ impl Filesystem for Raft5Fs {
         );
     }
 
-    /// Mounted without `default_permissions`, the kernel checks nothing
-    /// itself and asks here instead. Answering is what makes access(2) --
-    /// and so `test -w` -- agree with what the servers will actually allow.
+    /// The mount does not use `default_permissions`, so the kernel checks
+    /// nothing itself and asks here. This answer makes access(2), and so
+    /// `test -w`, agree with what the servers allow.
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         reply_empty(
             reply,
@@ -424,7 +425,7 @@ impl Filesystem for Raft5Fs {
         reply_empty(reply, self.block(self.session().fsync(ino.0)));
     }
 
-    /// Best-effort, since `close()` never sees what `release` returns.
+    /// Best effort, because `close()` never sees what `release` returns.
     fn release(
         &self,
         _req: &Request,

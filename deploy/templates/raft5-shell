@@ -1,7 +1,7 @@
 #!/bin/sh
 # raft5-shell: the raft5 store's admin shell (`raft`), logged in as the
-# store's administrator, through this node. Run as root. It asks for
-# admin's password.
+# store's administrator, through this node. Run as root. It asks for admin's
+# password.
 exec /usr/local/bin/raft --nodes https://@WG_IP@:27051 \
     --ca-cert /etc/raft5/internal-ca.pem \
     --cert /etc/raft5/node.pem --key /etc/raft5/node.key \

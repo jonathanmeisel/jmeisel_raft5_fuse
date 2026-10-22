@@ -1,6 +1,6 @@
-//! How the filesystem is laid out in the KV store, and the size limits
-//! that layout has to respect. Pure functions only: nothing here talks to
-//! the store, so all of it can be tested without a cluster.
+//! How the filesystem is laid out in the KV store, and the size limits that
+//! the layout must respect. Only pure functions: nothing here talks to the
+//! store, so all of it can be tested without a cluster.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -11,93 +11,90 @@ use raft5fs_proto::types::{BLOCK_RANDOM_LEN, BlockRef};
 pub(crate) const ROOT_INO: u64 = 1;
 pub(crate) const COUNTER_KEY: &[u8] = b"\x04next_ino";
 
-/// Keys deleted per transaction when tearing down a file's chunks. Each
-/// buffered write is its own round trip, so this bounds how long one
-/// transaction stays open against its (absolute, 15 s maximum) deadline.
+/// Keys deleted in each transaction when a file's chunks are removed. Each
+/// buffered write is its own round trip, so this limits how long one
+/// transaction stays open against its deadline (at most 15 s).
 pub(crate) const DELETE_BATCH: usize = 256;
 
-/// Records the chunk size a filesystem was created with, so later mounts
-/// adopt it rather than reinterpreting every chunk boundary.
+/// Records the chunk size that the filesystem was created with, so later
+/// mounts use it and do not misread every chunk boundary.
 pub const CHUNK_SIZE_KEY: &[u8] = b"\x04chunk_size";
 
-/// Records the object grid hybrid files are laid out by (see `objects`),
-/// once a server with object storage has opened the filesystem.
+/// Records the object grid that hybrid files use (see `objects`), after a
+/// server with object storage opens the filesystem.
 pub(crate) const OBJECT_GRID_KEY: &[u8] = b"\x04object_grid";
 
-/// Who sweeps object storage for garbage, until when (see `gc`).
+/// Which server sweeps object storage for garbage, and until when (see
+/// `gc`).
 pub(crate) const GC_LEASE_KEY: &[u8] = b"\x04gc_lease";
 
-/// Marks a store as holding a filesystem in this raft5fs's format (one
-/// byte, `STORE_FORMAT`). An older raft5fs's store has a root but no such
-/// key, or another byte here -- 0 for an unencrypted one, 1 for one whose
-/// grants, names and grantees aren't sealed the way this one's are --
-/// which this one refuses (see `check_store`).
+/// Marks a store as holding a filesystem in this raft5fs format (one byte,
+/// `STORE_FORMAT`). This raft5fs refuses a store with a root but no such
+/// key, or with another byte here (see `check_store`). 0 means an
+/// unencrypted store, and 1 means a store whose grants, names, and grantees
+/// are not sealed as this version seals them.
 pub const ENCRYPTED_KEY: &[u8] = b"\x04encrypted";
 
-/// The format `ENCRYPTED_KEY` records.
+/// The format that `ENCRYPTED_KEY` records.
 pub const STORE_FORMAT: u8 = 2;
 
 pub const DEFAULT_CHUNK_SIZE: u64 = 1 << 20;
 pub const MIN_CHUNK_SIZE: u64 = 4096;
-/// The largest chunk we will create. A chunk has to fit in one
-/// transaction along with the attributes even when it is the only one in
-/// its batch (see `chunks_per_batch`), and a read of it has to fit in one
-/// gRPC message. 8 MiB clears both with room to spare; the largest power
-/// of two under `MAX_TRANSACTION_BYTES`.
+/// The largest chunk size. A chunk must fit in one transaction with the
+/// attributes, even when it is the only chunk in its batch (see
+/// `chunks_per_batch`). A read of it must fit in one gRPC message. 8 MiB is
+/// well within both: it is the largest power of two below
+/// `MAX_TRANSACTION_BYTES`.
 pub const MAX_CHUNK_SIZE: u64 = 8 << 20;
 
-/// Mirrors `raft5_shared::MAX_TRANSACTION_BYTES`, the most a transaction
-/// may buffer, which the server enforces.
+/// Same as `raft5_shared::MAX_TRANSACTION_BYTES`: the most that a
+/// transaction can buffer. The server enforces it.
 const SERVER_TXN_LIMIT: u64 = 10 * 1024 * 1024;
 
-/// Mirrors `raft5_shared::MAX_KV_MESSAGE_BYTES`, the decoding limit
-/// `raft5_client` sets (`raft5-client/src/routing.rs`): a transaction's
-/// worth plus 1 MiB of framing. A value larger than it could be written
-/// and then never read back.
+/// Same as `raft5_shared::MAX_KV_MESSAGE_BYTES`, the decoding limit that
+/// `raft5_client` sets (`raft5-client/src/routing.rs`): one transaction
+/// plus 1 MiB for framing. A value larger than this could be written but
+/// never read back.
 const CLIENT_READ_LIMIT: u64 = SERVER_TXN_LIMIT + 1024 * 1024;
 
-// Slack for the attributes and the per-key overhead the server charges
-// (64 bytes a key, so a full batch's worth is a kilobyte) alongside the
-// chunk data in one transaction.
+// Space for the attributes and the server's cost for each key (64 bytes a
+// key, so about a kilobyte for a full batch), next to the chunk data in one
+// transaction.
 const TXN_SLACK: u64 = 64 * 1024;
 const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK <= SERVER_TXN_LIMIT);
 const _: () = assert!(MAX_CHUNK_SIZE + TXN_SLACK < CLIENT_READ_LIMIT);
 
-/// How many bytes of chunk data one transaction may carry. Sized well
-/// under `SERVER_TXN_LIMIT` so that one commit's replicate-and-apply stays
-/// a fraction of `TXN_TTL` even on a slow cluster, and so that an aborted
-/// batch is not too much work to redo.
+/// How many bytes of chunk data one transaction can hold. It is much less
+/// than `SERVER_TXN_LIMIT`, so that one commit's replicate-and-apply takes
+/// only a part of `TXN_TTL` even on a slow cluster, and an aborted batch is
+/// not too much work to do again.
 const MAX_BATCH_BYTES: u64 = 4 << 20;
 
-/// How many chunk keys one transaction may touch.
-///
-/// The byte budget alone would not bound this: at `MIN_CHUNK_SIZE` a
-/// batch's worth of bytes is a thousand keys. That matters because every
-/// buffered write is its own round trip and every key a transaction takes
-/// stays locked until it commits -- including the attributes, the one key
-/// everything else on the inode contends for. This caps how long a batch
-/// can hold them.
+/// How many chunk keys one transaction can touch. The byte limit alone does
+/// not limit this: at `MIN_CHUNK_SIZE`, a batch of bytes is a thousand
+/// keys. That matters because each buffered write is its own round trip,
+/// and each key a transaction takes stays locked until it commits. This
+/// includes the attributes, the one key that every other operation on the
+/// inode needs. This limit stops a batch from holding them for too long.
 const MAX_BATCH_CHUNKS: usize = 16;
 
-// A batch is at most `MAX_BATCH_CHUNKS` chunks *or* `MAX_BATCH_BYTES`,
-// whichever binds first -- except that a single chunk always gets a
-// transaction even when it alone is over the budget, which is what the
-// `MAX_CHUNK_SIZE` assert above covers.
+// A batch is at most `MAX_BATCH_CHUNKS` chunks or `MAX_BATCH_BYTES`,
+// whichever limit comes first. The one exception is a single chunk, which
+// always gets a transaction even if it alone is over the limit. The
+// `MAX_CHUNK_SIZE` assert above covers that case.
 const _: () = assert!(MAX_BATCH_BYTES + TXN_SLACK <= SERVER_TXN_LIMIT);
 
-/// How many chunks one transaction covers at this filesystem's chunk size.
-///
-/// At least one: a chunk that alone fills the budget still has to be
-/// stored. At `chunk_size` of `MAX_BATCH_BYTES` or more this is 1 and
-/// batching does nothing, which is the honest outcome -- one chunk already
-/// fills a transaction.
+/// How many chunks one transaction covers at this chunk size. At least one:
+/// a chunk that fills the limit alone must still be stored. At a
+/// `chunk_size` of `MAX_BATCH_BYTES` or more this is 1, so batching does
+/// nothing: one chunk already fills a transaction.
 pub(crate) fn chunks_per_batch(chunk_size: u64) -> usize {
     ((MAX_BATCH_BYTES / chunk_size) as usize).clamp(1, MAX_BATCH_CHUNKS)
 }
 
-/// How much contiguous data one transaction stores at this chunk size, and
-/// so how much a buffer accumulates before it is handed off. Public for
-/// tests, which need to write exactly a batch to exercise that trigger.
+/// How much contiguous data one transaction stores at this chunk size. A
+/// buffer collects this much before it sends it. Public for tests, which
+/// must write exactly one batch to test that trigger.
 pub fn batch_bytes(chunk_size: u64) -> u64 {
     chunks_per_batch(chunk_size) as u64 * chunk_size
 }
@@ -116,48 +113,47 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x0A ++ ino(BE8)                    -> an inode number reserved for a create, by username
 //   0x0B ++ ino(BE8)                    -> who ino is granted to, sealed under its key (`grants`)
 //
-// Deleting an inode takes several transactions (its chunks can't all fit
-// in one), so it is announced first: one transaction removes the dirent,
-// marks the Entry deleted (`nlink == 0`) and writes the `0x05` marker.
-// Writes read the Entry inside their own transaction and refuse a marked
-// one, so once the mark commits no new chunk can appear; the chunks and
-// then the Entry and marker are removed after. A crash part-way leaves
-// the marker, which is how the deletion gets finished later -- without
-// it, an inode with no dirent would be unreachable and its chunks leaked.
+// **Deleting an inode** takes several transactions, because its chunks
+// cannot all fit in one. So the deletion is announced first:
 //
-// The singletons were once `0x00 ++ name`, which the cluster has since
-// reserved for itself (`raft5-server`'s `keyspace`): keys under `\x00`
-// are no longer addressable through the client API at all, so those two
-// rows can be neither read nor migrated from here. A store written before
-// that change therefore has no reachable record of its chunk size or its
-// inode counter. It will mount -- adopting the requested chunk size and
-// restarting the counter -- and reinterpret every chunk boundary while
-// handing out inode numbers that already exist. Such a store must be
-// discarded, not mounted.
+// - One transaction removes the dirent, marks the Entry deleted (`nlink ==
+//   0`), and writes the `0x05` marker. Writes read the Entry in their own
+//   transaction and refuse a marked one, so after the mark commits, no new
+//   chunk can appear.
+// - Later transactions remove the chunks, then the Entry and the marker.
+// - If a crash stops this part way, the marker stays, and the deletion is
+//   finished later. Without the marker, an inode with no dirent could not
+//   be reached, and its chunks would leak.
 //
-// A file's bytes are split across chunks of `chunk_size` each. A chunk
-// that was never written is simply absent and reads as zeros, so holes
-// cost nothing; end-of-file lives in the Entry, never in the chunks.
+// **Singletons must not be under `0x00`.** The cluster reserves that prefix
+// (`raft5-server`'s `keyspace`), and the client API cannot reach it. A
+// store with its singletons there has no readable chunk size or inode
+// counter. It would mount, use the requested chunk size, and start the
+// counter again, so it would misread every chunk boundary and give out
+// inode numbers that already exist. Discard such a store. Do not mount it.
 //
-// A hybrid file (its Entry's layout, see `entry`) keeps its chunks from
-// the filesystem's `ObjectGrid::from_index` on in object storage, a block
-// of `per_block` chunks per object. A block's pointer is stored under its
-// first chunk's key; the other keys of the block are never written. So a
-// chunk key holds one of two values, told apart by length:
+// **Chunks.** A file's bytes are split into chunks of `chunk_size` each. A
+// chunk that was never written is absent and reads as zeros, so holes cost
+// nothing. The end of the file is in the Entry, never in the chunks.
+//
+// A hybrid file (see the Entry's layout in `entry`) keeps its chunks from
+// the filesystem's `ObjectGrid::from_index` up in object storage, one block
+// of `per_block` chunks in each object. A block's pointer is stored under
+// its first chunk's key, and the block's other keys are never written. So a
+// chunk key holds one of two values, which differ by length:
 //
 //   inline:  version(BE4) ++ AEAD                      >= CHUNK_OVERHEAD (44) bytes
 //   pointer: version(BE4) ++ minted_ms(BE8) ++ random(16) ++ nseg(BE4)   = POINTER_LEN (32)
 //
-// Both start with the key version they were sealed under, so everything
-// that checks versions (writes, pruning) reads either alike, and neither
-// needs the object fetched. Pointers stay under 0x02, so deleting and
-// scanning a file's chunks finds them with no change either.
+// Both start with the key version they were sealed under. So everything
+// that checks versions (writes, pruning) reads both in the same way, and
+// neither needs the object. Pointers are also under 0x02, so deleting and
+// scanning a file's chunks finds them with no change.
 //
-// This layout is not compatible with the earlier one that held a whole
-// file under `0x02 ++ ino`. Those 9-byte keys are ignored (every scan
-// requires the full 17-byte chunk key), so an old database reads as a
-// tree of empty files rather than as corrupt data -- but it cannot be
-// migrated, only discarded.
+// **Whole-file keys.** A 9-byte key `0x02 ++ ino` (a whole file under one
+// key) is ignored, because every scan requires the full 17-byte chunk key.
+// A store with such keys reads as a tree of empty files, not as corrupt
+// data. It cannot be migrated, only discarded.
 
 pub(crate) fn attr_key(ino: u64) -> Vec<u8> {
     let mut key = vec![0x01];
@@ -182,28 +178,28 @@ pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";
 
-/// The prefix every deletion marker shares; see the layout notes above.
+/// The prefix of every deletion marker; see the layout notes above.
 pub(crate) const TOMBSTONE_PREFIX: &[u8] = &[0x05];
 
-/// The marker recording that `ino`'s deletion has started. Public for
-/// tests, which simulate a deletion interrupted part-way.
+/// The marker that records that `ino`'s deletion has started. Public for
+/// tests, which stop a deletion part way.
 pub fn tombstone_key(ino: u64) -> Vec<u8> {
     let mut key = TOMBSTONE_PREFIX.to_vec();
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }
 
-/// The common prefix of every chunk key belonging to `ino`. Chunk indices
-/// are fixed-width and big-endian, so lexicographic order over this prefix
-/// is ascending chunk order.
+/// The prefix of every chunk key of `ino`. Chunk indices are fixed-width
+/// and big-endian, so byte order under this prefix is ascending chunk
+/// order.
 pub fn chunk_prefix(ino: u64) -> Vec<u8> {
     let mut key = vec![0x02];
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }
 
-/// How long a block pointer is: never as long as any sealed chunk, which
-/// is how a value says which it is.
+/// The length of a block pointer. It is shorter than any sealed chunk, so
+/// the length shows which kind a value is.
 pub(crate) const POINTER_LEN: usize = 4 + 8 + BLOCK_RANDOM_LEN + 4;
 const _: () = assert!(POINTER_LEN < CHUNK_OVERHEAD);
 
@@ -212,15 +208,15 @@ const _: () = assert!(POINTER_LEN < CHUNK_OVERHEAD);
 pub(crate) enum ChunkValue {
     /// A sealed chunk.
     Inline(Vec<u8>),
-    /// A pointer to the block starting at this index.
+    /// A pointer to the block that starts at this index.
     Block(BlockRef),
 }
 
 impl ChunkValue {
     pub(crate) fn decode(value: Vec<u8>) -> Self {
         if value.len() != POINTER_LEN {
-            // Anything else is a sealed chunk, or garbage that won't open
-            // as one -- which the client finds, as it always has.
+            // Anything else is a sealed chunk, or bad data that does not
+            // open as one. The client finds that when it opens it.
             return ChunkValue::Inline(value);
         }
         let at = |range: std::ops::Range<usize>| &value[range];
@@ -252,8 +248,8 @@ pub(crate) fn is_chunk_key(key: &[u8], prefix: &[u8]) -> bool {
     key.starts_with(prefix) && key.len() == prefix.len() + 8
 }
 
-/// The common prefix of every directory entry in `parent`. Public for
-/// tests, which check a removed directory left no entries behind.
+/// The prefix of every directory entry in `parent`. Public for tests, which
+/// check that a removed directory left no entries.
 pub fn dirent_prefix(parent: u64) -> Vec<u8> {
     let mut key = vec![0x03];
     key.extend_from_slice(&parent.to_be_bytes());
@@ -261,19 +257,19 @@ pub fn dirent_prefix(parent: u64) -> Vec<u8> {
 }
 
 /// A directory entry's value: the child's inode, then its real name,
-/// sealed (the key's name being only a tag).
+/// sealed. The key holds only a tag.
 pub(crate) fn dirent_value(ino: u64, sealed_name: &[u8]) -> Vec<u8> {
     let mut value = ino.to_be_bytes().to_vec();
     value.extend_from_slice(sealed_name);
     value
 }
 
-/// The inode a directory entry's value names.
+/// The inode that a directory entry's value names.
 pub(crate) fn dirent_ino(value: &[u8]) -> u64 {
     u64::from_be_bytes(value[..8].try_into().unwrap())
 }
 
-/// The sealed name a directory entry's value holds, if any.
+/// The sealed name in a directory entry's value, if any.
 pub(crate) fn dirent_sealed_name(value: &[u8]) -> &[u8] {
     &value[8..]
 }
@@ -324,7 +320,7 @@ mod tests {
         };
         let value = encode_pointer(&block);
         assert_eq!(value.len(), POINTER_LEN);
-        // It starts with its key version, as a sealed chunk does.
+        // It starts with its key version, like a sealed chunk.
         assert_eq!(
             raft5fs_crypto::data::sealed_version(&value).unwrap(),
             block.version
@@ -347,29 +343,29 @@ mod tests {
         let prefix = chunk_prefix(9);
         assert!(is_chunk_key(&chunk_key(9, 0), &prefix));
         assert!(!is_chunk_key(&chunk_key(10, 0), &prefix));
-        // The pre-chunking layout kept a whole file under this key.
+        // A whole-file key, with no chunk index, is not a chunk key.
         assert!(!is_chunk_key(&chunk_prefix(9), &prefix));
     }
 
     #[test]
     fn batches_respect_both_the_byte_and_the_chunk_cap() {
-        // Small chunks: the count cap binds, which is the point of having
-        // it -- the byte budget alone would allow a thousand keys here.
+        // Small chunks: the count limit applies. This is why it exists: the
+        // byte limit alone would allow a thousand keys here.
         assert_eq!(chunks_per_batch(MIN_CHUNK_SIZE), MAX_BATCH_CHUNKS);
         assert_eq!(chunks_per_batch(64 * 1024), MAX_BATCH_CHUNKS);
 
-        // Where the two caps meet.
+        // Where the two limits are equal.
         assert_eq!(
             chunks_per_batch(MAX_BATCH_BYTES / MAX_BATCH_CHUNKS as u64),
             16
         );
 
-        // Large chunks: the byte budget binds.
+        // Large chunks: the byte limit applies.
         assert_eq!(chunks_per_batch(DEFAULT_CHUNK_SIZE), 4);
         assert_eq!(chunks_per_batch(MAX_BATCH_BYTES), 1);
 
-        // A chunk bigger than the whole budget still gets a transaction,
-        // rather than rounding down to none.
+        // A chunk larger than the whole limit still gets a transaction. The
+        // count does not round down to zero.
         assert_eq!(chunks_per_batch(MAX_CHUNK_SIZE), 1);
 
         for size in [
@@ -380,8 +376,8 @@ mod tests {
         ] {
             let bytes = batch_bytes(size);
             assert!(chunks_per_batch(size) <= MAX_BATCH_CHUNKS, "size {size}");
-            // The one permitted overshoot is a lone chunk, which the
-            // `MAX_CHUNK_SIZE` assert covers instead.
+            // Only a single chunk can go over the limit. The
+            // `MAX_CHUNK_SIZE` assert covers that case.
             assert!(
                 bytes <= MAX_BATCH_BYTES || chunks_per_batch(size) == 1,
                 "size {size} batches {bytes} bytes"

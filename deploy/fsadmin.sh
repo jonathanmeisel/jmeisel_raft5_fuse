@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The filesystem's administration, run on a node (the first, unless the
-# first argument names one) -- see templates/raft5fs-admin:
+# Runs filesystem administration on a node (the first node, unless the first
+# argument names one). See templates/raft5fs-admin:
 #
 #   ./fsadmin.sh [<node>] user add <NAME>       prints an invitation to enrol with
 #   ./fsadmin.sh [<node>] user del <NAME>
@@ -9,7 +9,7 @@
 #   ./fsadmin.sh [<node>] snapshot del <NAME>
 #   ./fsadmin.sh [<node>] snapshot list
 #
-# Snapshots ask for admin's store password (secrets/admin.pw).
+# Snapshot commands ask for admin's store password (secrets/admin.pw).
 . "$(dirname "$0")/lib.sh"
 node=$(first_node)
 if (($#)) && node_names | grep -qx -- "$1"; then

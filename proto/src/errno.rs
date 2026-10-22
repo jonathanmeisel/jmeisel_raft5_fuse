@@ -1,18 +1,19 @@
-//! Errnos as they cross the wire: in Linux's numbering, whatever either
-//! end runs on. Errno numbers are the host's own -- they agree between
-//! Linux and the BSDs (macOS among them) only up to `ERANGE` -- so an
-//! `FsError` is translated from the host's numbering on the way out
-//! (`to_wire`) and back into it on the way in (`from_wire`). On Linux both
-//! are the identity.
+//! Errnos on the wire use Linux's numbers, on every platform.
 //!
-//! Only the errnos the filesystem uses are translated; any other passes
-//! through as it is, which is right for the shared low numbers and at
-//! worst a misleading errno for the rest.
+//! Errno numbers belong to the host. Linux and the BSDs (including macOS)
+//! agree only up to `ERANGE`. So an `FsError` is translated from the host's
+//! numbers when it goes out (`to_wire`), and back when it comes in
+//! (`from_wire`). On Linux, both do nothing.
+//!
+//! Only the errnos that the filesystem uses are translated. Others pass
+//! through unchanged. That is correct for the shared low numbers, and at
+//! worst gives a misleading errno for the rest.
 
-/// A stale key: a write sealed under a key that has since been rotated,
-/// or under a node whose parent's has (see core's `grants::check_fresh`).
-/// Linux has its own errno for it; elsewhere it is one no host errno uses,
-/// for the client to retry on and never hand a kernel.
+/// A stale key: a write sealed under a key that was rotated, or under a
+/// node whose parent's key was rotated (see core's `grants::check_fresh`).
+/// Linux has its own errno for this. On other hosts it is a number that no
+/// host errno uses. The client retries on it, and never gives it to a
+/// kernel.
 #[cfg(target_os = "linux")]
 pub const EKEYEXPIRED: i32 = libc::EKEYEXPIRED;
 #[cfg(not(target_os = "linux"))]
@@ -21,7 +22,7 @@ pub const EKEYEXPIRED: i32 = 0x10000 + LINUX_EKEYEXPIRED;
 #[cfg(not(target_os = "linux"))]
 const LINUX_EKEYEXPIRED: i32 = 127;
 
-/// Each translated errno: (the host's number, Linux's).
+/// Each translated errno: (the host's number, Linux's number).
 #[cfg(not(target_os = "linux"))]
 const TABLE: &[(i32, i32)] = &[
     (libc::EAGAIN, 11),
@@ -38,13 +39,13 @@ const TABLE: &[(i32, i32)] = &[
     (EKEYEXPIRED, LINUX_EKEYEXPIRED),
 ];
 
-/// The host's `errno`, in the wire's numbering.
+/// Translates the host's `errno` to the wire's numbers.
 #[cfg(target_os = "linux")]
 pub fn to_wire(errno: i32) -> i32 {
     errno
 }
 
-/// The wire's `errno`, in the host's numbering.
+/// Translates the wire's `errno` to the host's numbers.
 #[cfg(target_os = "linux")]
 pub fn from_wire(errno: i32) -> i32 {
     errno

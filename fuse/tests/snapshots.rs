@@ -1,6 +1,6 @@
-//! Snapshots, end to end: taken by the store's administrator, browsed
-//! read-only at `/.snapshot/<name>` in every mount, each user seeing what
-//! they could see when it was taken.
+//! Tests snapshots end to end: the store's administrator takes them, every
+//! mount shows them read-only at `/.snapshot/<name>`, and each user sees
+//! what they could see when the snapshot was taken.
 
 mod support;
 
@@ -15,9 +15,9 @@ use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::Vault;
 use raft5fs_core::{ChunkWrite, WriteBody};
 
-/// Not really a test: the entry point that lets the harness run a
-/// filesystem server as a separate process (see `support::TestServer`).
-/// Returns at once in a normal run.
+/// Not a real test: the entry point that lets the harness run a filesystem
+/// server as a separate process (see `support::TestServer`). Returns at
+/// once in a normal run.
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
@@ -75,7 +75,8 @@ fn snap(root: &Path, name: &str) -> PathBuf {
     root.join(".snapshot").join(name)
 }
 
-/// Longer than the mount tells the kernel to keep a name or attributes.
+/// Waits longer than the mount tells the kernel to keep a name or
+/// attributes.
 fn past_kernel_cache() {
     std::thread::sleep(Duration::from_millis(1200));
 }
@@ -99,7 +100,8 @@ fn a_snapshot_keeps_what_was_there_when_it_was_taken() {
     assert_eq!(names(&old), ["big", "d"]);
     assert_eq!(fs::read(old.join("d/f")).unwrap(), b"before");
     assert_eq!(fs::read(old.join("big")).unwrap(), big);
-    // Again: from the cache this time, which a snapshot never outdates.
+    // Again, from the cache this time. A snapshot never makes the cache out
+    // of date.
     assert_eq!(fs::read(old.join("big")).unwrap(), big);
     assert_eq!(
         fs::metadata(old.join("big")).unwrap().len(),
@@ -109,7 +111,7 @@ fn a_snapshot_keeps_what_was_there_when_it_was_taken() {
     assert_eq!(fs::read(h.path().join("d/f")).unwrap(), b"after");
     assert_eq!(names(h.path()), ["d", "new"]);
 
-    // A snapshot's inodes are its own to the kernel, not the live ones.
+    // To the kernel, a snapshot's inodes are separate from the live ones.
     assert_ne!(ino(&old.join("d/f")), ino(&h.path().join("d/f")));
     assert_eq!(
         fs::metadata(old.join("..")).unwrap().ino(),
@@ -128,7 +130,7 @@ fn the_snapshot_directory_is_reachable_but_not_listed() {
     assert!(fs::metadata(h.root().join(".snapshot")).unwrap().is_dir());
     assert_eq!(names(&h.root().join(".snapshot")), ["s1", "s2"]);
     assert_errno(fs::metadata(snap(h.root(), "nope")), libc::ENOENT);
-    // Nor can a volume take its name.
+    // A volume cannot use its name either.
     assert_errno(fs::create_dir(h.root().join(".snapshot")), libc::EEXIST);
 }
 
@@ -163,13 +165,13 @@ fn nothing_in_a_snapshot_can_be_changed() {
         libc::EROFS,
     );
     assert_errno(fs::rename(old.join("f"), old.join("g")), libc::EROFS);
-    // Out of one and into the live filesystem is a move between
-    // filesystems, which `mv` copies.
+    // A move from a snapshot into the live filesystem is a move between
+    // filesystems, which `mv` does as a copy.
     assert_errno(fs::rename(old.join("f"), h.path().join("g")), libc::EXDEV);
     assert_errno(fs::remove_dir(h.root().join(".snapshot")), libc::EROFS);
     assert_errno(fs::remove_dir(snap(h.root(), "s1")), libc::EROFS);
 
-    // And a copy out is how to get something back.
+    // A copy out of the snapshot is how to restore something.
     fs::remove_file(h.path().join("f")).unwrap();
     fs::copy(old.join("f"), h.path().join("f")).unwrap();
     assert_eq!(fs::read(h.path().join("f")).unwrap(), b"bytes");
@@ -194,12 +196,12 @@ fn a_snapshot_is_read_only_whoever_asks() {
         h.runtime.block_on(at.write_chunks(ino(&f), &[write], 0)),
         libc::EROFS,
     );
-    // ...and by the server, for the one that is sent as a read.
+    // ...and refused by the server, for the request that is sent as a read.
     assert_fs_errno(
         h.runtime.block_on(at.grants_under(ino(h.path()))),
         libc::EROFS,
     );
-    // Asked of a snapshot there isn't, the answer is at once.
+    // For a snapshot that does not exist, the answer comes at once.
     assert_fs_errno(
         h.runtime.block_on(live.at("nope").getattr(ino(&f))),
         libc::ENOENT,
@@ -229,8 +231,9 @@ fn access_in_a_snapshot_is_as_it_was_when_it_was_taken() {
         .unwrap();
     fs::write(team.join("plan"), b"new plan").unwrap();
 
-    // alice is cut off from the filesystem, but not from what she could
-    // read then: she held its keys, and the snapshot is sealed under them.
+    // alice has no access to the filesystem now, but she can still read
+    // what she could read then: she had its keys, and the snapshot is
+    // sealed under them.
     let alice = h.mount_as("alice");
     assert!(names(&alice.root).is_empty());
     assert_eq!(names(&snap(&alice.root, "s1")), ["theirs"]);
@@ -239,7 +242,7 @@ fn access_in_a_snapshot_is_as_it_was_when_it_was_taken() {
         b"secret plan"
     );
 
-    // bob, granted since, sees nothing in it.
+    // bob, granted access after the snapshot, sees nothing in it.
     let bob = h.mount_as("bob");
     assert_eq!(fs::read(bob.root.join("theirs/plan")).unwrap(), b"new plan");
     assert!(names(&snap(&bob.root, "s1")).is_empty());
@@ -310,7 +313,7 @@ fn a_removed_snapshot_is_gone_from_the_mount() {
     assert!(names(&h.root().join(".snapshot")).is_empty());
     assert_errno(fs::metadata(&old), libc::ENOENT);
 
-    // Another under the same name is another snapshot.
+    // A new snapshot with the same name is a different snapshot.
     fs::write(h.path().join("f"), b"later").unwrap();
     h.snapshot("s1");
     past_kernel_cache();

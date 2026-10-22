@@ -1,4 +1,4 @@
-//! The filesystem's store logic, independent of how requests arrive.
+//! The filesystem's store logic, separate from how requests arrive.
 
 pub mod accounts;
 mod entry;

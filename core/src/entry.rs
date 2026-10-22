@@ -1,22 +1,27 @@
-//! Inode records: what an inode's attribute key holds.
+//! Inode records: the value of an inode's attribute key.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use raft5fs_proto::types::{Attr, Kind, Layout};
 
-/// A directory's attributes plus its parent inode, so `readdir` can answer
-/// `..` without a separate lookup. Files leave `parent` at 0 (unused: we
-/// don't support hard links, so a file only ever has the one directory
-/// entry that named it in `create`).
+/// An inode's attributes and its parent inode.
+///
+/// - `readdir` uses a directory's parent to return `..` without a separate
+///   lookup.
+/// - `grants::authorize` walks up through parents to find a grant.
+///
+/// There are no hard links, so a file's only parent is the directory that
+/// named it in `create`. A `parent` of 0 means no parent is recorded, so no
+/// grant can reach the inode.
 pub(crate) struct Entry {
     pub(crate) attr: Attr,
     pub(crate) parent: u64,
 }
 
 impl Entry {
-    /// Whether this inode's deletion has started. Encoded as a link count
-    /// of zero, which no live inode has -- a file is created with 1 and a
-    /// directory with 2 -- so the record format doesn't change.
+    /// Whether this inode's deletion has started. It is stored as a link
+    /// count of zero, which no live inode has (a file starts with 1 and a
+    /// directory with 2), so the record format does not change.
     pub(crate) fn is_deleted(&self) -> bool {
         self.attr.nlink == 0
     }
@@ -48,9 +53,9 @@ pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
         Kind::File => 0,
     });
     buf.extend_from_slice(&a.perm.to_be_bytes());
-    // Where a uid and gid once went, kept so every field after them stays
-    // where it was: the first byte is now the file's data layout, which
-    // reads as 0 -- all inline -- in every record written before it.
+    // These bytes keep every later field at the same offset. The first byte
+    // is the file's data layout. Records written before layouts existed
+    // have 0 here, which means all inline.
     buf.push(match a.layout {
         Layout::Inline => 0,
         Layout::Hybrid => 1,
@@ -121,7 +126,7 @@ mod tests {
             parent: 7,
         };
         let bytes = encode_entry(&entry);
-        // The on-disk size existing stores were written with.
+        // The on-disk size that existing stores use.
         assert_eq!(bytes.len(), 1 + 2 + 4 + 4 + 8 + 4 + 3 * 12 + 8);
         let back = decode_entry(42, &bytes);
         assert_eq!(back.attr, entry.attr);
@@ -147,7 +152,7 @@ mod tests {
                 parent: 0,
             }),
         );
-        // What a record from before layouts holds there: zeros.
+        // A record from before layouts has zeros here.
         assert_eq!(encode_entry(&entry)[3..11], [0; 8]);
         entry.attr.layout = Layout::Hybrid;
         let bytes = encode_entry(&entry);

@@ -1,12 +1,13 @@
 #!/bin/sh
-# Runs on a node, as root, from the bundle install.sh unpacked there:
-# installs it, and (re)starts what it changed. Debian or Ubuntu.
+# Runs on a node, as root, from the bundle that install.sh unpacked there.
+# It installs the bundle and starts or restarts what changed. Debian or
+# Ubuntu.
 #
 #   remote-install.sh [--bootstrap]
 #
-# --bootstrap starts the store node with the first administrator's login,
-# for bootstrapping the cluster; without it, any such login left from a
-# bootstrap is removed.
+# --bootstrap starts the store node with the first administrator's login, to
+# bootstrap the cluster. Without it, any such login left from a bootstrap is
+# removed.
 set -eu
 cd "$(dirname "$0")"
 . ./node.conf
@@ -29,12 +30,12 @@ for user in raft5 raft5fs; do
 done
 
 # -- files ----------------------------------------------------------------
-# A changed file is noted in $changed, by the service it belongs to.
+# Each changed file is recorded in $changed, by the service it belongs to.
 changed=""
 
-# put SRC DEST MODE OWNER:GROUP SERVICE: installs SRC at DEST if it
-# differs, replacing it atomically -- a running binary can't be written
-# over, only replaced.
+# put SRC DEST MODE OWNER:GROUP SERVICE: installs SRC at DEST if it is
+# different. It replaces the file atomically, because a running binary
+# cannot be written over, only replaced.
 put() {
     src=$1 dest=$2 mode=$3 owner=$4 service=$5
     if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
@@ -63,7 +64,8 @@ for f in node.pem node.key internal-ca.pem fs.pem fs.key token.key; do
     put "raft5fs/$f" "/etc/raft5fs/$f" 0640 root:raft5fs raft5fs-server
 done
 put raft5fs/store.env /etc/raft5fs/store.env 0600 root:root raft5fs-server
-# The object store's CA, if it has a private one (cluster.conf's S3_*).
+# The object store's CA, if it has a private one (cluster.conf's S3_*
+# settings).
 if [ -f raft5fs/s3-ca.pem ]; then
     put raft5fs/s3-ca.pem /etc/raft5fs/s3-ca.pem 0644 root:root raft5fs-server
 fi
@@ -96,8 +98,8 @@ has() { case " $changed " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # -- WireGuard -------------------------------------------------------------
 if systemctl is-active -q wg-quick@wg0; then
-    # Applied in place: tearing wg0 down would take the store's address
-    # out from under it.
+    # Apply changes in place: stopping wg0 would remove the store's address
+    # while the store uses it.
     if has wg0; then
         say "updating wg0's peers"
         wg syncconf wg0 /dev/stdin <<WG
@@ -110,9 +112,9 @@ else
 fi
 
 # -- firewall --------------------------------------------------------------
-# Only SSH, WireGuard and the filesystem servers' port are open to the
-# world; the store's ports only on wg0. (The store binds to the WireGuard
-# address anyway: this is the second guard.)
+# Only SSH, WireGuard, and the filesystem servers' port are open to the
+# world. The store's ports are open only on wg0. (The store binds to the
+# WireGuard address anyway, so this is a second protection.)
 ufw allow "$SSH_PORT/tcp" >/dev/null
 ufw allow "$WG_PORT/udp" >/dev/null
 ufw allow 27060/tcp >/dev/null

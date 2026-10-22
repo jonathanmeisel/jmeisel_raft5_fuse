@@ -17,27 +17,28 @@ use super::{ConnectArgs, Outcome, SessionArgs, runtime};
 
 #[derive(Args)]
 pub struct WebdavArgs {
-    /// Where to listen: a loopback address and port, nothing else. Only
-    /// this machine's user may use it -- everything done there is done as
-    /// the account -- so clients must give the password it prints.
+    /// Where to listen: a loopback address and port only. Only this
+    /// machine's user can use it, because everything done there is done as
+    /// the account. Clients must give the password that it prints.
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// Store the files macOS keeps metadata in (`._*`, `.DS_Store`), which
-    /// are refused by default: Finder makes them next to everything.
+    /// Store the files where macOS keeps metadata (`._*`, `.DS_Store`).
+    /// They are refused by default, because Finder makes them next to
+    /// everything.
     #[arg(long)]
     pub keep_apple_double: bool,
     #[command(flatten)]
     pub session: SessionArgs,
 }
 
-/// Where the server's password is kept while it runs, for clients to
-/// read: named after the profile, or failing that the account.
+/// Where the server's password is kept while it runs, for clients to read.
+/// The file is named after the profile, or else the account.
 fn password_file(ctx: &Context) -> PathBuf {
     let name = ctx.profile.as_deref().unwrap_or(&ctx.user);
     runtime_dir().join(format!("{name}.webdav"))
 }
 
-/// Writes `password` to `path`, readable by its owner only.
+/// Writes `password` to `path`, readable only by its owner.
 fn write_password(path: &Path, password: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         make_private_dir(dir)?;

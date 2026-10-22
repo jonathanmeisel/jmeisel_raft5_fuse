@@ -1,6 +1,6 @@
-//! The filesystem's operations against the store, one async method per
-//! operation. No buffering and no FUSE: a front end (the FUSE client
-//! today, the server later) decides when to call these.
+//! The filesystem's operations on the store, one async method for each
+//! operation. There is no buffering and no FUSE here: a front end (the
+//! server) decides when to call these.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -44,26 +44,27 @@ pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 const R: u32 = libc::R_OK as u32;
 const W: u32 = libc::W_OK as u32;
 
-/// Runs `attempt` -- one whole transaction, from opening it to committing
-/// it -- until the store stops aborting it, and returns what it returned.
+/// Runs `attempt` (one whole transaction, from open to commit) until the
+/// store stops aborting it, and returns its result.
 ///
-/// The retry has to cover the whole attempt, because `Aborted` can come
-/// from *any* step, not just `commit`: a contended key refuses the `read`
-/// or `write` that touches it outright (see the server's wound-wait
-/// `acquire`), it doesn't wait and let commit be the one to fail.
-/// `Transaction` deliberately does not retry this itself (see its doc
-/// comment): it doesn't know what the reads were, so only the caller that
-/// issued them can redo it. An aborted transaction wrote nothing, so
-/// running the attempt again is always safe.
+/// - The retry must cover the whole attempt, because `Aborted` can come
+///   from any step, not only `commit`. A contended key refuses the `read`
+///   or `write` that touches it at once (see the server's wound-wait
+///   `acquire`). It does not wait for commit to fail.
+/// - `Transaction` does not retry this itself, on purpose (see its doc
+///   comment): it does not know what the reads were, so only the caller
+///   that made them can do them again.
+/// - An aborted transaction wrote nothing, so it is always safe to run the
+///   attempt again.
+/// - An attempt that reaches its own decision ("that name is taken", "no
+///   such inode") returns it inside `Ok`, as `Ok(Err(..))`, so only the
+///   store's aborts are retried.
 ///
-/// An attempt that reaches a decision of its own -- "that name is taken",
-/// "no such inode" -- returns it inside `Ok`, as `Ok(Err(..))`, so that
-/// only the store's aborts are retried.
-///
-/// Takes a closure returning a fresh future per attempt, rather than an
-/// async closure: an async closure's future can't be shown `Send` for
-/// every lifetime, which the server's runtime needs. So callers capture
-/// only references (which copy) and `move` them into each attempt.
+/// It takes a closure that returns a new future for each attempt, not an
+/// async closure. The compiler cannot show that an async closure's future
+/// is `Send` for every lifetime, and the server's runtime needs that. So
+/// callers capture only references (which copy) and `move` them into each
+/// attempt.
 pub(crate) async fn retrying<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, KvError>
 where
     Fut: std::future::Future<Output = Result<T, KvError>>,
@@ -76,9 +77,9 @@ where
     }
 }
 
-/// Inside a transaction attempt, unwraps a filesystem decision, or ends
-/// the attempt with it as `Ok(Err(..))` -- the form `retrying` leaves
-/// alone.
+/// In a transaction attempt, unwraps a filesystem decision, or ends the
+/// attempt with it as `Ok(Err(..))`, the form that `retrying` does not
+/// retry.
 macro_rules! decide {
     ($result:expr) => {
         match $result {
@@ -88,48 +89,48 @@ macro_rules! decide {
     };
 }
 
-/// `ino`'s Entry as `txn` sees it, which holds it against changes until
-/// `txn` ends. A missing or deleted inode is `ENOENT`.
+/// `ino`'s Entry as `txn` sees it. It stays locked against changes until
+/// `txn` ends. A missing or deleted inode gives `ENOENT`.
 async fn live_entry(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
     Ok(live(ino, txn.read_one(&attr_key(ino)).await?.value).ok_or_else(enoent))
 }
 
-/// Directory `ino`'s Entry from the value its key was read as, to add or
-/// remove names in, as `modifiable_dir` reads it.
+/// Decodes directory `ino`'s Entry from the value read for its key, to add
+/// or remove names, as `modifiable_dir` reads it.
 fn dir_entry(ino: u64, value: Option<Vec<u8>>) -> Result<Entry, FsError> {
     let dir = live(ino, value).ok_or_else(enoent)?;
     check_kind(&dir, Kind::Directory)?;
     Ok(dir)
 }
 
-/// `ino`'s Entry from the value its key was read as, unless it is missing
-/// or its deletion has started.
+/// Decodes `ino`'s Entry from the value read for its key. Returns `None` if
+/// it is missing or its deletion has started.
 fn live(ino: u64, value: Option<Vec<u8>>) -> Option<Entry> {
     value
         .map(|bytes| decode_entry(ino, &bytes))
         .filter(|entry| !entry.is_deleted())
 }
 
-/// Directory `ino`, to add or remove names in -- `caller` having been
-/// checked for a writable grant over it already.
+/// Reads directory `ino` to add or remove names. The caller must already
+/// have checked `caller` for a writable grant above it.
 async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
     Ok(dir_entry(ino, txn.read_one(&attr_key(ino)).await?.value))
 }
 
-/// The inode a directory entry names, if it exists.
+/// The inode that a directory entry names, if it exists.
 async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError> {
     Ok(txn.read_one(dirent).await?.value.map(|b| dirent_ino(&b)))
 }
 
-/// The entries a read of a fixed number of keys gave, in order.
+/// The entries that a read of a fixed number of keys returned, in order.
 fn each<const N: usize>(entries: Vec<raft5_client::Entry>) -> [raft5_client::Entry; N] {
     entries
         .try_into()
         .expect("a read of every key answers each")
 }
 
-/// What a filesystem keeping no data in object storage answers anything
-/// that would need it.
+/// The error for a request that needs object storage, when the filesystem
+/// keeps no data there.
 fn no_objects() -> FsError {
     FsError::new(
         libc::ENOTSUP,
@@ -137,13 +138,17 @@ fn no_objects() -> FsError {
     )
 }
 
-/// Stores `writes` to file `entry` inside `txn`: each kept where the
-/// file's layout keeps it (see `objects::check_placement`), sealed under
-/// the file's current key version (`EKEYEXPIRED` if not), a block named
-/// recently enough to commit, and each with an `expected_seq` only if the
-/// chunk is still at it (`EAGAIN` if not). With `existing`, every chunk
-/// must be there already, at its seq. Returns the objects the blocks it
-/// stored replaced, for `discard` once the transaction has committed.
+/// Stores `writes` to file `entry` in `txn`. Each write must:
+///
+/// - be where the file's layout keeps it (see `objects::check_placement`);
+/// - be sealed under the file's current key version (`EKEYEXPIRED` if not);
+/// - for a block, name an object minted recently enough to commit;
+/// - with an `expected_seq`, find the chunk still at that seq (`EAGAIN` if
+///   not).
+///
+/// With `existing`, every chunk must already exist at its seq. Returns the
+/// objects that the stored blocks replaced, for `discard` after the
+/// transaction commits.
 async fn put_chunks(
     core: &FsCore,
     txn: &Transaction,
@@ -163,11 +168,11 @@ async fn put_chunks(
         }
     }
     let (version, _) = decide!(key_versions(txn, ino).await?);
-    // Every inline chunk's seq in one read, checked below in turn. Only
-    // seqs are compared, so only seqs are read -- and held, as a value read
-    // would hold them. 0 is a chunk with no value. A block's pointer is
-    // read whole, seq and all: it is small, and names the object a new one
-    // replaces.
+    // Read every inline chunk's seq in one read, and check each one below.
+    // Only seqs are compared, so only seqs are read, and they are locked as
+    // a value read would lock them. 0 means a chunk with no value. A
+    // block's pointer is read in full with its seq: it is small, and it
+    // names the object that the new one replaces.
     let block = |w: &&ChunkWrite| matches!(w.body, WriteBody::Block(_));
     let checked_keys: Vec<Vec<u8>> = writes
         .iter()
@@ -224,9 +229,10 @@ async fn put_chunks(
     Ok(Ok(dropped))
 }
 
-/// Whether `sealed_name` is sealed under directory `dir`'s current key
-/// version, `version`: what every name filed in it must be, so that none
-/// is left under a version a revoked user holds -- or one a prune drops.
+/// Checks that `sealed_name` is sealed under directory `dir`'s current key
+/// version, `version`. Every name filed in the directory must be, so that
+/// no name stays under a version that a revoked user has, or that a prune
+/// removes.
 fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), FsError> {
     if sealed_version(sealed_name).ok() == Some(version) {
         Ok(())
@@ -241,13 +247,13 @@ fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), 
 /// Whether directory `ino` has no entries. The caller must already have
 /// written `ino`'s Entry in this transaction.
 ///
-/// The scan locks only the keys it finds, not the range, so on its own it
-/// couldn't stop a concurrent create adding an entry right after. What
-/// does is that lock on the Entry: every operation adding a name to a
-/// directory reads the directory's Entry and holds it until it commits,
-/// and an exclusive lock taken *before* the scan conflicts with that
-/// whatever the timing. So either the create commits first, and the scan
-/// sees its entry, or it can't start until this transaction is over.
+/// The scan locks only the keys it finds, not the range, so the scan alone
+/// cannot stop a create from adding an entry just after it. The lock on the
+/// Entry stops it. Every operation that adds a name to a directory reads
+/// the directory's Entry and holds it until it commits. An exclusive lock
+/// taken before the scan conflicts with that, whatever the timing. So
+/// either the create commits first and the scan sees its entry, or the
+/// create cannot start until this transaction ends.
 async fn is_empty_dir(txn: &Transaction, ino: u64) -> Result<bool, KvError> {
     let prefix = dirent_prefix(ino);
     let mut iter = txn.key_iterator(&prefix);
@@ -259,18 +265,18 @@ async fn write_entry(txn: &Transaction, entry: &Entry) -> Result<(), KvError> {
         .await
 }
 
-/// Records that a directory's entries changed, as POSIX asks.
+/// Records that a directory's entries changed, as POSIX requires.
 async fn touch_dir(txn: &Transaction, dir: &mut Entry, now: SystemTime) -> Result<(), KvError> {
     dir.attr.mtime = now;
     dir.attr.ctime = now;
     write_entry(txn, dir).await
 }
 
-/// The chunk size in force for the filesystem in `client`'s store: whatever
-/// the store already records, or `preferred` if the store is new, which
-/// then claims it. Reading and claiming in one transaction is what makes
-/// two simultaneous first mounts safe -- the loser's retry sees the
-/// winner's value and adopts it.
+/// The chunk size of the filesystem in `client`'s store: the value the
+/// store already records, or `preferred` if the store is new, which it then
+/// records. Reading and recording in one transaction makes two first mounts
+/// at the same time safe: the loser's retry sees the winner's value and
+/// uses it.
 pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, String> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
@@ -289,10 +295,10 @@ pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, 
     .map_err(|e| e.to_string())?
 }
 
-/// Checks the store in `client` holds a filesystem made by this raft5fs --
-/// in its format, `STORE_FORMAT` -- or is new, and then records that it
-/// does. One made by an older raft5fs is refused rather than opened:
-/// carrying on would mix the two.
+/// Checks that the store in `client` holds a filesystem in this raft5fs's
+/// format (`STORE_FORMAT`), or is new, and then records that it does. A
+/// store in another format is refused, not opened, because using it would
+/// mix the two formats.
 pub async fn check_store(client: &Client) -> Result<(), String> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
@@ -310,7 +316,7 @@ pub async fn check_store(client: &Client) -> Result<(), String> {
                 refused()
             };
         }
-        // No record but a root: from before there was a record.
+        // A root with no format record is a store in an older format.
         if txn.read_one(&attr_key(ROOT_INO)).await?.value.is_some() {
             return refused();
         }
@@ -335,10 +341,9 @@ fn decode_chunk_size(bytes: &[u8]) -> Result<u64, String> {
     Ok(stored)
 }
 
-/// Hands out inode numbers. A transaction makes the read-increment-write
-/// atomic, since the KV store gives us no other way to do a safe counter
-/// bump: two `mkdir`s racing on a plain read/write could otherwise hand
-/// out the same inode twice.
+/// Gives out inode numbers. A transaction makes the read-increment-write
+/// atomic. The KV store has no other safe counter: with a plain read and
+/// write, two `mkdir`s at the same time could get the same inode.
 async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
     retrying(move || async move {
         let txn = client.transaction(TXN_TTL).await?;
@@ -360,8 +365,8 @@ fn enoent() -> FsError {
     FsError::errno(libc::ENOENT)
 }
 
-/// `entry` is of `kind`, or the errno for asking a file to be a directory
-/// or the reverse.
+/// Checks that `entry` is of `kind`. Returns the errno for a file used as a
+/// directory, or the reverse.
 fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
     match (kind, entry.attr.kind) {
         (Kind::File, Kind::Directory) => Err(FsError::errno(libc::EISDIR)),
@@ -373,29 +378,33 @@ fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
 pub struct FsCore {
     pub(crate) client: Client,
     chunk_size: u64,
-    /// How hybrid files are laid out, if the filesystem has any: recorded
-    /// by the first server that kept objects for it, and known to every
-    /// server after, object storage or not.
+    /// How hybrid files are laid out, if the filesystem has any. The first
+    /// server that kept objects for it records this, and every later server
+    /// knows it, with or without object storage.
     pub(crate) grid: Option<ObjectGrid>,
     /// Where this server keeps data in object storage, if it does.
     pub(crate) objects: Option<Objects>,
-    /// Where walks up to grants have gone, for the next to check rather
-    /// than retrace (see `grants::Paths`).
+    /// Where walks up to grants went, so the next walk can check the path
+    /// and not walk it again (see `grants::Paths`).
     paths: grants::Paths,
 }
 
 impl FsCore {
-    /// Opens the filesystem in `client`'s store (see `check_store`),
-    /// settling its chunk size (see `resolve_chunk_size`) and, with
-    /// `objects`, its object grid, creating the real root if the
-    /// filesystem is new, and finishing any deletion an earlier process
-    /// left half done (see `reap_tombstones`).
+    /// Opens the filesystem in `client`'s store.
+    ///
+    /// - Checks the store's format (`check_store`).
+    /// - Sets the chunk size (`resolve_chunk_size`) and, with `objects`,
+    ///   the object grid.
+    /// - Makes the real root if the filesystem is new.
+    /// - Finishes any deletion that an earlier process left half done
+    ///   (`reap_tombstones`).
     pub async fn connect(
         client: Client,
         preferred_chunk_size: u64,
         objects: Option<ObjectSettings>,
     ) -> Result<Self, String> {
-        // Before the root exists, which is how it tells a new filesystem.
+        // Check before the root exists, because the root is how it knows
+        // that a filesystem is new.
         check_store(&client).await?;
         let chunk_size = resolve_chunk_size(&client, preferred_chunk_size).await?;
         let grid = match &objects {
@@ -424,8 +433,8 @@ impl FsCore {
         core.ensure_root()
             .await
             .map_err(|e| format!("could not create the root directory: {e}"))?;
-        // Not fatal: leftover deletions cost space, not correctness, and
-        // the next instance to start tries again.
+        // Not fatal: unfinished deletions cost space, not correctness, and
+        // the next instance tries again.
         if let Err(e) = core.reap_tombstones().await {
             eprintln!("could not finish interrupted deletions: {e}");
         }
@@ -436,13 +445,13 @@ impl FsCore {
         self.chunk_size
     }
 
-    /// The object grid, if this server keeps data in object storage: what
-    /// a client needs to write hybrid files through it.
+    /// The object grid, if this server keeps data in object storage. A
+    /// client needs it to write hybrid files through this server.
     pub fn object_grid(&self) -> Option<ObjectGrid> {
         self.objects.as_ref().and(self.grid)
     }
 
-    /// The store client this filesystem works through.
+    /// The store client that this filesystem uses.
     pub fn client(&self) -> &Client {
         &self.client
     }
@@ -452,8 +461,8 @@ impl FsCore {
         View::live(&self.client)
     }
 
-    /// Where a read-only operation reads: the live store, or snapshot
-    /// `at` -- `ENOENT` if there is no such snapshot.
+    /// Where a read-only operation reads: the live store, or snapshot `at`.
+    /// Returns `ENOENT` if there is no such snapshot.
     async fn view<'a>(&'a self, at: Option<&'a [u8]>) -> Result<View<'a>, FsError> {
         let Some(id) = at else {
             return Ok(self.live());
@@ -468,9 +477,9 @@ impl FsCore {
         }
     }
 
-    /// An inode's Entry, or `None` if it doesn't exist -- including one
-    /// whose deletion has started, which is gone as far as everything but
-    /// the deletion itself is concerned.
+    /// An inode's Entry, or `None` if it does not exist. An inode whose
+    /// deletion has started also gives `None`: only the deletion itself
+    /// still uses it.
     async fn read_entry(&self, view: &View<'_>, ino: u64) -> Result<Option<Entry>, FsError> {
         Ok(live(ino, view.read_one(&attr_key(ino)).await?.value))
     }
@@ -485,9 +494,10 @@ impl FsCore {
         Ok(result.value.map(|b| dirent_ino(&b)))
     }
 
-    /// Creates the root directory unless it exists. Checking and creating
-    /// in one transaction is what lets several servers start on a new
-    /// filesystem at once: whichever commits second finds the root there.
+    /// Makes the root directory if it does not exist. The check and the
+    /// create are in one transaction, so several servers can start on a new
+    /// filesystem at the same time: the one that commits second finds the
+    /// root.
     async fn ensure_root(&self) -> Result<(), KvError> {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
@@ -522,9 +532,9 @@ impl FsCore {
         self.read_entry(view, ino).await?.ok_or_else(enoent)
     }
 
-    /// Whether `caller` reaches `ino` through a grant (a writable one,
-    /// for `write`), checked with `r`'s reads -- an operation's own
-    /// transaction, so that the check and the change commit together (see
+    /// Checks that `caller` reaches `ino` through a grant (a writable one,
+    /// for `write`), with `r`'s reads. `r` is the operation's own
+    /// transaction, so the check and the change commit together (see
     /// `grants`).
     async fn guard(
         &self,
@@ -538,14 +548,15 @@ impl FsCore {
             .map(|_| ()))
     }
 
-    /// Whether `ino` and everything above it to its volume are wrapped
-    /// under their parents' current keys (see `grants::check_fresh`).
+    /// Checks that `ino` and everything above it up to its volume are
+    /// wrapped under their parents' current keys (see
+    /// `grants::check_fresh`).
     async fn fresh(&self, txn: &Transaction, ino: u64) -> Result<Result<(), FsError>, KvError> {
         grants::check_fresh(txn, ino).await
     }
 
-    /// `guard`, outside any transaction, with `view`'s reads: for
-    /// operations that only read. Nothing may be written at a snapshot.
+    /// `guard` outside a transaction, with `view`'s reads, for operations
+    /// that only read. Nothing can be written at a snapshot.
     async fn guard_now(
         &self,
         view: &View<'_>,
@@ -559,9 +570,9 @@ impl FsCore {
         self.guard(view, caller, ino, write).await?
     }
 
-    /// Whether a new entry's `name` is a tag and comes with its real name
-    /// sealed: so no real name can reach the store, even from a client
-    /// that tried.
+    /// Checks that a new entry's `name` is a tag and comes with its real
+    /// name sealed. So no real name can reach the store, even from a client
+    /// that tries.
     fn check_entry_name(name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
         if name.len() == TAG_LEN && !sealed_name.is_empty() {
             Ok(())
@@ -573,8 +584,8 @@ impl FsCore {
         }
     }
 
-    /// What every batch of chunks to store must be: no more than a write
-    /// takes, and none larger than a sealed chunk.
+    /// Checks a batch of chunks to store: no more than one write takes, and
+    /// none larger than a sealed chunk.
     fn check_chunk_writes(&self, writes: &[ChunkWrite]) -> Result<(), FsError> {
         if writes.len() > chunks_per_batch(self.chunk_size) {
             return Err(FsError::new(
@@ -599,7 +610,7 @@ impl FsCore {
         Ok(())
     }
 
-    /// Needs a grant over `ino`, at snapshot `at` if one is given.
+    /// Needs a grant above `ino`, at snapshot `at` if one is given.
     pub async fn getattr(
         &self,
         caller: &Caller,
@@ -611,16 +622,17 @@ impl FsCore {
         Ok(self.resolve(&view, ino).await?.attr)
     }
 
-    /// The inode `name` names in `parent`, without reading its attributes.
+    /// The inode that `name` names in `parent`, without reading its
+    /// attributes.
     async fn child_ino(&self, view: &View<'_>, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         self.lookup_child(view, parent, name)
             .await?
             .ok_or_else(enoent)
     }
 
-    /// The entry `name` (a tag) in `parent`: its attributes, and its name
-    /// sealed as the listing has it, for the client to check that the
-    /// name really names that inode.
+    /// The entry `name` (a tag) in `parent`: its attributes, and its sealed
+    /// name as the listing has it, so the client can check that the name
+    /// points to that inode.
     pub async fn lookup(
         &self,
         caller: &Caller,
@@ -645,12 +657,15 @@ impl FsCore {
         Ok((attr, dirent_sealed_name(&bytes).to_vec()))
     }
 
-    /// access(2), and what an open checks: whether `caller` holds every
-    /// right in `mask` (access(2)'s bits) -- any grant over `ino` reads
-    /// and searches, a writable one writes -- or with a `mask` of 0,
-    /// whether `ino` exists. Writing a directory's contents is a different
-    /// thing from writing the directory, which `EISDIR` refuses only when
-    /// `open` asks. Nothing at a snapshot is writable (`EROFS`).
+    /// access(2), and the check for an open: whether `caller` has every
+    /// right in `mask` (access(2)'s bits). With a `mask` of 0, only whether
+    /// `ino` exists.
+    ///
+    /// - Any grant above `ino` allows read and search. A writable grant
+    ///   allows write.
+    /// - Writing a directory's contents is different from writing the
+    ///   directory. `EISDIR` refuses the second only when `open` asks.
+    /// - Nothing at a snapshot is writable (`EROFS`).
     pub async fn access(
         &self,
         caller: &Caller,
@@ -700,8 +715,8 @@ impl FsCore {
             }
             keys.push(key);
         }
-        // A concurrent unlink/rmdir between the scan and this read is the
-        // only way a value comes back empty; skip it.
+        // An unlink or rmdir between the scan and this read is the only
+        // cause of an empty value. Skip it.
         let dirents: Vec<(Vec<u8>, Vec<u8>)> = view
             .read_many(&keys)
             .await?
@@ -725,29 +740,29 @@ impl FsCore {
         Ok(items)
     }
 
-    /// Applies `changes` -- mode, size and times; there are no owners to
-    /// change -- if `caller` has a writable grant over `ino`, including the
-    /// data-side work a size change implies. The chunk a cut size falls
-    /// inside the client has re-sealed already, cut short (see
-    /// `write_chunks`): the server can't open it to cut it.
+    /// Applies `changes` (mode, size, and times; there are no owners) if
+    /// `caller` has a writable grant above `ino`, including the data work
+    /// that a size change needs. The client has already sealed again, cut
+    /// short, the chunk that a new smaller size falls inside (see
+    /// `write_chunks`), because the server cannot open it to cut it.
     pub async fn setattr(
         &self,
         caller: &Caller,
         ino: u64,
         changes: SetAttr,
     ) -> Result<Attr, FsError> {
-        // Whole chunks past the new end go first, before anything records
-        // the smaller size. A crash here loses tail bytes the caller asked
-        // to discard; the other order would leave chunks beyond EOF that a
-        // later grow would resurrect instead of reading as zeros.
+        // Delete whole chunks past the new end first, before anything
+        // records the smaller size. A crash here loses tail bytes that the
+        // caller asked to remove. The other order would leave chunks past
+        // EOF, which a later grow would bring back in place of zeros.
         if let Some(new_size) = changes.size {
-            // Deleting chunks is destructive and happens outside the
-            // transaction below, so the caller's right to truncate is
-            // checked before it as well as in it.
+            // Deleting chunks cannot be undone, and happens outside the
+            // transaction below. So check the caller's right to truncate
+            // before it, as well as in it.
             self.guard_now(&self.live(), caller, ino, true).await?;
             let layout = self.resolve(&self.live(), ino).await?.attr.layout;
             let first = new_size.div_ceil(self.chunk_size);
-            // Gone whatever the transaction below does.
+            // These chunks are gone, whatever the transaction below does.
             self.discard(self.delete_chunks_from(ino, first, layout).await?);
         }
 
@@ -757,8 +772,8 @@ impl FsCore {
                 return Ok(Err(enoent()));
             };
             let mut entry = decode_entry(ino, &bytes);
-            // A truncate rewrites the boundary chunk, which must not happen
-            // to an inode whose deletion may already have removed it.
+            // A truncate rewrites the boundary chunk. It must not do that
+            // to an inode whose deletion could already have removed it.
             if entry.is_deleted() {
                 return Ok(Err(enoent()));
             }
@@ -787,8 +802,8 @@ impl FsCore {
         Ok(attr)
     }
 
-    /// `name` is the new entry's tag, and `new` the rest of what a create
-    /// brings (see `NewNode`).
+    /// `name` is the new entry's tag, and `new` is the rest of what a
+    /// create sends (see `NewNode`).
     pub async fn mkdir(
         &self,
         caller: &Caller,
@@ -801,7 +816,7 @@ impl FsCore {
             .await
     }
 
-    /// As `mkdir`.
+    /// Same as `mkdir`.
     pub async fn create(
         &self,
         caller: &Caller,
@@ -814,9 +829,9 @@ impl FsCore {
             .await
     }
 
-    /// The inode number `caller`'s next create will use, held for them
-    /// until it does: a node's key record is bound to its inode, so the
-    /// client needs the number before it can make one.
+    /// The inode number that `caller`'s next create uses, kept for them
+    /// until then. A node's key record is bound to its inode, so the client
+    /// needs the number before it can make the record.
     pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
         let user = caller.user.as_str();
         let ino = allocate_inode(&self.client).await?;
@@ -826,13 +841,15 @@ impl FsCore {
         Ok(ino)
     }
 
-    /// Claims `name` in `parent` for `new`'s reserved inode, writing the
-    /// entry, its key record and the directory entry in one transaction.
-    /// Reading the name inside that transaction is what makes the
-    /// existence check authoritative: two concurrent creates of one name
-    /// can't both find it absent. Reading the parent there too means the
-    /// grant check sees the directory as it is at commit, and that a
-    /// directory whose removal has begun takes no new entries.
+    /// Claims `name` in `parent` for `new`'s reserved inode, and writes the
+    /// Entry, its key record, and the directory entry in one transaction.
+    ///
+    /// - Reading the name in that transaction makes the existence check
+    ///   correct: two creates of one name at the same time cannot both find
+    ///   it absent.
+    /// - Reading the parent there too means that the grant check sees the
+    ///   directory as it is at commit, and that a directory whose removal
+    ///   has started takes no new entries.
     async fn create_child(
         &self,
         caller: &Caller,
@@ -850,7 +867,8 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
-            // The new node's key and name are sealed under the parent's.
+            // The new node's key and name are sealed under the parent's
+            // key.
             decide!(self.fresh(&txn, parent).await?);
             let [dir, taken, record] = each(
                 txn.read_many(&[attr_key(parent), dirent.to_vec(), node_keys_key(parent)])
@@ -874,16 +892,17 @@ impl FsCore {
                     atime: now,
                     mtime: now,
                     ctime: now,
-                    // A file made through a server with object storage
-                    // can grow into it; one made without never will.
+                    // A file made through a server with object storage can
+                    // grow into it. A file made without it never will.
                     layout: if kind == Kind::File && self.objects.is_some() {
                         Layout::Hybrid
                     } else {
                         Layout::Inline
                     },
                 },
-                // Files too: the walk up to a grant goes through it, and
-                // a file's only parent is the one directory naming it.
+                // Files too: the walk up to a grant goes through the
+                // parent, and a file's only parent is the one directory
+                // that names it.
                 parent,
             };
             write_entry(&txn, &entry).await?;
@@ -895,9 +914,9 @@ impl FsCore {
         .await?
     }
 
-    /// Takes up `new`'s reserved inode for `caller` and stores its key
-    /// record, which must have `versions` -- version 1, under the parent's
-    /// current key. Inside the creating transaction.
+    /// Uses `new`'s reserved inode for `caller` and stores its key record,
+    /// which must have `versions`: version 1, under the parent's current
+    /// key. Runs in the creating transaction.
     async fn claim(
         &self,
         txn: &Transaction,
@@ -921,8 +940,8 @@ impl FsCore {
         }
         match NodeKeys::versions(&new.keys) {
             Ok(found) if found == versions => {}
-            // Most likely a client holding an old version of the parent's
-            // key, which fetching it again cures.
+            // Most likely a client with an old version of the parent's key.
+            // Fetching the key again fixes that.
             _ => {
                 return Ok(Err(FsError::new(
                     raft5fs_proto::errno::EKEYEXPIRED,
@@ -938,7 +957,7 @@ impl FsCore {
         Ok(Ok(()))
     }
 
-    /// Removes a file, returning the inode it was.
+    /// Removes a file and returns its inode.
     pub async fn unlink(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let child = self.child_ino(&self.live(), parent, name).await?;
         self.remove_child(caller, parent, name, child, Kind::File, parent)
@@ -946,7 +965,7 @@ impl FsCore {
         Ok(child)
     }
 
-    /// Removes an empty directory, returning the inode it was.
+    /// Removes an empty directory and returns its inode.
     pub async fn rmdir(&self, caller: &Caller, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let child = self.child_ino(&self.live(), parent, name).await?;
         self.remove_child(caller, parent, name, child, Kind::Directory, parent)
@@ -954,22 +973,27 @@ impl FsCore {
         Ok(child)
     }
 
-    /// Unlinks `name` from `parent` and drops the inode it named, which
-    /// must be of `kind` -- and if a directory, empty -- if `caller` may.
+    /// Unlinks `name` from `parent` and removes the inode it named, if
+    /// `caller` is allowed. The inode must be of `kind`, and a directory
+    /// must be empty.
     ///
-    /// Three steps, because an inode's chunks needn't fit in one
-    /// transaction. First, one transaction checks the caller's rights on
-    /// `parent`, removes the dirent, marks the Entry deleted and records a
-    /// tombstone; it re-reads the dirent, so it only removes `ino` if the
-    /// name still means `ino`. From then on no write can add a chunk (see
-    /// `write_chunks`), whichever process it comes from, nor a
-    /// create add an entry to a removed directory. Then `finish_removal`
-    /// deletes the chunks, the Entry and the tombstone. A crash between the
-    /// two leaves the tombstone, which `reap_tombstones` finishes.
+    /// It takes several steps, because an inode's chunks might not fit in
+    /// one transaction:
     ///
-    /// The caller needs a writable grant over `guarded`: the parent,
-    /// except for a volume, which is guarded by itself (its parent, the
-    /// real root, being no one's).
+    /// - One transaction checks the caller's rights on `guarded`, removes
+    ///   the dirent, marks the Entry deleted, and records a tombstone. It
+    ///   reads the dirent again, so it removes `ino` only if the name still
+    ///   means `ino`. After this, no write from any process can add a chunk
+    ///   (see `write_chunks`), and no create can add an entry to a removed
+    ///   directory.
+    /// - `finish_removal` then deletes the chunks, the Entry, and the
+    ///   tombstone.
+    /// - If a crash happens between the two, the tombstone stays, and
+    ///   `reap_tombstones` finishes the work.
+    ///
+    /// The caller needs a writable grant above `guarded`: the parent, or
+    /// for a volume the volume itself, because its parent (the real root)
+    /// belongs to no one.
     async fn remove_child(
         &self,
         caller: &Caller,
@@ -992,8 +1016,8 @@ impl FsCore {
             let now = SystemTime::now();
             entry.mark_deleted();
             entry.attr.ctime = now;
-            // Before the emptiness check, which relies on it; if the check
-            // fails, dropping the transaction undoes it.
+            // Write this before the emptiness check, which needs it. If the
+            // check fails, dropping the transaction undoes it.
             write_entry(&txn, &entry).await?;
             if kind == Kind::Directory && !is_empty_dir(&txn, ino).await? {
                 return Ok(Err(FsError::errno(libc::ENOTEMPTY)));
@@ -1008,15 +1032,16 @@ impl FsCore {
         self.finish_removal(ino).await
     }
 
-    /// Moves `name` in `parent` to `new_name` in `new_parent`, replacing
-    /// whatever that named unless `noreplace`, and returns the inode it
-    /// replaced, if any.
+    /// Moves `name` in `parent` to `new_name` in `new_parent`, and replaces
+    /// what `new_name` named unless `noreplace`. Returns the replaced
+    /// inode, if any.
     ///
-    /// One transaction, so the name is never missing and never in both
-    /// places. Data stays put -- chunks are keyed by inode, not by name --
-    /// so the size of the file makes no difference. A replaced inode is
-    /// removed the way `unlink` removes one, starting with a tombstone in
-    /// the same transaction.
+    /// - It is one transaction, so the name is never missing and never in
+    ///   both places.
+    /// - Data does not move: chunks are keyed by inode, not by name, so the
+    ///   file's size does not matter.
+    /// - A replaced inode is removed as `unlink` removes one, starting with
+    ///   a tombstone in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn rename(
         &self,
@@ -1037,9 +1062,9 @@ impl FsCore {
             if new_parent != parent {
                 decide!(self.guard(&txn, caller, new_parent, true).await?);
             }
-            // Both directories and both names in one read, then both
-            // inodes they name in another; checked in the order they
-            // would be read one at a time.
+            // Read both directories and both names in one read, then both
+            // inodes they name in another. Check them in the order of a
+            // one-at-a-time read.
             let moves = new_parent != parent;
             let mut keys = vec![attr_key(parent), from.to_vec(), to.to_vec()];
             if moves {
@@ -1066,8 +1091,8 @@ impl FsCore {
             let mut next = move || found.next().expect("a read of every key answers each");
             let mut moved = decide!(live(ino, next()).ok_or_else(enoent));
             if target == Some(ino) {
-                // Two names for one inode: POSIX says do nothing. (With no
-                // hard links, only `rename(a, a)` gets here.)
+                // Two names for one inode: POSIX says to do nothing. With
+                // no hard links, only `rename(a, a)` gets here.
                 return Ok(Ok(None));
             }
 
@@ -1088,7 +1113,7 @@ impl FsCore {
             }
 
             // The sealed name and key record are for one inode, which must
-            // be the one moving.
+            // be the inode that moves.
             if sealed.ino != ino {
                 return Ok(Err(FsError::new(
                     libc::ESTALE,
@@ -1096,7 +1121,7 @@ impl FsCore {
                 )));
             }
             // Its name is sealed under the new parent's key, and a stale
-            // node mustn't come out of the move looking fresh.
+            // node must not look fresh after the move.
             decide!(self.fresh(&txn, new_parent).await?);
             decide!(self.fresh(&txn, ino).await?);
             let mut records = vec![node_keys_key(new_parent)];
@@ -1111,7 +1136,8 @@ impl FsCore {
                 dst_version
             ));
             if moves {
-                // Its key moves with it, re-wrapped under the new parent's.
+                // Its key moves with it, wrapped again under the new
+                // parent's key.
                 let keys = &sealed.node_keys;
                 let (version, _) = decide!(versions_of(ino, records.next().flatten()));
                 if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
@@ -1123,11 +1149,11 @@ impl FsCore {
                 txn.write(&node_keys_key(ino), Some(keys)).await?;
             }
             if moved.attr.kind == Kind::Directory && new_parent != parent {
-                // A directory may not become its own descendant: walk up
-                // from where it is going. The walk reads every ancestor,
-                // so a concurrent rename that would close a loop the other
-                // way round -- which writes one of them -- conflicts with
-                // this one rather than slipping past it.
+                // A directory cannot move below itself, so walk up from the
+                // destination. The walk reads every ancestor, so a rename
+                // at the same time that would close a loop the other way
+                // (and writes one of them) conflicts with this one and
+                // cannot get past it.
                 let mut cur = new_parent;
                 while cur != ROOT_INO {
                     if cur == ino {
@@ -1155,8 +1181,8 @@ impl FsCore {
         .await??;
 
         if let Some(victim) = replaced {
-            // The rename has happened whatever this says: a failure here
-            // leaves the tombstone, for a later start to finish.
+            // The rename is done, whatever this returns. A failure here
+            // leaves the tombstone, and a later start finishes it.
             if let Err(e) = self.finish_removal(victim).await {
                 eprintln!("could not finish removing inode {victim}, replaced by a rename: {e}");
             }
@@ -1164,18 +1190,19 @@ impl FsCore {
         Ok(replaced)
     }
 
-    /// Up to a write batch's worth of `ino`'s sealed chunks from `first`
-    /// on -- fewer than `count` if that is more -- each with the store's
-    /// sequence number for it, and the file's attributes.
+    /// Reads up to one write batch of `ino`'s sealed chunks from `first`,
+    /// with the file's attributes. It returns fewer than `count` if `count`
+    /// is more than a batch. Each chunk comes with the store's sequence
+    /// number for it.
     ///
-    /// `known[i]`, if there and not 0, is the seq the client already holds
-    /// chunk `first + i` at (decrypted, in its cache). A chunk still at it
-    /// comes back `unchanged`, without its bytes: the store is asked only
-    /// for its version, which costs eight bytes however big the chunk is.
-    ///
-    /// `objects_ok` says the client can fetch from object storage. Without
-    /// it, a chunk there is `ENOTSUP`: an older client would otherwise
-    /// take the pointer it can't read for a hole, and see zeros.
+    /// - `known[i]`, if present and not 0, is the seq at which the client
+    ///   already has chunk `first + i` (decrypted, in its cache). A chunk
+    ///   still at that seq comes back `unchanged`, without its bytes. Only
+    ///   its version is read, which costs eight bytes whatever the chunk's
+    ///   size.
+    /// - `objects_ok` says that the client can fetch from object storage.
+    ///   If not, a chunk there gives `ENOTSUP`. Otherwise a client that
+    ///   cannot read the pointer would take it for a hole and see zeros.
     #[allow(clippy::too_many_arguments)]
     pub async fn read_chunks(
         &self,
@@ -1199,17 +1226,17 @@ impl FsCore {
                 )
             })?),
         };
-        // A block's chunks cost one read and a pointer between them, so a
-        // read in blocks may cover a whole one.
+        // A block's chunks cost one read and one pointer, so a read in
+        // blocks can cover a whole block.
         let mut cap = chunks_per_batch(self.chunk_size) as u64;
         if let Some(g) = grid.filter(|g| g.in_blocks(first)) {
             cap = cap.max(u64::from(g.per_block));
         }
         let count = u64::from(count).min(cap);
 
-        // Each chunk is stored at its own index, or in a block, at the
-        // block's start: one key for a run of consecutive chunks. A run,
-        // with each chunk's index and the seq the client holds it at.
+        // Each chunk is stored at its own index, or in a block at the
+        // block's start: one key for a run of consecutive chunks. A run
+        // holds each chunk's index and the seq the client has it at.
         let mut runs: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
         for (i, index) in (first..first.saturating_add(count)).enumerate() {
             let stored = grid
@@ -1221,9 +1248,9 @@ impl FsCore {
                 _ => runs.push((stored, vec![(index, held)])),
             }
         }
-        // Where the client holds every chunk of a run, its key's seq alone
-        // says whether they are still current -- eight bytes however big
-        // the value -- and all of those are asked in one read.
+        // If the client has every chunk of a run, the key's seq alone shows
+        // whether they are still current. That costs eight bytes whatever
+        // the value's size, and all of those are read in one read.
         let held_runs: Vec<usize> = (0..runs.len())
             .filter(|&r| runs[r].1.iter().all(|&(_, held)| held != 0))
             .collect();
@@ -1272,7 +1299,8 @@ impl FsCore {
             let read = read.expect("every run not current was read");
             let is_current = |held: u64| held != 0 && held == read.seq;
             if !grid.is_some_and(|g| g.in_blocks(stored)) {
-                // An inline chunk: its key is its own, so its run is one.
+                // An inline chunk has its own key, so its run has one
+                // chunk.
                 let (index, held) = run[0];
                 if is_current(held) {
                     chunks.push(unchanged(index, held));
@@ -1335,9 +1363,10 @@ impl FsCore {
         })
     }
 
-    /// A presigned URL reading `block` of `ino`, for a client that said it
-    /// can (`objects_ok`). Without it, `ENOTSUP`: an older client would
-    /// take the pointer it can't read for a hole, and see zeros.
+    /// A presigned URL that reads `block` of `ino`, for a client that can
+    /// read object storage (`objects_ok`). If it cannot, returns `ENOTSUP`.
+    /// Otherwise a client that cannot read the pointer would take it for a
+    /// hole and see zeros.
     fn read_url(&self, ino: u64, block: &BlockRef, objects_ok: bool) -> Result<String, FsError> {
         if !objects_ok {
             return Err(FsError::new(
@@ -1357,10 +1386,11 @@ impl FsCore {
     }
 
     /// Names and presigned upload URLs for new blocks of file `ino`, one
-    /// per block asked for, each for exactly the length its segments take.
-    /// Needs a writable grant over `ino`, a hybrid file; each block must
-    /// start where the grid says one does. Minting stores nothing: an
-    /// upload nothing ever commits is garbage collection's to remove.
+    /// for each block asked for, each for exactly the length of its
+    /// segments. Needs a writable grant above `ino`, which must be a hybrid
+    /// file. Each block must start where the grid says a block starts.
+    /// Minting stores nothing: garbage collection removes an upload that
+    /// nothing commits.
     pub async fn prepare_uploads(
         &self,
         caller: &Caller,
@@ -1416,13 +1446,13 @@ impl FsCore {
             .collect()
     }
 
-    /// For a truncate to `new_size`: the block the new end falls in keeps
-    /// only the segments before it. Whole blocks past the end are gone
-    /// already (`delete_chunks_from`); this one stays, and its later
-    /// segments -- which the new end leaves past it -- must read as zeros
-    /// if the file grows again, not come back. The pointer is plaintext,
-    /// so that is a smaller `nseg`: no keys, no upload. A segment the end
-    /// cuts part-way through the client has rewritten already.
+    /// For a truncate to `new_size`, the block that the new end falls in
+    /// keeps only the segments before the end. `delete_chunks_from` already
+    /// removed whole blocks past the end. This block stays, but its later
+    /// segments must read as zeros if the file grows again, and must not
+    /// come back. The pointer is plaintext, so this only lowers `nseg`: no
+    /// keys and no upload. The client has already rewritten a segment that
+    /// the end cuts part way through.
     async fn trim_block(
         &self,
         txn: &Transaction,
@@ -1432,7 +1462,7 @@ impl FsCore {
         let Some(grid) = self.grid.filter(|_| entry.attr.layout == Layout::Hybrid) else {
             return Ok(Ok(()));
         };
-        // The first chunk wholly past the new end.
+        // The first chunk that is completely past the new end.
         let cut = new_size.div_ceil(self.chunk_size);
         if cut == 0 || !grid.in_blocks(cut - 1) {
             return Ok(Ok(()));
@@ -1452,12 +1482,15 @@ impl FsCore {
         Ok(Ok(()))
     }
 
-    /// Stores sealed chunks of `ino` -- all of them, or with any not as
-    /// its `expected_seq` says, none (`EAGAIN`) -- and grows the file to
-    /// `end`. Each must be sealed under the file's current key version
-    /// (`EKEYEXPIRED` if not, for the client to fetch the key again).
-    /// Returns the file's attributes and the seq every chunk written is
-    /// now at, which is what lets the client cache what it wrote.
+    /// Stores sealed chunks of `ino` and grows the file to `end`.
+    ///
+    /// - If any chunk is not at its `expected_seq`, nothing is stored
+    ///   (`EAGAIN`).
+    /// - Each chunk must be sealed under the file's current key version
+    ///   (`EKEYEXPIRED` if not, so the client fetches the key again).
+    ///
+    /// Returns the file's attributes, and the seq of every chunk written,
+    /// so the client can cache what it wrote.
     pub async fn write_chunks(
         &self,
         caller: &Caller,
@@ -1470,11 +1503,12 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
-            // Read first, and load-bearing: a deletion marks the Entry
-            // before it removes the chunks, in a transaction this one
-            // conflicts with on it, so no chunk lands after the deletion
-            // has scanned past -- and the Entry goes last, so no chunk is
-            // stored for an inode nothing could reach again.
+            // Read the Entry first. This is required: a deletion marks the
+            // Entry before it removes the chunks, in a transaction that
+            // conflicts with this one on the Entry. So no chunk is stored
+            // after the deletion's scan has passed it. The Entry is removed
+            // last, so no chunk is stored for an inode that nothing can
+            // reach.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
             let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
@@ -1493,7 +1527,7 @@ impl FsCore {
         Ok(attr)
     }
 
-    /// `caller`'s grant over `ino` and the key records down to it (see
+    /// `caller`'s grant above `ino`, and the key records down to it (see
     /// `grants::key_path`), at snapshot `at` if one is given.
     pub async fn key_path(
         &self,
@@ -1516,8 +1550,8 @@ impl FsCore {
         snapshots::list(&self.client).await
     }
 
-    /// `user`'s public key, for sealing grants to them. `ENOENT` for an
-    /// account that hasn't enrolled.
+    /// `user`'s public key, for sealing grants to them. Returns `ENOENT`
+    /// for an account that has not enrolled.
     pub async fn public_key(&self, user: &str) -> Result<Vec<u8>, FsError> {
         crate::accounts::get(&self.client, user)
             .await?
@@ -1525,15 +1559,16 @@ impl FsCore {
             .ok_or_else(|| FsError::new(libc::ENOENT, format!("{user} hasn't enrolled")))
     }
 
-    /// Grants directory `grant.ino` to `grantee`, replacing any grant of
-    /// it they had. `caller` needs a writable grant over it, and the grant
-    /// must hold its current key version.
+    /// Grants directory `grant.ino` to `grantee`, and replaces any grant of
+    /// it that they had.
     ///
-    /// `sealed_grantees` is the node's grantee list with this grant in it,
-    /// sealed under its current key version, which replaces the one kept
-    /// -- if that is still at `expected_grantees_seq`, the seq the list it
-    /// was made from was at (`EAGAIN` if not: a grant made meanwhile would
-    /// be lost from it).
+    /// - `caller` needs a writable grant above it, and the grant must hold
+    ///   its current key version.
+    /// - `sealed_grantees` is the node's grantee list with this grant
+    ///   added, sealed under its current key version. It replaces the
+    ///   stored list if that list is still at `expected_grantees_seq`, the
+    ///   seq of the list it was made from. If not, returns `EAGAIN`,
+    ///   because a grant made in the meantime would be lost from it.
     pub async fn grant(
         &self,
         caller: &Caller,
@@ -1547,7 +1582,7 @@ impl FsCore {
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
-            // A stale key may be one someone revoked still holds.
+            // A revoked user may still have a stale key.
             decide!(self.fresh(&txn, ino).await?);
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::Directory));
@@ -1584,10 +1619,11 @@ impl FsCore {
         .await?
     }
 
-    /// A new volume: a directory under the real root, at `new`'s reserved
-    /// inode, granted read-write to `caller` with `sealed_key` (its key,
-    /// version 1) and `sealed_label`. Named after its inode -- what people
-    /// call it lives only in the grants, where the server can't read it.
+    /// Makes a new volume: a directory under the real root, at `new`'s
+    /// reserved inode, granted read-write to `caller` with `sealed_key`
+    /// (its key, version 1) and `sealed_label`. Its name is its inode
+    /// number. The name people use is only in the grants, where the server
+    /// cannot read it.
     pub async fn create_volume(
         &self,
         caller: &Caller,
@@ -1613,7 +1649,7 @@ impl FsCore {
             if txn.read_one(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
             }
-            // No parent key: a volume's key only reaches people by grant.
+            // No parent key: only grants give a volume's key to users.
             decide!(self.claim(&txn, caller, new, (1, 0)).await?);
             let now = SystemTime::now();
             let entry = Entry {
@@ -1642,9 +1678,9 @@ impl FsCore {
         .await?
     }
 
-    /// Every node at or under `top` granted to anyone (see
-    /// `grants::grants_under`). Needs a writable grant over `top`: it is
-    /// what rotating `top`'s key takes.
+    /// Every node at or below `top` that is granted to anyone (see
+    /// `grants::grants_under`). Needs a writable grant above `top`, because
+    /// a rotation of `top`'s key needs this.
     pub async fn grants_under(
         &self,
         caller: &Caller,
@@ -1654,18 +1690,22 @@ impl FsCore {
         grants::grants_under(&self.client, top).await
     }
 
-    /// Gives each node in `rotations` -- parents before children -- a new
-    /// key, in one transaction: its record one version on, wrapped under
-    /// its parent's key as it is now or as this leaves it, and every grant
-    /// of it re-sealed or (sealed empty) removed. `EAGAIN` if a node isn't
-    /// at its expected version any more, or its grants aren't the ones the
-    /// rotation re-seals: someone else changed it meanwhile.
+    /// Gives each node in `rotations` (parents before children) a new key,
+    /// in one transaction:
+    ///
+    /// - its record one version higher, wrapped under its parent's key as
+    ///   it is now, or as this transaction leaves it;
+    /// - every grant of it sealed again, or (sealed empty) removed.
+    ///
+    /// Returns `EAGAIN` if a node is no longer at its expected version, or
+    /// its grants are not the grants that the rotation seals again: another
+    /// client changed it in the meantime.
     pub async fn rotate(&self, caller: &Caller, rotations: &[Rotation]) -> Result<(), FsError> {
         let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
-            // Versions this transaction has moved on, for the children
-            // rotated after their parents.
+            // Versions that this transaction has changed, for the children
+            // that are rotated after their parents.
             let mut rotated: HashMap<u64, u32> = HashMap::new();
             for r in rotations {
                 let ino = r.ino;
@@ -1721,7 +1761,7 @@ impl FsCore {
                         kept += 1;
                     }
                 }
-                // Whoever is left, re-listed under the new key.
+                // The remaining grantees, listed again under the new key.
                 if kept > 0 {
                     decide!(check_grantees_version(ino, &r.sealed_grantees, new_version));
                     txn.write(&grantees_key(ino), Some(&r.sealed_grantees))
@@ -1738,10 +1778,10 @@ impl FsCore {
         .await?
     }
 
-    /// Seals chunks of file `ino` again under its current key version --
-    /// each still at its `expected_seq`, which is required -- leaving the
-    /// file's size and times as they were: what a prune needs done first.
-    /// Needs a writable grant over `ino`, freshly keyed.
+    /// Seals chunks of file `ino` again under its current key version. Each
+    /// chunk must still be at its `expected_seq`, which is required. The
+    /// file's size and times do not change. A prune needs this first. Needs
+    /// a writable grant above `ino`, with fresh keys.
     pub async fn reseal_chunks(
         &self,
         caller: &Caller,
@@ -1759,8 +1799,8 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
-            // As in `write_chunks`, read first: no chunk lands after a
-            // deletion has started.
+            // As in `write_chunks`, read the Entry first, so no chunk is
+            // stored after a deletion has started.
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
             let dropped = decide!(put_chunks(self, &txn, &entry, writes, true).await?);
@@ -1773,9 +1813,9 @@ impl FsCore {
     }
 
     /// Seals entry names in directory `dir` again under its current key
-    /// version, each only if its tag still names the same inode, leaving
-    /// the directory's times as they were. Needs a writable grant over
-    /// `dir`, freshly keyed.
+    /// version, each only if its tag still names the same inode. The
+    /// directory's times do not change. Needs a writable grant above `dir`,
+    /// with fresh keys.
     pub async fn reseal_names(
         &self,
         caller: &Caller,
@@ -1815,18 +1855,19 @@ impl FsCore {
         .await?
     }
 
-    /// Replaces `ino`'s key record, at `expected_version`, with `node_keys`:
-    /// the same record with only its oldest history entries dropped.
-    /// Refused with `EBUSY` while anything is still sealed under a version
-    /// it drops. Needs a writable grant over `ino`.
+    /// Replaces `ino`'s key record, at `expected_version`, with
+    /// `node_keys`: the same record with only its oldest history entries
+    /// removed. Returns `EBUSY` while anything is still sealed under a
+    /// version that it removes. Needs a writable grant above `ino`.
     ///
-    /// What could still be under an old version is looked for outside any
-    /// transaction, and the record then replaced only if it is still the
-    /// one the search started from. That is enough: while the record stays
-    /// the same, everything the server takes in for `ino` -- chunks, entry
-    /// names, children's keys, grants -- is checked, in the transaction
-    /// that stores it, against the current version, which the prune keeps.
-    /// Nothing under a dropped version can appear behind the search.
+    /// The search for data under an old version runs outside any
+    /// transaction. The record is then replaced only if it is still the
+    /// record that the search started from. That is enough: while the
+    /// record stays the same, everything the server takes in for `ino`
+    /// (chunks, entry names, children's keys, grants) is checked against
+    /// the current version in the transaction that stores it, and the prune
+    /// keeps that version. So nothing under a removed version can appear
+    /// after the search.
     pub async fn prune_keys(
         &self,
         caller: &Caller,
@@ -1885,9 +1926,9 @@ impl FsCore {
         .await?
     }
 
-    /// The first thing found that is sealed under a version of `ino`'s key
-    /// before `base` -- a chunk, an entry's name, a child's key, a grant --
-    /// described, or `None`.
+    /// Describes the first thing found that is sealed under a version of
+    /// `ino`'s key before `base`: a chunk, an entry's name, a child's key,
+    /// or a grant. Returns `None` if there is none.
     async fn sealed_below(&self, ino: u64, base: u32) -> Result<Option<String>, FsError> {
         let below = |blob: &[u8]| sealed_version(blob).is_ok_and(|v| v < base);
         let kind = self.resolve(&self.live(), ino).await?.attr.kind;
@@ -1907,8 +1948,8 @@ impl FsCore {
                 if window.len() < MAX_KEYS_PER_READ && key.is_some() {
                     continue;
                 }
-                // Each answer as it comes, rather than the window's whole
-                // worth of chunks at once.
+                // Check each answer as it arrives, not a whole window of
+                // chunks at once.
                 let mut checked = 0;
                 while checked < window.len() {
                     let entries = self.client.read_some(&window[checked..]).await?;
@@ -1986,7 +2027,7 @@ impl FsCore {
         Ok(None)
     }
 
-    /// Removes volume `ino`, which must be empty, with every grant of it.
+    /// Removes volume `ino`, which must be empty, and every grant of it.
     /// Needs a writable grant of the volume itself.
     pub async fn delete_volume(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
         self.guard_now(&self.live(), caller, ino, true).await?;
@@ -2008,13 +2049,13 @@ impl FsCore {
         .await
     }
 
-    /// Everything after the tombstone: the chunks, then the Entry and the
-    /// tombstone together. Idempotent, so it is safe for several processes
-    /// to finish the same deletion at once.
+    /// Does everything after the tombstone: removes the chunks, then the
+    /// Entry and the tombstone together. It is idempotent, so several
+    /// processes can safely finish the same deletion at the same time.
     async fn finish_removal(&self, ino: u64) -> Result<(), FsError> {
-        // The Entry, marked deleted, stays until the chunks are gone. With
-        // none, an earlier finish got that far: whatever chunks are left
-        // the sweep can have.
+        // The Entry, marked deleted, stays until the chunks are gone. If it
+        // is missing, an earlier finish got that far, and the sweep can
+        // remove any chunks that are left.
         let layout = match self.client.read_one(&attr_key(ino)).await?.value {
             Some(bytes) => decode_entry(ino, &bytes).attr.layout,
             None => Layout::Inline,
@@ -2024,7 +2065,7 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
-            // Its grants and key record go with it.
+            // Its grants and key record are removed with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;
             Ok(())
@@ -2034,9 +2075,9 @@ impl FsCore {
         Ok(())
     }
 
-    /// Finishes every deletion an earlier process started but didn't
-    /// complete, returning how many there were. The tombstone index holds
-    /// only in-progress deletions, so this is cheap when there are none.
+    /// Finishes every deletion that an earlier process started but did not
+    /// complete, and returns how many there were. The tombstone index holds
+    /// only unfinished deletions, so this is cheap when there are none.
     async fn reap_tombstones(&self) -> Result<usize, FsError> {
         let mut inos = Vec::new();
         let mut iter = self.client.key_iterator(TOMBSTONE_PREFIX);
@@ -2054,12 +2095,12 @@ impl FsCore {
         Ok(inos.len())
     }
 
-    /// Deletes every chunk of `ino` from `first_index` on, in bounded
-    /// batches. Scanning rather than walking `0..=size/chunk_size` skips
-    /// holes, collects anything an interrupted truncate left behind, and
-    /// needs no trust in the recorded size. Returns the objects the
-    /// pointers it deleted named, if the file is `layout` hybrid: only
-    /// then are block starts' values read.
+    /// Deletes every chunk of `ino` from `first_index` up, in limited
+    /// batches. A scan (not a walk of `0..=size/chunk_size`) skips holes,
+    /// finds anything an interrupted truncate left, and does not depend on
+    /// the recorded size. If the file's `layout` is hybrid, returns the
+    /// objects that the deleted pointers named. Only then are block starts'
+    /// values read.
     async fn delete_chunks_from(
         &self,
         ino: u64,
@@ -2075,7 +2116,7 @@ impl FsCore {
             while batch.len() < DELETE_BATCH {
                 match next_key(&mut iter).await? {
                     // `key_iterator` runs to the end of the keyspace, so
-                    // leaving this inode's chunks is the end of the walk.
+                    // the walk ends when it leaves this inode's chunks.
                     Some(key) if !key.starts_with(&prefix) => break,
                     Some(key) if is_chunk_key(&key, &prefix) => batch.push(key),
                     Some(_) => {}
@@ -2120,9 +2161,9 @@ impl FsCore {
     }
 }
 
-/// Compile-time only: the server will run these on tonic's multithreaded
+/// Compile-time check only: the server runs these on tonic's multithreaded
 /// runtime, which needs every request's future to be `Send`. Generic async
-/// closures (`retrying`) are exactly where that can quietly stop holding.
+/// closures (`retrying`) are where that can stop being true without notice.
 #[allow(dead_code)]
 fn operations_are_send(
     core: &FsCore,

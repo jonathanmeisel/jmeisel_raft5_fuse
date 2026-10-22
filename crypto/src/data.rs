@@ -1,16 +1,18 @@
-//! File chunks and directory entry names, under their node's key.
+//! File chunks and directory entry names, sealed under their node's key.
 //!
-//! Both start with the key version they were sealed under, unencrypted:
-//! the server checks it (a write must use the node's current version) and
-//! a reader uses it to pick the right key from the node's history.
+//! Both start with the key version they were sealed under, not encrypted.
+//! The server checks it (a write must use the node's current version), and
+//! a reader uses it to find the correct key in the node's history.
 //!
-//! A name has two forms. Its *tag* -- `HMAC(directory's name key, name)`
-//! -- is what the server files the entry under, so lookups by name still
-//! work without the server learning it. Its *sealed* form is what the
-//! listing returns, readable by key holders. Opening a sealed name checks
-//! it against the tag, and it is bound to the inode the entry names, so
-//! the server can't show one entry under another entry's name, nor point
-//! a name at another inode.
+//! A name has two forms:
+//!
+//! - Its *tag*, `HMAC(directory's name key, name)`. The server files the
+//!   entry under the tag, so lookups by name work without the server
+//!   learning the name.
+//! - Its *sealed* form, which a listing returns and key holders can read.
+//!   Opening a sealed name checks it against the tag. It is also bound to
+//!   the inode the entry points to. So the server cannot show one entry
+//!   under another entry's name, or point a name at another inode.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -18,7 +20,8 @@ use sha2::Sha256;
 use crate::{AEAD_OVERHEAD, Error, Key, Reader, aad, open, seal};
 
 pub const TAG_LEN: usize = 32;
-/// What sealing adds to a chunk: its version, the nonce and the tag.
+/// The bytes that sealing adds to a chunk: its version, the nonce, and the
+/// tag.
 pub const CHUNK_OVERHEAD: usize = 4 + AEAD_OVERHEAD;
 
 fn chunk_aad(ino: u64, index: u64, version: u32) -> Vec<u8> {
@@ -45,7 +48,7 @@ pub fn sealed_version(blob: &[u8]) -> Result<u32, Error> {
 }
 
 /// Opens a chunk with the file's key at the chunk's version (see
-/// `sealed_version`). A chunk moved to another file or index won't open.
+/// `sealed_version`). A chunk moved to another file or index does not open.
 pub fn open_chunk(key: &Key, ino: u64, index: u64, blob: &[u8]) -> Result<Vec<u8>, Error> {
     let version = sealed_version(blob)?;
     open(
@@ -56,7 +59,7 @@ pub fn open_chunk(key: &Key, ino: u64, index: u64, blob: &[u8]) -> Result<Vec<u8
     )
 }
 
-/// The tag `name` is filed under in a directory with `name_key`.
+/// The tag that `name` is filed under in a directory with `name_key`.
 pub fn name_tag(name_key: &Key, name: &[u8]) -> [u8; TAG_LEN] {
     name_mac(name_key, name).finalize().into_bytes().into()
 }
@@ -80,8 +83,8 @@ fn name_aad(parent: u64, child: u64, tag: &[u8], version: u32) -> Vec<u8> {
     )
 }
 
-/// `name`, filed under `tag` in directory `parent` and naming inode
-/// `child`, sealed under the directory's key at `version`.
+/// Seals `name` under the directory's key at `version`. The name is filed
+/// under `tag` in directory `parent` and points to inode `child`.
 pub fn seal_name(
     key: &Key,
     version: u32,
@@ -95,8 +98,8 @@ pub fn seal_name(
     out
 }
 
-/// Opens a sealed name with the directory's key at its version, and
-/// checks it is the name `tag` stands for, and that it names `child`.
+/// Opens a sealed name with the directory's key at its version. Fails
+/// unless the name matches `tag` and points to `child`.
 pub fn open_name(
     key: &Key,
     name_key: &Key,
@@ -167,8 +170,8 @@ mod tests {
             open_name(&key, &name_key, 7, 21, &tag, &blob).is_err(),
             "the name is bound to the inode it names"
         );
-        // A name sealed under the right tag but not matching it: what a
-        // client with the key, but no honesty, could write.
+        // A name sealed under a tag that it does not match. A client with
+        // the key could write this on purpose.
         let lying = seal_name(&key, 1, 7, 20, &other, b"report.txt");
         assert!(open_name(&key, &name_key, 7, 20, &other, &lying).is_err());
     }

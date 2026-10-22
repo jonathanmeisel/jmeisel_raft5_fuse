@@ -1,15 +1,17 @@
-//! The rules for data in object storage, past the size a hybrid file
-//! keeps in the store (see `layout` for how blocks are laid out, and
-//! `ObjectGrid` for which chunks are in them).
+//! The rules for data in object storage, after the size that a hybrid file
+//! keeps in the store. See `layout` for how blocks are laid out, and
+//! `ObjectGrid` for which chunks are in them.
 //!
-//! The server never sees a block's contents -- the client seals each
-//! segment, uploads the object through a URL the server signed, and only
-//! then commits a pointer to it -- so what it checks is the pointer: that
-//! it sits where a block starts, is sealed under the file's current key
-//! version (which is what keeps `prune_keys` sound with no download), and
-//! names an object minted recently enough. That last one is what lets
-//! garbage collection treat an object minted long ago that nothing points
-//! at as never going to be: no commit naming it would be accepted.
+//! The server never sees a block's contents. The client seals each segment,
+//! uploads the object through a URL that the server signed, and only then
+//! commits a pointer to it. So the server checks the pointer:
+//!
+//! - It is at the start of a block.
+//! - It is sealed under the file's current key version. This keeps
+//!   `prune_keys` correct without a download.
+//! - It names an object minted recently. So if nothing points to an object
+//!   minted long ago, garbage collection knows that nothing ever will: no
+//!   commit naming it would be accepted.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -25,37 +27,37 @@ use crate::view::ReadKeys;
 
 pub const DEFAULT_OBJECT_FROM: u64 = 10 << 20;
 pub const DEFAULT_OBJECT_BLOCK: u64 = 16 << 20;
-/// The largest block: what a client may have to hold in memory to write
-/// one, and to re-upload for a small change inside it.
+/// The largest block. A client may need to hold this much in memory to
+/// write a block, and to upload it again for a small change inside it.
 pub const MAX_OBJECT_BLOCK: u64 = 256 << 20;
 pub const DEFAULT_PUT_TTL: Duration = Duration::from_secs(600);
 pub const DEFAULT_GET_TTL: Duration = Duration::from_secs(900);
-/// How far apart the servers' clocks may be. A name one server minted is
-/// judged by another's clock when committed.
+/// How far apart the servers' clocks can be. One server can commit a name
+/// that another server minted, by its own clock.
 pub const CLOCK_SKEW: Duration = Duration::from_secs(120);
 
-/// The most blocks one `prepare_uploads` names.
+/// The most blocks that one `prepare_uploads` request names.
 pub const MAX_UPLOADS: usize = 64;
 
 /// What a server needs to keep data in object storage.
 pub struct ObjectSettings {
     pub store: S3Store,
-    /// Where hybrid files' blocks start, in bytes, and how big each is.
-    /// Both are fixed when the first server with object storage opens
-    /// the filesystem; later servers adopt what it recorded.
+    /// Where hybrid files' blocks start, in bytes, and the size of each
+    /// block. The first server with object storage sets both when it opens
+    /// the filesystem. Later servers use what it recorded.
     pub object_from: u64,
     pub object_block: u64,
-    /// How long an upload URL, and a read URL, stays good.
+    /// How long an upload URL or a read URL stays valid.
     pub put_ttl: Duration,
     pub get_ttl: Duration,
-    /// Whether to try deleting an object as soon as a change drops the
-    /// last pointer to it, rather than leaving it all to garbage
-    /// collection (see `FsCore::discard`).
+    /// Whether to try to delete an object as soon as a change removes the
+    /// last pointer to it, and not leave it all to garbage collection (see
+    /// `FsCore::discard`).
     pub prompt_delete: bool,
 }
 
 pub(crate) struct Objects {
-    /// Shared with the deletions `FsCore::discard` sets going.
+    /// Shared with the deletions that `FsCore::discard` starts.
     pub(crate) store: Arc<S3Store>,
     pub(crate) put_ttl: Duration,
     pub(crate) get_ttl: Duration,
@@ -72,14 +74,15 @@ impl Objects {
         }
     }
 
-    /// How long after minting a name may still be committed: the upload
-    /// URL's life, and one transaction's for the commit that follows it.
+    /// How long after minting a name can still be committed: the upload
+    /// URL's lifetime, plus one transaction's lifetime for the commit after
+    /// it.
     pub(crate) fn commit_window(&self) -> Duration {
         self.put_ttl + TXN_TTL
     }
 }
 
-/// The grid `object_from` and `object_block` make at this chunk size.
+/// The grid that `object_from` and `object_block` give at this chunk size.
 pub fn grid_for(
     chunk_size: u64,
     object_from: u64,
@@ -101,7 +104,8 @@ pub fn grid_for(
     })
 }
 
-/// The grid recorded for the filesystem in `client`'s store, if one is.
+/// The grid recorded for the filesystem in `client`'s store, if there is
+/// one.
 pub(crate) async fn recorded_grid(client: &Client) -> Result<Option<ObjectGrid>, String> {
     let value = client
         .read_one(OBJECT_GRID_KEY)
@@ -111,9 +115,9 @@ pub(crate) async fn recorded_grid(client: &Client) -> Result<Option<ObjectGrid>,
     value.map(|v| decode_grid(&v)).transpose()
 }
 
-/// The grid in force: the one recorded, or -- for a filesystem no server
-/// has kept objects for yet -- `wanted`, which is then recorded. In one
-/// transaction, so two first servers at once agree.
+/// The grid to use: the recorded grid, or `wanted` for a filesystem that no
+/// server has kept objects for yet. In that case it records `wanted`. It
+/// runs in one transaction, so two first servers at the same time agree.
 pub(crate) async fn resolve_grid(
     client: &Client,
     wanted: ObjectGrid,
@@ -168,8 +172,8 @@ pub(crate) fn object_name(ino: u64, block: &BlockRef) -> ObjectName {
     }
 }
 
-/// An object a change just stopped pointing at, from the chunk key that
-/// pointed at it -- the only key that ever can.
+/// An object that a change just stopped pointing to, with the chunk key
+/// that pointed to it. Only that key can ever point to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Dropped {
     pub(crate) key: Vec<u8>,
@@ -185,9 +189,10 @@ impl Dropped {
     }
 }
 
-/// Whether `w` stores its index the way a file of `layout` keeps it: in
-/// a hybrid file, chunks before the grid's start inline and from it on
-/// as blocks at each block's first index; in any other, inline only.
+/// Whether `w` stores its index as a file of `layout` keeps it. In a hybrid
+/// file, chunks before the grid's start are inline, and chunks from the
+/// start on are blocks at each block's first index. Any other file keeps
+/// all chunks inline.
 pub(crate) fn check_placement(
     ino: u64,
     layout: Layout,
@@ -228,7 +233,7 @@ pub(crate) fn check_placement(
     }
 }
 
-/// Whether a block named at `minted_ms` may still be committed at `now`.
+/// Whether a block named at `minted_ms` can still be committed at `now`.
 pub(crate) fn check_minted(
     minted_ms: u64,
     now: SystemTime,
@@ -287,7 +292,7 @@ mod tests {
                 per_block: 4
             }
         );
-        // A start part-way into a chunk begins at the next one.
+        // A start part way into a chunk moves to the next chunk.
         assert_eq!(grid_for(C, C + 1, C).unwrap().from_index, 2);
         assert!(grid_for(C, 0, C / 2).is_err());
         assert!(grid_for(C, 0, C * 3 / 2).is_err());

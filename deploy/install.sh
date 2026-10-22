@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Installs or upgrades nodes: renders each one's bundle (render.sh), sends
-# it over SSH, and installs it there (templates/remote-install.sh), which
-# restarts only what changed. Nodes are done one at a time, each checked
-# to be serving before the next is touched, so upgrading every node keeps
-# the cluster up.
+# Installs or upgrades nodes. For each node it makes the bundle (render.sh),
+# sends it over SSH, and installs it there (templates/remote-install.sh),
+# which restarts only what changed. It does one node at a time, and checks
+# that each one serves before it starts the next. So an upgrade of every
+# node keeps the cluster up.
 #
 #   ./install.sh [--no-check] <node>...
 #   ./install.sh --all                every node, in cluster.conf's order
 #   ./install.sh --bootstrap <first node>
 #
 # --bootstrap is for creating the cluster (see README.md): the first node
-# starts with the first administrator's login. Install it again without
-# the flag once the cluster is bootstrapped, which removes that login.
-# --no-check skips waiting for each node to serve, which can't happen
-# before the cluster is bootstrapped.
+# starts with the first administrator's login. After the cluster is
+# bootstrapped, install the node again without the flag, which removes that
+# login. --no-check does not wait for each node to serve, which cannot
+# happen before the cluster is bootstrapped.
 . "$(dirname "$0")/lib.sh"
 
 flag=""
@@ -35,7 +35,8 @@ fi
 
 "$DEPLOY/render.sh" "${nodes[@]}"
 
-# Unpacked into a private directory, removed afterwards: it holds keys.
+# Unpack into a private directory, and remove it after, because it holds
+# keys.
 remote="d=\$(mktemp -d); trap 'rm -rf \"\$d\"' EXIT; tar -C \"\$d\" -xzf - && sh \"\$d/remote-install.sh\" $flag"
 
 for node in "${nodes[@]}"; do

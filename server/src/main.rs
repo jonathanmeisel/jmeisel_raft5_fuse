@@ -181,8 +181,8 @@ fn parse_number(flag: &str, s: &str) -> u32 {
         .unwrap_or_else(|_| usage(&format!("{flag} takes a number, not {s:?}")))
 }
 
-/// Every flag, from either mode; each mode then checks it got what it
-/// needs and nothing it doesn't use matters.
+/// Every flag from both modes. Each mode checks that it got the flags it
+/// needs, and ignores the rest.
 #[derive(Default)]
 struct Args {
     positional: Vec<String>,
@@ -286,7 +286,7 @@ fn read_file(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| fail(format!("cannot read {path}: {e}")))
 }
 
-/// A certificate and key from two PEM files, if both were named.
+/// A certificate and key from two PEM files, if both were given.
 fn identity(cert: &Option<String>, key: &Option<String>, what: &str) -> Option<Identity> {
     match (cert, key) {
         (Some(cert), Some(key)) => Some(Identity::from_pem(read_file(cert), read_file(key))),
@@ -295,7 +295,7 @@ fn identity(cert: &Option<String>, key: &Option<String>, what: &str) -> Option<I
     }
 }
 
-/// How to dial the store over TLS, if at all.
+/// How to connect to the store over TLS, if at all.
 fn store_tls(a: &Args) -> Option<ClientTls> {
     let identity = identity(&a.store_cert, &a.store_key, "--store-cert/--store-key");
     let Some(ca) = &a.store_ca else {
@@ -314,7 +314,8 @@ fn store_tls(a: &Args) -> Option<ClientTls> {
     Some(tls)
 }
 
-/// Where to keep large files' data, if the object options ask for it.
+/// Where to keep large files' data, if the object options ask for object
+/// storage.
 fn object_settings(a: &Args) -> Option<ObjectSettings> {
     let Some(bucket) = &a.object_bucket else {
         if a.object_endpoint.is_some() {
@@ -406,7 +407,8 @@ async fn user_command(a: Args) {
         _ => usage("user takes add, del or list"),
     };
     let seeds = positional.cloned().collect();
-    // Checked before a code is issued, so a mistake here wastes none.
+    // Check this before a code is issued, so a mistake does not use up a
+    // code.
     let invite_ca = invite_ca(&a);
     let client = store_client(&a, seeds).await;
     let result = match (command, name) {
@@ -445,8 +447,8 @@ async fn user_command(a: Args) {
     result.unwrap_or_else(|e| fail(e));
 }
 
-/// The invite options' CA certificate, DER, if invitations were asked
-/// for -- after checking they were asked for in full.
+/// The CA certificate from the invite options, in DER, if invitations were
+/// asked for. It first checks that all the invite options were given.
 fn invite_ca(a: &Args) -> Option<Vec<u8>> {
     let asked = !a.invite_servers.is_empty() || a.invite_ca.is_some();
     if !asked {
@@ -475,7 +477,7 @@ async fn snapshot_command(a: Args) {
     let mut positional = a.positional.iter().skip(1).peekable();
     let command = positional.next().map(String::as_str);
     let name = match command {
-        // A name can't hold a '/', which every seed address does.
+        // A name cannot contain '/', and every seed address does.
         Some("create") => positional.next_if(|p| !p.contains('/')).cloned(),
         Some("del") => Some(
             positional
@@ -510,7 +512,7 @@ async fn snapshot_command(a: Args) {
     result.unwrap_or_else(|e| fail(e));
 }
 
-/// Logs through `tracing` as RAFT5FS_LOG says, if it says anything.
+/// Logs through `tracing` as RAFT5FS_LOG says, if it is set.
 fn init_logging() {
     let Ok(filter) = env::var("RAFT5FS_LOG") else {
         return;

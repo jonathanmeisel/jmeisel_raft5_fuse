@@ -1,17 +1,21 @@
-//! Invitations: everything a new user needs to enrol, in one line an
-//! administrator can hand them.
+//! Invitations: everything that a new user needs to enrol, in one line that
+//! an administrator can give them.
 //!
-//! `raft5fs-invite:1:` and then, base64url, the account's name, its
-//! one-time enrolment code, the filesystem servers' addresses, the name to
-//! check their certificates against (if not the addresses' hosts), and the
-//! certificate of the CA they chain to -- the certificate itself, not a
-//! hash of it, so nothing has to be fetched, and trusted on first sight,
-//! to enrol. The CA in the invite is what the user's client then trusts,
-//! for good.
+//! The format is `raft5fs-invite:1:` and then, in base64url:
 //!
-//! An invite holds the code, so it is as secret as the code: whoever has
-//! it can enrol as the user. It travels the way the code would -- out of
-//! band, to the user alone.
+//! - the account's name and its one-time enrolment code;
+//! - the filesystem servers' addresses;
+//! - the name to check their certificates against, if it is not the
+//!   addresses' hosts;
+//! - the certificate of the CA that their certificates chain to.
+//!
+//! The invite holds the CA certificate itself, not a hash. So the user does
+//! not need to fetch a certificate and trust it the first time it is seen.
+//! The user's client then always trusts the CA in the invite.
+//!
+//! An invite holds the enrolment code, so it is as secret as the code:
+//! anyone who has it can enrol as the user. Send it the same way as the
+//! code: on a separate channel, only to the user.
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -25,7 +29,7 @@ pub struct Invite {
     pub code: String,
     pub servers: Vec<String>,
     pub tls_server_name: Option<String>,
-    /// The CA certificate, DER.
+    /// The CA certificate, in DER.
     pub ca: Vec<u8>,
 }
 
@@ -79,8 +83,8 @@ impl Invite {
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
     }
 
-    /// Reads an invitation back, as `encode` writes it -- give or take
-    /// whitespace around it. Anything else is refused, with why.
+    /// Reads an invitation in the format that `encode` writes. Whitespace
+    /// around it is allowed. Anything else is refused, with the reason.
     pub fn decode(line: &str) -> Result<Self, String> {
         let line = line.trim();
         let Some(body) = line.strip_prefix(PREFIX) else {

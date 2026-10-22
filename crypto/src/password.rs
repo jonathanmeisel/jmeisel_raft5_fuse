@@ -1,17 +1,18 @@
-//! From a password to the two secrets a login needs.
+//! Turns a password into the two secrets that a login needs.
 //!
 //! Argon2id stretches the password into a master secret, and HKDF splits
-//! that into the two below. The salt is the server's per-user one (which
-//! it keeps and hands out before login) hashed with the user's name, here:
-//! a server that handed many users one salt still couldn't crack their
-//! `auth`s together, since each is stretched with a salt of its own.
+//! that into two secrets:
 //!
+//! - `auth`, which the client sends to the server at login. The server
+//!   stores only `verifier(auth)`, a plain hash. `auth` is already 256
+//!   random bits, so a slow hash adds nothing.
+//! - `kek`, which wraps the user's private key and never leaves the client.
+//!   `auth` and the verifier give no information about it.
 //!
-//! - `auth`, sent to the server at login. The server stores only
-//!   `verifier(auth)`, a plain hash: `auth` is already 256 uniformly
-//!   random bits, so there is nothing left to slow down.
-//! - `kek`, which wraps the user's private key and never leaves the
-//!   client. Knowing `auth` (or the verifier) gives no handle on it.
+//! The salt is the server's salt for the user (which it keeps and gives out
+//! before login), hashed here with the user's name. So if a server gave
+//! many users one salt, it still could not attack their `auth` values
+//! together, because each one uses its own salt.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
@@ -23,12 +24,11 @@ use crate::{Error, KEY_LEN, Key, Reader};
 
 pub const SALT_LEN: usize = 16;
 pub const AUTH_LEN: usize = 32;
-/// The shortest password a client will set. The password is what every
-/// key a user holds comes down to.
+/// The shortest password that a client accepts. All of a user's keys depend
+/// on the password.
 pub const MIN_PASSWORD_LEN: usize = 12;
 
-/// Whether `password` is long enough to set (see `MIN_PASSWORD_LEN`), in
-/// characters.
+/// Fails if `password` is shorter than `MIN_PASSWORD_LEN` characters.
 pub fn check_new_password(password: &str) -> Result<(), String> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
@@ -38,8 +38,8 @@ pub fn check_new_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Argon2id's cost settings, kept beside the salt so they can be raised
-/// for new enrolments without breaking existing ones.
+/// Argon2id's cost settings. They are stored with the salt, so new accounts
+/// can use higher settings without breaking existing accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
     pub memory_kib: u32,
@@ -48,35 +48,35 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// 64 MiB, three passes: RFC 9106's second recommended setting, in
-    /// one lane. Every filesystem server sees `auth`, and a server that
-    /// shouldn't could test password guesses against it offline at this
-    /// cost per guess, so it is set as high as a login can bear.
+    /// 64 MiB and three passes: RFC 9106's second recommended setting, in
+    /// one lane. Every filesystem server sees `auth`, and a bad server
+    /// could test password guesses against it offline, at this cost for
+    /// each guess. So the cost is as high as a login can accept.
     pub const DEFAULT: Self = Self {
         memory_kib: 64 * 1024,
         iterations: 3,
         parallelism: 1,
     };
 
-    /// Cheap settings for tests, which derive keys for every login.
+    /// Low-cost settings for tests, which derive keys for every login.
     pub const TESTING: Self = Self {
         memory_kib: 64,
         iterations: 1,
         parallelism: 1,
     };
 
-    /// The most a client will spend on a login: 4 GiB, 64 passes, 16
-    /// lanes -- far above anything an honest account needs.
+    /// The highest cost that a client accepts for a login: 4 GiB, 64
+    /// passes, 16 lanes. This is much more than an honest account needs.
     pub const MAXIMUM: Self = Self {
         memory_kib: 4 * 1024 * 1024,
         iterations: 64,
         parallelism: 16,
     };
 
-    /// Refuses settings outside `floor` and `MAXIMUM`. The server hands
-    /// these out at login, so a client that took them as given could be
-    /// talked into stretching its password cheaply -- making the `auth`
-    /// it sends back fast to brute-force -- or into exhausting its memory.
+    /// Refuses settings below `floor` or above `MAXIMUM`. The server gives
+    /// these settings at login. A client that accepted any settings could
+    /// be made to stretch its password weakly, which makes the `auth` it
+    /// sends easy to attack, or to use all its memory.
     pub fn check(&self, floor: KdfParams) -> Result<(), String> {
         let max = Self::MAXIMUM;
         if self.memory_kib < floor.memory_kib || self.iterations < floor.iterations {
@@ -126,14 +126,15 @@ pub fn new_salt() -> [u8; SALT_LEN] {
     salt
 }
 
-/// What one password yields. Wiped when dropped.
+/// The two secrets from one password. They are erased from memory when
+/// dropped.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PasswordKeys {
     pub auth: [u8; AUTH_LEN],
     pub kek: Key,
 }
 
-/// The salt Argon2 is given: the server's, bound to the account's name.
+/// The salt for Argon2: the server's salt, bound to the account's name.
 fn user_salt(user: &str, salt: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"raft5fs/salt");
@@ -143,9 +144,9 @@ fn user_salt(user: &str, salt: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Stretches `user`'s `password`. Slow on purpose (see `KdfParams`);
-/// unusable parameters -- which only a tampered record would hold -- are
-/// an error.
+/// Stretches `user`'s `password`. This is slow on purpose (see
+/// `KdfParams`). Returns an error for parameters that Argon2 cannot use,
+/// which only a changed record would have.
 pub fn derive(
     password: &[u8],
     user: &str,
@@ -177,7 +178,7 @@ pub fn derive(
     Ok(keys)
 }
 
-/// What the server keeps to check an `auth` against.
+/// The hash that the server keeps to check an `auth` value.
 pub fn verifier(auth: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"raft5fs/verifier");
@@ -185,16 +186,17 @@ pub fn verifier(auth: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Whether `auth` matches `stored`, in time that doesn't depend on where
+/// Whether `auth` matches `stored`. The time taken does not depend on where
 /// they differ.
 pub fn check_verifier(auth: &[u8], stored: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     stored.len() == 32 && bool::from(verifier(auth).ct_eq(stored))
 }
 
-/// The salt Prelogin hands out for an account that doesn't exist: made up
-/// from a server secret and the name, so it is the same on every server
-/// and every ask, like a real one -- a stranger can't tell the two apart.
+/// The salt that Prelogin gives for an account that does not exist. It is
+/// made from a server secret and the name, so every server always gives the
+/// same salt, like a real one. A stranger cannot tell a real account from a
+/// missing one.
 pub fn decoy_salt(server_secret: &[u8], user: &str) -> [u8; SALT_LEN] {
     use hmac::{Hmac, Mac};
     let mut mac =
@@ -212,8 +214,8 @@ pub fn new_enrolment_code() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// What the server keeps of an enrolment code. A plain hash is enough:
-/// the code is random, not something a person chose.
+/// The hash of an enrolment code that the server keeps. A plain hash is
+/// enough, because the code is random and not chosen by a person.
 pub fn enrolment_code_hash(code: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"raft5fs/enrolment-code");
@@ -265,7 +267,7 @@ mod tests {
         assert_ne!(keys.auth, other_password.auth);
         let other_salt = derive(b"hunter2", "u", &new_salt(), KdfParams::TESTING).unwrap();
         assert_ne!(keys.kek, other_salt.kek);
-        // One server salt handed to two users still stretches differently.
+        // Two users with the same server salt still get different keys.
         let other_user = derive(b"hunter2", "v", &salt, KdfParams::TESTING).unwrap();
         assert_ne!(keys.auth, other_user.auth);
         assert_ne!(keys.kek, other_user.kek);
@@ -328,7 +330,7 @@ mod tests {
         assert!(check_new_password("short").is_err());
         assert!(check_new_password("elevenchars").is_err());
         check_new_password("twelve chars").unwrap();
-        // Characters, not bytes.
+        // The limit counts characters, not bytes.
         assert!(check_new_password("ééééééééééé").is_err());
     }
 }

@@ -1,8 +1,7 @@
-//! `raft5fs grant`, `revoke`, `grants`, `trust`, `forget-key` and
-//! `pending`.
-//!
-//! A path starts with an entry of the account's root -- what a mount
-//! shows at its top -- and goes on below it: `photos/2024`.
+//! `raft5fs grant`, `revoke`, `grants`, `trust`, `forget-key`, and
+//! `pending`. A path starts with an entry of the account's root (what a
+//! mount shows at its top) and continues below it, for example
+//! `photos/2024`.
 
 use std::ffi::OsStr;
 
@@ -17,19 +16,18 @@ use raft5fs_client::vault::ShareTrust;
 pub struct GrantArgs {
     /// The directory to share.
     pub path: String,
-    /// Who to share it with. (Not `user`: that is the global `--user`'s
-    /// name, which this would take over.)
+    /// The user to share it with. (Not `user`: that is the name of the
+    /// global `--user`, which this would replace.)
     #[arg(value_name = "USER")]
     pub grantee: String,
-    /// Read-only: writes under it fail for them.
+    /// Read-only: their writes below it fail.
     #[arg(long)]
     pub ro: bool,
-    /// What it shows up as in their root (by default, the path's last
-    /// part).
+    /// Its label in their root (by default, the last part of the path).
     #[arg(long)]
     pub name: Option<String>,
-    /// Their key's fingerprint, as they saw it when enrolling (`raft5fs
-    /// whoami` shows it): words or hex. Needed the first time you share
+    /// Their key's fingerprint, as they saw it when they enrolled (`raft5fs
+    /// whoami` shows it), in words or hex. Needed the first time you share
     /// with them, unless you `trust` them first.
     #[arg(long)]
     pub fingerprint: Option<String>,
@@ -39,10 +37,10 @@ pub struct GrantArgs {
 pub struct RevokeArgs {
     /// The directory.
     pub path: String,
-    /// Whose share of it to take back.
+    /// The user whose share to remove.
     #[arg(value_name = "USER")]
     pub grantee: String,
-    /// Don't queue the directory for pruning (see `raft5fs prune`).
+    /// Do not add the directory to the prune queue (see `raft5fs prune`).
     #[arg(long)]
     pub no_prune: bool,
 }
@@ -85,8 +83,8 @@ pub fn grant(connect: &ConnectArgs, args: GrantArgs) -> Outcome {
     let vault = log_in(&runtime, &ctx)?;
     let public_key = runtime
         .block_on(async {
-            // A first share with someone: their key only on the
-            // fingerprint's say-so, never on the server's alone.
+            // A first share with a user: trust their key only if the
+            // fingerprint matches, never only because the server says so.
             if vault.known_keys().pinned(&args.grantee).is_none() {
                 let Some(expected) = &args.fingerprint else {
                     let served = vault.served_key(&args.grantee).await?;

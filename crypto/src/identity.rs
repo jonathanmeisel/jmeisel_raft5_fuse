@@ -1,21 +1,24 @@
 //! Users' key pairs, and grants: node keys sealed to a user.
 //!
-//! A user's private key is random, not derived from the password, so a
-//! password change only re-wraps it (`wrap`) rather than changing who
-//! the user is to every grant already sealed to them.
+//! A user's private key is random, not derived from the password. So a
+//! password change only wraps it again (`wrap`), and grants already sealed
+//! to the user stay valid.
 //!
-//! Grants are authenticated boxes from the granter to the grantee
-//! (X25519 between their two key pairs, then XChaCha20-Poly1305): only the
-//! grantee opens one, and opening it proves which key pair made it. The
-//! granter's name travels in the clear in front, so the grantee knows
-//! whose public key to open it with -- and inside too, with the grantee's
-//! public key and the inode, so a box can't be passed off as from someone
-//! else, to someone else, or of another inode. A grant is only as good as
-//! the grantee's trust in its sender's public key: a malicious server can
-//! still make up a user and grant from it, but not pass that off as from
-//! anyone the grantee has pinned.
+//! A grant is an authenticated box from the granter to the grantee (X25519
+//! between their key pairs, then XChaCha20-Poly1305). Only the grantee can
+//! open it, and opening it proves which key pair made it.
 //!
-//! Labels -- what a grant shows up as -- are only cosmetic, so they stay
+//! - The granter's name is in clear text at the start, so the grantee knows
+//!   which public key opens the box.
+//! - The granter's name is also inside the box, with the grantee's public
+//!   key and the inode. So the server cannot show a box as from another
+//!   user, to another user, or for another inode.
+//!
+//! A grant is only as safe as the grantee's trust in the sender's public
+//! key. A malicious server can make up a user and grant from it, but it
+//! cannot show that grant as from a user the grantee has pinned.
+//!
+//! Labels (the names that grants show as) are only for display, so they are
 //! anonymous sealed boxes.
 
 use crypto_box::aead::{Aead, AeadCore};
@@ -43,8 +46,9 @@ impl Identity {
         self.secret.public_key().to_bytes()
     }
 
-    /// The private key sealed under `kek`, for the server to keep. Bound
-    /// to `user`, so one account's blob can't be handed to another.
+    /// Seals the private key under `kek`, for the server to keep. The
+    /// result is bound to `user`, so the server cannot give one account's
+    /// private key to another account.
     pub fn wrap(&self, kek: &Key, user: &str) -> Vec<u8> {
         let secret = zeroize::Zeroizing::new(self.secret.to_bytes());
         seal(kek, &aad("identity", &[user.as_bytes()]), secret.as_ref())
@@ -65,9 +69,11 @@ impl Identity {
     }
 
     /// Opens a grant of `ino` made to this identity by the holder of
-    /// `sender_key` -- whose name the grant gives (`grant_sender`): the
-    /// node's key and which version of it the grant holds. Fails unless
-    /// `sender_key` really made it, for this identity, of `ino`.
+    /// `sender_key`. The grant names its sender (`grant_sender`).
+    ///
+    /// Returns the node's key and the key version that the grant holds.
+    /// Fails unless `sender_key` made the grant, for this identity, of
+    /// `ino`.
     pub fn open_grant(
         &self,
         sender_key: &[u8; PUBLIC_KEY_LEN],
@@ -98,7 +104,7 @@ impl Identity {
         Ok((version, key))
     }
 
-    /// Opens the name a grant of `ino` was given.
+    /// Opens the label that a grant of `ino` shows as.
     pub fn open_label(&self, ino: u64, sealed: &[u8]) -> Result<Vec<u8>, Error> {
         let what = "a grant's name";
         let plain = self.unseal(sealed, what)?;
@@ -117,7 +123,7 @@ impl Identity {
 const NONCE_LEN: usize = 24;
 const GRANT_DOMAIN: &[u8] = b"raft5fs/grant";
 
-/// `ino`'s key at `version`, from `sender` (whose account is
+/// Seals `ino`'s key at `version` from `sender` (whose account is
 /// `sender_name`) to the holder of `public_key`. See the module doc.
 pub fn seal_grant(
     sender: &Identity,
@@ -145,17 +151,17 @@ pub fn seal_grant(
     out
 }
 
-/// Whose account a grant says it is from: the name to fetch the public
-/// key to open it with. Unproven until `open_grant` succeeds.
+/// The account that a grant says it comes from: the name to get the public
+/// key that opens it. This is not proven until `open_grant` succeeds.
 pub fn grant_sender(sealed: &[u8]) -> Result<&str, Error> {
     let what = "a grant's sender";
     let name = Reader(sealed).bytes(what)?;
     std::str::from_utf8(name).map_err(|_| Error(what))
 }
 
-/// The name a grant of `ino` shows up as in the grantee's root, sealed to
-/// them: they can't read the node's real name, which is encrypted under
-/// its parent's key.
+/// Seals the label that a grant of `ino` shows as in the grantee's root.
+/// The grantee cannot read the node's real name, which is sealed under its
+/// parent's key.
 pub fn seal_label(public_key: &[u8; PUBLIC_KEY_LEN], ino: u64, name: &[u8]) -> Vec<u8> {
     let mut plain = ino.to_be_bytes().to_vec();
     plain.extend_from_slice(name);
@@ -168,13 +174,13 @@ fn seal_to(public_key: &[u8; PUBLIC_KEY_LEN], plain: &[u8]) -> Vec<u8> {
         .expect("sealing in-memory data can't fail")
 }
 
-/// How many words `fingerprint_words` reads a key out as.
+/// How many words `fingerprint_words` gives for a key.
 pub const FINGERPRINT_WORDS: usize = 12;
 
-/// A public key's fingerprint as words, for people to read to each other
-/// out of band: the first 132 bits of its SHA-256, 11 bits a word, from
-/// the BIP-39 English list. A little more than the hex form's 128 bits,
-/// and much easier to compare over the phone.
+/// A public key's fingerprint as words, for people to read to each other on
+/// another channel. It is the first 132 bits of the key's SHA-256, 11 bits
+/// for each word from the BIP-39 English list. That is a little more than
+/// the 128 bits of the hex form, and much easier to compare by phone.
 pub fn fingerprint_words(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
     let digest = Sha256::digest(public_key);
     (0..FINGERPRINT_WORDS)
@@ -183,18 +189,19 @@ pub fn fingerprint_words(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
         .join(" ")
 }
 
-/// `n` bits of `bytes` from bit `start` on, most significant first.
+/// Reads `n` bits of `bytes` from bit `start`, most significant bit first.
 fn bits_at(bytes: &[u8], start: usize, n: usize) -> u32 {
     (start..start + n).fold(0, |acc, bit| {
         (acc << 1) | u32::from((bytes[bit / 8] >> (7 - bit % 8)) & 1)
     })
 }
 
-/// Whether `written` -- a fingerprint as someone read it out, in either
-/// form: `fingerprint`'s 32 hex digits, or `fingerprint_words`' 12 words
-/// -- is `public_key`'s. Case, spaces and hyphens don't matter. Anything
-/// that is neither form is an error rather than a mismatch, so a typo
-/// isn't mistaken for a different key.
+/// Whether `written` is `public_key`'s fingerprint, in either form:
+/// `fingerprint`'s 32 hex digits, or `fingerprint_words`' 12 words. Case,
+/// spaces, and hyphens do not matter.
+///
+/// Text in neither form returns an error, not a mismatch, so a typo is not
+/// taken as a different key.
 pub fn fingerprint_matches(
     public_key: &[u8; PUBLIC_KEY_LEN],
     written: &str,
@@ -227,9 +234,9 @@ pub fn fingerprint_matches(
     Ok(matches)
 }
 
-/// A short, readable digest of a public key, for people to compare out of
-/// band: `ab12 cd34 ...`, 16 bytes of SHA-256 in groups of two. (See
-/// `fingerprint_words` for the friendlier form.)
+/// A short digest of a public key, for people to compare on another
+/// channel: `ab12 cd34 ...`, the first 16 bytes of SHA-256 in groups of
+/// two. `fingerprint_words` gives an easier form.
 pub fn fingerprint(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
     let digest = Sha256::digest(public_key);
     digest[..16]
@@ -278,7 +285,7 @@ mod tests {
         let carol = Identity::generate();
         let key = Key::random();
         let grant = seal_grant(&carol, "carol", &alice.public_key(), 42, 3, &key);
-        // The same box under another sender's name in front.
+        // The same box, with another sender's name at the start.
         let mut relabelled = Vec::new();
         put_bytes(&mut relabelled, b"dave");
         relabelled.extend_from_slice(&grant[4 + "carol".len()..]);
@@ -287,9 +294,9 @@ mod tests {
                 .open_grant(&carol.public_key(), 42, &relabelled)
                 .is_err()
         );
-        // Carol and alice share one box key either way round, so a grant
-        // from alice to carol would open for alice "from carol" -- but it
-        // names its sender and grantee inside.
+        // Carol and alice share one box key in both directions. So a grant
+        // from alice to carol would open for alice as "from carol", but the
+        // box names its sender and grantee inside.
         let back = seal_grant(&alice, "alice", &carol.public_key(), 42, 3, &key);
         let mut reflected = Vec::new();
         put_bytes(&mut reflected, b"carol");
@@ -334,7 +341,7 @@ mod tests {
         assert!(fingerprint_matches(&a, &fingerprint(&a).replace(' ', "")).unwrap());
         assert!(!fingerprint_matches(&b, &words).unwrap());
         assert!(!fingerprint_matches(&b, &fingerprint(&a)).unwrap());
-        // One word swapped for another real one: a mismatch, not a match.
+        // One word changed to another real word is a mismatch, not a match.
         let mut one_off: Vec<&str> = words.split(' ').collect();
         one_off[11] = if one_off[11] == "zoo" {
             "abandon"
@@ -342,7 +349,8 @@ mod tests {
             "zoo"
         };
         assert!(!fingerprint_matches(&a, &one_off.join(" ")).unwrap());
-        // Neither form: an error, so a typo isn't read as another key.
+        // Text in neither form is an error, so a typo is not read as
+        // another key.
         assert!(fingerprint_matches(&a, "not a fingerprint").is_err());
         let typo = words.replacen(one_off[0], "zzzz", 1);
         assert!(fingerprint_matches(&a, &typo).is_err());

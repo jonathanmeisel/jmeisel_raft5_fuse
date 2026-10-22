@@ -1,18 +1,19 @@
-//! Accounts: what checks a login, and the user's
-//! wrapped private key.
+//! Accounts: what checks a login, and the user's wrapped private key.
 //!
-//! The server never sees a password here. Each account holds what the
-//! client derived from one (see raft5fs-crypto's `password`): a salt and
-//! cost settings to stretch it with, a verifier to check the resulting
-//! `auth` against, and the user's key pair -- the public half, and the
-//! private half wrapped under a key only the password yields.
+//! The server never sees a password. Each account holds what the client
+//! derived from one (see raft5fs-crypto's `password`):
 //!
-//! An account is its keys. It gets them by enrolling with a one-time code
-//! an administrator issued (`issue_code`), which is all there is to adding
-//! a user. Only the code's hash is stored,
-//! and enrolling consumes it. Issuing a new code lets a user who lost
-//! their password enrol again -- with a new key pair, so whatever was
-//! granted to the old one is out of reach until granted again.
+//! - a salt and cost settings to stretch the password with;
+//! - a verifier to check the resulting `auth` against;
+//! - the user's key pair: the public key, and the private key wrapped under
+//!   a key that only the password gives.
+//!
+//! An account is its keys. A user gets keys by enrolling with a one-time
+//! code from an administrator (`issue_code`). This is the only step to add
+//! a user. Only the code's hash is stored, and enrolling uses it up. A new
+//! code lets a user who lost their password enrol again, with a new key
+//! pair. Anything granted to the old key pair is then out of reach until
+//! someone grants it again.
 
 use raft5_client::{Client, Error as KvError, Transaction};
 use raft5fs_crypto::identity::PUBLIC_KEY_LEN;
@@ -86,9 +87,8 @@ fn decode(user: &str, mut bytes: &[u8]) -> Result<AccountKeys, FsError> {
     Ok(keys)
 }
 
-/// Refuses keys a client couldn't have made honestly: the wrong sizes, or
-/// cost settings Argon2 would reject. What they open isn't checked -- it
-/// can't be, here.
+/// Refuses keys that an honest client could not make: wrong sizes, or cost
+/// settings that Argon2 rejects. This cannot check what the keys open.
 fn validate(keys: &AccountKeys) -> Result<(), FsError> {
     let bad = |what: &str| {
         Err(FsError::new(
@@ -122,7 +122,7 @@ pub async fn get(client: &Client, user: &str) -> Result<Option<AccountKeys>, FsE
     }
 }
 
-/// Every one of `users`' keys, in order, as `get` reads one.
+/// The keys of each user in `users`, in order, read as `get` reads them.
 pub(crate) async fn get_many(
     client: &Client,
     users: &[&str],
@@ -136,9 +136,9 @@ pub(crate) async fn get_many(
         .collect()
 }
 
-/// `user`'s keys, if `auth` is right for them. A wrong `auth` and an
-/// account with no keys look the same, so a login can't tell a stranger
-/// which accounts exist.
+/// Returns `user`'s keys if `auth` is correct for them. A wrong `auth` and
+/// an account with no keys give the same result, so a login does not show a
+/// stranger which accounts exist.
 pub async fn check_login(
     client: &Client,
     user: &str,
@@ -152,8 +152,8 @@ pub async fn check_login(
         .filter(|keys| check_verifier(auth, &keys.verifier)))
 }
 
-/// A fresh one-time code `user` can enrol with, replacing any code issued
-/// before. Only its hash is stored.
+/// Makes a new one-time code that `user` can enrol with, and replaces any
+/// earlier code. Only its hash is stored.
 pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> {
     crate::grants::check_username(user)?;
     let code = new_enrolment_code();
@@ -163,16 +163,17 @@ pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> 
     Ok(code)
 }
 
-/// Stores `user`'s keys, if `code` is the one issued to them, and uses the
-/// code up. A wrong or used code is `EACCES`.
+/// Stores `user`'s keys if `code` is the code issued to them, and uses the
+/// code up. A wrong or used code gives `EACCES`.
 ///
-/// Enrolling again replaces the key pair, and takes every grant the
-/// account held with it. The server decides what an account may do by
-/// its grants, by name, not by what it can decrypt -- so grants left in
-/// place would let whoever holds the new code delete and overwrite what
-/// they can't read. A grant made concurrently can't slip past this: it
-/// reads the account's keys in its own transaction, which this one
-/// writes, so one of the two retries.
+/// Enrolling again replaces the key pair and removes every grant the
+/// account had. The server decides what an account can do by its grants, by
+/// name, not by what it can decrypt. So if the grants stayed, the holder of
+/// the new code could delete and overwrite data that they cannot read.
+///
+/// A grant made at the same time cannot get past this. The grant reads the
+/// account's keys in its own transaction, and this transaction writes them,
+/// so one of the two retries.
 pub async fn enrol(
     client: &Client,
     user: &str,
@@ -208,7 +209,7 @@ pub async fn enrol(
     .await?
 }
 
-/// The inodes `user` holds grants of, per their grant index, as `txn`
+/// The inodes that `user` has grants of, from their grant index, as `txn`
 /// sees it.
 async fn granted_in(txn: &Transaction, user: &str) -> Result<Vec<u64>, KvError> {
     let prefix = crate::grants::index_prefix(user);
@@ -225,9 +226,9 @@ async fn granted_in(txn: &Transaction, user: &str) -> Result<Vec<u64>, KvError> 
     Ok(granted)
 }
 
-/// Replaces `user`'s password-derived material, if `old_auth` is right.
-/// The key pair must stay the same: what was granted to it has to keep
-/// opening.
+/// Replaces the parts of `user`'s account that come from the password, if
+/// `old_auth` is correct. The key pair must stay the same, so that what was
+/// granted to it still opens.
 pub async fn change_password(
     client: &Client,
     user: &str,
@@ -267,10 +268,10 @@ pub async fn change_password(
     .await?
 }
 
-/// Removes `user`: their keys, any code issued them, and every grant made
-/// to them. Returns whether there was anything to remove. A session
-/// already issued to them stops working once servers notice the keys are
-/// gone (their identity cache).
+/// Removes `user`: their keys, any code issued to them, and every grant
+/// made to them. Returns whether there was anything to remove. A session
+/// already issued to them stops working when the servers see that the keys
+/// are gone (their identity cache).
 pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     let prefix = crate::grants::index_prefix(user);
     let mut granted = Vec::new();
@@ -300,8 +301,8 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     .await?
 }
 
-/// Every account with keys, and every one with a code it hasn't used yet,
-/// in name order: `(name, enrolled)`.
+/// Every account with keys, and every account with an unused code, in name
+/// order, as `(name, enrolled)`.
 pub async fn list(client: &Client) -> Result<Vec<(String, bool)>, FsError> {
     let mut accounts = std::collections::BTreeMap::new();
     for (prefix, enrolled) in [(ACCOUNT_KEYS_PREFIX, true), (ENROLMENT_PREFIX, false)] {

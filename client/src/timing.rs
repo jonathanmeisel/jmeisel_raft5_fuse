@@ -1,13 +1,15 @@
-//! Timing every request to the servers, with `RAFT5FS_TIMING=1`: a line
-//! on stderr for each, saying how long it took from being sent to the
-//! last byte of its answer, and -- from a server that says (see
-//! `raft5fs_proto::timing`) -- how much of that the server spent
-//! handling it, and how much of that went on the store. What neither
-//! accounts for is the network: the round trip, the bytes each way, and
-//! anything queued in front of the request at either end.
+//! With `RAFT5FS_TIMING=1`, times every request to the servers and prints
+//! one line on stderr for each. The line says:
 //!
-//! Each attempt gets its own line, so a request that fails over shows
-//! as one line per server it tried.
+//! - how long the request took, from send to the last byte of the answer;
+//! - if the server reports it (see `raft5fs_proto::timing`), how much of
+//!   that time the server spent on the request, and how much of that went
+//!   to the store.
+//!
+//! The rest is the network: the round trip, the bytes each way, and
+//! anything queued in front of the request on either side. Each attempt
+//! gets its own line, so a request that fails over shows one line for each
+//! server it tried.
 
 use std::env;
 use std::fmt::Display;
@@ -25,7 +27,7 @@ use tonic::codegen::{Bytes, Service};
 static ENABLED: LazyLock<bool> =
     LazyLock::new(|| env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
 
-/// `S`, a connection to `server`, with every request through it timed.
+/// Wraps `S`, a connection to `server`, and times every request through it.
 #[derive(Clone)]
 pub struct Timed<S> {
     inner: S,
@@ -56,7 +58,7 @@ where
     }
 
     fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
-        // `/raft5fs.Fs/Lookup` is `Lookup`.
+        // The name for `/raft5fs.Fs/Lookup` is `Lookup`.
         let path = request.uri().path();
         let method = path.rsplit('/').next().unwrap_or(path).to_string();
         let server = Arc::clone(&self.server);
@@ -95,11 +97,11 @@ where
     }
 }
 
-/// An answer's body, which says how long the answer took once it has all
-/// arrived.
+/// An answer's body. It reports how long the answer took after all of it
+/// arrives.
 pub struct TimedBody<B> {
     inner: Pin<Box<B>>,
-    /// What to say, until it has been said. `None` when timing is off.
+    /// The report to print, until it is printed. `None` when timing is off.
     report: Option<Report>,
 }
 
@@ -107,8 +109,8 @@ struct Report {
     method: String,
     server: Arc<str>,
     start: Instant,
-    /// When the answer's headers came: the server is done by then, and
-    /// what follows is the body crossing the network.
+    /// When the answer's headers arrived. The server is done by then, and
+    /// the rest is the body crossing the network.
     first_byte: Duration,
     server_timing: Option<ServerTiming>,
     bytes: u64,
@@ -144,8 +146,8 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// An empty body, timing nothing: what tonic answers with itself when
-/// there is no answer from the server to give.
+/// An empty body that times nothing. tonic uses this when there is no
+/// answer from the server.
 impl<B: Default> Default for TimedBody<B> {
     fn default() -> Self {
         Self {
@@ -178,8 +180,9 @@ impl<B: Body<Data = Bytes>> Body for TimedBody<B> {
                 if let (Some(report), Some(data)) = (&mut this.report, frame.data_ref()) {
                     report.bytes += data.len() as u64;
                 }
-                // gRPC's status comes last, in the trailers: the answer is
-                // all here, whether or not anything polls for its end.
+                // gRPC's status comes last, in the trailers. The whole
+                // answer is here, whether or not anything polls for its
+                // end.
                 if frame.is_trailers() {
                     this.finish("");
                 }

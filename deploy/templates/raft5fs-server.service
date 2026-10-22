@@ -1,9 +1,8 @@
-# The raft5fs filesystem server on @NODE@. Rendered by deploy/render.sh.
-#
-# Stateless: it serves users on the public port and keeps everything in
-# the store, through whichever store node answers -- so it needs the store
-# running, but not this node's in particular. Until the store is
-# bootstrapped it can't log in, and systemd keeps restarting it.
+# The raft5fs filesystem server on @NODE@. deploy/render.sh renders this
+# file. The server is stateless: it serves users on the public port and
+# keeps everything in the store, through whichever store node answers. So it
+# needs the store to run, but not this node's store node. It cannot log in
+# until the store is bootstrapped, so systemd restarts it until then.
 [Unit]
 Description=raft5fs filesystem server
 After=raft5-server.service wg-quick@wg0.service network-online.target
@@ -13,9 +12,10 @@ StartLimitIntervalSec=0
 [Service]
 User=raft5fs
 Group=raft5fs
-# RAFT5FS_STORE_PASSWORD: the store account's password, and with object
-# storage RAFT5FS_OBJECT_ACCESS_KEY/RAFT5FS_OBJECT_SECRET_KEY, the
-# bucket's credentials. Read by systemd, as root; the file is root's alone.
+# RAFT5FS_STORE_PASSWORD is the store account's password. With object
+# storage, RAFT5FS_OBJECT_ACCESS_KEY and RAFT5FS_OBJECT_SECRET_KEY are the
+# bucket's credentials. systemd reads the file as root, and only root can
+# read it.
 EnvironmentFile=/etc/raft5fs/store.env
 ExecStart=/usr/local/bin/raft5fs-server --listen 0.0.0.0:27060 \
     --token-key-file /etc/raft5fs/token.key \

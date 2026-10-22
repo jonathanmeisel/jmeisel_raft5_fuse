@@ -1,38 +1,38 @@
-//! Garbage collection of object storage: deleting the objects nothing
-//! points at any more.
+//! Garbage collection of object storage: deletes the objects that nothing
+//! points to.
 //!
-//! Every change to a block makes a new object (objects are written once).
-//! The KV store side of a change is just a key removed or rewritten, as it
-//! always was; the object it stopped pointing at a server tries to delete
-//! at once (`discard`), but only tries -- nothing records the attempt, so
-//! a failure or a crash leaves it behind, as does an upload for a commit
-//! that then failed or never came. This finds what is left, by mark and
-//! sweep:
+//! Every change to a block makes a new object, because objects are written
+//! once. In the KV store, a change only removes or rewrites a key. A server
+//! tries to delete the object that the change stopped pointing to at once
+//! (`discard`). But nothing records the attempt, so a failure or a crash
+//! leaves the object. An upload for a commit that failed, or never
+//! happened, also leaves an object. This code finds what is left, by mark
+//! and sweep:
 //!
-//! 1. Mark: every block pointer in the live store, then in every
-//!    snapshot. Live first: a snapshot taken while the live scan runs is
-//!    then always listed after it, so a pointer the scan passed before it
-//!    was overwritten is still found, in that snapshot.
+//! 1. Mark every block pointer in the live store, then in every snapshot.
+//!    The live store comes first: a snapshot taken during the live scan is
+//!    then always listed after it. So a pointer that the scan passed before
+//!    it was overwritten is still found, in that snapshot.
 //! 2. List the bucket under the filesystem's prefix.
-//! 3. Delete each object that is unreferenced now and was unreferenced at
-//!    a sweep at least a read URL's life ago, so that nobody can still be
-//!    reading it through a URL handed out when it was referenced. An
-//!    object minted too recently to be past the commit window is left
-//!    alone whatever: a commit naming it may still come.
+//! 3. Delete each object that has no pointer now, and had no pointer at a
+//!    sweep at least one read URL lifetime ago. So no one can still be
+//!    reading it through a URL given out while it had a pointer. Never
+//!    delete an object minted too recently to be past the commit window,
+//!    because a commit naming it can still come.
 //!
-//! Anything going wrong before the deleting -- a read failing, a
-//! snapshot gone mid-scan, the listing failing, the lease lost -- ends
-//! the sweep with nothing deleted. A key under the prefix that isn't one
-//! of our object names is never deleted.
+//! If anything goes wrong before the delete step (a read fails, a snapshot
+//! disappears during the scan, the listing fails, or the lease is lost),
+//! the sweep stops and deletes nothing. A key under the prefix that is not
+//! one of our object names is never deleted.
 //!
-//! Reads outside a transaction may be stale, but a stale replica can only
-//! miss a *recent* pointer, and the mint-age rule and the two sweeps
-//! cover that.
+//! Reads outside a transaction can be stale. But a stale replica can only
+//! miss a *recent* pointer, and the mint-age rule and the two sweeps cover
+//! that.
 //!
-//! One server sweeps at a time: whichever holds the lease, a value with an
-//! expiry (no lock is held across transactions). Which objects were
-//! unreferenced last time is the holder's to remember, in memory; another
-//! server taking over only starts that count again.
+//! Only one server sweeps at a time: the server that holds the lease, a
+//! value with an expiry. No lock is held across transactions. The lease
+//! holder remembers in memory which objects had no pointer last time. A
+//! different server that takes over starts that count again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,17 +50,18 @@ use crate::objects::{CLOCK_SKEW, Dropped, object_name};
 use crate::timing::next_key;
 use crate::view::{ReadKeys, View};
 
-/// How long one sweep may hold the lease before renewing it.
+/// How long one sweep can hold the lease before it renews it.
 pub const LEASE_TTL: Duration = Duration::from_secs(600);
-/// Beyond a read URL's life, how long an object must have gone
-/// unreferenced before it is deleted: slack for clocks and slow reads.
+/// How long an object must have no pointer, in addition to a read URL's
+/// lifetime, before it is deleted. This allows for clock differences and
+/// slow reads.
 pub const DELETE_MARGIN: Duration = Duration::from_secs(300);
 pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(3600);
 /// How many block starts `mark` reads the pointers of at a time.
 const MARK_WINDOW: usize = 1024;
 
-/// One server's collector: its lease holder id, and what it found
-/// unreferenced, since when.
+/// One server's collector: its lease holder id, and the objects it found
+/// with no pointer, with the time it found each.
 pub struct Gc {
     holder: [u8; 16],
     candidates: HashMap<ObjectName, SystemTime>,
@@ -80,25 +81,33 @@ impl Default for Gc {
 /// What a sweep found and did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcStats {
-    /// Whether this server held the lease, and so swept at all.
+    /// Whether this server held the lease, and so swept.
     pub swept: bool,
-    /// Distinct objects pointed at, live or in a snapshot.
+    /// Distinct objects with a pointer, live or in a snapshot.
     pub referenced: usize,
     pub snapshots: usize,
     /// Objects listed under the prefix.
     pub listed: usize,
-    /// Keys under the prefix that aren't object names of ours.
+    /// Keys under the prefix that are not our object names.
     pub foreign: usize,
-    /// Unreferenced, but minted too recently to be sure of.
+    /// Objects with no pointer, but minted too recently to be sure.
     pub young: usize,
-    /// Unreferenced, waiting for a later sweep.
+    /// Objects with no pointer that wait for a later sweep.
     pub waiting: usize,
     pub deleted: usize,
 }
 
 impl FsCore {
-    /// Sweeps once, if this server keeps objects and gets the lease, as of
-    /// `now`. On an error, nothing has been deleted.
+    /// Sweeps once, as of `now`, if this server keeps objects and gets the
+    /// lease.
+    ///
+    /// - Mark the pointers in the live store, then in each snapshot.
+    /// - List the bucket.
+    /// - Delete objects that had no pointer in this sweep and in a sweep at
+    ///   least `DELETE_MARGIN` plus a read URL's lifetime ago, and that are
+    ///   past the commit window.
+    ///
+    /// On an error before the delete step, nothing is deleted.
     pub async fn gc_once(&self, gc: &mut Gc, now: SystemTime) -> Result<GcStats, String> {
         let mut stats = GcStats::default();
         let (Some(objects), Some(grid)) = (&self.objects, self.grid) else {
@@ -174,12 +183,12 @@ impl FsCore {
         }
         stats.waiting = candidates.len();
 
-        // Still ours, at the last moment it can be checked.
+        // Check the lease again at the last possible moment.
         if !self.take_lease(gc, SystemTime::now().max(now)).await? {
             return Err("lost the lease before deleting".into());
         }
-        // From here on, what was found stands: the candidates are this
-        // sweep's even if a deletion fails (it is retried next time).
+        // From here, the candidates belong to this sweep even if a deletion
+        // fails. The next sweep tries it again.
         gc.candidates = candidates;
         if !doomed.is_empty() {
             let deleting = objects.store.delete(&doomed).await;
@@ -194,8 +203,8 @@ impl FsCore {
         Ok(stats)
     }
 
-    /// Sweeps every `interval`, for as long as the server runs, saying
-    /// what each sweep did and why one failed.
+    /// Sweeps every `interval` while the server runs, and logs what each
+    /// sweep did, or why it failed.
     pub async fn run_gc(self: Arc<Self>, interval: Duration) {
         let mut gc = Gc::default();
         loop {
@@ -218,8 +227,8 @@ impl FsCore {
         }
     }
 
-    /// Takes or renews the lease for `gc` as of `now`: if no one holds it,
-    /// its holder's time is up, or `gc` holds it already.
+    /// Takes or renews the lease for `gc` as of `now`, if no one holds it,
+    /// if its holder's time is up, or if `gc` already holds it.
     async fn take_lease(&self, gc: &Gc, now: SystemTime) -> Result<bool, String> {
         let client = &self.client;
         let holder = gc.holder;
@@ -243,11 +252,12 @@ impl FsCore {
         .map_err(|e| format!("taking the gc lease: {e}"))
     }
 
-    /// Adds every object a block pointer in `view` names to `referenced`.
-    /// Only a hybrid file's block starts can hold one, so only those
-    /// values are read; the rest of the file's chunks are passed over by
-    /// key alone. A chunk whose file's Entry can't be found -- one being
-    /// deleted -- is read anyway: what might be a pointer counts.
+    /// Adds every object that a block pointer in `view` names to
+    /// `referenced`. Only a hybrid file's block starts can hold a pointer,
+    /// so only those values are read. The file's other chunks are skipped
+    /// by their key. If a chunk's file has no Entry (because it is being
+    /// deleted), the chunk is read anyway: a value that could be a pointer
+    /// counts.
     async fn mark(
         &self,
         view: View<'_>,
@@ -255,8 +265,8 @@ impl FsCore {
         referenced: &mut HashSet<ObjectName>,
     ) -> Result<(), KvError> {
         const CHUNKS: u8 = 0x02;
-        // Block starts, by inode, a window at a time: their files' Entries
-        // in one read, then the hybrid ones' pointers in another.
+        // Block starts, by inode, one window at a time: the files' Entries
+        // in one read, then the hybrid files' pointers in another.
         let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut iter = view.key_iterator(&[CHUNKS]);
         while let Some(key) = next_key(&mut iter).await? {
@@ -279,14 +289,14 @@ impl FsCore {
         self.mark_window(view, &mut window, referenced).await
     }
 
-    /// `mark` for the block starts in `window`, which it empties.
+    /// Runs `mark` for the block starts in `window`, and empties it.
     async fn mark_window(
         &self,
         view: View<'_>,
         window: &mut Vec<(u64, Vec<u8>)>,
         referenced: &mut HashSet<ObjectName>,
     ) -> Result<(), KvError> {
-        // Keys come in order, so each inode's are together.
+        // Keys come in order, so each inode's keys are together.
         let mut inos: Vec<u64> = window.iter().map(|&(ino, _)| ino).collect();
         inos.dedup();
         let attr_keys: Vec<Vec<u8>> = inos.iter().map(|&ino| attr_key(ino)).collect();
@@ -320,10 +330,10 @@ impl FsCore {
 
 impl FsCore {
     /// Tries, in the background, to delete the objects in `dropped`, which
-    /// a change that has committed stopped pointing at -- unless the store
-    /// still points at one, live or in a snapshot. The change is done
-    /// whatever this does: what it fails to delete, or never gets to, the
-    /// sweep finds.
+    /// a committed change stopped pointing to. It does not delete an object
+    /// that the store still points to, live or in a snapshot. The change is
+    /// done whatever this does: the sweep finds anything that this fails to
+    /// delete.
     pub(crate) fn discard(&self, dropped: Vec<Dropped>) {
         let Some(objects) = self.objects.as_ref().filter(|o| o.prompt_delete) else {
             return;
@@ -342,10 +352,10 @@ impl FsCore {
     }
 }
 
-/// `discard`'s work. A snapshot taken after the change committed can't
-/// point at what it dropped, so the snapshots listed after it are every
-/// one that can. The live store is read too: a commit resent within its
-/// mint window could have put a pointer back.
+/// The work of `discard`. A snapshot taken after the change committed
+/// cannot point to what it dropped, so it checks only the snapshots listed
+/// before it. It also reads the live store, because a commit sent again
+/// within its mint window could have added a pointer back.
 async fn discard_now(
     client: &Client,
     store: &S3Store,

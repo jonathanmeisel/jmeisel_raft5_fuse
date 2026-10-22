@@ -1,16 +1,16 @@
-//! The mount's `/.snapshot`: every snapshot of the filesystem, each
-//! browsable, read-only, as `/.snapshot/<name>/...`.
+//! The mount's `/.snapshot`: every snapshot of the filesystem, each one
+//! readable as `/.snapshot/<name>/...`.
 //!
-//! Under `<name>` is what this account's root was when the snapshot was
-//! taken -- its grants then, under their labels then -- and below that the
-//! filesystem as it stood. It is read through a vault of its own
-//! (`Vault::at_snapshot`), since a snapshot's keys are as they were then.
-//!
-//! The kernel knows one inode number per file, but a snapshot's inodes
-//! have the same numbers as the live ones. So everything here gets a
-//! number of its own, from `SNAPSHOT_BASE` up, kept for the life of the
-//! mount; the live filesystem keeps the server's numbers, which stay below
-//! it.
+//! - Under `<name>` is this account's root as it was when the snapshot was
+//!   taken (its grants then, under their labels then), and below that the
+//!   filesystem as it was.
+//! - It is read through its own vault (`Vault::at_snapshot`), because a
+//!   snapshot's keys are as they were then.
+//! - The kernel needs one inode number for each file, but a snapshot's
+//!   inodes have the same numbers as the live ones. So everything here gets
+//!   its own number, from `SNAPSHOT_BASE` up, kept for the life of the
+//!   mount. The live filesystem keeps the server's numbers, which are all
+//!   below it.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -21,11 +21,11 @@ use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SnapshotInfo};
 
 use crate::vault::{SNAPSHOT_DIR, Vault};
 
-/// The first inode number of the snapshots' side: `/.snapshot` itself.
-/// Every number below it is the live filesystem's.
+/// The first inode number on the snapshots' side, for `/.snapshot` itself.
+/// Every number below it belongs to the live filesystem.
 pub const SNAPSHOT_BASE: u64 = 1 << 63;
 
-/// Whether the kernel's inode `ino` is one of the snapshots'.
+/// Whether the kernel's inode `ino` belongs to the snapshots.
 pub fn is_snapshot_ino(ino: u64) -> bool {
     ino >= SNAPSHOT_BASE
 }
@@ -35,7 +35,7 @@ pub fn is_snapshot_dir(name: &OsStr) -> bool {
     name == SNAPSHOT_DIR
 }
 
-/// What every change asked of a snapshot gets.
+/// The error for every change asked of a snapshot.
 pub fn read_only() -> FsError {
     FsError::new(libc::EROFS, "a snapshot is read-only")
 }
@@ -44,7 +44,7 @@ fn stale() -> FsError {
     FsError::new(libc::ENOENT, "that snapshot is gone")
 }
 
-/// One snapshot this mount has looked into.
+/// One snapshot that this mount has opened.
 struct Snap {
     name: String,
     created: SystemTime,
@@ -53,7 +53,7 @@ struct Snap {
     root: u64,
 }
 
-/// What one of the kernel's snapshot-side inodes stands for.
+/// What one of the kernel's snapshot-side inodes means.
 enum Target {
     /// `/.snapshot`.
     List,
@@ -65,20 +65,20 @@ enum Target {
 
 #[derive(Default)]
 struct Inodes {
-    /// The next inode number to hand out.
+    /// The next inode number to give out.
     next: u64,
-    /// The next cache space (see `ChunkCache`) to hand out; 0 is the live
-    /// filesystem's.
+    /// The next cache space (see `ChunkCache`) to give out. 0 belongs to
+    /// the live filesystem.
     next_space: u64,
     by_name: HashMap<String, Arc<Snap>>,
     targets: HashMap<u64, (Arc<Snap>, Option<u64>)>,
-    /// The kernel's number for each snapshot's inode, by root inode and
-    /// the inode's own number.
+    /// The kernel's number for each snapshot inode, by root inode and the
+    /// inode's own number.
     numbers: HashMap<(u64, u64), u64>,
 }
 
 pub struct SnapshotTree {
-    /// The times `/.snapshot` shows: the mount's.
+    /// The times that `/.snapshot` shows: the mount's.
     mounted_at: SystemTime,
     inodes: Mutex<Inodes>,
 }
@@ -107,7 +107,7 @@ impl SnapshotTree {
         }
     }
 
-    /// The kernel's number for inode `node` of `snap`, handed out the first
+    /// The kernel's number for inode `node` of `snap`, given out the first
     /// time it is asked for.
     fn number(&self, snap: &Arc<Snap>, node: u64) -> u64 {
         let mut inodes = self.inodes.lock().unwrap();
@@ -132,9 +132,9 @@ impl SnapshotTree {
         Ok(self.snap(live, info))
     }
 
-    /// The snapshot `info` lists, opened the first time it is seen -- and
-    /// again if it has since been removed and another taken under its
-    /// name, which is a different snapshot.
+    /// The snapshot that `info` lists, opened the first time it is seen. It
+    /// is opened again if it was removed and another snapshot was taken
+    /// with its name, because that is a different snapshot.
     fn snap(&self, live: &Vault, info: SnapshotInfo) -> Arc<Snap> {
         let mut inodes = self.inodes.lock().unwrap();
         if let Some(snap) = inodes.by_name.get(&info.name)
@@ -172,8 +172,8 @@ impl SnapshotTree {
         }
     }
 
-    /// `node`'s attributes as of `snap`, under the kernel's number for it,
-    /// and with no write bits: nothing here can be written.
+    /// `node`'s attributes at `snap`, with the kernel's number for it and
+    /// no write bits, because nothing here can be written.
     fn node_attr(&self, snap: &Arc<Snap>, mut attr: Attr) -> Attr {
         attr.ino = self.number(snap, attr.ino);
         attr.perm &= !0o222;
@@ -214,7 +214,7 @@ impl SnapshotTree {
         }
     }
 
-    /// access(2): anything but writing, which nothing here allows.
+    /// access(2): allows anything except writing.
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
         if mask & libc::W_OK as u32 != 0 {
             return Err(read_only());
@@ -232,7 +232,7 @@ impl SnapshotTree {
         }
     }
 
-    /// A directory's entries, `.` and `..` included, under the kernel's
+    /// A directory's entries, including `.` and `..`, with the kernel's
     /// numbers. `root` is the kernel's number for the mount's root.
     pub async fn readdir(
         &self,
@@ -275,7 +275,8 @@ impl SnapshotTree {
             }
             Target::Node(snap, node) => {
                 let mut items = snap.vault.readdir(node).await?;
-                // A grant's `..` is the snapshot's root, as in the live one.
+                // A grant's `..` is the snapshot's root, as in the live
+                // filesystem.
                 let above_grant = snap.vault.is_grant_root(node);
                 for item in &mut items {
                     item.ino = if above_grant && item.name == ".." {

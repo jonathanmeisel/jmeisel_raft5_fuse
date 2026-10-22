@@ -1,6 +1,6 @@
 #!/bin/sh
-# raft5fs-cert-check [DAYS]: fails, naming them, if any certificate the
-# servers use expires within DAYS days (default 30).
+# raft5fs-cert-check [DAYS]: fails, and names them, if any certificate that
+# the servers use expires within DAYS days (default 30).
 days=${1:-30}
 status=0
 for pem in /etc/raft5/*.pem /etc/raft5fs/*.pem; do

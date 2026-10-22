@@ -1,4 +1,4 @@
-//! `raft5fs enrol`, `passwd` and `whoami`.
+//! `raft5fs enrol`, `passwd`, and `whoami`.
 
 use clap::Args;
 use raft5fs_crypto::password::{KdfParams, check_new_password};
@@ -13,14 +13,14 @@ use raft5fs_client::remote::{Credentials, Remote};
 
 #[derive(Args)]
 pub struct EnrolArgs {
-    /// The invitation an administrator gave you (`raft5fs-invite:1:...`),
-    /// or a bare enrolment code -- which then needs --user, --server and
-    /// --ca. Saves a profile named --profile, or else after the account.
+    /// The invitation from your administrator (`raft5fs-invite:1:...`), or
+    /// a bare enrolment code, which then needs --user, --server, and --ca.
+    /// Saves a profile named by --profile, or else by the account.
     pub invitation: String,
 }
 
-/// A new password: from `var`, or asked for twice on the terminal. Long
-/// enough (`check_new_password`), either way.
+/// A new password, from `var` or asked for twice on the terminal. Either
+/// way, it must be long enough (`check_new_password`).
 fn new_password(var: &str, username: &str) -> Result<String, String> {
     if let Ok(password) = std::env::var(var) {
         check_new_password(&password)?;
@@ -55,8 +55,8 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
             invite.code,
         )
     } else {
-        // A bare code: the rest from the command line alone -- not from a
-        // profile, which would be someone else's account.
+        // A bare code: get the rest only from the command line, not from a
+        // profile, which would be another account's.
         let user = connect
             .user
             .clone()
@@ -83,7 +83,8 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
     };
     check_username(&profile.user).map_err(|e| e.message)?;
     let name = connect.profile.clone().unwrap_or(profile.user.clone());
-    // Before the code is used up: nothing is overwritten after.
+    // Check this before the code is used up, so nothing is overwritten
+    // after.
     let profile_path = Profile::path(&base, &name);
     let ca_path = base.join("profiles").join(format!("{name}.ca.pem"));
     if profile_path.exists() || ca_path.exists() {
@@ -160,7 +161,8 @@ pub fn whoami(connect: &ConnectArgs) -> Outcome {
         .remote()
         .identity()
         .ok_or("logged in, but with no key pair")?;
-    // From the key pair this machine just opened: not the server's word.
+    // This comes from the key pair that this machine just opened, not from
+    // the server.
     println!("{}, whose key's fingerprint is", ctx.user);
     println!("{}", show_fingerprint(&identity.public_key()));
     Ok(0)

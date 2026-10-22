@@ -1,70 +1,34 @@
-//! The client's side of the filesystem's encryption: inode keys, and the root
-//! a user sees.
+//! Client-side encryption for the filesystem. The server stores all data,
+//! but it must not learn names or file contents, even if it lies.
 //!
-//! **Keys.** Every inode has a key, wrapped under its parent's (see
-//! raft5fs-crypto's `node`). The vault unwraps them top down: from a grant
-//! sealed to this account, through the key records the server hands back
-//! with it (`Remote::key_path`), to the inode wanted -- and keeps what it
-//! unwrapped, so the walk is paid once per subtree. A create makes the new
-//! node's key here, wrapped under its parent's, and a move to another
-//! directory re-wraps the moved node's key under its new parent's.
+//! - **Keys.** Each inode has a key, wrapped under its parent's key. The
+//!   vault unwraps keys from this account's grant down to the inode, and
+//!   keeps them, so it walks each subtree only once.
+//! - **Data.** The client seals each chunk under the file's key, so the
+//!   server cannot change byte ranges. A partial chunk write is a
+//!   read-modify-write, guarded by the chunk's sequence number.
+//! - **Names.** Each entry is filed under a tag, an HMAC of its name. The
+//!   real name is sealed under the directory's key, and opens only if it
+//!   matches its tag.
+//! - **Revocation.** Revoking a grant gives the directory a new key at
+//!   once. Nodes below it get new keys lazily: they are stale, the server
+//!   refuses writes under them (`EKEYEXPIRED`), and `freshen` rotates them.
+//!   A revocation also rotates the path down to every grant below, because
+//!   those grantees cannot rotate keys above their grant.
+//! - **Public keys.** The vault pins each user's key the first time it sees
+//!   it (`KnownKeys`), and refuses a different key later.
+//! - **The root.** A mount shows a virtual root, with one entry for each
+//!   grant to this account. Making a directory there makes a new volume.
 //!
-//! **Data.** Nor any file's contents: each chunk is sealed under the
-//! file's key here (raft5fs-crypto's `data`), so the server can't patch a
-//! byte range. A write that
-//! covers a chunk whole just seals it; one that covers part of a chunk
-//! reads the chunk, opens it, changes it and seals it again -- stored only
-//! if no one changed the chunk in between (the store's sequence number
-//! says), and otherwise done over. Truncating re-seals the chunk the new
-//! end falls in, cut short, before the server drops the chunks past it.
+//! The vault does not trust the server:
 //!
-//! **Names.** The server never sees one. An entry is filed under a tag --
-//! an HMAC of its name under the directory's name key -- so the vault
-//! turns every name it is handed into a tag before asking for it, and
-//! seals the real name under the directory's key for listings to return.
-//! A listed name opens only if it matches its tag, so the server can't
-//! pass one entry off under another's name.
-//!
-//! **Revocation.** Taking a grant back gives the directory a new key --
-//! the old one stays in its history, under the new, so nothing written
-//! before is lost -- and re-seals it for everyone else who holds it. The
-//! revoked user still has the old key, and every key under it, so the rest
-//! is lazy: a node wrapped under an old version of its parent's key is
-//! stale, the server refuses writes that would seal anything new under a
-//! stale node (`EKEYEXPIRED`), and the vault then gives the stale nodes on
-//! the way new keys, top down (`freshen`), and writes again. One thing
-//! can't wait: whoever holds a grant further down can't rotate what is
-//! above it, so a revocation also rotates the path down to every other
-//! grant beneath it -- which keeps every grant, and everything above it,
-//! always fresh.
-//!
-//! **Public keys** come from the server, which could hand out its own.
-//! The vault pins each user's key the first time it grants to them
-//! (`KnownKeys`), and refuses to seal to a different one later.
-//!
-//! **What the server says isn't taken on trust.** It decides who sees
-//! what, but a server that lied could still learn nothing it shouldn't:
-//!
-//! - A rotation re-seals a node's key only to who is on the grantee list
-//!   its key holders sealed under it (raft5fs-crypto's `grantees`), with
-//!   the public keys on it -- never to a grantee only the server names.
-//! - A grant is opened with its sender's public key, which proves who
-//!   made it. One from a sender this account hasn't pinned (or itself) may
-//!   be one the server made up, with a key it knows; it can be read, but
-//!   nothing is sealed under it until the sender is trusted.
-//! - A looked-up entry's sealed name must name the inode the server
-//!   answered with, as listed names must.
-//! - A node wrapped, or under one wrapped, under an old version of its
-//!   parent's key gets a new key before anything is sealed under it,
-//!   whether or not the server asks; and a key record or grant older
-//!   than one already seen this session is refused.
-//!
-//! **The root.** The server's real root is no one's to see. What a mount
-//! shows at its root instead is virtual: one entry per grant made to this
-//! account, named as the granter named it (a label sealed to this account,
-//! so the server can't read it either). Making a directory there makes a
-//! volume -- a new top-level directory, granted to its maker -- and
-//! removing one removes the volume.
+//! - It seals keys only to users on the sealed grantee list, never to users
+//!   that only the server names.
+//! - It reads grants from senders that are not pinned, but seals nothing
+//!   under them.
+//! - It checks that a looked-up name names the inode that the server
+//!   returned.
+//! - It refuses key records older than ones it already saw.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -99,54 +63,56 @@ pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
 
-/// The inode the kernel knows a mount's root by: the virtual root, never
-/// the server's real one.
+/// The inode number that the kernel uses for a mount's root. This is the
+/// virtual root, not the server's real root.
 pub const VIRTUAL_ROOT: u64 = 1;
 
-/// Where the root shows the snapshots, though it doesn't list it.
+/// The root resolves this name, but does not list it.
 pub const SNAPSHOT_DIR: &str = ".snapshot";
 
-/// An inode's key record, its current key, and (for a directory) the key
-/// its entries' tags are made with.
+/// An inode's key record and current key. A directory also has a name key,
+/// which makes its entries' tags.
 pub struct Node {
     pub record: NodeKeys,
     pub key: Key,
     name_key: Key,
-    /// Wrapped -- or under a node wrapped -- under an old version of its
-    /// parent's key: one someone revoked may hold. Nothing new is sealed
-    /// under it until `freshen` has given it a new one.
+    /// True if this node, or a node above it, is wrapped under an old
+    /// version of its parent's key. A revoked user can have that key, so
+    /// the vault gives this node a new key (`freshen`) before it seals
+    /// anything new under it.
     stale: bool,
-    /// Who the grant it was reached through is from, if that isn't someone
-    /// this account trusts (itself, or a key pinned for them): see
-    /// `sealable`.
+    /// The sender of the grant that this node was reached through, if this
+    /// account does not trust them (it is not this account, and no key is
+    /// pinned for them). See `sealable`.
     untrusted: Option<Arc<Untrusted>>,
 }
 
 /// A grant made to this account, as `Vault::shares` lists it.
 #[derive(Debug)]
 pub struct Share {
-    /// What it shows up as in the root.
+    /// The name it shows in the root.
     pub label: OsString,
     pub ino: u64,
     pub writable: bool,
-    /// Who it says made it.
+    /// The sender that the grant claims.
     pub sender: String,
     pub trust: ShareTrust,
 }
 
-/// Whether a share's sender is trusted here.
+/// Whether this account trusts a share's sender.
 #[derive(Debug)]
 pub enum ShareTrust {
-    /// This account, or someone whose key is pinned here.
+    /// This account, or a user whose key is pinned here.
     Trusted,
-    /// Someone else, whose key -- `key`, as the server has it -- isn't
-    /// pinned: read-only until it is (`Vault::trust`).
+    /// Another user whose key is not pinned. `key` is the key that the
+    /// server gives for them. The share is read-only until the user pins it
+    /// (`Vault::trust`).
     Untrusted { key: [u8; PUBLIC_KEY_LEN] },
-    /// It doesn't open.
+    /// The grant does not open.
     Unreadable(FsError),
 }
 
-/// A grant's sender, as the server vouches for them.
+/// A grant's sender, with the public key that the server gives for them.
 #[derive(Debug)]
 struct Untrusted {
     sender: String,
@@ -154,9 +120,10 @@ struct Untrusted {
 }
 
 impl Node {
-    /// `ino`'s node with current key `key`, which this checks: a key that
-    /// doesn't open the record's name key isn't this node's. Fresh, and
-    /// trusted, unless the caller says otherwise.
+    /// Makes the node for `ino` with current key `key`. It fails if `key`
+    /// does not open the record's name key, because then `key` is not this
+    /// node's key. The node starts fresh and trusted; the caller changes
+    /// this if necessary.
     fn new(ino: u64, record: NodeKeys, key: Key) -> Result<Self, FsError> {
         let name_key = record.name_key(ino, &key).map_err(|e| corrupt(ino, e))?;
         Ok(Self {
@@ -168,11 +135,10 @@ impl Node {
         })
     }
 
-    /// Whether anything may be sealed under this node: not if the grant it
-    /// was reached through is from someone untrusted. Such a grant may be
-    /// one the server made, with a key the server knows -- and the tree
-    /// under it, too -- so whatever was written there, or shared on from
-    /// there, the server could read.
+    /// Fails if the grant above this node comes from an untrusted sender.
+    /// The server could have made that grant, and the tree below it, with a
+    /// key it knows. Then the server could read anything written there, or
+    /// shared from there.
     fn sealable(&self, ino: u64) -> Result<(), FsError> {
         match &self.untrusted {
             None => Ok(()),
@@ -192,13 +158,13 @@ impl Node {
         }
     }
 
-    /// The tag `name` is filed under in this directory.
+    /// The tag that `name` is filed under in this directory.
     pub fn tag(&self, name: &OsStr) -> OsString {
         OsString::from_vec(name_tag(&self.name_key, name.as_bytes()).to_vec())
     }
 
-    /// `name`, filed under `tag` in this directory `ino` and naming inode
-    /// `child`, sealed under its current key.
+    /// Seals `name`, filed under `tag` in directory `ino` and pointing to
+    /// inode `child`, under the directory's current key.
     pub fn seal(&self, ino: u64, child: u64, tag: &OsStr, name: &OsStr) -> Vec<u8> {
         seal_name(
             &self.key,
@@ -210,8 +176,8 @@ impl Node {
         )
     }
 
-    /// This node's key at `version`: the current one, or an older one
-    /// walked down to through the history.
+    /// This node's key at `version`: the current key, or an older key from
+    /// the key history.
     fn key_at(&self, ino: u64, version: u32) -> Result<Key, FsError> {
         if version == self.record.version {
             Ok(self.key.clone())
@@ -223,8 +189,8 @@ impl Node {
     }
 }
 
-/// How many times giving keys new versions is tried again when someone
-/// else changed them meanwhile.
+/// How many times to try a key rotation again when another client changes
+/// the keys at the same time.
 const ROTATION_ROUNDS: usize = 16;
 
 fn expired(e: &FsError) -> bool {
@@ -235,14 +201,15 @@ fn changed(e: &FsError) -> bool {
     e.errno == libc::EAGAIN
 }
 
-/// Public keys sealed to before, by user: the first one seen for a user is
-/// trusted, and a different one later refused -- the server could have
-/// substituted its own. Kept in memory, and in a file if given one (lines
-/// of `user hex-key`, readable only by its owner).
+/// Public keys that this account sealed to, by user. The server could give
+/// its own key in place of a user's key, so the vault trusts the first key
+/// it sees for a user and refuses a different key later. It keeps the keys
+/// in memory, and also in a file if it has one (one `user hex-key` line for
+/// each user, readable only by its owner).
 ///
-/// Names come from the server, so each is checked (`check_username`)
-/// before it goes near the file: a name with a line break in it could
-/// otherwise write a line pinning someone else's key.
+/// The names come from the server, so the vault checks each one
+/// (`check_username`) before it writes it to the file. A name with a line
+/// break could otherwise add a line that pins a key for a different user.
 pub struct KnownKeys {
     keys: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
     file: Option<PathBuf>,
@@ -256,10 +223,10 @@ impl KnownKeys {
         }
     }
 
-    /// The keys pinned in `file`, which needn't exist yet; new pins are
-    /// added to it. A line that isn't a good name and a key, or a second
-    /// key for one name, makes the whole file refused: it isn't one this
-    /// wrote, and which key to believe can't be guessed.
+    /// Loads the keys pinned in `file`, which does not have to exist yet.
+    /// New pins go into the same file. A bad line, or a second key for the
+    /// same user, makes the whole file fail: this code did not write that
+    /// file, and it cannot know which key is correct.
     pub fn load(file: PathBuf) -> std::io::Result<Self> {
         let keys = read_pins(&file)?;
         Ok(Self {
@@ -268,8 +235,8 @@ impl KnownKeys {
         })
     }
 
-    /// Another handle on the same pins: what is pinned now, and the same
-    /// file, so pins either makes later reach the other through it.
+    /// Another handle on the same pins and the same file. A pin that one
+    /// handle adds later reaches the other handle through the file.
     pub fn duplicate(&self) -> Self {
         Self {
             keys: Mutex::new(self.keys.lock().unwrap().clone()),
@@ -277,10 +244,10 @@ impl KnownKeys {
         }
     }
 
-    /// The key pinned for `user`, if any -- looking in the file again if
-    /// none is known here yet, so that a pin made since (`raft5fs-share
-    /// trust`, while a mount runs) counts. A file that no longer reads
-    /// right adds nothing.
+    /// The key pinned for `user`, if there is one. If no key is known in
+    /// memory, this reads the file again, because `raft5fs-share trust` can
+    /// add a pin while a mount runs. If the file is now bad, this adds
+    /// nothing.
     pub fn pinned(&self, user: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
         let mut keys = self.keys.lock().unwrap();
         if let Some(key) = keys.get(user) {
@@ -291,14 +258,19 @@ impl KnownKeys {
         Some(key)
     }
 
-    /// `key` as `user`'s, if it is the one pinned for them -- or, if none
-    /// is, after pinning it. `EPERM` if another one is pinned.
+    /// Checks `key` against the key pinned for `user`.
+    ///
+    /// - Returns `key` if it matches the pin.
+    /// - If no key is pinned, pins `key` (also in the file, if there is
+    ///   one) and returns it.
+    /// - Returns `EPERM` if a different key is pinned, and `EIO` if `key`
+    ///   has the wrong length.
     pub fn check(&self, user: &str, key: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         let key: [u8; PUBLIC_KEY_LEN] = key
             .try_into()
             .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
-        // Whatever the file has for them by now, made here or not.
+        // Another process could have pinned this user in the file.
         self.pinned(user);
         let mut keys = self.keys.lock().unwrap();
         match keys.get(user) {
@@ -327,7 +299,8 @@ impl KnownKeys {
         }
     }
 
-    /// Forgets `user`'s pinned key, so the next one seen is trusted.
+    /// Removes `user`'s pinned key, so the vault trusts the next key it
+    /// sees for them.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
         check_username(user).map_err(|e| std::io::Error::other(e.message))?;
         let mut keys = self.keys.lock().unwrap();
@@ -345,8 +318,8 @@ impl KnownKeys {
     }
 }
 
-/// The pins in `file`, which needn't exist. A line that isn't a good name
-/// and a key, or a second key for one name, makes the whole file refused.
+/// Reads the pins in `file`. A missing file has no pins. A bad line, or a
+/// second key for the same user, makes the whole file fail.
 fn read_pins(file: &std::path::Path) -> std::io::Result<HashMap<String, [u8; PUBLIC_KEY_LEN]>> {
     let bad = |n: usize, why: &str| {
         std::io::Error::new(
@@ -376,7 +349,7 @@ fn read_pins(file: &std::path::Path) -> std::io::Result<HashMap<String, [u8; PUB
     Ok(keys)
 }
 
-/// Adds a `user key` line to `file`, made readable by its owner only.
+/// Adds a `user key` line to `file`. Only the owner can read the file.
 fn append_pin(file: &std::path::Path, user: &str, key: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = file.parent() {
@@ -390,8 +363,8 @@ fn append_pin(file: &std::path::Path, user: &str, key: &[u8]) -> std::io::Result
     writeln!(f, "{user} {}", to_hex(key))
 }
 
-/// Replaces `file` with `contents` all at once -- written beside it, then
-/// renamed over it -- readable by its owner only.
+/// Replaces `file` with `contents` in one step: it writes a file next to
+/// it, then renames that file over it. Only the owner can read the result.
 pub(crate) fn replace_private(file: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut tmp = file.as_os_str().to_owned();
@@ -424,15 +397,17 @@ fn from_hex(hex: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
     Some(out)
 }
 
-/// How many times a read-modify-write of a chunk is redone when someone
-/// else changed the chunk under it, before giving up with `EAGAIN`.
+/// How many times to do a read-modify-write of a chunk again when another
+/// writer changes the chunk first. After that, the write fails with
+/// `EAGAIN`.
 const CHANGE_RETRIES: usize = 32;
 
-/// A piece of a write within one chunk: the chunk's index, where in the
-/// chunk the piece starts, and how long it is.
+/// The part of a write that falls in one chunk: the chunk's index, where in
+/// the chunk the part starts, and its length.
 type Span = (u64, usize, usize);
 
-/// The pieces of `[offset, offset + len)` by chunk (see `Span`).
+/// Splits `[offset, offset + len)` into one span for each chunk (see
+/// `Span`).
 fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut pos = offset;
@@ -446,13 +421,13 @@ fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<Span> {
     spans
 }
 
-/// How many ranges of objects one read fetches at once.
+/// How many object ranges one read fetches at the same time.
 const MAX_FETCHES: usize = 8;
 
-/// A chunk's sealed bytes as a read sent them, `None` for a hole. Every
-/// read here fetches segments in object storage first (`fetch_segments`),
-/// so one still there is an error -- as it is, for now, for a prune,
-/// which reads for itself.
+/// A chunk's sealed bytes from a read, or `None` for a hole. Every read
+/// here fetches object-storage segments first (`fetch_segments`), so a
+/// segment here is an error. This is also true for a prune, which reads
+/// chunks itself.
 fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
     match body {
         ChunkBody::Hole => Ok(None),
@@ -468,7 +443,7 @@ fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
     FsError::new(libc::EIO, format!("inode {ino}: {e}"))
 }
 
-/// The grants this account holds, by the names they show up as.
+/// The grants this account has, by the names they show in the root.
 #[derive(Default)]
 struct Roots {
     by_name: BTreeMap<OsString, u64>,
@@ -480,39 +455,38 @@ pub struct Vault {
     identity: Arc<Identity>,
     known: KnownKeys,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
-    /// The newest key version seen for each inode this session -- kept
-    /// when `nodes` is cleared -- so that a server can't hand back an
-    /// older record, under a key someone since revoked still holds.
+    /// The newest key version seen for each inode in this session. Clearing
+    /// `nodes` does not clear it. It stops the server from returning an
+    /// older key record, under a key that a revoked user still has.
     seen: Mutex<HashMap<u64, u32>>,
-    /// Public keys the server gave for grant senders, by name.
+    /// Public keys that the server gave for grant senders, by user name.
     senders: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
-    /// Whether to say so, once each, when a grant from someone untrusted
-    /// is opened (`with_untrusted_warnings`), and the ones said already.
+    /// If true (`with_untrusted_warnings`), print a message once for each
+    /// grant from an untrusted sender. `warned` holds the grants already
+    /// reported.
     warn_untrusted: bool,
     warned: Mutex<HashSet<u64>>,
     roots: Mutex<Roots>,
-    /// Decrypted chunks, each with the seq it was read or written at:
-    /// shared with the vaults of the same mount's snapshots, each keeping
-    /// its own `space` in it.
+    /// Decrypted chunks, each with the seq it was read or written at. The
+    /// snapshot vaults of the same mount share this cache, and each one
+    /// uses its own `space` in it.
     cache: Arc<Mutex<ChunkCache>>,
     space: u64,
-    /// Each file's layout, once asked for (see `layout`).
+    /// Each file's layout, kept after the first request (see `layout`).
     layouts: Mutex<HashMap<u64, Layout>>,
 }
 
-/// How much decrypted file data a vault caches unless told otherwise.
+/// How much decrypted file data a vault caches by default.
 pub const DEFAULT_CACHE_BYTES: usize = 64 << 20;
 
-/// How long a cached chunk may go unconfirmed before it is dropped rather
-/// than revalidated. Not a staleness bound: every hit is confirmed with
-/// the server first (see `ChunkCache`), so what this buys is only that a
-/// chunk nothing has read for this long stops holding its share of the
-/// budget. Generous on purpose -- dropping an entry costs a whole chunk
-/// fetched and decrypted, where confirming one costs eight bytes.
+/// How long a cached chunk can stay unconfirmed before the cache drops it.
+/// The vault confirms every cache hit with the server anyway, so this only
+/// frees space. The value is large because a dropped chunk costs a full
+/// fetch and decrypt, but a confirmation costs only eight bytes.
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 impl Vault {
-    /// The vault of `remote`'s account, which must have logged in.
+    /// The vault for `remote`'s account. The account must be logged in.
     pub fn new(remote: Arc<Remote>) -> Result<Self, FsError> {
         let identity = remote
             .identity()
@@ -533,17 +507,17 @@ impl Vault {
         })
     }
 
-    /// Caches up to `bytes` of decrypted file data (0 caches none).
+    /// Caches up to `bytes` of decrypted file data. 0 disables the cache.
     pub fn with_cache_size(mut self, bytes: usize) -> Self {
         self.cache = Arc::new(Mutex::new(ChunkCache::new(bytes, CACHE_TTL)));
         self
     }
 
-    /// The vault of snapshot `name`: this account's view of the
-    /// filesystem as it was then, read-only. Its keys are its own -- a
-    /// snapshot's key records are as they were, not as they are -- but it
-    /// caches into this vault's cache, under `space`, which must be unique
-    /// to it and not 0.
+    /// A read-only vault for snapshot `name`: this account's view of the
+    /// filesystem at that time. It keeps its own keys, because a snapshot's
+    /// key records are as they were then, not as they are now. It uses this
+    /// vault's cache under `space`, which must be unique to this snapshot
+    /// and not 0.
     pub fn at_snapshot(&self, name: &str, space: u64) -> Self {
         debug_assert_ne!(space, 0, "space 0 is the live filesystem's");
         Self {
@@ -562,15 +536,15 @@ impl Vault {
         }
     }
 
-    /// Says on stderr, once for each, when a grant from someone untrusted
-    /// is opened: what a mount does, as the one place it can say why
-    /// writes there are refused.
+    /// Prints a message on stderr, once for each grant, when the vault
+    /// opens a grant from an untrusted sender. A mount uses this, because
+    /// stderr is the only place where it can say why writes there fail.
     pub fn with_untrusted_warnings(mut self) -> Self {
         self.warn_untrusted = true;
         self
     }
 
-    /// Pins public keys in `known` rather than in memory only.
+    /// Pins public keys in `known`, not only in memory.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.known = known;
         self
@@ -584,25 +558,32 @@ impl Vault {
         &self.remote
     }
 
-    /// Drops every key unwrapped so far, for the next use to fetch afresh:
-    /// what a rotation, here or anywhere, can leave out of date.
+    /// Drops every key unwrapped so far, so the next use fetches it again.
+    /// A rotation, here or by another client, can make the kept keys out of
+    /// date.
     fn forget_all(&self) {
         self.nodes.lock().unwrap().clear();
     }
 
-    /// `ino`'s key fetched afresh, with everything above it: for data
-    /// sealed under a version newer than the one known here.
+    /// Fetches `ino`'s key again, with every key above it. Use this when
+    /// data is sealed under a newer key version than the one known here.
     async fn refresh(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         self.forget_all();
         self.node(ino).await
     }
 
-    /// `ino`'s key, to seal something new under: refused if it is reached
-    /// through an untrusted grant (`Node::sealable`), and given a new key
-    /// first -- with every stale node above it -- if it is stale.
+    /// Returns `ino`'s key for sealing new data.
+    ///
+    /// - Opens the grant again if the user trusted its sender after it was
+    ///   opened.
+    /// - Returns `EACCES` if the key comes through an untrusted grant
+    ///   (`Node::sealable`).
+    /// - If the node is stale, first gives it, and every stale node above
+    ///   it, a new key.
     async fn fresh_node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         let mut node = self.node(ino).await?;
-        // Its grant's sender trusted since it was opened: open it again.
+        // The user trusted the grant's sender after the grant was opened,
+        // so open the grant again.
         if let Some(untrusted) = &node.untrusted
             && self.known.pinned(&untrusted.sender).is_some()
         {
@@ -625,10 +606,18 @@ impl Vault {
             .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino}'s key went missing")))
     }
 
-    /// `ino`'s key, after giving every stale node from this account's grant
-    /// down to it a new key, top down: what a write the server refused
-    /// with `EKEYEXPIRED` needs before it is tried again, and what sealing
-    /// under a node seen to be stale needs anyway.
+    /// Gives every stale node on the path from this account's grant to
+    /// `ino` a new key, and returns `ino`'s key. Call it after the server
+    /// refuses a write with `EKEYEXPIRED`.
+    ///
+    /// Steps, repeated up to `ROTATION_ROUNDS` times:
+    ///
+    /// - Fetch and unwrap the key path again.
+    /// - Find the highest stale node. If there is none, return.
+    /// - Rotate it, and everything below it down to each grant
+    ///   (`rotate_from`). If another client rotated first, start again.
+    ///
+    /// Returns `EAGAIN` if the keys keep changing.
     pub async fn freshen(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         for _ in 0..ROTATION_ROUNDS {
             self.forget_all();
@@ -652,7 +641,7 @@ impl Vault {
             };
             match self.rotate_from(stale, Some(&parent), None).await {
                 Ok(()) => {}
-                // Someone else got there first: look again.
+                // Another client rotated the key first. Check again.
                 Err(e) if changed(&e) => {}
                 Err(e) => return Err(e),
             }
@@ -663,14 +652,22 @@ impl Vault {
         ))
     }
 
-    /// Who `granted` is granted to, by name -- as far as both the server
-    /// and the grantee list its key holders sealed under its key (`node`'s,
-    /// current) agree, and with the public key each grant was sealed to.
-    /// Grantees the server lists but the sealed list doesn't, or lists
-    /// differently, are `EPERM`: only a server that wanted a key sealed to
-    /// someone else would add them. Grantees with no keys left -- their
-    /// account went -- are left out, as are any on the sealed list the
-    /// server no longer has: dropping a grant takes no one's say-so.
+    /// Checks the server's grantee list for `granted` against the list
+    /// sealed under its key. A server that lies could add a user, to get a
+    /// key sealed to them.
+    ///
+    /// Returns each grantee's sealed entry (public key and write access),
+    /// by user name.
+    ///
+    /// Edge cases:
+    ///
+    /// - Returns `EPERM` if the sealed list is missing or under an old key
+    ///   version, or if the server lists a user that the sealed list does
+    ///   not have, or lists them differently.
+    /// - Returns `EPERM` if a different key is pinned here for a user.
+    /// - Leaves out users with no keys (their account was deleted).
+    /// - Leaves out users on the sealed list that the server no longer
+    ///   lists, because removing a grant needs no approval.
     fn checked_grantees(
         &self,
         node: &Node,
@@ -728,8 +725,9 @@ impl Vault {
                     if entry.writable { "write" } else { "only" }
                 )));
             }
-            // Pinned here as someone else: whoever put them on the list
-            // took a key this account wouldn't have.
+            // A different key is pinned here for this user. Whoever added
+            // them to the list used a key that this account would not
+            // accept.
             if let Some(pinned) = self.known.pinned(&grantee.user)
                 && pinned != entry.public_key
             {
@@ -740,12 +738,28 @@ impl Vault {
         Ok(out)
     }
 
-    /// Gives `top` a new key, and every node from it down to each grant
-    /// beneath it, re-sealing every grant of them -- except `drop`'s of
-    /// `top`, which is removed -- to the grantees and keys on each node's
-    /// sealed grantee list (`checked_grantees`), and sealing that list
-    /// again under the new key. `parent`: `top`'s parent's node, which its
-    /// new key is wrapped under (unless `top` is a volume, which has none).
+    /// Gives `top`, and every node from `top` down to each grant below it,
+    /// a new key. Grantees lower down cannot rotate keys above their grant,
+    /// so this must happen now.
+    ///
+    /// Inputs:
+    ///
+    /// - `parent`: the node of `top`'s parent, which wraps `top`'s new key.
+    ///   `None` for a volume.
+    /// - `drop`: a user whose grant of `top` to remove, for a revocation.
+    ///
+    /// Steps:
+    ///
+    /// - List the grants below `top`, and order the nodes from the top
+    ///   down.
+    /// - Make a new key for each node, wrapped under its parent's new key.
+    /// - Seal each grant again, only to the users and keys on the node's
+    ///   sealed grantee list (`checked_grantees`). Seal that list again
+    ///   under the new key.
+    /// - Send all rotations in one request. The server refuses them with
+    ///   `EAGAIN` if another client changed a key first.
+    ///
+    /// Returns `ENOENT` if `drop` has no grant of `top`.
     async fn rotate_from(
         &self,
         top: u64,
@@ -806,8 +820,9 @@ impl Vault {
             let mut grants = Vec::new();
             let mut kept = Vec::new();
             if let Some(node) = granted.remove(&ino) {
-                // Whoever is being dropped needs no one's say-so: not even
-                // a grantee the server made up, whom this is how to remove.
+                // Removing a user needs no approval, so do not check the
+                // user being removed. This is also how to remove a grantee
+                // that the server made up.
                 let dropping = |g: &Grantee| ino == top && drop == Some(g.user.as_str());
                 let checked = GrantedNode {
                     grantees: node
@@ -833,8 +848,8 @@ impl Vault {
                                 &key,
                             )
                         }
-                        // Their account has no keys any more: nothing to
-                        // seal to, so the grant goes.
+                        // The user's account has no keys, so there is
+                        // nothing to seal to. Remove the grant.
                         None => {
                             eprintln!(
                                 "dropping {}'s grant of inode {ino}: they have no keys",
@@ -865,9 +880,10 @@ impl Vault {
         rotated
     }
 
-    /// Takes `user`'s grant of directory `ino` back, giving it a new key
-    /// (see the module doc). Needs the key of the directory above it --
-    /// its new key is wrapped under that -- unless it is a volume.
+    /// Removes `user`'s grant of directory `ino` and gives the directory a
+    /// new key. This needs the key of the directory above, which wraps the
+    /// new key, unless `ino` is a volume. Tries again if another client
+    /// changes the keys at the same time.
     pub async fn revoke(&self, ino: u64, user: &str) -> Result<(), FsError> {
         for _ in 0..ROTATION_ROUNDS {
             self.freshen(ino).await?;
@@ -887,9 +903,9 @@ impl Vault {
         ))
     }
 
-    /// Who directory `ino` is granted to, checked against the grantee list
-    /// sealed under its key, and the keys pinned here (`EPERM` if either
-    /// disagrees).
+    /// The users that directory `ino` is granted to. Returns `EPERM` if the
+    /// list does not agree with the grantee list sealed under its key, or
+    /// with the keys pinned here.
     pub async fn grantees(&self, ino: u64) -> Result<Vec<Grantee>, FsError> {
         let node = self.node(ino).await?;
         let Some(granted) = self
@@ -905,8 +921,8 @@ impl Vault {
         Ok(granted.grantees)
     }
 
-    /// `ino`'s key, unwrapping it from this account's grant if it isn't
-    /// known yet.
+    /// Returns `ino`'s key. If it is not known yet, unwraps it from this
+    /// account's grant.
     pub async fn node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         if let Some(node) = self.nodes.lock().unwrap().get(&ino) {
             return Ok(Arc::clone(node));
@@ -915,9 +931,11 @@ impl Vault {
         self.unwrap_path(path).await
     }
 
-    /// Opens the grant of `ino` that `grant` is, with its sender's public
-    /// key: the key and version it holds, and the sender, if they aren't
-    /// trusted -- this account, or someone whose key is pinned here.
+    /// Opens `grant` of `ino` with its sender's public key. Returns the key
+    /// version, the key, and the sender if this account does not trust
+    /// them. A trusted sender is this account, or a user whose key is
+    /// pinned here. For other senders, the vault uses the key that the
+    /// server gives, so the server could have made the grant.
     async fn open_grant(
         &self,
         ino: u64,
@@ -951,7 +969,7 @@ impl Vault {
         Ok((version, key, Some(Arc::new(untrusted))))
     }
 
-    /// `user`'s public key, as the server has it.
+    /// `user`'s public key, as the server gives it.
     async fn sender_key(&self, user: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         if let Some(key) = self.senders.lock().unwrap().get(user) {
             return Ok(*key);
@@ -966,7 +984,14 @@ impl Vault {
         Ok(key)
     }
 
-    /// Unwraps every key along `path`, keeping each, and returns the last.
+    /// Unwraps every key along `path`, from the grant down, keeps each one,
+    /// and returns the last.
+    ///
+    /// - Refuses a key record older than one already seen
+    ///   (`check_not_older`).
+    /// - Marks a node stale if it, or a node above it, is wrapped under an
+    ///   old version of its parent's key.
+    /// - Marks every node below an untrusted grant as untrusted.
     async fn unwrap_path(&self, path: KeyPath) -> Result<Arc<Node>, FsError> {
         let mut nodes = path.nodes.into_iter();
         let (root_ino, root_bytes) = nodes
@@ -975,16 +1000,16 @@ impl Vault {
         let record = NodeKeys::decode(&root_bytes).map_err(|e| corrupt(root_ino, e))?;
         self.check_not_older(root_ino, &record)?;
         let (version, key, untrusted) = self.open_grant(root_ino, &path.grant).await?;
-        // A grant always holds the current version: a rotation re-seals
-        // every grant of the node it rotates.
+        // A grant always holds the current key version, because a rotation
+        // seals every grant of the node again.
         if version != record.version {
             return Err(FsError::new(
                 libc::EACCES,
                 format!("the grant of inode {root_ino} holds an out-of-date key"),
             ));
         }
-        // `Node::new` proves the key: whatever the grant claims, one that
-        // doesn't open the record isn't this node's.
+        // `Node::new` checks the key. If the key does not open the record,
+        // it is not this node's key, whatever the grant says.
         let mut root = Node::new(root_ino, record, key)?;
         if let Some(u) = &untrusted
             && self.warn_untrusted
@@ -1012,9 +1037,9 @@ impl Vault {
         Ok(parent.1)
     }
 
-    /// `EIO` if `record` is older than one seen for `ino` before: what a
-    /// server would hand back to have new things sealed under a key that
-    /// was since rotated away from someone.
+    /// Returns `EIO` if `record` is older than a record seen before for
+    /// `ino`. A server could send an old record so that the client seals
+    /// new data under a key that a revoked user still has.
     fn check_not_older(&self, ino: u64, record: &NodeKeys) -> Result<(), FsError> {
         match self.seen.lock().unwrap().get(&ino) {
             Some(&seen) if record.version < seen => Err(FsError::new(
@@ -1039,7 +1064,7 @@ impl Vault {
         node
     }
 
-    /// Reads this account's grants afresh, returning the root's entries:
+    /// Reads this account's grants again and returns the root's entries:
     /// each grant's label, made unique, and its inode.
     pub async fn root_entries(&self) -> Result<Vec<(OsString, u64)>, FsError> {
         let mut grants = self.remote.list_grants().await?;
@@ -1071,14 +1096,14 @@ impl Vault {
         Ok(entries)
     }
 
-    /// Whether `name` is taken in the root already, whatever is granted:
-    /// the live root's `.snapshot`, which a grant labelled so gives way to.
+    /// Whether `name` is reserved in the root. Only the live root's
+    /// `.snapshot` is. A grant with that label gets a different name.
     fn reserved(&self, name: &OsStr) -> bool {
         self.remote.snapshot().is_none() && name == SNAPSHOT_DIR
     }
 
-    /// The grant `name` stands for in the root, reading the grants afresh
-    /// if it isn't one already known.
+    /// Returns the grant that `name` refers to in the root. If the name is
+    /// not known, reads the grants again.
     pub async fn root_lookup(&self, name: &OsStr) -> Result<u64, FsError> {
         if let Some(&ino) = self.roots.lock().unwrap().by_name.get(name) {
             return Ok(ino);
@@ -1091,14 +1116,14 @@ impl Vault {
             .ok_or_else(|| FsError::errno(libc::ENOENT))
     }
 
-    /// Whether `ino` is granted to this account: one of the root's entries,
-    /// whose `..` is the root.
+    /// Whether `ino` is granted to this account. These inodes are the
+    /// root's entries, and their `..` is the root.
     pub fn is_grant_root(&self, ino: u64) -> bool {
         self.roots.lock().unwrap().inos.contains(&ino)
     }
 
-    /// A reserved inode and key for a new child `name` of `parent`, and
-    /// the tag it is filed under.
+    /// Reserves an inode and makes a key for a new child `name` of
+    /// `parent`. Also returns the tag that the entry is filed under.
     async fn new_child(
         &self,
         parent: u64,
@@ -1117,23 +1142,25 @@ impl Vault {
         Ok((new, Node::new(ino, record, key)?, tag))
     }
 
-    /// The tag `name` is filed under in directory `parent`.
+    /// The tag that `name` is filed under in directory `parent`.
     async fn tag(&self, parent: u64, name: &OsStr) -> Result<OsString, FsError> {
         Ok(self.node(parent).await?.tag(name))
     }
 
-    /// `name` in directory `parent`, checked: the entry's sealed name must
-    /// open under the directory's key as `name`, naming the inode the
-    /// server answered with -- or the server could have answered with any
-    /// inode this account can reach, and had what is written to `name`
-    /// land somewhere others read.
+    /// Looks up `name` in directory `parent` and returns its attributes.
+    ///
+    /// The entry's sealed name must open under the directory's key as
+    /// `name`, and must name the inode that the server returned. If not,
+    /// the server could return any inode this account can reach, and writes
+    /// to `name` could go to a place that other users read. Returns `EIO`
+    /// if this check fails.
     pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
         let mut dir = self.node(parent).await?;
         let tag = dir.tag(name);
         let (attr, sealed) = self.remote.lookup(parent, &tag).await?;
         let version = sealed_version(&sealed).map_err(|e| corrupt(parent, e))?;
         if version > dir.record.version {
-            // Sealed under a key newer than the one known here.
+            // The name is sealed under a newer key than the one known here.
             dir = self.refresh(parent).await?;
         }
         let key = dir.key_at(parent, version)?;
@@ -1157,13 +1184,13 @@ impl Vault {
         Ok(attr)
     }
 
-    /// Drops what is held for an inode that is gone.
+    /// Drops the kept key and cached data of an inode that is gone.
     fn forget_inode(&self, ino: u64) {
         self.nodes.lock().unwrap().remove(&ino);
         self.cache.lock().unwrap().invalidate_ino(self.space, ino);
     }
 
-    /// Removes a file, as `Remote::unlink`.
+    /// Removes a file, as `Remote::unlink` does.
     pub async fn unlink(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let tag = self.tag(parent, name).await?;
         let ino = self.remote.unlink(parent, &tag).await?;
@@ -1171,7 +1198,7 @@ impl Vault {
         Ok(ino)
     }
 
-    /// Removes an empty directory, as `Remote::rmdir`.
+    /// Removes an empty directory, as `Remote::rmdir` does.
     pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let tag = self.tag(parent, name).await?;
         let ino = self.remote.rmdir(parent, &tag).await?;
@@ -1179,14 +1206,18 @@ impl Vault {
         Ok(ino)
     }
 
-    /// Directory `ino`'s entries, with their real names. An entry whose
-    /// name doesn't open, or doesn't match its tag, isn't one this
-    /// directory's key holders made: it is left out, and said so.
+    /// Returns directory `ino`'s entries with their real names.
+    ///
+    /// - Fetches newer keys if a name is sealed under a newer key version.
+    /// - Keeps `.` and `..`, which have no sealed name.
+    /// - Leaves out, and reports on stderr, any entry whose name does not
+    ///   open or does not match its tag. The directory's key holders did
+    ///   not make that entry.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         let items = self.remote.readdir(ino).await?;
         let mut dir = self.node(ino).await?;
-        // Names sealed under a key newer than the one known here: someone
-        // rotated it since.
+        // A name sealed under a newer key than the one known here means
+        // that another client rotated the key.
         let newest = items
             .iter()
             .filter_map(|i| sealed_version(&i.sealed_name).ok())
@@ -1198,7 +1229,7 @@ impl Vault {
         let mut named = Vec::with_capacity(items.len());
         for mut item in items {
             if item.sealed_name.is_empty() {
-                // `.` and `..`, which have no tag to hide behind.
+                // `.` and `..` have no tag.
                 if item.name == "." || item.name == ".." {
                     named.push(item);
                 } else {
@@ -1249,7 +1280,7 @@ impl Vault {
         Ok(attr)
     }
 
-    /// Creates a file, as `Remote::create`.
+    /// Creates a file, as `Remote::create` does.
     pub async fn create(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         match self.create_once(parent, name, perm).await {
             Err(e) if expired(&e) => {
@@ -1267,13 +1298,20 @@ impl Vault {
         Ok(attr)
     }
 
-    /// Moves a name, as `Remote::rename`: the new name sealed under the
-    /// new parent's key, and -- if the parent changes -- the moved node
-    /// given a new key first, which is then re-wrapped under the new
-    /// parent's. Without the new key, whoever holds the old parent's (a
-    /// directory shared with others, say) would keep a key to what is
-    /// written to the node after it moved. What is under the moved node
-    /// gets new keys too, as it is next written (it is stale).
+    /// Moves `name` in `parent` to `new_name` in `new_parent`. Returns the
+    /// inode it replaced, if any.
+    ///
+    /// Steps:
+    ///
+    /// - If the parent changes, give the moved node a new key first
+    ///   (`rotate_moving`). Otherwise, users with the old parent's key
+    ///   could read what is written to the node after the move.
+    /// - Seal the new name under the new parent's key, and wrap the moved
+    ///   node's key under the new parent's key.
+    /// - If a key is stale (`EKEYEXPIRED`), get new keys and try once more.
+    ///
+    /// Nodes below the moved node become stale, so they get new keys the
+    /// next time they are written.
     pub async fn rename(
         &self,
         parent: u64,
@@ -1348,8 +1386,9 @@ impl Vault {
         Ok(replaced)
     }
 
-    /// Gives the node `name` in `parent` names a new key, wrapped under
-    /// `parent`'s, ahead of moving it to another directory (see `rename`).
+    /// Gives the node that `name` refers to in `parent` a new key, wrapped
+    /// under `parent`'s key, before it moves to another directory (see
+    /// `rename`).
     async fn rotate_moving(&self, parent: u64, name: &OsStr) -> Result<(), FsError> {
         for _ in 0..ROTATION_ROUNDS {
             let from = self.fresh_node(parent).await?;
@@ -1368,7 +1407,7 @@ impl Vault {
         ))
     }
 
-    /// A new volume, shown in this account's root as `label`.
+    /// Makes a new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
         if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
             return Err(FsError::errno(libc::EEXIST));
@@ -1417,14 +1456,23 @@ impl Vault {
         Ok(())
     }
 
-    /// Grants directory `ino`, and everything under it, to `user`, to show
-    /// up in their root as `label`, adding them to its sealed grantee list.
-    /// Returns the public key it was sealed to -- the server's word for
-    /// whose it is, pinned if nothing was for `user` yet, which is worth
-    /// checking against the fingerprint the grantee saw when they
-    /// enrolled. (`raft5fs-share` insists on that before a first grant,
-    /// by `trust`ing them first.) A pin is trust both ways: shares from
-    /// `user` are trusted from then on too.
+    /// Grants directory `ino`, and everything below it, to `user`. The
+    /// grant shows in their root as `label`.
+    ///
+    /// Steps:
+    ///
+    /// - Check that this account can seal under `ino`.
+    /// - Get `user`'s public key from the server, and pin it if no key is
+    ///   pinned.
+    /// - Seal the key to `user`, add them to the sealed grantee list, and
+    ///   send both. Try again if another client changes the grants at the
+    ///   same time.
+    ///
+    /// Returns the public key that the grant was sealed to. If it was not
+    /// pinned before, compare it with the fingerprint that the user saw
+    /// when they enrolled (`raft5fs-share` calls `trust` first to require
+    /// this). A pin is trust in both directions: shares from `user` are
+    /// trusted after this.
     pub async fn grant(
         &self,
         ino: u64,
@@ -1433,9 +1481,9 @@ impl Vault {
         label: &OsStr,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
-        // Checked before `user`'s key is pinned: a pin also makes shares
-        // from `user` trusted, which sharing from a share that isn't
-        // mustn't bring about.
+        // Check this before pinning `user`'s key. A pin also makes shares
+        // from `user` trusted, and sharing from an untrusted share must not
+        // cause that.
         self.fresh_node(ino).await?;
         let public_key = self.remote.public_key(user).await?;
         let public_key = self.known.check(user, &public_key)?;
@@ -1483,7 +1531,8 @@ impl Vault {
                     expired_once = true;
                     self.freshen(ino).await?;
                 }
-                // Someone else granted it meanwhile: start from their list.
+                // Another client changed the grants at the same time. Start
+                // again from their list.
                 Err(e) if changed(&e) => {}
                 other => return other.map(|()| public_key),
             }
@@ -1494,12 +1543,13 @@ impl Vault {
         ))
     }
 
-    /// Pins `user`'s public key, as the server has it, if its fingerprint
-    /// is `expected` (as `fingerprint` writes it; spaces and case don't
-    /// matter): what makes grants from `user` trusted (see `Node::sealable`),
-    /// and lets a first grant to them go ahead without trusting the server
-    /// for their key. `EPERM` if the fingerprint differs, or another key
-    /// is pinned for them already.
+    /// Pins `user`'s public key if its fingerprint matches `expected`.
+    /// Spaces and case in `expected` do not matter. This makes grants from
+    /// `user` trusted, and lets a first grant to them go ahead without
+    /// trusting the server for their key.
+    ///
+    /// Returns `EPERM` if the fingerprint is different, or if a different
+    /// key is already pinned.
     pub async fn trust(&self, user: &str, expected: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         let served = self.served_key(user).await?;
@@ -1516,12 +1566,14 @@ impl Vault {
             ));
         }
         let key = self.known.check(user, &served)?;
-        // What was opened as from them before was opened untrusted.
+        // Grants from this user were opened as untrusted before, so open
+        // them again.
         self.forget_all();
         Ok(key)
     }
 
-    /// The public key the server has for `user` -- its word, nothing more.
+    /// The public key that the server gives for `user`. Only the server
+    /// says it is theirs.
     pub async fn served_key(&self, user: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         self.remote
@@ -1531,8 +1583,8 @@ impl Vault {
             .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))
     }
 
-    /// Every grant made to this account, with who made it and whether
-    /// they are trusted here (see `Node::sealable`).
+    /// Every grant made to this account, with its sender and whether this
+    /// account trusts them (see `Node::sealable`).
     pub async fn shares(&self) -> Result<Vec<Share>, FsError> {
         let mut grants = self.remote.list_grants().await?;
         grants.sort_by_key(|g| g.ino);
@@ -1560,7 +1612,7 @@ impl Vault {
         Ok(shares)
     }
 
-    /// The inode at `path`: a root entry's name, then names under it,
+    /// The inode at `path`: a root entry's name, then names below it,
     /// separated by `/`.
     pub async fn resolve(&self, path: &str) -> Result<u64, FsError> {
         let mut parts = path.split('/').filter(|p| !p.is_empty() && *p != ".");
@@ -1574,9 +1626,13 @@ impl Vault {
         Ok(ino)
     }
 
-    /// File `ino`'s bytes `[offset, offset + len)`, as far as its size,
-    /// with holes reading as zeros. Chunks cached here are served from the
-    /// cache once the server confirms they haven't changed.
+    /// Returns bytes `[offset, offset + len)` of file `ino`.
+    ///
+    /// - Stops at the end of the file. Returns nothing if `offset` is at or
+    ///   past the end.
+    /// - Holes read as zeros.
+    /// - Uses a cached chunk only after the server confirms that it has not
+    ///   changed.
     pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         if len == 0 {
             return Ok(Vec::new());
@@ -1618,9 +1674,10 @@ impl Vault {
         Ok(out)
     }
 
-    /// The plaintext a read's answer for one chunk stands for: the cached
-    /// bytes it confirmed, or the bytes it sent, opened and cached. `node`
-    /// is the file's key, fetched the first time one is needed.
+    /// Returns the plaintext for one chunk of a read: the cached bytes that
+    /// the server confirmed, or the bytes that the server sent, opened and
+    /// cached. `node` holds the file's key, fetched the first time it is
+    /// needed.
     async fn chunk_from(
         &self,
         ino: u64,
@@ -1641,9 +1698,9 @@ impl Vault {
             {
                 return Ok(data);
             }
-            // Confirmed unchanged on the server, but invalidated here
-            // meanwhile -- a write of ours may have replaced it: read it
-            // afresh.
+            // The server confirmed that the chunk did not change, but the
+            // cache dropped it in the meantime, possibly because of a write
+            // from this client. Read it again.
             let fresh = self.fetch_one(ino, index, 0).await?;
             let generation = self
                 .cache
@@ -1659,7 +1716,8 @@ impl Vault {
         self.open_and_keep(ino, chunk, generation, node).await
     }
 
-    /// Opens a chunk as sent (empty for a hole) and caches it at its seq.
+    /// Opens a chunk as the server sent it (a hole is empty) and caches it
+    /// at its seq.
     async fn open_and_keep(
         &self,
         ino: u64,
@@ -1674,8 +1732,8 @@ impl Vault {
                     Some(known) => known,
                     None => self.node(ino).await?,
                 };
-                // Sealed under a key newer than the one known here:
-                // someone rotated it since.
+                // The chunk is sealed under a newer key than the one known
+                // here, so another client rotated the key.
                 let current = if version > known.record.version {
                     self.refresh(ino).await?
                 } else {
@@ -1698,10 +1756,11 @@ impl Vault {
         Ok(plain)
     }
 
-    /// Chunks `first..=last` of `ino`, in as many asks as the server's cap
-    /// takes, and the file's size as of the last. `known[i]` is the seq
-    /// chunk `first + i` is cached at, or 0. Chunks in object storage come
-    /// back fetched, as if they were inline (see `fetch_segments`).
+    /// Fetches chunks `first..=last` of `ino`, in as many requests as the
+    /// server's limit needs, and returns the file's size from the last
+    /// reply. `known[i]` is the seq that chunk `first + i` is cached at, or
+    /// 0. Chunks in object storage come back fetched, as if they were
+    /// inline (see `fetch_segments`).
     async fn fetch(
         &self,
         ino: u64,
@@ -1726,8 +1785,8 @@ impl Vault {
         Ok((size, self.fetch_segments(ino, reads).await?))
     }
 
-    /// One chunk of `ino`, and the store's seq for it; `unchanged`, with
-    /// no bytes, if it is still at `known` (0 for none).
+    /// Fetches one chunk of `ino` and its seq. If the chunk is still at
+    /// `known` (0 for none), it comes back `unchanged`, with no bytes.
     async fn fetch_one(&self, ino: u64, index: u64, known: u64) -> Result<SealedChunk, FsError> {
         let read = self.remote.read_chunks(ino, index, 1, &[known]).await?;
         let mut got = self.fetch_segments(ino, vec![read]).await?;
@@ -1736,16 +1795,16 @@ impl Vault {
             .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
     }
 
-    /// The chunks `reads` returned, with each one in object storage
-    /// fetched from it and put in its place as the sealed bytes it is --
-    /// so everything after reads it as it reads an inline chunk, opening
-    /// it at its own index.
+    /// Fetches each chunk in `reads` that is in object storage, and puts
+    /// its sealed bytes in its place. Later code can then read it like an
+    /// inline chunk.
     ///
-    /// Consecutive segments of one block are fetched in one ranged GET, and
-    /// different runs at once, up to `MAX_FETCHES`. Every segment is the
-    /// same length (each was zero-padded to a whole chunk before sealing),
-    /// which is what lets a range be cut out of a block without reading
-    /// the rest of it.
+    /// - Groups consecutive segments of one block into one ranged GET.
+    /// - Runs up to `MAX_FETCHES` GETs at the same time.
+    ///
+    /// A range can be cut from a block without reading the rest, because
+    /// each segment is padded with zeros to a full chunk before sealing. So
+    /// all segments have the same length.
     async fn fetch_segments(
         &self,
         ino: u64,
@@ -1753,8 +1812,8 @@ impl Vault {
     ) -> Result<Vec<SealedChunk>, FsError> {
         let segment_len = self.remote.chunk_size() + CHUNK_OVERHEAD as u64;
         let mut chunks = Vec::new();
-        // Runs to fetch: the URL, the first segment, and where in `chunks`
-        // each segment of the run goes.
+        // The runs to fetch: the URL, the first segment, and the place in
+        // `chunks` for each segment of the run.
         let mut runs: Vec<(String, u32, Vec<usize>)> = Vec::new();
         for read in reads {
             let mut wanted: Vec<(u32, u32, usize)> = Vec::new();
@@ -1807,18 +1866,19 @@ impl Vault {
         Ok(chunks)
     }
 
-    /// Opens a sealed chunk of `ino`, with whichever of its key versions
-    /// it was sealed under.
+    /// Opens a sealed chunk of `ino` with the key version that it was
+    /// sealed under.
     fn open(&self, node: &Node, ino: u64, index: u64, blob: &[u8]) -> Result<Vec<u8>, FsError> {
         let version = sealed_version(blob).map_err(|e| corrupt(ino, e))?;
         let key = node.key_at(ino, version)?;
         open_chunk(&key, ino, index, blob).map_err(|e| corrupt(ino, e))
     }
 
-    /// The current plaintext of chunk `index` of `ino`, and the seq it is
-    /// at, to change and write back: the cached copy if there is one --
-    /// unconfirmed, since the write names the seq it expects and the
-    /// server refuses it if the copy was out of date -- or else fetched.
+    /// Returns the current plaintext of chunk `index` and its seq, to
+    /// change and write back. It uses the cached copy without asking the
+    /// server, because the write sends the seq it expects, and the server
+    /// refuses the write if the copy is out of date. If there is no cached
+    /// copy, it fetches the chunk.
     async fn base(&self, node: &Node, ino: u64, index: u64) -> Result<(Vec<u8>, u64), FsError> {
         if let Lookup::Unconfirmed { data, version, .. } =
             self.cache.lock().unwrap().get(self.space, ino, index)
@@ -1833,14 +1893,30 @@ impl Vault {
         Ok((plain, chunk.seq))
     }
 
-    /// Writes `data` at `offset` in file `ino`, a batch at a time, growing
-    /// it as needed. A failure says how many leading bytes were stored, by
-    /// whole batches.
+    /// Writes `data` at `offset` in file `ino`, and makes the file larger
+    /// if necessary.
+    ///
+    /// Steps:
+    ///
+    /// - Split the range into one span for each chunk.
+    /// - Group the spans: one group for each block in a hybrid file's block
+    ///   region, and at most one batch for each group of inline chunks.
+    /// - Store each group in order: `rewrite_block` for a block,
+    ///   `write_batch` for inline chunks. If the key is stale, get new keys
+    ///   and try that group once more.
+    ///
+    /// Returns the file's attributes after the last group.
+    ///
+    /// Edge cases:
+    ///
+    /// - An empty write stores nothing, but still changes mtime.
+    /// - On failure, `WriteError::written` counts the bytes stored, in
+    ///   whole groups. The groups before the failed one stay stored.
     pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<Attr, WriteError> {
         let failed = |written, error| WriteError { written, error };
         let mut node = self.fresh_node(ino).await.map_err(|e| failed(0, e))?;
         if data.is_empty() {
-            // Still a write, as far as mtime is concerned.
+            // An empty write still changes mtime.
             let touched = match self.remote.write_chunks(ino, &[], offset).await {
                 Err(e) if expired(&e) => {
                     self.freshen(ino).await.map_err(|e| failed(0, e))?;
@@ -1853,8 +1929,8 @@ impl Vault {
         let chunk_size = self.remote.chunk_size();
         let per_batch = (self.remote.batch_bytes() / chunk_size).max(1) as usize;
         let spans = spans(chunk_size, offset, data.len());
-        // A hybrid file's chunks past the grid's start go a block at a
-        // time; the rest, as every inline file's, a batch at a time.
+        // Spans are in order, so if the last span is not in a block, no
+        // span is.
         let grid = match self.remote.grid() {
             Some(grid)
                 if spans
@@ -1872,8 +1948,8 @@ impl Vault {
             grid.filter(|g| g.in_blocks(index))
                 .map(|g| g.block_start(index))
         };
-        // Runs of spans stored together: in the block starting at the
-        // index given, or inline.
+        // Each group is stored in one commit. An inline group holds at most
+        // one batch, to stay below the server's transaction size limit.
         let mut groups: Vec<(Option<u64>, &[Span])> = Vec::new();
         let mut rest = &spans[..];
         while let Some(&(index, ..)) = rest.first() {
@@ -1916,7 +1992,8 @@ impl Vault {
                 }
             };
             let stored = match once(Arc::clone(&node)).await {
-                // A stale key, here or above: new keys, then again.
+                // The key is stale, here or above. Get new keys and try
+                // again.
                 Err(e) if expired(&e) => {
                     node = self.freshen(ino).await.map_err(|e| failed(cursor, e))?;
                     once(Arc::clone(&node)).await
@@ -1930,10 +2007,20 @@ impl Vault {
         Ok(attr.expect("a non-empty write has at least one batch"))
     }
 
-    /// One batch of `write`: seals each span's chunk -- whole, or changed
-    /// from its current bytes and re-sealed -- and stores them all, or
-    /// does it over if a chunk changed before they could be. What it
-    /// stores, it caches.
+    /// Stores one inline group of spans in one transaction, and caches what
+    /// it stores.
+    ///
+    /// Steps:
+    ///
+    /// - Seal each span's chunk. A whole-chunk span seals the new bytes
+    ///   directly. A partial span changes the chunk's current bytes
+    ///   (`base`), and the write expects the chunk's seq.
+    /// - Send all chunks in one `write_chunks` call.
+    /// - If another writer changed a chunk first (`EAGAIN`), drop the
+    ///   cached copies and do it again, up to `CHANGE_RETRIES` times.
+    ///
+    /// On any other error, the result is not known, so it drops the file's
+    /// whole cache.
     async fn write_batch(
         &self,
         node: &Node,
@@ -1981,14 +2068,16 @@ impl Vault {
             }
             match self.remote.write_chunks(ino, &writes, end).await {
                 Err(e) if changed(&e) => {
-                    // A base was out of date: drop it, and fetch afresh.
+                    // A cached base was out of date. Drop it and fetch it
+                    // again.
                     let mut cache = self.cache.lock().unwrap();
                     for &(index, ..) in spans {
                         cache.invalidate(self.space, ino, index..=index);
                     }
                 }
                 Err(e) => {
-                    // Whether it landed is unknown: trust nothing cached.
+                    // It is not known whether the write was stored, so do
+                    // not trust the cache.
                     self.cache.lock().unwrap().invalidate_ino(self.space, ino);
                     return Err(e);
                 }
@@ -2007,16 +2096,17 @@ impl Vault {
         ))
     }
 
-    /// Applies `changes` to `ino` (see `Remote::setattr`). Cutting a file
-    /// short first re-seals the chunk its new end falls in, cut short too,
-    /// which the server can't do itself.
+    /// Applies `changes` to `ino` (see `Remote::setattr`). When the file
+    /// gets shorter, the client first seals the chunk at the new end again,
+    /// cut short, because the server cannot open the chunk to do this.
     pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
         if let Some(size) = changes.size {
             self.truncate(ino, size).await?;
         }
         let changed = self.remote.setattr(ino, changes).await;
         if let Some(size) = changes.size {
-            // The chunks past the new end are gone, whatever came back.
+            // The chunks after the new end are gone, whatever the result
+            // was.
             let chunk_size = self.remote.chunk_size();
             self.cache
                 .lock()
@@ -2026,7 +2116,8 @@ impl Vault {
         changed
     }
 
-    /// Re-seals the chunk `new_size` falls in without what lies past it.
+    /// Seals the chunk that `new_size` falls in again, without the bytes
+    /// after `new_size`.
     async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
         match self.truncate_once(ino, new_size).await {
             Err(e) if expired(&e) => {
@@ -2073,7 +2164,7 @@ impl Vault {
                 )),
             };
             let written = self.remote.write_chunks(ino, &[write], 0).await;
-            // Whatever happened, the cached copy is superseded.
+            // Whatever happened, the cached copy is now out of date.
             self.cache
                 .lock()
                 .unwrap()
@@ -2134,7 +2225,7 @@ mod tests {
             KnownKeys::load(file.clone()).unwrap().pinned("bob"),
             Some([2; 32])
         );
-        // Only its owner reads the file.
+        // Only the owner can read the file.
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&file).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -2149,7 +2240,8 @@ mod tests {
         let file = std::env::temp_dir().join(format!("raft5fs-known-bad-{}", std::process::id()));
         let line = |user: &str, byte: u8| format!("{user} {}\n", to_hex(&[byte; 32]));
         for text in [
-            // Two keys for one name: which is bob's can't be guessed.
+            // Two keys for one user: the code cannot know which key is
+            // correct.
             format!("{}{}", line("bob", 1), line("bob", 2)),
             format!("{}junk\n", line("bob", 1)),
             line("Bob", 1),
@@ -2159,7 +2251,7 @@ mod tests {
             std::fs::write(&file, &text).unwrap();
             assert!(KnownKeys::load(file.clone()).is_err(), "{text:?}");
         }
-        // The same key twice, and blank lines, are fine.
+        // The same key twice, and blank lines, are accepted.
         std::fs::write(&file, format!("{}\n{}", line("bob", 1), line("bob", 1))).unwrap();
         assert_eq!(
             KnownKeys::load(file.clone()).unwrap().pinned("bob"),

@@ -1,6 +1,6 @@
-//! The `raft5fs` command: mounting, accounts, sharing and pruning, each a
-//! subcommand. What reaches a filesystem comes from a profile (see `cli`),
-//! with any of it overridden on the command line.
+//! The `raft5fs` command: mounting, accounts, sharing, and pruning, each a
+//! subcommand. How to reach a filesystem comes from a profile (see `cli`),
+//! and the command line can override any of it.
 
 mod account;
 #[cfg(feature = "fuse")]
@@ -40,33 +40,33 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// How to reach the filesystem, over the profile's say.
+/// How to reach the filesystem. These override the profile.
 #[derive(Args, Debug, Clone, Default)]
 pub struct ConnectArgs {
-    /// The profile to use (by default, the only one there is).
+    /// The profile to use (by default, the only one).
     #[arg(long, global = true)]
     pub profile: Option<String>,
     /// The account.
     #[arg(long, global = true)]
     pub user: Option<String>,
-    /// A filesystem server, https://host:port. May be given more than once:
-    /// requests go to whichever answers.
+    /// A filesystem server, as https://host:port. Can be given more than
+    /// once: requests go to whichever server answers.
     #[arg(long = "server", global = true)]
     pub servers: Vec<String>,
-    /// The CA certificate (PEM) the servers' certificates chain to.
+    /// The CA certificate (PEM) that the servers' certificates chain to.
     #[arg(long, global = true)]
     pub ca: Option<PathBuf>,
-    /// Check the servers' certificates against this name instead of the
-    /// host in each address.
+    /// Check the servers' certificates against this name, not the host in
+    /// each address.
     #[arg(long, global = true)]
     pub tls_server_name: Option<String>,
-    /// Where other users' public keys are pinned (by default, per
-    /// filesystem, under ~/.config/raft5fs/filesystems/).
+    /// Where other users' public keys are pinned (by default, one file for
+    /// each filesystem, under ~/.config/raft5fs/filesystems/).
     #[arg(long, global = true)]
     pub known_keys: Option<PathBuf>,
-    /// Talk to http:// servers without TLS. Only for throwaway setups: a
-    /// login is enough to test password guesses against, and to act as
-    /// the user.
+    /// Connect to http:// servers without TLS. Only for temporary setups:
+    /// anyone who sees a login can test password guesses against it, and
+    /// act as the user.
     #[arg(long, global = true)]
     pub insecure_plaintext: bool,
 }
@@ -87,35 +87,35 @@ impl ConnectArgs {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Mount the filesystem, in the foreground, as the profile's account.
+    /// Mount the filesystem in the foreground, as the profile's account.
     #[cfg(feature = "fuse")]
     Mount(mount::MountArgs),
     /// Serve the filesystem over WebDAV, on this machine only, in the
     /// foreground, as the profile's account.
     #[cfg(feature = "webdav")]
     Webdav(webdav::WebdavArgs),
-    /// Set up an account from an invitation (or a bare enrolment code),
-    /// choosing its password; saves a profile for it.
+    /// Set up an account from an invitation (or a bare enrolment code) and
+    /// choose its password. Saves a profile for it.
     Enrol(account::EnrolArgs),
     /// Change the account's password. Everything shared with it stays
     /// readable.
     Passwd,
-    /// Show the account's key fingerprint, for others to check when
-    /// sharing with it.
+    /// Show the account's key fingerprint, for others to check when they
+    /// share with it.
     Whoami,
-    /// Share a directory, and everything under it, with a user.
+    /// Share a directory, and everything below it, with a user.
     Grant(share::GrantArgs),
-    /// Take a user's share of a directory back. What is written there from
-    /// then on is sealed under keys they never had.
+    /// Remove a user's share of a directory. Data written there after this
+    /// is sealed under keys that they never had.
     Revoke(share::RevokeArgs),
-    /// Who a directory is shared with.
+    /// Show who a directory is shared with.
     Grants(share::PathArg),
-    /// Pin a user's key, after checking its fingerprint with them: what
+    /// Pin a user's key after you check its fingerprint with them. This
     /// makes their shares writable here.
     Trust(share::TrustArgs),
-    /// Forget a user's pinned key (after they enrolled again).
+    /// Forget a user's pinned key (for example, after they enrolled again).
     ForgetKey(share::UserArg),
-    /// What is shared with this account by someone not trusted yet.
+    /// Show what users that are not trusted yet share with this account.
     Pending,
     /// Prune old key versions: what is queued, or the given directories.
     Prune(prune::PruneArgs),
@@ -124,7 +124,7 @@ pub enum Command {
     Profile(profile::ProfileCommand),
 }
 
-/// Runs the command line, returning the process's exit status.
+/// Runs the command line and returns the process's exit status.
 pub fn run(cli: Cli) -> i32 {
     let result = match cli.command {
         #[cfg(feature = "fuse")]
@@ -152,31 +152,32 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
-/// What a subcommand comes to: an exit status, or why it failed.
+/// The result of a subcommand: an exit status, or why it failed.
 type Outcome = Result<i32, String>;
 
-/// How a mount or a WebDAV server keeps its session.
+/// How a mount or a WebDAV server runs its session.
 #[derive(Args)]
 pub struct SessionArgs {
-    /// Memory for caching file data this machine has read or written,
-    /// decrypted: a byte count, or with a K/M suffix (default 64M; 0
-    /// disables). A cached chunk is still checked with a server on every
-    /// read, at the cost of a few bytes, so it is never stale.
+    /// Memory to cache decrypted file data that this machine read or wrote:
+    /// a byte count, or with a K or M suffix (default 64M; 0 disables).
+    /// Every read still checks a cached chunk with a server, for a few
+    /// bytes, so it is never stale.
     #[arg(long)]
     pub cache_size: Option<String>,
-    /// Store every write at once instead of buffering small sequential
-    /// writes until a batch fills, the file is closed, or fsync is called.
+    /// Store every write at once. By default, small sequential writes are
+    /// buffered until a batch fills, the file is closed, or fsync is
+    /// called.
     #[arg(long)]
     pub no_write_buffer: bool,
-    /// Don't work through this account's prune queue (see `raft5fs prune`)
+    /// Do not work through this account's prune queue (see `raft5fs prune`)
     /// in the background while running.
     #[arg(long)]
     pub no_background_prune: bool,
 }
 
 impl SessionArgs {
-    /// The session these say to open as `ctx`'s account, asking for its
-    /// password (or reading it from RAFT5FS_PASSWORD).
+    /// The session that these settings open, as `ctx`'s account. Asks for
+    /// the password, or reads it from RAFT5FS_PASSWORD.
     #[cfg_attr(not(any(feature = "fuse", feature = "webdav")), allow(dead_code))]
     fn config(&self, ctx: &Context) -> Result<SessionConfig, String> {
         let cache = self.cache_size.clone().or(ctx.cache_size.clone());
@@ -202,8 +203,8 @@ fn runtime() -> Runtime {
     Runtime::new().expect("failed to start tokio runtime")
 }
 
-/// Logs in as `ctx`'s account -- asking for the password, or reading it
-/// from RAFT5FS_PASSWORD -- and opens its keys, with its pins.
+/// Logs in as `ctx`'s account (asks for the password, or reads it from
+/// RAFT5FS_PASSWORD), and opens its keys with its pins.
 fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
     let password = password_from("RAFT5FS_PASSWORD", &format!("password for {}: ", ctx.user))
         .map_err(|e| format!("cannot read a password: {e}"))?;
@@ -219,7 +220,7 @@ fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
         .with_known_keys(ctx.known_keys()?))
 }
 
-/// A key's fingerprint as people read it out: words, then hex.
+/// A key's fingerprint as people read it: words, then hex.
 fn show_fingerprint(key: &[u8; raft5fs_crypto::identity::PUBLIC_KEY_LEN]) -> String {
     format!(
         "  {}\n  ({})",

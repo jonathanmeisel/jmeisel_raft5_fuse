@@ -1,14 +1,16 @@
-//! Serving the session over HTTP, on loopback only: a WebDAV server is
-//! a mount by other means, with everything in it decrypted and acted on
-//! as the account, so it is for this machine's user alone.
+//! Serves the session over HTTP, on loopback only.
 //!
-//! Binding to loopback keeps other machines out, but not this machine's
-//! other users, nor web pages its browsers open, which can send requests
-//! to localhost too. So every request must also carry the password this
-//! server was started with (HTTP Basic: what Finder, davfs2 and gio all
-//! speak), and name a loopback host -- a page can point a name of its own
-//! at 127.0.0.1, but not make its requests say `localhost` -- and come
-//! from no other origin.
+//! A WebDAV server is another kind of mount: everything in it is decrypted
+//! and used as the account. So it is for this machine's user only. Loopback
+//! keeps other machines out, but not this machine's other users, or web
+//! pages that its browsers open, which can also send requests to localhost.
+//! So every request must also:
+//!
+//! - send the password that this server was started with (HTTP Basic, which
+//!   Finder, davfs2, and gio all use);
+//! - name a loopback host. A page can point its own name at 127.0.0.1, but
+//!   it cannot make its requests say `localhost`;
+//! - come from no other origin.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -33,18 +35,18 @@ use tokio::net::TcpListener;
 
 use crate::fs::DavFs;
 
-/// How much of a file a GET reads at a time: big enough that a large
-/// file isn't one round trip per 16 KiB (`dav_server`'s default).
+/// How much of a file a GET reads at a time: big enough that a large file
+/// is not one round trip per 16 KiB (`dav_server`'s default).
 const READ_SIZE: usize = 1 << 20;
 
-/// How long a shutdown waits for requests in flight.
+/// How long a shutdown waits for requests in progress.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// The realm a 401 names.
+/// The realm that a 401 names.
 const REALM: &str = "raft5fs";
 
-/// Who may use the server: the account's name, and a password made when
-/// the server started.
+/// Who can use the server: the account's name, and a password made when the
+/// server started.
 #[derive(Clone)]
 pub struct Auth {
     user: String,
@@ -70,7 +72,7 @@ impl Auth {
         &self.password
     }
 
-    /// Whether `headers` carry these credentials.
+    /// Whether `headers` contain these credentials.
     fn admits(&self, headers: &HeaderMap) -> bool {
         let Some(given) = headers
             .get(header::AUTHORIZATION)
@@ -85,13 +87,14 @@ impl Auth {
     }
 }
 
-/// Whether `a` and `b` are equal, taking as long whichever byte differs.
+/// Whether `a` and `b` are equal. The time taken does not depend on which
+/// byte differs.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// Whether `host` (a `Host` header, or an origin's host and port) is this
-/// machine's loopback, by a name no one else can give it.
+/// machine's loopback, by a name that no one else can give it.
 fn is_loopback_host(host: &str) -> bool {
     let name = match host.strip_prefix('[') {
         // An IPv6 address, with or without a port after it.
@@ -101,7 +104,7 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(name, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Why a request is refused before it reaches the handler, if it is.
+/// The refusal for a request that must not reach the handler, if any.
 fn refusal(auth: &Auth, headers: &HeaderMap) -> Option<Response<Body>> {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     if !host.is_some_and(is_loopback_host) {
@@ -135,14 +138,16 @@ fn status(code: StatusCode) -> Response<Body> {
     response
 }
 
-/// Whether `addr` is a loopback address -- all `serve` will listen on.
+/// Whether `addr` is a loopback address, the only kind that `serve` listens
+/// on.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
 /// Serves `session` on `listener`, which must be bound to loopback, to
-/// requests `auth` admits, until `shutdown` completes. Then it waits a
-/// little for requests in flight, and stores everything still buffered.
+/// requests that `auth` admits, until `shutdown` completes. Then it waits a
+/// short time for requests in progress, and stores everything still
+/// buffered.
 pub async fn serve(
     session: Arc<Session>,
     listener: TcpListener,

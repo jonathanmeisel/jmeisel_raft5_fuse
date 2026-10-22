@@ -1,13 +1,16 @@
-//! The filesystem server: the raft5fs protocol over `FsCore`.
+//! The filesystem server: the raft5fs protocol on top of `FsCore`.
 //!
-//! Stateless by design, so any number can run against one store and a
-//! client can use any of them: nothing here outlives a request except the
-//! account cache, which remembers that an account is still enrolled for at
-//! most `identity_ttl`, and the core's paths up to grants, which only say
-//! what to read and are checked against the store every time (see
-//! `raft5fs_core`'s `grants::Paths`). Write buffering and the chunk cache
-//! live in the client; sessions live in signed tokens the client holds
-//! (see `auth`).
+//! It is stateless, so any number of servers can run on one store, and a
+//! client can use any of them. Only two things last longer than a request:
+//!
+//! - the account cache, which remembers that an account is still enrolled
+//!   for at most `identity_ttl`;
+//! - the core's paths up to grants, which only say what to read, and are
+//!   checked against the store every time (see `raft5fs_core`'s
+//!   `grants::Paths`).
+//!
+//! Write buffering and the chunk cache are in the client. Sessions are
+//! signed tokens that the client holds (see `auth`).
 
 pub mod auth;
 pub mod timing;
@@ -45,19 +48,19 @@ use tonic::{Request, Response, Status};
 use crate::auth::Signer;
 use crate::timing::Timed;
 
-/// The largest request the server accepts: one write batch, which is at
-/// most one maximum-size chunk, plus room for framing. Above tonic's 4 MiB
-/// default, which a batch of large chunks would exceed.
+/// The largest request that the server accepts: one write batch, which is
+/// at most one maximum-size chunk, plus space for framing. This is above
+/// tonic's 4 MiB default, which a batch of large chunks would exceed.
 const MAX_MESSAGE_BYTES: usize = MAX_CHUNK_SIZE as usize + (1 << 20);
 
-/// How long a server may go on trusting that an account is enrolled before
-/// looking again, unless told otherwise: how long removing an account
-/// takes to reach a user who is already mounted. Costs at most one store
-/// read per active user per this long.
+/// How long a server can trust that an account is enrolled before it checks
+/// again, by default. This is how long it takes for an account removal to
+/// reach a user who is already mounted. It costs at most one store read for
+/// each active user in this time.
 pub const DEFAULT_IDENTITY_TTL: Duration = Duration::from_secs(5);
 
-/// How to reach the store: the seeds and TLS settings a server's client is
-/// built from.
+/// How to connect to the store: the seeds and TLS settings for a server's
+/// client.
 #[derive(Clone)]
 pub struct Store {
     pub seeds: Vec<String>,
@@ -65,7 +68,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// A fresh client, sharing nothing with any other.
+    /// A new client that shares nothing with any other client.
     pub fn client(&self) -> Result<Client, KvError> {
         match &self.tls {
             Some(tls) => Client::with_tls(&self.seeds, tls.clone()),
@@ -80,13 +83,13 @@ pub struct FsService {
     /// When each account was last seen enrolled.
     enrolled: Mutex<HashMap<String, Instant>>,
     identity_ttl: Duration,
-    /// Whether answers say where their time went (see `timing`).
+    /// Whether responses say where their time went (see `timing`).
     timing_header: bool,
 }
 
 impl FsService {
-    /// `identity_ttl` is how long an account is trusted to still be
-    /// enrolled before looking again (`DEFAULT_IDENTITY_TTL`; zero looks
+    /// `identity_ttl` is how long to trust that an account is still
+    /// enrolled before checking again (`DEFAULT_IDENTITY_TTL`; zero checks
     /// on every request).
     pub fn new(core: Arc<FsCore>, signer: Signer, identity_ttl: Duration) -> Self {
         Self {
@@ -98,15 +101,15 @@ impl FsService {
         }
     }
 
-    /// Answers every request with `raft5fs_proto::timing::HEADER`: how
-    /// long it took to handle, and how much of that went on the store.
-    /// Off by default -- see that module for why.
+    /// Adds `raft5fs_proto::timing::HEADER` to every response: how long the
+    /// request took to handle, and how much of that went to the store. Off
+    /// by default; that module says why.
     pub fn with_timing_header(mut self, on: bool) -> Self {
         self.timing_header = on;
         self
     }
 
-    /// Who `request` is from, per its session, and its message.
+    /// Who sent `request`, from its session, and its message.
     async fn caller<T>(&self, request: Request<T>) -> Result<(Caller, T), Status> {
         let token = session_from_metadata(request.metadata())
             .ok_or_else(|| Status::unauthenticated("the request carries no session"))?;
@@ -115,10 +118,10 @@ impl FsService {
         Ok((Caller::new(name), request.into_inner()))
     }
 
-    /// That account `name` is still enrolled, give or take
-    /// `identity_ttl`. One removed is `UNAUTHENTICATED`: the client then
-    /// logs in again, which is refused, so removing an account cuts a
-    /// mounted user off without waiting for their session to expire.
+    /// Checks that account `name` is still enrolled, within `identity_ttl`.
+    /// A removed account gives `UNAUTHENTICATED`. The client then logs in
+    /// again, which fails, so removing an account cuts off a mounted user
+    /// without waiting for their session to expire.
     async fn check_enrolled(&self, name: &str) -> Result<(), Status> {
         if let Some(seen) = self.enrolled.lock().unwrap().get(name)
             && seen.elapsed() < self.identity_ttl
@@ -148,8 +151,8 @@ impl FsService {
     }
 }
 
-/// A store failure: the server's problem, so a status, which sends the
-/// client to another server.
+/// A store failure is the server's problem, so it becomes a gRPC status,
+/// which sends the client to another server.
 fn store_unavailable(e: FsError) -> Status {
     Status::unavailable(format!("cannot reach the store: {e}"))
 }
@@ -160,7 +163,7 @@ pub fn service(fs: FsService) -> FsServer<FsService> {
 }
 
 /// Serves on `listener` until `shutdown` completes, over TLS if `tls` is
-/// given, timing every request (see `timing`).
+/// given, and times every request (see `timing`).
 pub async fn serve(
     fs: FsService,
     listener: TcpListener,
@@ -182,13 +185,13 @@ fn name(bytes: &[u8]) -> &OsStr {
     OsStr::from_bytes(bytes)
 }
 
-/// The snapshot a read-only request asks to read at, if any.
+/// The snapshot that a read-only request asks to read at, if any.
 fn at(snapshot: &str) -> Option<&[u8]> {
     (!snapshot.is_empty()).then_some(snapshot.as_bytes())
 }
 
-/// Refuses a snapshot on a request that writes, which shares its message
-/// with ones that only read.
+/// Refuses a snapshot on a request that writes. Such requests share their
+/// message type with requests that only read.
 fn live_only(snapshot: &str) -> Result<(), FsError> {
     if snapshot.is_empty() {
         Ok(())
@@ -197,8 +200,8 @@ fn live_only(snapshot: &str) -> Result<(), FsError> {
     }
 }
 
-/// The chunks a write or reseal carries, `EINVAL` if one can't mean
-/// anything.
+/// The chunks in a write or reseal. Returns `EINVAL` for a chunk with no
+/// valid meaning.
 fn chunk_writes(chunks: Vec<raft5fs_proto::pb::ChunkWrite>) -> Result<Vec<ChunkWrite>, FsError> {
     chunks.into_iter().map(ChunkWrite::try_from).collect()
 }
@@ -224,8 +227,8 @@ impl Fs for FsService {
                 salt: keys.salt,
                 params: keys.kdf_params,
             },
-            // Indistinguishable from a real account's: the same made-up
-            // salt every time, and the parameters new accounts get.
+            // The same as a real account's settings: the same made-up salt
+            // each time, and the settings that new accounts get.
             Ok(None) => KdfSettings {
                 salt: self.signer.decoy_salt(&username).to_vec(),
                 params: KdfParams::DEFAULT.encode().to_vec(),
@@ -235,9 +238,9 @@ impl Fs for FsService {
         Ok(Response::new(Ok(settings).into()))
     }
 
-    /// Checks `auth` against the account's verifier, and hands back the
-    /// wrapped private key. A wrong `auth` and an unknown account are
-    /// refused alike.
+    /// Checks `auth` against the account's verifier, and returns the
+    /// wrapped private key. A wrong `auth` and an unknown account give the
+    /// same error.
     async fn login(&self, r: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
         let r = r.into_inner();
         let session = match accounts::check_login(self.core.client(), &r.username, &r.auth).await {
@@ -629,7 +632,7 @@ impl Fs for FsService {
     }
 }
 
-/// What a create brings besides the parent, tag and mode.
+/// What a create sends in addition to the parent, tag, and mode.
 fn new_node(r: &CreateRequest) -> NewNode {
     NewNode {
         ino: r.ino,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Makes everything secret the cluster needs, into secrets/ -- keep that
-# directory backed up somewhere safe and offline; it is the only copy of
-# the CA keys and the passwords.
+# Makes all the secrets that the cluster needs, in secrets/. Keep a backup
+# of that directory in a safe place, offline: it is the only copy of the CA
+# keys and the passwords.
 #
 #   ./certs.sh          make whatever is missing: both CAs, every
 #                       certificate, the WireGuard keys, the shared secrets
@@ -11,7 +11,7 @@
 #                       renewal or after the nodes' names or addresses
 #                       changed. Then install.sh each node, one at a time.
 #
-# Two CAs, kept apart:
+# Two separate CAs:
 #   internal-ca  the store's: its nodes' peer and client mTLS. Only the
 #                servers ever see it. Each node has one certificate, for
 #                its WireGuard address, used as the store node, as the
@@ -35,7 +35,7 @@ command -v wg >/dev/null || die "wg isn't installed (the wireguard-tools package
 umask 077
 mkdir -p "$SECRETS/nodes" "$SECRETS/wg"
 
-# A random secret, written once.
+# A random secret, written one time.
 secret() {
     local file=$1 bytes=$2
     [[ -f $file ]] && return
@@ -43,7 +43,7 @@ secret() {
     echo "made $file"
 }
 
-# A self-signed CA, made once.
+# A self-signed CA, made one time.
 ca() {
     local name=$1 cn=$2
     [[ -f $SECRETS/$name.pem ]] && return
@@ -55,8 +55,8 @@ ca() {
     echo "made $SECRETS/$name.pem"
 }
 
-# A certificate $out.pem / $out.key from CA $ca, for subjectAltName $san
-# and extended key usage $eku -- unless it exists and this isn't a renewal.
+# A certificate $out.pem / $out.key from CA $ca, for subjectAltName $san and
+# extended key usage $eku. Skipped if it exists and this is not a renewal.
 leaf() {
     local out=$1 ca=$2 cn=$3 san=$4 eku=$5
     if [[ -f $out.pem ]] && ! $renew; then return; fi
@@ -76,11 +76,12 @@ leaf() {
 ca internal-ca "raft5fs internal CA"
 ca fs-ca "raft5fs CA"
 
-# The store's token-signing secret, and the filesystem servers' session
-# key: each the same on every node.
+# The store's token-signing secret, and the filesystem servers' session key.
+# Each one is the same on every node.
 secret "$SECRETS/jwt.secret" 48
 secret "$SECRETS/token.key" 48
-# The store's administrator, and the filesystem servers' store account.
+# Passwords for the store's administrator and the filesystem servers' store
+# account.
 secret "$SECRETS/admin.pw" 24
 secret "$SECRETS/store.pw" 24
 
@@ -97,7 +98,7 @@ while read -r name public_ip wg_ip public_name; do
 done < <(nodes)
 
 san=$(IFS=,; echo "${fs_san[*]}")
-# Issued again, too, whenever the nodes' public names or addresses change.
+# Also issue it again when the nodes' public names or addresses change.
 if [[ $(cat "$SECRETS/fs.san" 2>/dev/null) != "$san" ]]; then
     rm -f "$SECRETS/fs.pem"
 fi

@@ -1,5 +1,5 @@
-//! Plain types shared by core, the server and the client: what an
-//! operation takes and returns, independent of the wire format.
+//! Plain types that core, the server, and the client share: what each
+//! operation takes and returns, separate from the wire format.
 
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -10,8 +10,8 @@ pub enum Kind {
     Directory,
 }
 
-/// An inode's attributes, as stored. There are no owners: access goes by
-/// grants, and a mount shows its own user as the owner of everything.
+/// An inode's attributes, as stored. There are no owners: grants control
+/// access, and a mount shows its own user as the owner of everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attr {
     pub ino: u64,
@@ -25,25 +25,27 @@ pub struct Attr {
     pub layout: Layout,
 }
 
-/// Where a file's data lives. Fixed when the file is made.
+/// Where a file's data is stored. It does not change after the file is
+/// made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
-    /// Every chunk in the store. Every directory, and every file made
-    /// before object storage was turned on.
+    /// Every chunk is in the store. This is the layout of every directory,
+    /// and of every file made before object storage was turned on.
     #[default]
     Inline,
-    /// Chunks before the filesystem's `ObjectGrid::from_index` in the
-    /// store, the rest in blocks in object storage.
+    /// Chunks before the filesystem's `ObjectGrid::from_index` are in the
+    /// store, and the rest are in blocks in object storage.
     Hybrid,
 }
 
-/// How a hybrid file's chunks from `from_index` on are grouped into
-/// blocks, one object each: block `b` holds chunks `from_index + b *
-/// per_block` up to (not including) `from_index + (b + 1) * per_block`.
-/// Fixed for the filesystem's lifetime. The chunk grid itself doesn't
-/// change -- a block is just consecutive chunks stored together -- so a
-/// chunk's index, and everything keyed or sealed by it, means the same in
-/// either layout.
+/// How a hybrid file groups its chunks from `from_index` up into blocks,
+/// one object for each block. Block `b` holds chunks `from_index + b *
+/// per_block` up to (but not including) `from_index + (b + 1) * per_block`.
+/// It never changes for the filesystem.
+///
+/// The chunk grid is the same in both layouts: a block is only consecutive
+/// chunks stored together. So a chunk's index, and everything keyed or
+/// sealed by it, means the same in both layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectGrid {
     pub from_index: u64,
@@ -56,15 +58,16 @@ impl ObjectGrid {
         index >= self.from_index
     }
 
-    /// The first chunk index of the block chunk `index` is in, which is
-    /// the key the block's pointer is stored under. Only for an index
-    /// `in_blocks`.
+    /// The first chunk index of the block that holds chunk `index`. The
+    /// block's pointer is stored under this index. Use only for an index
+    /// that is `in_blocks`.
     pub fn block_start(&self, index: u64) -> u64 {
         let per = u64::from(self.per_block);
         self.from_index + (index - self.from_index) / per * per
     }
 
-    /// Where in its block chunk `index` is. Only for an index `in_blocks`.
+    /// The position of chunk `index` in its block. Use only for an index
+    /// that is `in_blocks`.
     pub fn segment(&self, index: u64) -> u32 {
         ((index - self.from_index) % u64::from(self.per_block)) as u32
     }
@@ -73,11 +76,13 @@ impl ObjectGrid {
 /// The random part of an object's name.
 pub const BLOCK_RANDOM_LEN: usize = 16;
 
-/// An object holding one block of a file (see `ObjectGrid`): `nseg`
-/// chunks, each zero-padded to the chunk size and then sealed, back to
-/// back, all under key version `version`. Its name is the file's inode,
-/// `minted_ms` and `random`; the inode comes from where the pointer is
-/// stored, so a pointer can only name its own file's objects.
+/// An object that holds one block of a file (see `ObjectGrid`): `nseg`
+/// chunks, all under key version `version`. Each chunk is padded with zeros
+/// to the chunk size, then sealed, and the chunks are stored back to back.
+///
+/// Its name is the file's inode, `minted_ms`, and `random`. The inode comes
+/// from the key that stores the pointer, so a pointer can only name its own
+/// file's objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRef {
     pub version: u32,
@@ -86,15 +91,15 @@ pub struct BlockRef {
     pub nseg: u32,
 }
 
-/// A block a read refers to, and a presigned URL to fetch it by.
+/// A block that a read refers to, and a presigned URL to fetch it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUrl {
     pub block: BlockRef,
     pub url: String,
 }
 
-/// Who an operation is on behalf of: the account whose grants decide what
-/// it may do.
+/// The account that an operation is for. Its grants control what the
+/// operation can do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub user: String,
@@ -106,7 +111,7 @@ impl Caller {
     }
 }
 
-/// A time to set, keeping "now" -- the server's clock -- distinct from an
+/// A time to set. "Now" (the server's clock) is a separate case from an
 /// explicit time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetTime {
@@ -123,7 +128,7 @@ impl SetTime {
     }
 }
 
-/// The attribute changes one `setattr` asks for; `None` leaves a field
+/// The attribute changes that one `setattr` asks for. `None` leaves a field
 /// as it is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SetAttr {
@@ -145,9 +150,9 @@ pub struct DirItem {
     pub sealed_name: Vec<u8>,
 }
 
-/// A directory granted to a user: whether they
-/// may write under it, and its key at `key_version`, sealed to them, with
-/// the name it shows up as in their root, also sealed to them.
+/// A directory granted to a user: whether they can write below it, its key
+/// at `key_version` sealed to them, and its label in their root, also
+/// sealed to them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub ino: u64,
@@ -157,15 +162,15 @@ pub struct Grant {
     pub sealed_label: Vec<u8>,
 }
 
-/// A user's grant over an inode, and the key record of each node from the
-/// granted directory down to it, in that order.
+/// A user's grant above an inode, and the key record of each node from the
+/// granted directory down to the inode, in that order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPath {
     pub grant: Grant,
     pub nodes: Vec<(u64, Vec<u8>)>,
 }
 
-/// Someone a node is granted to, as the server knows them.
+/// A user that a node is granted to, as the server knows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grantee {
     pub user: String,
@@ -173,50 +178,50 @@ pub struct Grantee {
     pub writable: bool,
 }
 
-/// A node at or under some directory that is granted to someone: the path
-/// from that directory down to it (both included), and its grantees.
+/// A node at or below a directory, that is granted to some user: the path
+/// from the directory down to the node (both included), and its grantees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantedNode {
     pub ino: u64,
     pub path: Vec<u64>,
     pub grantees: Vec<Grantee>,
-    /// Who the node's key holders say it is granted to (raft5fs-crypto's
-    /// `grantees`), which `grantees` must agree with.
+    /// The users that the node's key holders say it is granted to
+    /// (raft5fs-crypto's `grantees`). `grantees` must agree with this list.
     pub sealed_grantees: Vec<u8>,
-    /// The store's seq for `sealed_grantees`, for a grant to say which
+    /// The store's seq for `sealed_grantees`. A grant sends it to say which
     /// list it replaces.
     pub grantees_seq: u64,
 }
 
-/// A new key for one node: its key record a version on from
-/// `expected_version`, and each of its grants re-sealed under it -- or,
-/// with an empty sealed key, removed.
+/// A new key for one node: its key record one version after
+/// `expected_version`, and each of its grants sealed again under the new
+/// key. A grant with an empty sealed key is removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rotation {
     pub ino: u64,
     pub expected_version: u32,
     pub node_keys: Vec<u8>,
     pub grants: Vec<(String, Vec<u8>)>,
-    /// The grantees as the rotation leaves them, sealed under the new key;
-    /// empty if none are left.
+    /// The grantees after the rotation, sealed under the new key. Empty if
+    /// no grantees are left.
     pub sealed_grantees: Vec<u8>,
 }
 
-/// A file chunk as stored, with the store's sequence number for it (for
-/// a chunk in a block, the block's).
+/// A file chunk as stored, with the store's sequence number for it. For a
+/// chunk in a block, this is the block's sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedChunk {
     pub index: u64,
     pub seq: u64,
     pub body: ChunkBody,
-    /// Still at the seq the client said it held, so its body wasn't sent
-    /// (and is `Hole`).
+    /// The chunk is still at the seq that the client has, so the server did
+    /// not send its body (it is `Hole`).
     pub unchanged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkBody {
-    /// Never written: all zeros. Also what an `unchanged` chunk carries.
+    /// Never written: all zeros. An `unchanged` chunk also has this body.
     Hole,
     /// The chunk, sealed.
     Inline(Vec<u8>),
@@ -224,8 +229,8 @@ pub enum ChunkBody {
     Segment { block: u32, segment: u32 },
 }
 
-/// What a read of chunks returns: the file's attributes (for its size),
-/// the chunks, and the blocks their segments are in.
+/// What a chunk read returns: the file's attributes (for its size), the
+/// chunks, and the blocks that hold their segments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunks {
     pub attr: Attr,
@@ -233,8 +238,9 @@ pub struct Chunks {
     pub blocks: Vec<BlockUrl>,
 }
 
-/// A chunk, or a block, to store, if what is there is still at
-/// `expected_seq` (or whatever it holds, without one).
+/// A chunk or a block to store. If `expected_seq` is set, the server stores
+/// it only if the stored item is still at that seq. If not, it replaces
+/// whatever is there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkWrite {
     pub index: u64,
@@ -251,8 +257,8 @@ pub enum WriteBody {
     Block(BlockRef),
 }
 
-/// A block to be uploaded: its first chunk index, and how many segments
-/// it will hold.
+/// A block to upload: its first chunk index, and how many segments it will
+/// hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockUpload {
     pub index: u64,
@@ -260,7 +266,7 @@ pub struct BlockUpload {
 }
 
 /// Where to upload a block: the object's name, and a presigned PUT for
-/// exactly its length, usable once.
+/// exactly its length that works one time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedUpload {
     pub minted_ms: u64,
@@ -268,21 +274,24 @@ pub struct PreparedUpload {
     pub url: String,
 }
 
-/// What a create brings: the inode it reserved,
-/// and the new node's key record.
+/// What a create sends: the inode that it reserved, and the new node's key
+/// record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNode {
     pub ino: u64,
     pub keys: Vec<u8>,
-    /// Its real name, sealed under the parent's key. (The name the create
-    /// passes is the tag.)
+    /// Its real name, sealed under the parent's key. The create sends the
+    /// tag as the name.
     pub sealed_name: Vec<u8>,
 }
 
-/// What a rename brings: the inode it moves --
-/// refused if the name no longer names it -- its key record re-wrapped
-/// under the new parent's key if the parent changes (empty if not), and
-/// the new name sealed under the new parent's key.
+/// What a rename sends:
+///
+/// - the inode that moves (the server refuses the move if the name no
+///   longer points to it);
+/// - its key record, wrapped again under the new parent's key if the parent
+///   changes (empty if not);
+/// - the new name, sealed under the new parent's key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedMove {
     pub ino: u64,
@@ -290,19 +299,19 @@ pub struct SealedMove {
     pub sealed_name: Vec<u8>,
 }
 
-/// A snapshot of the filesystem, which mounts show at `/.snapshot/<name>`.
+/// A snapshot of the filesystem. Mounts show it at `/.snapshot/<name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotInfo {
     pub name: String,
-    /// When it was taken, by the clock of whoever took it.
+    /// When it was taken, by the clock of the machine that took it.
     pub created: SystemTime,
 }
 
-/// The most entry names one re-seal takes.
+/// The most entry names that one re-seal request takes.
 pub const RESEAL_NAMES_BATCH: usize = 256;
 
-/// A directory entry's name sealed again, under the directory's current
-/// key: the entry filed under `tag`, which must still name `ino`.
+/// A directory entry's name, sealed again under the directory's current
+/// key. The entry is filed under `tag`, which must still point to `ino`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResealedName {
     pub tag: OsString,
@@ -310,9 +319,9 @@ pub struct ResealedName {
     pub sealed_name: Vec<u8>,
 }
 
-/// What the filesystem keeps for an account: enough to check a
-/// login and to hand the client back its wrapped private key, and nothing
-/// that opens anything. The fields are raft5fs-crypto's encodings.
+/// What the filesystem keeps for an account: enough to check a login and to
+/// give the client its wrapped private key, and nothing that opens
+/// anything. The fields use raft5fs-crypto's encodings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountKeys {
     pub salt: Vec<u8>,
@@ -322,9 +331,9 @@ pub struct AccountKeys {
     pub wrapped_private_key: Vec<u8>,
 }
 
-/// An errno plus a message. The errno is what a caller hands the kernel;
-/// the message carries the real cause (usually the store's own error
-/// text) so it can be logged.
+/// An errno and a message. The caller gives the errno to the kernel. The
+/// message has the real cause (usually the store's own error text), so it
+/// can be logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsError {
     pub errno: i32,
@@ -339,22 +348,23 @@ impl FsError {
         }
     }
 
-    /// An error whose errno says everything there is to say.
+    /// An error that needs no message beyond its errno.
     pub fn errno(errno: i32) -> Self {
         Self::new(errno, std::io::Error::from_raw_os_error(errno).to_string())
     }
 }
 
-/// The longest account name there can be.
+/// The longest possible account name.
 pub const MAX_USERNAME_LEN: usize = 64;
 
-/// Whether `user` can be an account's name: a lower-case letter or `_`,
-/// then up to 63 more of those, digits, `.` and `-`. Names end up in
-/// store keys, in the known-keys file a client pins public keys in (one
-/// `name key` line each), and in front of people, so nothing that could
-/// break a line or a field, or look like another name, gets in. Both ends
-/// check: the server where an account is made or named, and the client
-/// on every name a server hands it.
+/// Whether `user` is a valid account name: a lower-case letter or `_`, then
+/// up to 63 more of those, digits, `.`, or `-`.
+///
+/// Names go into store keys, into the known-keys file where a client pins
+/// public keys (one `name key` line each), and in front of people. So the
+/// rules block anything that could break a line or a field, or look like
+/// another name. Both sides check: the server when it makes or names an
+/// account, and the client on every name that a server gives it.
 pub fn check_username(user: &str) -> Result<(), FsError> {
     let mut chars = user.chars();
     let ok = user.len() <= MAX_USERNAME_LEN
@@ -392,9 +402,9 @@ impl std::fmt::Display for FsError {
 
 impl std::error::Error for FsError {}
 
-/// A failed write: how many leading bytes had already been stored (each
-/// batch commits on its own, so a failure part-way leaves the earlier
-/// batches in place) and why it failed.
+/// A failed write: how many bytes at the start were already stored, and why
+/// it failed. Each batch commits on its own, so a failure part way leaves
+/// the earlier batches stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteError {
     pub written: usize,

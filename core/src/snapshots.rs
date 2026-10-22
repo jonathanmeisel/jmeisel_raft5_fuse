@@ -1,12 +1,14 @@
-//! Snapshots: the store's own (raft5's), each pinning the whole filesystem
-//! as it stood when it was taken, for mounts to browse read-only under
-//! `/.snapshot/<name>`.
+//! Snapshots: the store's own (raft5) snapshots. Each one keeps the whole
+//! filesystem as it was when it was taken, and mounts show it read-only
+//! under `/.snapshot/<name>`.
 //!
-//! Taking and removing one is the store administrator's: raft5 allows it
-//! no one else, since a snapshot holds every version of every key changed
-//! after it until it is removed. Listing and reading at one are open to the
-//! filesystem servers' account like any other read. Everything read at a
-//! snapshot is read as of it, the grants deciding access included.
+//! - Only the store administrator can take or remove a snapshot. raft5
+//!   allows no one else, because a snapshot keeps every version of every
+//!   key changed after it until it is removed.
+//! - The filesystem servers' account can list and read snapshots like any
+//!   other read.
+//! - A read at a snapshot reads everything as it was then, including the
+//!   grants that control access.
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -15,8 +17,8 @@ use raft5fs_proto::types::{FsError, SnapshotInfo};
 
 use crate::timing;
 
-/// Whether `name` can be a snapshot's: what raft5 takes as an id, and what
-/// can be a file name besides -- not `.` or `..`.
+/// Whether `name` is a valid snapshot name: a valid raft5 id that is also a
+/// valid file name, so not `.` or `..`.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("a snapshot name must be 1 to 128 bytes long".to_string());
@@ -45,8 +47,9 @@ fn info(s: raft5_client::SnapshotInfo) -> Option<SnapshotInfo> {
     })
 }
 
-/// Every snapshot, oldest first. One whose id can't be a file name -- taken
-/// some other way than `create` -- isn't listed: no path could reach it.
+/// Every snapshot, oldest first. A snapshot whose id is not a valid file
+/// name (taken in some way other than `create`) is not listed, because no
+/// path could reach it.
 pub async fn list(client: &Client) -> Result<Vec<SnapshotInfo>, FsError> {
     let mut snapshots: Vec<_> = timing::other("snapshot list", client.list_snapshots())
         .await?
@@ -57,14 +60,16 @@ pub async fn list(client: &Client) -> Result<Vec<SnapshotInfo>, FsError> {
     Ok(snapshots)
 }
 
-/// Whether snapshot `name` exists. Asked before reading at one, since the
-/// store keeps retrying a read at an unknown snapshot until its deadline.
+/// Whether snapshot `name` exists. Check this before reading at a snapshot,
+/// because the store keeps retrying a read at an unknown snapshot until its
+/// deadline.
 pub async fn exists(client: &Client, name: &[u8]) -> Result<bool, FsError> {
     Ok(client.list_snapshots().await?.iter().any(|s| s.id == name))
 }
 
-/// Takes a snapshot of the filesystem as it is now, named `name`, or by
-/// the time if `None`. `client` must be logged in as a store administrator.
+/// Takes a snapshot of the filesystem as it is now, named `name`, or named
+/// by the time if `None`. `client` must be logged in as a store
+/// administrator.
 pub async fn create(client: &Client, name: Option<&str>) -> Result<SnapshotInfo, String> {
     if let Some(name) = name {
         validate_name(name)?;
@@ -76,8 +81,8 @@ pub async fn create(client: &Client, name: Option<&str>) -> Result<SnapshotInfo,
     info(made).ok_or_else(|| "the store named the snapshot something unusable".to_string())
 }
 
-/// Removes snapshot `name`, releasing what it held. `client` must be
-/// logged in as a store administrator.
+/// Removes snapshot `name` and frees what it held. `client` must be logged
+/// in as a store administrator.
 pub async fn remove(client: &Client, name: &str) -> Result<(), String> {
     client
         .remove_snapshot(name.as_bytes())

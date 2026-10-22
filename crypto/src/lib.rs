@@ -1,28 +1,25 @@
-//! Client-side encryption for raft5fs.
+//! Client-side encryption for raft5fs. The client makes and uses every
+//! secret. The servers and the store only hold what this crate outputs.
 //!
-//! Everything secret is made and used on the client; the servers and the
-//! store only ever hold what this crate outputs. The pieces:
-//!
-//! - `password`: one password stretched into two unrelated secrets -- an
-//!   `auth` value the client logs in with, and a key-encryption key that
+//! - `password`: turns one password into two unrelated secrets: an `auth`
+//!   value that the client logs in with, and a key-encryption key that
 //!   never leaves the client. A server that sees `auth` learns nothing
-//!   about the other.
-//! - `identity`: each user's X25519 key pair, its private half stored
-//!   wrapped under that key-encryption key, and grants -- a node's key
-//!   sealed to one user's public key.
-//! - `node`: every inode's key record. A node's current key is wrapped
-//!   under its parent's, and each rotation leaves the previous key wrapped
-//!   under the new one, so holding a key opens every older version of it
-//!   and no newer one.
+//!   about the other secret.
+//! - `identity`: each user's X25519 key pair, with the private key wrapped
+//!   under the key-encryption key. Also grants: a node's key sealed to one
+//!   user's public key.
+//! - `node`: each inode's key record. A node's current key is wrapped under
+//!   its parent's key. Each rotation wraps the old key under the new one,
+//!   so a key opens all older versions and no newer one.
 //! - `data`: file chunks and directory entry names, encrypted under their
 //!   node's key.
-//! - `grantees`: who a node is granted to, sealed under its key, so the
-//!   server can't add anyone a rotation would then re-seal the key to.
+//! - `grantees`: the users a node is granted to, sealed under its key. The
+//!   server cannot add a user that a rotation would then seal the key to.
 //!
-//! Every ciphertext is bound (as associated data) to what it is and where
-//! it belongs -- its purpose, its inode, its versions -- so the server
-//! can't pass one off as another: a chunk moved to another index, or a
-//! wrapper copied onto another inode, fails to open.
+//! Each ciphertext is bound (as associated data) to its purpose, its inode,
+//! and its versions. So the server cannot use one ciphertext in place of
+//! another: a chunk moved to another index, or a wrapped key copied to
+//! another inode, does not open.
 
 pub mod data;
 pub mod grantees;
@@ -40,10 +37,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
-/// What sealing adds to a plaintext: the nonce in front, the tag after.
+/// The bytes that sealing adds to a plaintext: the nonce before it and the
+/// tag after it.
 pub const AEAD_OVERHEAD: usize = NONCE_LEN + 16;
 
-/// A symmetric key. Wiped when dropped.
+/// A symmetric key. It is erased from memory when dropped.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Key([u8; KEY_LEN]);
 
@@ -76,9 +74,9 @@ impl fmt::Debug for Key {
     }
 }
 
-/// Something didn't open or didn't parse: a wrong key, a tampered or
-/// misplaced ciphertext, or garbage. Deliberately vague about which --
-/// the message says what was being opened, not why it failed.
+/// A ciphertext did not open or parse: a wrong key, a changed or moved
+/// ciphertext, or bad data. The message tells what was being opened, but
+/// not why it failed, on purpose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub &'static str);
 
@@ -90,8 +88,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Associated data: a purpose label, then the fields that pin a
-/// ciphertext to its place.
+/// Associated data: a purpose label, then the fields that bind a ciphertext
+/// to its place. Each field has a length prefix, so fields cannot be
+/// shifted into each other.
 fn aad(purpose: &str, fields: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(b"raft5fs/");
@@ -103,9 +102,9 @@ fn aad(purpose: &str, fields: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// `nonce ‖ ciphertext ‖ tag`, with a fresh random nonce. XChaCha's
-/// 24-byte nonces make random ones safe however many messages one key
-/// seals.
+/// Returns `nonce ‖ ciphertext ‖ tag`, with a new random nonce. XChaCha's
+/// 24-byte nonces make random nonces safe for any number of messages under
+/// one key.
 fn seal(key: &Key, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let mut nonce = [0; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
@@ -142,8 +141,8 @@ fn open(key: &Key, aad: &[u8], sealed: &[u8], what: &'static str) -> Result<Vec<
         .map_err(|_| Error(what))
 }
 
-/// A cursor over an encoded record, for the decoders: each step fails
-/// cleanly on short input instead of panicking.
+/// A cursor over an encoded record for the decoders. Each step returns an
+/// error on short input, and does not panic.
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -160,7 +159,7 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(self.take(4, what)?.try_into().unwrap()))
     }
 
-    /// A field written by `put_bytes`: its length, then it.
+    /// Reads a field written by `put_bytes`: its length, then its bytes.
     fn bytes(&mut self, what: &'static str) -> Result<&'a [u8], Error> {
         let n = self.u32(what)? as usize;
         self.take(n, what)

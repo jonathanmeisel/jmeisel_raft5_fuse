@@ -12,8 +12,8 @@ raft5fs-proto = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 
-# The end-to-end tests run the whole stack in-process: a raft5 cluster,
-# filesystem servers over it, and mounts over those.
+# The end-to-end tests run the whole stack: a raft5 cluster, filesystem
+# servers on it (as child processes), and mounts on those.
 [dev-dependencies]
 raft5-client = { workspace = true }
 raft5-server = { workspace = true }

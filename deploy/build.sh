@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds every binary the servers need, statically linked (musl), into
+# Builds every binary that the servers need, statically linked (musl), into
 # out/bin: raft5-server and the `raft` admin shell from the raft5 store's
-# repository (RAFT5_REPO in cluster.conf), and raft5fs-server from this
-# one. Static so they run on whatever distribution the VMs have,
-# whatever glibc this machine has.
+# repository (RAFT5_REPO in cluster.conf), and raft5fs-server from this one.
+# They are static so they run on any distribution the VMs have, whatever
+# glibc this machine has.
 #
-# Needs, once:
+# Needs, one time:
 #   rustup target add x86_64-unknown-linux-musl
 #   and musl-gcc (Arch: pacman -S musl; Debian/Ubuntu: apt install musl-tools)
 . "$(dirname "$0")/lib.sh"

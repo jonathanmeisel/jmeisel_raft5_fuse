@@ -1,9 +1,10 @@
-//! The BIP-39 English word list, which public-key fingerprints are read
-//! out in (`identity::fingerprint_words`): 2048 common words, sorted, no
-//! two sharing their first four letters.
+//! The BIP-39 English word list, used to read out public-key fingerprints
+//! (`identity::fingerprint_words`). It has 2048 common words, sorted, and
+//! no two words share their first four letters.
 //!
 //! From https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt
-//! (SHA-256 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda).
+//! (SHA-256
+//! 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda).
 //! BIP-39 is licensed under the MIT License.
 
 pub static WORDS: [&str; 2048] = [

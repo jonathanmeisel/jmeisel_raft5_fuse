@@ -3,36 +3,36 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Which filesystem a chunk is of -- the live one, or one of its snapshots
-/// (see `Vault`), whose inode numbers are the same -- its inode, and its
-/// index.
+/// The filesystem that a chunk belongs to (the live one, or one of its
+/// snapshots, which use the same inode numbers; see `Vault`), its inode,
+/// and its index.
 type Key = (u64, u64, u64);
 
-/// Bookkeeping charged per entry on top of its bytes, so a filesystem full
-/// of holes (empty entries) can't grow the cache without bound.
+/// A cost charged for each entry in addition to its bytes, so a filesystem
+/// full of holes (empty entries) cannot grow the cache without limit.
 const ENTRY_OVERHEAD: usize = 64;
 
 struct Slot {
     data: Arc<[u8]>,
-    /// The seq these bytes were read at. A later hit asks the store
-    /// whether this is still the key's current seq rather than sending
-    /// the bytes again.
+    /// The seq that these bytes were read at. A later hit asks the store
+    /// whether this is still the key's current seq, so the bytes need not
+    /// be sent again.
     version: u64,
-    /// When `version` was last known current -- the fetch, or the most
-    /// recent confirmation of it -- not when the bytes arrived.
+    /// When `version` was last known to be current (the fetch, or the
+    /// latest confirmation), not when the bytes arrived.
     confirmed: Instant,
     tick: u64,
 }
 
-/// What a lookup found. Both arms carry the `generation` to hand back to
-/// [`ChunkCache::insert`] or [`ChunkCache::confirm`] afterwards.
+/// The result of a lookup. Both variants carry the `generation` to give
+/// back to [`ChunkCache::insert`] or [`ChunkCache::confirm`] later.
 pub enum Lookup {
     /// Nothing usable. Fetch the chunk, then `insert` it with the seq it
     /// came back at.
     Miss { generation: u64 },
-    /// Bytes that were current as of `version`. They may only be served
-    /// once the store says `version` is still this key's current seq --
-    /// then `confirm`; otherwise fetch and `insert` the replacement.
+    /// Bytes that were current at `version`. Use them only after the store
+    /// says that `version` is still this key's current seq, and then call
+    /// `confirm`. Otherwise fetch the chunk and `insert` the new bytes.
     Unconfirmed {
         data: Arc<[u8]>,
         version: u64,
@@ -41,7 +41,7 @@ pub enum Lookup {
 }
 
 impl Lookup {
-    /// The generation to hand back to `insert` or `confirm`.
+    /// The generation to give back to `insert` or `confirm`.
     pub fn generation(&self) -> u64 {
         match *self {
             Self::Miss { generation } | Self::Unconfirmed { generation, .. } => generation,
@@ -50,28 +50,30 @@ impl Lookup {
 }
 
 /// An LRU cache of whole decrypted chunks, keyed by `(space, ino, chunk
-/// index)` -- `space` telling the live filesystem's apart from each
-/// snapshot's, so that one budget covers them all -- and bounded by bytes: the client's, so a hit saves the trip, the
-/// decryption, and the server's store read alike.
+/// index)`. `space` separates the live filesystem from each snapshot, so
+/// one size limit covers all of them. It is limited by bytes. It is on the
+/// client, so a hit saves the round trip, the decryption, and the server's
+/// store read.
 ///
-/// This client's own writes invalidate exactly, or replace the entry with
-/// what they wrote. Other clients' writes it cannot see at all, so a hit
-/// is never served on trust: every entry carries the store's seq for the
-/// chunk as read, and a read hands that to the server, which sends the
-/// chunk again only if the seq moved on (see `Vault::read`). That check
-/// costs eight bytes whatever the chunk weighs, and answers on exactly the
-/// terms an uncached read would, so a confirmed hit is as fresh as reading
-/// the chunk outright. A write may take an entry's bytes unconfirmed, as
-/// the base of a read-modify-write: it names the seq it expects, so the
-/// server refuses it if the bytes were out of date.
+/// - This client's own writes invalidate exactly, or replace the entry with
+///   what they wrote.
+/// - This client cannot see other clients' writes, so it never uses a hit
+///   without a check. Every entry has the store's seq for the chunk as
+///   read. A read sends that seq to the server, which sends the chunk again
+///   only if the seq changed (see `Vault::read`). The check costs eight
+///   bytes whatever the chunk's size, and gives the same result as a read
+///   without a cache. So a confirmed hit is as fresh as a full read.
+/// - A write can use an entry's bytes without a check, as the base of a
+///   read-modify-write. The write sends the seq it expects, so the server
+///   refuses it if the bytes were out of date.
 ///
-/// `ttl` therefore bounds not staleness but how long an entry may sit
-/// unconfirmed: it only expires entries nothing has looked at since.
+/// So `ttl` does not limit staleness. It limits how long an entry can stay
+/// unconfirmed: it only expires entries that nothing has used since.
 ///
-/// A `generation` counter closes the race between a reader using a chunk
-/// and a writer invalidating it: the reader notes the generation before it
-/// goes to the server, and `insert`/`confirm` refuse if any invalidation
-/// happened since.
+/// A `generation` counter stops a race between a reader that uses a chunk
+/// and a writer that invalidates it. The reader notes the generation before
+/// it asks the server, and `insert` and `confirm` refuse if any
+/// invalidation happened after that.
 pub struct ChunkCache {
     capacity: usize,
     ttl: Duration,
@@ -105,8 +107,8 @@ impl ChunkCache {
         self.capacity > 0
     }
 
-    /// The cached chunk and the seq it was read at, for the caller to
-    /// confirm against the store; or a miss.
+    /// Returns the cached chunk and the seq it was read at, for the caller
+    /// to confirm with the store, or a miss.
     pub fn get(&mut self, space: u64, ino: u64, index: u64) -> Lookup {
         let key = (space, ino, index);
         let Some(slot) = self.map.get_mut(&key) else {
@@ -131,14 +133,14 @@ impl ChunkCache {
         }
     }
 
-    /// Whether bytes taken at `generation` are still safe to serve, having
-    /// just had their version confirmed current by the store. False once
-    /// anything has been invalidated since, because a local write may have
-    /// replaced them in the meantime -- the caller must fetch instead.
+    /// Whether bytes taken at `generation` are still safe to use, after the
+    /// store confirmed that their version is current.
     ///
-    /// Also restarts the entry's `ttl`, since its version is current as of
-    /// now. An entry evicted for space in the meantime is simply not
-    /// re-cached; the bytes in the caller's hand are still good.
+    /// - Returns false if anything was invalidated since, because a local
+    ///   write may have replaced them. The caller must then fetch.
+    /// - Restarts the entry's `ttl`, because its version is current now.
+    /// - If the entry was evicted for space in the meantime, it is not
+    ///   cached again. The caller's bytes are still good.
     pub fn confirm(&mut self, space: u64, ino: u64, index: u64, generation: u64) -> bool {
         if generation != self.generation {
             return false;
@@ -150,7 +152,7 @@ impl ChunkCache {
     }
 
     /// Caches `data`, read at seq `version`, unless something was
-    /// invalidated since `generation` was read -- in which case `data` may
+    /// invalidated after `generation` was read. In that case `data` could
     /// already be stale.
     pub fn insert(
         &mut self,
@@ -228,7 +230,7 @@ mod tests {
         vec![7u8; n].into()
     }
 
-    /// The cached bytes, ignoring the version the caller would confirm.
+    /// The cached bytes, without the version that the caller would confirm.
     fn cached(c: &mut ChunkCache, ino: u64, idx: u64) -> Option<Arc<[u8]>> {
         match c.get(0, ino, idx) {
             Lookup::Unconfirmed { data, .. } => Some(data),
@@ -330,9 +332,9 @@ mod tests {
         put(&mut c, 1, 0, 10);
         let generation = c.get(0, 1, 0).generation();
 
-        // A local write landing while the reader was asking the store for
-        // the current seq: its bytes are superseded, however that call
-        // came back.
+        // A local write happened while the reader asked the store for the
+        // current seq. Its bytes are out of date, whatever that call
+        // returned.
         c.invalidate(0, 1, 0..=0);
         assert!(!c.confirm(0, 1, 0, generation));
     }

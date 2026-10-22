@@ -1,5 +1,5 @@
-# Shared by the scripts here: reads cluster.conf and says where things go.
-# Sourced, not run.
+# Shared by the scripts here: reads cluster.conf and gives the paths for
+# files. Source it; do not run it.
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ node_names() {
     nodes | awk '{print $1}'
 }
 
-# The first node: where the cluster is bootstrapped.
+# The first node, where the cluster is bootstrapped.
 first_node() {
     node_names | head -n1
 }
@@ -40,13 +40,13 @@ node_field() {
     awk -v f="$2" '{print $f}' <<<"$line"
 }
 
-# The store's client API addresses, as the filesystem servers' seeds.
+# The store's client API addresses, used as the filesystem servers' seeds.
 store_seeds() {
     nodes | awk '{printf "%shttps://%s:27051", (NR > 1 ? " " : ""), $3}'
 }
 
 # The invite options for `raft5fs-server user add`: every node's public
-# filesystem address. (The CA goes with them, from /etc/raft5fs.)
+# filesystem address. (The CA comes from /etc/raft5fs.)
 invite_servers() {
     local node
     for node in $(node_names); do
@@ -54,8 +54,8 @@ invite_servers() {
     done
 }
 
-# raft5fs-server's object storage options, from cluster.conf: none unless
-# S3_BUCKET is set. Values may not contain spaces.
+# raft5fs-server's object storage options, from cluster.conf. None unless
+# S3_BUCKET is set. Values must not contain spaces.
 object_options() {
     if [[ -z ${S3_BUCKET:-} ]]; then
         return 0
@@ -71,7 +71,7 @@ object_options() {
     if [[ -f $SECRETS/s3-ca.pem ]]; then printf -- '--object-ca /etc/raft5fs/s3-ca.pem '; fi
 }
 
-# The address users dial for node $1.
+# The address that users connect to for node $1.
 public_address() {
     local name
     name=$(node_field "$1" 4)
@@ -84,7 +84,7 @@ ssh_node() {
     ssh "$SSH_USER@$(node_field "$node" 2)" "$@"
 }
 
-# Runs the rest as root on node $1, through sudo unless logging in as root.
+# Runs the rest as root on node $1, through sudo unless the login is root.
 as_root() {
     local node=$1
     shift
@@ -95,7 +95,7 @@ as_root() {
     fi
 }
 
-# As `as_root`, with a terminal: for anything that asks for a password.
+# Same as `as_root`, with a terminal, for commands that ask for a password.
 as_root_tty() {
     local node=$1
     shift
@@ -104,10 +104,10 @@ as_root_tty() {
     ssh -t "$SSH_USER@$(node_field "$node" 2)" "${sudo[@]}" "$@"
 }
 
-# Whether node $1 is serving: both its services running, and its own
-# store node answering a read made through it alone with the filesystem
-# servers' store account -- which needs the cluster to have a leader.
-# Waits up to $2 seconds.
+# Whether node $1 is serving: both its services run, and its own store node
+# answers a read sent only through it with the filesystem servers' store
+# account. That read needs the cluster to have a leader. Waits up to $2
+# seconds.
 healthy() {
     local node=$1 wait=${2:-30} i seed
     seed=https://$(node_field "$node" 3):27051

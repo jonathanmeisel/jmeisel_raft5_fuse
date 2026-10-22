@@ -1,26 +1,26 @@
-//! Where a request's time went on the server, for a client finding out
-//! why an operation is slow.
+//! Shows where a request's time went on the server, so a client can find
+//! out why an operation is slow.
 //!
-//! A server started with `RAFT5FS_TIMING=1` answers every request with a
-//! [`HEADER`] saying how long it took to handle and how much of that it
-//! spent waiting on the store; the client, given `RAFT5FS_TIMING=1` too,
-//! sets that against how long the request took from where it sits. The
-//! rest is the network -- and anything queued in front of the request on
-//! either end.
+//! A server started with `RAFT5FS_TIMING=1` adds a [`HEADER`] to every
+//! response. It says how long the server took to handle the request, and
+//! how much of that time it waited on the store. A client with
+//! `RAFT5FS_TIMING=1` compares that with the total time it measured. The
+//! rest is the network, and anything queued in front of the request on
+//! either side.
 //!
-//! Off on the server unless asked for: how many store calls a request
-//! made says something about what the request found, and that is no
-//! business of an unauthenticated caller's.
+//! It is off on the server by default. The number of store calls tells
+//! something about what the request found, and an unauthenticated caller
+//! must not learn that.
 
 use std::fmt;
 use std::time::Duration;
 
-/// The response header a timing server answers with.
+/// The response header that a timing server adds.
 pub const HEADER: &str = "x-raft5fs-timing";
 
-/// One kind of store call: how many, and how long they were waited on in
-/// all. Calls made concurrently are summed, so their waits can add up to
-/// more than the request took.
+/// One kind of store call: how many calls, and how long they were waited on
+/// in total. Calls made at the same time are added together, so their total
+/// wait can be longer than the request.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Calls {
     pub count: u32,
@@ -34,36 +34,35 @@ impl Calls {
     }
 }
 
-/// What a request spent on the store.
+/// The time that a request spent on the store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreTime {
-    /// Point reads, any number of keys each: one round trip apiece.
+    /// Point reads, of any number of keys each. Each one is one round trip.
     pub reads: Calls,
-    /// Batches of keys fetched by key walks: one round trip apiece.
+    /// Batches of keys fetched by key walks. Each one is one round trip.
     pub scans: Calls,
-    /// Transaction attempts -- more than one for a transaction that
-    /// aborted on a conflict and ran again -- each counted for the time
-    /// it took beyond its reads and scans: beginning, writing, committing,
-    /// and the server's own work in between.
+    /// Transaction attempts. A transaction that aborted on a conflict and
+    /// ran again counts more than once. Each attempt counts the time it
+    /// took apart from its reads and scans: begin, write, commit, and the
+    /// server's own work between them.
     pub txns: Calls,
-    /// Anything else: a write outside a transaction, a look at which
-    /// snapshots there are.
+    /// Anything else, such as a write outside a transaction, or a check of
+    /// which snapshots exist.
     pub other: Calls,
 }
 
-/// What [`HEADER`] carries.
+/// The contents of [`HEADER`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServerTiming {
-    /// From the request reaching the service to its answer being ready
-    /// to send: everything but the network.
+    /// From when the request reaches the service to when its answer is
+    /// ready to send: everything except the network.
     pub handled: Duration,
     pub store: StoreTime,
 }
 
 impl ServerTiming {
-    /// As the header carries it:
-    /// `handled=US;reads=N/US;scans=N/US;txns=N/US;other=N/US`, times in
-    /// microseconds.
+    /// Encodes as `handled=US;reads=N/US;scans=N/US;txns=N/US;other=N/US`,
+    /// with times in microseconds.
     pub fn encode(&self) -> String {
         let calls = |c: &Calls| format!("{}/{}", c.count, c.waited.as_micros());
         format!(
@@ -76,7 +75,8 @@ impl ServerTiming {
         )
     }
 
-    /// The header's value, or `None` if it isn't one `encode` makes.
+    /// Decodes the header's value. Returns `None` if `encode` did not make
+    /// it.
     pub fn decode(value: &str) -> Option<Self> {
         let micros = |s: &str| s.parse().ok().map(Duration::from_micros);
         let calls = |s: &str| {
@@ -95,7 +95,8 @@ impl ServerTiming {
                 "scans" => timing.store.scans = calls(value)?,
                 "txns" => timing.store.txns = calls(value)?,
                 "other" => timing.store.other = calls(value)?,
-                // From a newer server: what this client knows is still good.
+                // A field from a newer server. Ignore it: the known fields
+                // are still correct.
                 _ => {}
             }
         }
@@ -103,7 +104,7 @@ impl ServerTiming {
     }
 }
 
-/// `d` in milliseconds, to a tenth: the resolution worth reading.
+/// `d` in milliseconds, to one decimal place. More precision is not useful.
 pub fn ms(d: Duration) -> String {
     format!("{:.1}ms", d.as_secs_f64() * 1000.0)
 }

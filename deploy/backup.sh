@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Copies a node's store database off the cluster, to backups/ here (or
-# DIR). The node's store is stopped for the copy -- a running database
-# isn't safe to copy -- and the other two carry on meanwhile, so only do
-# this with the whole cluster up. Contents and names are encrypted, so the
-# copy is safe to keep off-site; the secrets/ directory never goes with it.
+# Copies a node's store database from the cluster to backups/ here (or DIR).
+# The node's store stops during the copy, because a running database is not
+# safe to copy. The other two nodes continue, so do this only when the whole
+# cluster is up. Contents and names are encrypted, so the copy is safe to
+# keep off-site. The secrets/ directory is never part of it.
 #
 #   ./backup.sh <node> [DIR]
 . "$(dirname "$0")/lib.sh"

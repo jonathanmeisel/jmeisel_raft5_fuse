@@ -1,17 +1,22 @@
-//! Writing a hybrid file's blocks (see `ObjectGrid`): every change to one
-//! -- a write into it, a truncate cutting a segment short, a prune
-//! sealing it again under a newer key -- is a new object, since objects
-//! are written once. So each is a read-modify-write of the whole block:
-//! read its pointer, fetch whichever of its segments the change keeps,
-//! change them, seal every segment again under the current key, upload
-//! the lot through a URL the servers mint, and commit a pointer to it,
-//! guarded by the block's seq. Someone else's change in between makes the
-//! commit `EAGAIN`, and it is all done over.
+//! Writes a hybrid file's blocks (see `ObjectGrid`).
 //!
-//! A block the change overwrites whole needs nothing read: what a
-//! sequential writer, buffering a block at a time, always does. The
-//! object a commit replaces, and one uploaded for a commit that then
-//! failed, are left for the servers' garbage collection.
+//! Objects are written once, so every change to a block makes a new object:
+//! a write into it, a truncate that cuts a segment short, or a prune that
+//! seals it again under a newer key. So each change is a read-modify-write
+//! of the whole block:
+//!
+//! - Read the block's pointer.
+//! - Fetch the segments that the change keeps, and change them.
+//! - Seal every segment again under the current key.
+//! - Upload the block through a URL that the servers mint.
+//! - Commit a pointer to it, guarded by the block's seq. If another client
+//!   changed the block in between, the commit gives `EAGAIN` and all the
+//!   steps run again.
+//!
+//! A change that overwrites the whole block reads nothing. A sequential
+//! writer that buffers one block at a time always does this. The servers'
+//! garbage collection removes the object that a commit replaces, and any
+//! object uploaded for a commit that then failed.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -27,36 +32,36 @@ use crate::chunk_cache::Lookup;
 
 /// What a rewrite of a block changes.
 pub(super) enum BlockEdit<'a> {
-    /// `data` at `spans` (index, where in the chunk, how long: see
-    /// `spans`), all within the block; the file grows to `end`.
+    /// `data` at `spans` (index, offset in the chunk, length: see `spans`),
+    /// all in the block. The file grows to `end`.
     Write {
         spans: &'a [(u64, usize, usize)],
         data: &'a [u8],
         end: u64,
     },
-    /// Everything from byte `keep` of chunk `index` on, gone: the chunk a
-    /// truncate's new end falls part-way into. Segments after it the
-    /// server drops itself (see `FsCore::setattr`); this one it can't
-    /// open to cut.
+    /// Removes everything from byte `keep` of chunk `index` up: the chunk
+    /// that a truncate's new end falls part way into. The server removes
+    /// later segments itself (see `FsCore::setattr`), but it cannot open
+    /// this one to cut it.
     Truncate { index: u64, keep: usize },
-    /// Sealed again under the current key, if sealed under a version
-    /// before `below`.
+    /// Seals the block again under the current key, if it is sealed under a
+    /// version before `below`.
     Reseal { below: u32 },
 }
 
 /// What a rewrite did.
 pub(super) enum Rewritten {
-    /// Stored a new block of `nseg` segments; with the file's attributes,
-    /// unless it was a reseal (which leaves them be).
+    /// Stored a new block of `nseg` segments. `attr` has the file's
+    /// attributes, except for a reseal, which does not change them.
     Stored { attr: Option<Attr>, nseg: u32 },
-    /// Nothing needed doing: no block there, or nothing in it to change.
+    /// Nothing to do: there is no block, or nothing in it to change.
     Unchanged,
 }
 
 impl Vault {
-    /// Where file `ino` keeps its data. Fixed when the file is made, so
-    /// asked for once and remembered. A filesystem with no object grid
-    /// has nothing but inline files.
+    /// Where file `ino` keeps its data. It does not change after the file
+    /// is made, so it is asked for once and remembered. A filesystem with
+    /// no object grid has only inline files.
     pub(super) async fn layout(&self, ino: u64) -> Result<Layout, FsError> {
         if self.remote.grid().is_none() {
             return Ok(Layout::Inline);
@@ -69,10 +74,11 @@ impl Vault {
         Ok(layout)
     }
 
-    /// The bytes of file `ino` that are stored together with byte
-    /// `offset`: its write batch inline, its block past the grid's start.
-    /// What a write buffer fills before handing a run over, so a writer
-    /// going through a file stores each batch, and each block, once.
+    /// The bytes of file `ino` that are stored together with byte `offset`:
+    /// its write batch for inline chunks, or its block after the grid's
+    /// start. A write buffer fills this range before it sends a run, so a
+    /// writer that goes through a file stores each batch, and each block,
+    /// once.
     pub async fn batch_at(&self, ino: u64, offset: u64) -> Result<Range<u64>, FsError> {
         let chunk_size = self.remote.chunk_size();
         let batch = self.remote.batch_bytes().max(chunk_size);
@@ -88,7 +94,7 @@ impl Vault {
         }
         let index = offset / chunk_size;
         if !grid.in_blocks(index) {
-            // Up to where the blocks start, never into them.
+            // Stop where the blocks start.
             return Ok(inline(grid.from_index * chunk_size));
         }
         let start = grid.block_start(index) * chunk_size;
@@ -96,7 +102,22 @@ impl Vault {
     }
 
     /// Applies `edit` to the block at chunk `start` of hybrid file `ino`,
-    /// sealing under `node`'s key: see the module doc.
+    /// and seals under `node`'s key (see the module doc).
+    ///
+    /// Steps, repeated up to `CHANGE_RETRIES` times:
+    ///
+    /// - If the edit overwrites every segment whole, skip the read.
+    ///   Otherwise read the block (`read_block`).
+    /// - Build each new segment's plaintext, padded to a whole chunk, and
+    ///   apply the edit.
+    /// - Upload the block (`upload_block`) and commit its pointer,
+    ///   expecting the block's seq.
+    /// - If another client changed the block first (`EAGAIN`), drop the
+    ///   block's cached chunks and start again.
+    ///
+    /// Returns `Rewritten::Unchanged` if there is nothing to do. On any
+    /// other error, the result is not known, so it drops the file's whole
+    /// cache.
     pub(super) async fn rewrite_block(
         &self,
         node: &Node,
@@ -107,7 +128,8 @@ impl Vault {
     ) -> Result<Rewritten, FsError> {
         let chunk_size = self.remote.chunk_size() as usize;
         let per = grid.per_block;
-        // Each segment the edit writes, and how much of it.
+        // For each segment that the edit writes: the offset in the chunk,
+        // and the range of `data`.
         let mut writes: HashMap<u32, Vec<(usize, Range<usize>)>> = HashMap::new();
         if let BlockEdit::Write { spans, .. } = &edit {
             let mut cursor = 0;
@@ -126,7 +148,8 @@ impl Vault {
                     .any(|(within, r)| *within == 0 && r.len() == chunk_size)
             })
         };
-        // Written whole, segment by segment: no need to see what was there.
+        // Every segment is overwritten whole, so there is no need to read
+        // what was there.
         let blind = matches!(edit, BlockEdit::Write { .. }) && (0..per).all(whole);
 
         for _ in 0..CHANGE_RETRIES {
@@ -165,7 +188,8 @@ impl Vault {
                 },
             };
 
-            // The new segments' plaintexts, each a whole chunk.
+            // The new segments' plaintexts, each a whole chunk, so ranged
+            // reads can find each segment.
             let mut plains = Vec::with_capacity(nseg as usize);
             for j in 0..nseg {
                 let mut plain = old_plain.remove(&j).unwrap_or_default();
@@ -201,8 +225,8 @@ impl Vault {
                     .write_chunks(ino, &[write], 0)
                     .await
                     .map(|(attr, seq)| (Some(attr), seq)),
-                // A reseal doesn't say the seq it stored at; what it
-                // stored, a read finds anew.
+                // A reseal does not return the seq it stored at, so a later
+                // read finds it.
                 BlockEdit::Reseal { .. } => self
                     .remote
                     .reseal_chunks(ino, &[write])
@@ -218,7 +242,8 @@ impl Vault {
                         .invalidate(self.space, ino, blocks);
                 }
                 Err(e) => {
-                    // Whether it landed is unknown: trust nothing cached.
+                    // It is not known whether the commit was stored, so do
+                    // not trust the cache.
                     self.cache.lock().unwrap().invalidate_ino(self.space, ino);
                     return Err(e);
                 }
@@ -241,11 +266,15 @@ impl Vault {
         ))
     }
 
-    /// The block at chunk `start` as it is now, for `edit` to change: its
-    /// pointer (`None` if there is no block), the seq a commit replacing
-    /// it must expect (0 for none), and the plaintext of each segment the
-    /// edit keeps -- from the cache where it still holds the block's
-    /// current seq, else fetched.
+    /// Reads the block at chunk `start` as it is now, for `edit` to change.
+    ///
+    /// Returns:
+    ///
+    /// - its pointer (`None` if there is no block);
+    /// - the seq that a commit replacing it must expect (0 for none);
+    /// - the plaintext of each segment that the edit keeps. It uses the
+    ///   cache where the cache still has the block's current seq, and
+    ///   fetches the rest.
     async fn read_block(
         &self,
         node: &Node,
@@ -261,8 +290,8 @@ impl Vault {
                 .map(|j| cache.get(self.space, ino, start + j))
                 .collect()
         };
-        // The first one is always asked for in full, which is what makes
-        // the server send the pointer, and so how many segments there are.
+        // Always ask for the first chunk in full. Only then does the server
+        // send the pointer, which gives the number of segments.
         let known: Vec<u64> = lookups
             .iter()
             .enumerate()
@@ -291,8 +320,8 @@ impl Vault {
         };
 
         let mut plains = HashMap::new();
-        // Only what the edit keeps is fetched, and only what isn't cached
-        // at the block's seq.
+        // Fetch only the segments that the edit keeps, and only those not
+        // cached at the block's seq.
         for (j, (chunk, lookup)) in read.chunks.iter_mut().zip(&lookups).enumerate() {
             let j = j as u32;
             if j >= old_nseg || !keeps(j) {
@@ -322,8 +351,8 @@ impl Vault {
         Ok((old, seq, plains))
     }
 
-    /// Seals `plains` -- whole chunks -- as the block at chunk `start`,
-    /// uploads it, and returns the pointer that would commit it.
+    /// Seals `plains` (whole chunks) as the block at chunk `start`, uploads
+    /// it, and returns the pointer that would commit it.
     async fn upload_block(
         &self,
         node: &Node,

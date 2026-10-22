@@ -1,35 +1,34 @@
-# The cluster's layout. Copy to cluster.conf and edit; every script here
-# reads it. Shell syntax.
+# The cluster's layout. Copy it to cluster.conf and edit it. Every script
+# here reads it. Shell syntax.
 
 # One line per node:  <name> <public IP> <WireGuard IP> <public DNS name or ->
 #
-# <name> is also the store node's raft id, which must never change once
-# the cluster is bootstrapped. The first node listed is the one the
-# cluster is bootstrapped on. Users dial each node at its DNS name if it
-# has one, or else its public IP; the filesystem servers' certificate
-# covers both.
+# <name> is also the store node's raft id, which must never change after the
+# cluster is bootstrapped. The cluster is bootstrapped on the first node
+# listed. Users connect to each node at its DNS name if it has one, or else
+# at its public IP. The filesystem servers' certificate covers both.
 NODES="
 node1 203.0.113.11 10.10.0.1 fs1.example.com
 node2 203.0.113.12 10.10.0.2 fs2.example.com
 node3 203.0.113.13 10.10.0.3 fs3.example.com
 "
 
-# How install.sh and friends log in to the nodes. Needs root, or sudo
-# without a password.
+# How install.sh and the other scripts log in to the nodes. Needs root, or
+# sudo without a password.
 SSH_USER=root
-# The port sshd listens on, which the firewall keeps open. Get this wrong
-# and install.sh locks you out.
+# The port that sshd listens on, which the firewall keeps open. If this is
+# wrong, install.sh locks you out.
 SSH_PORT=22
 
-# The port WireGuard listens on, between the nodes.
+# The port that WireGuard listens on, between the nodes.
 WG_PORT=51820
 
-# Where the raft5 store's source is checked out (for build.sh: it builds
-# raft5-server and the `raft` admin shell from there).
+# Where the raft5 store's source is checked out. build.sh builds
+# raft5-server and the `raft` admin shell from there.
 RAFT5_REPO=../../jmeisel_raft5
 
-# The filesystem's chunk size, fixed when the first server creates the
-# filesystem (see SETUP.txt section 4).
+# The filesystem's chunk size. The first server sets it when it creates the
+# filesystem, and it never changes (see SETUP.txt section 4).
 CHUNK_SIZE=1M
 
 # Large files in an S3-compatible bucket (README "Large files"; SETUP.txt
@@ -41,14 +40,14 @@ S3_REGION=eu-west-1
 # yes for MinIO and most self-hosted stores (<endpoint>/<bucket>/ URLs).
 S3_PATH_STYLE=no
 S3_PREFIX=raft5fs/
-# Where in a file its data starts going to the bucket, and how much of it
-# each object holds (a whole number of chunks). Both are fixed by the
-# first server that uses them.
+# Where in a file its data starts to go to the bucket, and how much data
+# each object holds (a whole number of chunks). The first server that uses
+# them sets both, and they never change.
 OBJECT_FROM=10M
 OBJECT_BLOCK=16M
-# How often, in seconds, to delete objects nothing points at any more.
+# How often, in seconds, to delete objects that nothing points to.
 GC_INTERVAL=3600
 
-# How long the certificates issued by certs.sh last, in days. The CAs
-# last ten years.
+# How long the certificates that certs.sh issues are valid, in days. The CAs
+# are valid for ten years.
 CERT_DAYS=397

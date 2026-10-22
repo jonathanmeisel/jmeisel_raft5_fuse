@@ -1,13 +1,15 @@
-//! Sessions: what lets a stateless server know who a request is from
-//! without remembering it.
+//! Sessions: how a stateless server knows who sent a request without
+//! remembering it.
 //!
-//! A session is a token signed with a key every server instance shares, so
-//! any instance can check what any other issued, and a server restart
-//! loses nothing. It says which account a client logged in as, and
-//! expires. Every request but the login ones carries one. What the account
-//! may do isn't in it: grants decide that, on every request, and whether
-//! the account still exists is looked up too (through a short-lived
-//! cache), so removing it cuts a mounted user off within seconds.
+//! - A session is a token signed with a key that every server instance
+//!   shares. So any instance can check a token that another one issued, and
+//!   a server restart loses nothing.
+//! - It says which account the client logged in as, and it expires. Every
+//!   request except the login requests sends one.
+//! - It does not say what the account can do: grants decide that on every
+//!   request. The server also checks that the account still exists (through
+//!   a short-lived cache), so removing an account cuts off a mounted user
+//!   within seconds.
 
 use std::time::Duration;
 
@@ -17,14 +19,13 @@ use tonic::Status;
 
 const ALGORITHM: Algorithm = Algorithm::HS256;
 
-/// How long a session lasts unless the server is told otherwise: how
-/// often a client proves again that it knows the password. Removing an
-/// account doesn't wait for it (see the server's account cache).
+/// How long a session lasts by default: how often a client must prove again
+/// that it knows the password. Removing an account does not wait for this
+/// (see the server's account cache).
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// What a token is. There is only the one kind now, but the claim stays:
-/// the file handles older servers signed with the same key must never
-/// pass as sessions.
+/// The kind of token. Only sessions exist, but every token states its kind,
+/// so that no other token signed with the same key can pass as a session.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Kind {
@@ -43,8 +44,8 @@ pub struct Signer {
     encoding: EncodingKey,
     decoding: DecodingKey,
     session_ttl: Duration,
-    /// The key itself, for the one other thing every server must agree on
-    /// without talking: the decoy salts of accounts that don't exist.
+    /// The key itself, for the one other value that all servers must agree
+    /// on without talking: the decoy salts of accounts that do not exist.
     secret: Vec<u8>,
 }
 
@@ -58,7 +59,7 @@ impl Signer {
         }
     }
 
-    /// The salt to hand out for an account that has none, the same on
+    /// The salt to give for an account that has none. It is the same on
     /// every server (see `raft5fs_crypto::password::decoy_salt`).
     pub fn decoy_salt(&self, user: &str) -> [u8; raft5fs_crypto::password::SALT_LEN] {
         raft5fs_crypto::password::decoy_salt(&self.secret, user)
@@ -69,8 +70,8 @@ impl Signer {
             .expect("HMAC signing of plain claims can't fail")
     }
 
-    /// A session for account `name`, and when it expires (seconds since
-    /// the epoch).
+    /// Makes a session for account `name`, and returns it with its expiry
+    /// time (seconds since the epoch).
     pub fn session(&self, name: &str) -> (String, u64) {
         let exp = jsonwebtoken::get_current_timestamp() + self.session_ttl.as_secs();
         let token = self.sign(&SessionClaims {
@@ -81,12 +82,12 @@ impl Signer {
         (token, exp)
     }
 
-    /// The account a session token is for. Anything wrong with it --
-    /// forged, expired, not a session at all -- is `UNAUTHENTICATED`, which
-    /// tells the client to log in again.
+    /// Returns the account that a session token is for. Any problem with
+    /// the token (forged, expired, not a session) gives `UNAUTHENTICATED`,
+    /// which tells the client to log in again.
     pub fn verify_session(&self, token: &str) -> Result<String, Status> {
         let refused = |why: String| Status::unauthenticated(format!("session refused: {why}"));
-        // `Validation::new` pins the algorithm and requires `exp`.
+        // `Validation::new` fixes the algorithm and requires `exp`.
         let claims = decode::<SessionClaims>(token, &self.decoding, &Validation::new(ALGORITHM))
             .map_err(|e| refused(e.to_string()))?
             .claims;
@@ -129,7 +130,7 @@ mod tests {
 
     #[test]
     fn an_expired_session_is_refused() {
-        // Past the default 60 s leeway.
+        // More than the default 60 s leeway.
         let s = signer();
         let token = s.sign(&SessionClaims {
             kind: Kind::Session,

@@ -1,6 +1,6 @@
-//! The session on its own, with no front end: what a mount and a WebDAV
-//! server share, against a real store and servers -- and no kernel, so
-//! these run wherever the tests do.
+//! Tests the session alone, with no front end: the part that a mount and a
+//! WebDAV server share. They run against a real store and servers, but no
+//! kernel, so they run wherever the tests run.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -15,8 +15,8 @@ fn server_process_mode() {
     raft5fs_testkit::serve_if_requested();
 }
 
-/// The backend, and a session as `TESTER` with `VOLUME` made in it.
-/// Field order is drop order: the session goes before the servers.
+/// The backend, and a session as `TESTER` with `VOLUME` made in it. Fields
+/// drop in order, so the session drops before the servers.
 struct Setup {
     session: Arc<Session>,
     volume: u64,
@@ -69,8 +69,8 @@ fn buffered_writes_read_back_across_batches() {
         .block(s.session.create(s.volume, OsStr::new("f"), 0o644))
         .unwrap()
         .ino;
-    // Small writes, three chunks' worth: buffered, and committed as each
-    // batch fills or when something needs to see them.
+    // Small writes, three chunks in total. They are buffered, and committed
+    // when each batch fills or when something needs to see them.
     let data: Vec<u8> = (0..3 * TEST_CHUNK_SIZE as usize)
         .map(|i| (i % 251) as u8)
         .collect();
@@ -147,7 +147,7 @@ fn changes_through_the_session_show_by_path_at_once() {
         .block(s.session.create(s.volume, OsStr::new("a"), 0o644))
         .unwrap()
         .ino;
-    // Resolved, so remembered.
+    // Resolved, so it is remembered.
     assert_eq!(s.block(s.session.resolve(b"/v/a")).unwrap().ino, ino);
 
     s.block(
@@ -174,7 +174,8 @@ fn another_clients_changes_show_by_path() {
         .unwrap();
     s.block(s.session.resolve(b"/v/d/f")).unwrap();
 
-    // Another client replaces `d`, under the name this one remembers.
+    // Another client replaces `d`, under the name that this client
+    // remembers.
     let other = open(&s.backend, |_| {});
     s.block(other.unlink(d, OsStr::new("f"))).unwrap();
     s.block(other.rmdir(s.volume, OsStr::new("d"))).unwrap();
@@ -187,7 +188,7 @@ fn another_clients_changes_show_by_path() {
         .unwrap()
         .ino;
 
-    // The remembered `d` is gone, so the path is resolved afresh.
+    // The remembered `d` is gone, so the path is resolved again.
     assert_eq!(s.block(s.session.resolve(b"/v/d/f")).unwrap().ino, new_f);
 }
 
@@ -251,7 +252,7 @@ fn snapshots_are_read_only_and_copy_out() {
         libc::EXDEV
     );
 
-    // Restoring is copying out.
+    // To restore is to copy out of the snapshot.
     let restored = s
         .block(
             s.session

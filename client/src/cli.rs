@@ -1,18 +1,18 @@
-//! What the `raft5fs` command's subcommands share: reading passwords,
-//! profiles, and turning a command line and a profile into everything
-//! needed to reach a filesystem (`Context`).
+//! What the `raft5fs` subcommands share: reading passwords, profiles, and
+//! making everything needed to reach a filesystem from a command line and a
+//! profile (`Context`).
 //!
 //! **Profiles.** `~/.config/raft5fs/profiles/<name>.toml` holds what would
-//! otherwise be repeated on every command line: the account, the servers,
-//! the CA certificate to trust for them. `raft5fs enrol` writes one. A
-//! command uses `--profile`'s, or else the only one there is; flags given
-//! on the command line win over the profile's.
+//! otherwise be on every command line: the account, the servers, and the CA
+//! certificate to trust for them. `raft5fs enrol` writes one. A command
+//! uses the profile from `--profile`, or else the only profile there is.
+//! Flags on the command line win over the profile.
 //!
 //! **Where trust is kept** comes from the user's own CA certificate, never
-//! from a server: pins of other users' keys (`KnownKeys`) are kept per
-//! filesystem, in `~/.config/raft5fs/filesystems/<CA id>/known_keys`,
-//! where the CA id is a hash of the certificate. A server that could pick
-//! which pin file a client used could have it start an empty one.
+//! from a server. Pins of other users' keys (`KnownKeys`) are kept for each
+//! filesystem, in `~/.config/raft5fs/filesystems/<CA id>/known_keys`, where
+//! the CA id is a hash of the certificate. If a server could choose a
+//! client's pin file, it could make the client start an empty one.
 
 use std::env;
 use std::io::{BufRead, Write};
@@ -31,7 +31,7 @@ use crate::prune_queue::PruneQueue;
 use crate::remote::Credentials;
 use crate::vault::KnownKeys;
 
-/// Reads a password from the terminal without echoing it, after showing
+/// Reads a password from the terminal without echo, after it shows
 /// `prompt`.
 pub fn prompt_password(prompt: &str) -> std::io::Result<String> {
     let tty = std::fs::OpenOptions::new()
@@ -57,8 +57,8 @@ pub fn prompt_password(prompt: &str) -> std::io::Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-/// A password from the environment variable `var`, or else asked for on
-/// the terminal with `prompt`.
+/// A password from the environment variable `var`, or else asked for on the
+/// terminal with `prompt`.
 pub fn password_from(var: &str, prompt: &str) -> std::io::Result<String> {
     match std::env::var(var) {
         Ok(password) => Ok(password),
@@ -66,8 +66,8 @@ pub fn password_from(var: &str, prompt: &str) -> std::io::Result<String> {
     }
 }
 
-/// TLS settings trusting the CA certificate `pem`, and checking the
-/// servers' certificates against `server_name` if given.
+/// TLS settings that trust the CA certificate `pem`, and check the servers'
+/// certificates against `server_name` if given.
 pub fn tls_from_pem(pem: Vec<u8>, server_name: Option<&str>) -> ClientTlsConfig {
     let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem));
     if let Some(name) = server_name {
@@ -108,15 +108,15 @@ pub fn state_dir() -> PathBuf {
     home_dir("XDG_STATE_HOME", ".local/state")
 }
 
-/// `$XDG_RUNTIME_DIR/raft5fs`, or `state_dir()` where there is none (as
-/// on macOS): what lasts only as long as a running mount or server does.
+/// `$XDG_RUNTIME_DIR/raft5fs`, or `state_dir()` where there is none (as on
+/// macOS): for files that last only as long as a running mount or server.
 pub fn runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
         .map(|dir| PathBuf::from(dir).join("raft5fs"))
         .unwrap_or_else(|| state_dir().join("run"))
 }
 
-/// Makes `dir` and those above it, readable by their owner only.
+/// Makes `dir` and the directories above it, readable only by their owner.
 pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -124,8 +124,8 @@ pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
         .create(dir)
 }
 
-/// Writes `contents` to a new `file`, readable by its owner only. An
-/// existing one is an error: nothing here overwrites what someone set up.
+/// Writes `contents` to a new `file`, readable only by its owner. Fails if
+/// the file exists: nothing here overwrites what someone set up.
 pub fn write_new_private(file: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {
         make_private_dir(dir)?;
@@ -146,22 +146,21 @@ fn short_hash(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// What names a filesystem here: a hash of the CA certificate its
+/// The name of a filesystem here: a hash of the CA certificate that its
 /// servers chain to (`pem`, as the user has it).
 pub fn ca_id(pem: &[u8]) -> Result<String, String> {
     let pem = std::str::from_utf8(pem).map_err(|_| "not a PEM certificate".to_string())?;
     Ok(short_hash(&pem_to_der(pem)?))
 }
 
-/// Where pins of other users' keys are kept for the filesystem whose CA
-/// has id `ca_id`, unless told otherwise, under config directory `base`.
+/// The default place for pins of other users' keys, for the filesystem
+/// whose CA has id `ca_id`, under config directory `base`.
 pub fn default_known_keys(base: &Path, ca_id: &str) -> PathBuf {
     base.join("filesystems").join(ca_id).join("known_keys")
 }
 
-/// `user`'s prune queue on this machine, for the filesystem with id
-/// `fs_id` (`ca_id`): the one `raft5fs revoke` adds to and a mount works
-/// through.
+/// `user`'s prune queue on this machine, for the filesystem with id `fs_id`
+/// (`ca_id`). `raft5fs revoke` adds to it, and a mount works through it.
 pub fn prune_queue_for(user: &str, fs_id: &str) -> PruneQueue {
     PruneQueue::at(state_dir().join(format!("{user}@{fs_id}")))
 }
@@ -174,30 +173,31 @@ pub struct Profile {
     pub user: String,
     /// The filesystem servers, `https://host:port`.
     pub servers: Vec<String>,
-    /// The CA certificate (PEM) the servers' certificates chain to.
+    /// The CA certificate (PEM) that the servers' certificates chain to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_server_name: Option<String>,
-    /// Where pins are kept, if not where `ca` says (`default_known_keys`).
+    /// Where pins are kept, if not in the default place for `ca`
+    /// (`default_known_keys`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub known_keys: Option<PathBuf>,
     /// For `mount`: how much decrypted data to cache (see `parse_size`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_size: Option<String>,
-    /// Talk to `http://` servers without TLS: throwaway setups only.
-    /// Allows an `http://` object store too.
+    /// Connect to `http://` servers without TLS, for temporary setups only.
+    /// Also allows an `http://` object store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub insecure_plaintext: bool,
-    /// A CA certificate (PEM) to trust for the object store large files
-    /// are kept in, besides the system's: for a store behind a private
-    /// CA, such as a MinIO deployment.
+    /// A CA certificate (PEM) to trust for the object store that holds
+    /// large files, in addition to the system's. Use this for a store
+    /// behind a private CA, such as a MinIO deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_ca: Option<PathBuf>,
 }
 
 impl Profile {
-    /// Where profile `name` is kept, under config directory `base`.
+    /// The path of profile `name` under config directory `base`.
     pub fn path(base: &Path, name: &str) -> PathBuf {
         base.join("profiles").join(format!("{name}.toml"))
     }
@@ -232,7 +232,8 @@ impl Profile {
         Ok(profile)
     }
 
-    /// Saves this as profile `name` under `base`, which mustn't exist yet.
+    /// Saves this as profile `name` under `base`. The profile must not
+    /// exist yet.
     pub fn save_new(&self, base: &Path, name: &str) -> Result<PathBuf, String> {
         check_profile_name(name)?;
         let path = Self::path(base, name);
@@ -251,14 +252,14 @@ impl Profile {
     }
 }
 
-/// Profile names follow the same rule as account names: they end up in
+/// Profile names follow the same rule as account names, because they become
 /// file names.
 fn check_profile_name(name: &str) -> Result<(), String> {
     check_username(name).map_err(|e| e.message.replace("username", "profile name"))
 }
 
-/// What a command line says about how to reach a filesystem; anything
-/// left out comes from the profile.
+/// What a command line says about how to reach a filesystem. Anything not
+/// given comes from the profile.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub profile: Option<String>,
@@ -270,8 +271,8 @@ pub struct Overrides {
     pub insecure_plaintext: bool,
 }
 
-/// Everything needed to reach a filesystem as one account, as a command
-/// line and a profile together say.
+/// Everything needed to reach a filesystem as one account, from a command
+/// line and a profile together.
 #[derive(Debug, Clone)]
 pub struct Context {
     /// The profile used, if one was.
@@ -282,18 +283,19 @@ pub struct Context {
     pub plaintext: bool,
     /// The CA's id (`ca_id`), if there is a CA.
     pub ca_id: Option<String>,
-    /// Where pins are kept; `None` to keep them in memory only.
+    /// Where pins are kept. `None` keeps them in memory only.
     pub known_keys: Option<PathBuf>,
     pub cache_size: Option<String>,
-    /// The object store's extra CA certificate, PEM, if the profile names
-    /// one.
+    /// The object store's extra CA certificate, in PEM, if the profile
+    /// names one.
     pub object_ca: Option<Vec<u8>>,
 }
 
 impl Context {
-    /// Puts `o` together with its profile: `o.profile`'s, or else the only
-    /// one there is (or with several, the one named for `o.user`).
-    /// `servers_needed`: whether the command talks to the servers at all.
+    /// Combines `o` with its profile: the profile in `o.profile`, or else
+    /// the only profile there is (or, if there are several, the one named
+    /// for `o.user`). `servers_needed` says whether the command talks to
+    /// the servers at all.
     pub fn resolve(o: &Overrides, servers_needed: bool) -> Result<Self, String> {
         Self::resolve_in(&config_dir(), o, servers_needed)
     }
@@ -369,8 +371,9 @@ impl Context {
         })
     }
 
-    /// The pins, from their file -- or, with none (plaintext, without
-    /// `--known-keys`), in memory only, which is said.
+    /// The pins, from their file. With no file (plaintext, without
+    /// `--known-keys`), they are kept in memory only, and a message says
+    /// so.
     pub fn known_keys(&self) -> Result<KnownKeys, String> {
         warn_of_legacy_pins();
         match &self.known_keys {
@@ -409,9 +412,10 @@ impl Context {
     }
 }
 
-/// Says so if the known-keys file of before pins were kept per filesystem
-/// is still there: it is no longer read, and can't be merged without
-/// knowing which filesystem each pin was for.
+/// Warns if `config_dir()/known_keys` exists. Pins are kept for each
+/// filesystem, so this file is not read. Its pins cannot be merged
+/// automatically, because the file does not say which filesystem each pin
+/// is for.
 fn warn_of_legacy_pins() {
     let legacy = config_dir().join("known_keys");
     if legacy.exists() {
@@ -473,7 +477,7 @@ mod tests {
         let ca = base.join("ca.pem");
         write_new_private(&ca, PEM.as_bytes()).unwrap();
         let none = Overrides::default();
-        // No profile: everything from flags, CA required.
+        // No profile: everything comes from flags, and the CA is required.
         assert!(Context::resolve_in(&base, &none, true).is_err());
         let flags = Overrides {
             user: Some("alice".into()),
@@ -494,7 +498,7 @@ mod tests {
             profile.save_new(&base, "alice").is_err(),
             "never overwritten"
         );
-        // The only profile: used without asking.
+        // The only profile is used without asking.
         let ctx = Context::resolve_in(&base, &none, true).unwrap();
         assert_eq!(
             (ctx.profile.as_deref(), ctx.user.as_str()),
@@ -504,7 +508,7 @@ mod tests {
         assert_eq!(ctx.known_keys, Some(default_known_keys(&base, &id)));
         assert!(ctx.tls.is_some());
         assert!(ctx.prune_queue().dir().ends_with(format!("alice@{id}")));
-        // Flags win over it.
+        // Flags win over the profile.
         let over = Overrides {
             servers: vec!["https://fs2".into()],
             known_keys: Some("/pins".into()),
@@ -514,7 +518,8 @@ mod tests {
         assert_eq!(ctx.servers, ["https://fs2"]);
         assert_eq!(ctx.known_keys, Some("/pins".into()));
 
-        // With two, one must be picked -- by name, or by the user's.
+        // With two profiles, one must be chosen, by name or by the user's
+        // name.
         Profile {
             user: "bob".into(),
             ..profile.clone()

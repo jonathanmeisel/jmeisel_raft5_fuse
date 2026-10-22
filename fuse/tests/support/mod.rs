@@ -1,9 +1,8 @@
-//! Setup for the FUSE tests: the store and servers `raft5fs_testkit`
-//! starts, and a `Raft5Fs` mounted on top of those through the actual
-//! FUSE kernel interface. Tests then just use `std::fs` against
-//! `Harness::path` -- the same path a real caller would take, all the
-//! way through the kernel, `fuser`, and our `Filesystem` impl, into a
-//! real (if single-node) cluster.
+//! Setup for the FUSE tests: the store and servers that `raft5fs_testkit`
+//! starts, and a `Raft5Fs` mounted on them through the real FUSE kernel
+//! interface. Tests then use `std::fs` on `Harness::path`: the same path
+//! that a real caller takes, through the kernel, `fuser`, and our
+//! `Filesystem` impl, into a real (single-node) cluster.
 
 #![allow(dead_code)]
 
@@ -20,8 +19,8 @@ use tokio::runtime::Runtime;
 
 pub use raft5fs_testkit::*;
 
-/// A `Raft5Fs` mounted at a real, temporary directory. Dropping it
-/// unmounts the filesystem and removes the (now-empty) mountpoint.
+/// A `Raft5Fs` mounted at a real, temporary directory. Dropping it unmounts
+/// the filesystem and removes the (now empty) mountpoint.
 pub struct MountedFs {
     session: Option<BackgroundSession>,
     /// The mountpoint: the mounting user's root.
@@ -31,20 +30,18 @@ pub struct MountedFs {
 }
 
 impl MountedFs {
-    /// Mounts against `servers`, trying them in that order, logged in as
-    /// `TESTER`.
+    /// Mounts using `servers`, in that order, logged in as `TESTER`.
     pub fn mount(runtime: &Runtime, servers: Vec<String>) -> Self {
         Self::mount_as(runtime, servers, TESTER, KnownKeys::in_memory())
     }
 
-    /// Like `mount`, but logged in as `user` -- whatever local user
-    /// actually uses the mountpoint -- with the public keys in `known`
-    /// pinned.
+    /// Like `mount`, but logged in as `user` (any local user can use the
+    /// mountpoint), with the public keys in `known` pinned.
     pub fn mount_as(runtime: &Runtime, servers: Vec<String>, user: &str, known: KnownKeys) -> Self {
         Self::mount_with(runtime, servers, user, known, None)
     }
 
-    /// Like `mount_as`, working through `prune` in the background too.
+    /// Like `mount_as`, and also works through `prune` in the background.
     pub fn mount_with(
         runtime: &Runtime,
         servers: Vec<String>,
@@ -56,7 +53,7 @@ impl MountedFs {
             .with_tls(fs_tls())
             .with_known_keys(known);
         if let Some(queue) = prune {
-            // Quick about it, for tests.
+            // Fast settings, for tests.
             let config = PrunerConfig {
                 poll: Duration::from_millis(50),
                 pace: Duration::from_millis(1),
@@ -69,9 +66,9 @@ impl MountedFs {
 
         let mut options = Config::default();
         options.mount_options = vec![MountOption::FSName("raft5fs-test".to_string())];
-        // Matches `raft5fs mount`: writes commit synchronously now, so this is
-        // what keeps one file's commit from stalling every other fuse
-        // request in tests too.
+        // Same as `raft5fs mount`: writes commit synchronously, so this
+        // stops one file's commit from blocking every other fuse request in
+        // tests too.
         options.n_threads = Some(8);
 
         let session = fuser::spawn_mount(fs, &path, &options)
@@ -84,7 +81,7 @@ impl MountedFs {
         }
     }
 
-    /// The same mount, with `path` the volume `VOLUME` rather than the
+    /// The same mount, with `path` set to the volume `VOLUME`, not the
     /// root.
     pub fn in_volume(mut self) -> Self {
         self.path = self.root.join(VOLUME);
@@ -101,10 +98,9 @@ impl Drop for MountedFs {
 }
 
 /// A cluster and a filesystem mounted on it, for one test. Everything
-/// but the mount is the `Backend`'s, which it derefs to.
-///
-/// Field order is the drop order, and it matters: the mount has to come
-/// down (storing what it buffered) before the servers it stores through.
+/// except the mount belongs to the `Backend`, which it derefs to. Fields
+/// drop in order, and the order matters: the mount must stop (storing what
+/// it buffered) before the servers it stores through.
 pub struct Harness {
     pub mount: MountedFs,
     /// Whether `TESTER`'s mounts work in `VOLUME`, made at setup.
@@ -127,8 +123,8 @@ impl DerefMut for Harness {
 }
 
 impl Harness {
-    /// Where tests work: `VOLUME` (or with `setup_root`, the root).
-    /// Shorthand for the `mount.path` every test needs.
+    /// Where tests work: `VOLUME` (or the root, with `setup_root`). Short
+    /// for the `mount.path` that every test needs.
     pub fn path(&self) -> &std::path::Path {
         &self.mount.path
     }
@@ -138,7 +134,7 @@ impl Harness {
         &self.mount.root
     }
 
-    /// A mount as `TESTER`, working where this harness's tests do.
+    /// A mount as `TESTER`, working where this harness's tests work.
     fn tester_mount(&self, servers: Vec<String>) -> MountedFs {
         let mount = MountedFs::mount(&self.runtime, servers);
         if self.volume {
@@ -148,34 +144,28 @@ impl Harness {
         }
     }
 
-    /// Restarts the servers (asking for `chunk_size`) and remounts, as a
-    /// restart of everything but the store would. The store, and
-    /// everything recorded in it, survives.
-    ///
-    /// The old mount comes down while its servers are still up, so what it
-    /// buffered is stored on the way out.
+    /// Restarts the servers (asking for `chunk_size`) and mounts again, as
+    /// a restart of everything except the store would. The store, and
+    /// everything in it, stays. The old mount stops while its servers are
+    /// still up, so what it buffered is stored on the way out.
     pub fn remount(&mut self, chunk_size: u64) {
         let old = self.backend.replace_servers(chunk_size);
         self.mount = self.tester_mount(self.addresses());
         drop(old);
     }
 
-    /// A second filesystem mounted over the same cluster, standing in for
-    /// another host's mount: its own write buffers, the same store
-    /// underneath, and a cache of its own -- and it starts on a different
-    /// server than the first mount.
-    ///
-    /// Bind it to a local declared *after* the `Harness`, so that it is
-    /// dropped -- and unmounted -- before the cluster and runtime it
-    /// talks to go away.
+    /// A second filesystem mounted on the same cluster, in place of another
+    /// host's mount: its own write buffers and cache, the same store, and a
+    /// different first server than the first mount. Bind it to a local
+    /// declared *after* the `Harness`, so it is dropped (and unmounted)
+    /// before the cluster and runtime it uses.
     pub fn second_mount(&self) -> MountedFs {
         self.tester_mount(self.addresses_from(1))
     }
 
-    /// Like `second_mount`, but logged in as `user`: another user's
-    /// mount of the same filesystem, working at its root. It trusts
-    /// `TESTER`'s key, as if `user` had checked its fingerprint (see
-    /// `known_keys`).
+    /// Like `second_mount`, but logged in as `user`: another user's mount
+    /// of the same filesystem, working at its root. It trusts `TESTER`'s
+    /// key, as if `user` checked its fingerprint (see `known_keys`).
     pub fn mount_as(&self, user: &str) -> MountedFs {
         MountedFs::mount_as(
             &self.runtime,
@@ -185,8 +175,8 @@ impl Harness {
         )
     }
 
-    /// Another mount as `TESTER`, at the root, working through `queue` in
-    /// the background.
+    /// Another mount as `TESTER`, at the root, that works through `queue`
+    /// in the background.
     pub fn pruning_mount(&self, queue: PruneQueue) -> MountedFs {
         MountedFs::mount_with(
             &self.runtime,
@@ -199,7 +189,7 @@ impl Harness {
 }
 
 /// A filesystem with `TESTER` enrolled and mounted, working in a volume
-/// made for the test (`VOLUME`): to most tests, an ordinary empty
+/// made for the test (`VOLUME`). For most tests, this is a normal empty
 /// filesystem.
 pub fn setup() -> Harness {
     setup_with_chunk_size(TEST_CHUNK_SIZE)
@@ -209,21 +199,21 @@ pub fn setup_with_chunk_size(chunk_size: u64) -> Harness {
     setup_with(chunk_size, true, false, true)
 }
 
-/// Like `setup`, but with nothing made: the mount works at `TESTER`'s
-/// root, which is empty.
+/// Like `setup`, but makes nothing: the mount works at `TESTER`'s root,
+/// which is empty.
 pub fn setup_root() -> Harness {
     setup_with(TEST_CHUNK_SIZE, false, false, true)
 }
 
 /// Like `setup`, with the servers keeping hybrid files' blocks in a fake
-/// object store (`Harness::store`), on the grid `TEST_OBJECT_FROM_CHUNKS`
-/// and `TEST_BLOCK_CHUNKS` make.
+/// object store (`Harness::store`), on the grid from
+/// `TEST_OBJECT_FROM_CHUNKS` and `TEST_BLOCK_CHUNKS`.
 pub fn setup_with_objects() -> Harness {
     setup_with(TEST_CHUNK_SIZE, true, true, true)
 }
 
-/// Like `setup_with_objects`, with the servers leaving every object
-/// nothing points at to garbage collection: for tests of the sweep.
+/// Like `setup_with_objects`, but the servers leave every object with no
+/// pointer to garbage collection. For tests of the sweep.
 pub fn setup_with_objects_no_prompt_delete() -> Harness {
     setup_with(TEST_CHUNK_SIZE, true, true, false)
 }

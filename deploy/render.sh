@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assembles each node's bundle -- binaries, certificates, secrets, units,
-# WireGuard config -- into out/<node>/, from cluster.conf, secrets/ and
-# templates/. install.sh runs it; run it alone to see what would be
+# Puts together each node's bundle (binaries, certificates, secrets, units,
+# WireGuard config) in out/<node>/, from cluster.conf, secrets/, and
+# templates/. install.sh runs it. Run it alone to see what would be
 # installed.
 #
 #   ./render.sh [<node>...]     every node if none are named
@@ -20,7 +20,7 @@ for bin in raft5-server raft raft5fs-server; do
     [[ -x $OUT/bin/$bin ]] || die "no $OUT/bin/$bin: run ./build.sh first"
 done
 
-# Fills in templates/$1's placeholders for node $2.
+# Fills in the placeholders in templates/$1 for node $2.
 fill() {
     local wg_ip
     wg_ip=$(node_field "$2" 3)
@@ -61,8 +61,8 @@ render() {
         fi
     fi
 
-    # Only the first node bootstraps the cluster, and only it ever needs
-    # the first administrator's password (install.sh --bootstrap).
+    # Only the first node bootstraps the cluster, and only it needs the
+    # first administrator's password (install.sh --bootstrap).
     if [[ $node == "$(first_node)" ]]; then
         mkdir -p "$dir/bootstrap"
         cp "$SECRETS/admin.pw" "$dir/bootstrap/"

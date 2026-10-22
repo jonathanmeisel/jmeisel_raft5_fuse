@@ -1,29 +1,29 @@
-//! Every inode's key record.
+//! Each inode's key record.
 //!
-//! A node has a key per version, starting at 1. The record holds:
+//! A node has one key for each version, starting at 1. The record holds:
 //!
-//! - its current version, and the version of its parent's key that the
-//!   current key is wrapped under -- the two numbers the server reads,
-//!   unencrypted, to tell a stale node from a fresh one;
+//! - The current version, and the version of the parent's key that wraps
+//!   the current key. The server reads these two numbers, not encrypted, to
+//!   find stale nodes.
 //! - `wrapper`: the current key, sealed under the parent's key at that
-//!   version (absent for a volume's root, which has no parent key: its key
-//!   only reaches people through grants);
-//! - `name_key`: a key for this directory's entry name tags, sealed under
-//!   the current key. Unlike the node key it never changes -- rotating it
-//!   would mean renaming every entry -- so a rotation just re-seals it;
-//! - `history`: the versions from `base` up to the current one, each
-//!   sealed under the next. Holding any version opens every older one
-//!   down to `base`, one step at a time, and nothing here leads from an
-//!   old key to a newer one. It starts at version 1 and only grows, until
-//!   a prune drops the oldest entries once nothing is sealed under them
-//!   any more: `base` is `version - history.len()`.
+//!   version. A volume's root has no wrapper, because it has no parent key:
+//!   only grants give its key to users.
+//! - `name_key`: the key for this directory's entry name tags, sealed under
+//!   the current key. It never changes, because a new name key would mean
+//!   renaming every entry. A rotation only seals it again.
+//! - `history`: the versions from `base` up to the current one, each sealed
+//!   under the next version. Any version opens all older versions down to
+//!   `base`, one step at a time, but never a newer one. The history only
+//!   grows, until a prune removes the oldest entries when nothing is sealed
+//!   under them. `base` is `version - history.len()`.
 //!
-//! **Staleness.** When a node's key is rotated, its children's keys stay
-//! wrapped under the old version. Someone who held the old key -- a user
-//! just revoked -- can still open them, so a child must get a new key of
-//! its own before anything new is written under it. A node whose
-//! `parent_version` is older than its parent's `version` is stale; the
-//! server refuses writes beneath one, and the writer rotates it first.
+//! **Staleness.** A rotation does not change the children's keys, so they
+//! stay wrapped under the old version. A user who had the old key, such as
+//! a user who was just revoked, can still open them. So a child must get
+//! its own new key before anything new is written under it. A node whose
+//! `parent_version` is older than its parent's `version` is stale. The
+//! server refuses writes below a stale node, and the writer rotates it
+//! first.
 
 use crate::{Error, KEY_LEN, Key, Reader, aad, open, put_bytes, seal};
 
@@ -52,7 +52,8 @@ fn name_key_aad(ino: u64, version: u32) -> Vec<u8> {
     aad("name-key", &[&ino.to_be_bytes(), &version.to_be_bytes()])
 }
 
-/// For the history entry holding `older`, sealed under `older + 1`.
+/// Associated data for the history entry that holds version `older`, sealed
+/// under version `older + 1`.
 fn history_aad(ino: u64, older: u32) -> Vec<u8> {
     aad("history", &[&ino.to_be_bytes(), &older.to_be_bytes()])
 }
@@ -74,7 +75,7 @@ impl NodeKeys {
         (record, key)
     }
 
-    /// The current key, through the parent's key at `parent_version`.
+    /// Opens the current key with the parent's key at `parent_version`.
     pub fn open(&self, ino: u64, parent_key: &Key) -> Result<Key, Error> {
         let what = "a node's key";
         if self.parent_version == 0 {
@@ -89,8 +90,8 @@ impl NodeKeys {
         Key::from_slice(&bytes)
     }
 
-    /// The directory's name-tag key, given its current key. Also how to
-    /// check that a key from a grant really is this node's current one.
+    /// Opens the directory's name-tag key with the current key. This also
+    /// checks that a key from a grant is this node's current key.
     pub fn name_key(&self, ino: u64, current: &Key) -> Result<Key, Error> {
         let bytes = open(
             current,
@@ -101,12 +102,14 @@ impl NodeKeys {
         Key::from_slice(&bytes)
     }
 
-    /// The oldest key version the history still opens.
+    /// The oldest key version that the history can still open.
     pub fn base(&self) -> u32 {
         self.version - self.history.len() as u32
     }
 
-    /// Version `want` of the key, walked down to from the current one.
+    /// Returns version `want` of the key. It opens each older version in
+    /// turn, starting from the current key. Fails if `want` is below `base`
+    /// or above the current version.
     pub fn older(&self, ino: u64, current: &Key, want: u32) -> Result<Key, Error> {
         let what = "an older key version";
         let base = self.base();
@@ -126,9 +129,9 @@ impl NodeKeys {
         Ok(key)
     }
 
-    /// The record with a new current key -- the old one kept in the
-    /// history under it -- wrapped under `parent`'s current key, and that
-    /// new key.
+    /// Makes a new current key. Returns a new record and the new key. The
+    /// new record keeps the old key in its history, under the new key, and
+    /// wraps the new key under `parent`'s current key.
     pub fn rotate(
         &self,
         ino: u64,
@@ -155,10 +158,11 @@ impl NodeKeys {
         Ok((record, key))
     }
 
-    /// The same key, wrapped under a different parent key: for a node
-    /// moved to another directory. `current` must be this node's key.
+    /// Wraps the same key under a different parent key, for a node that
+    /// moves to another directory. `current` must be this node's key.
     pub fn rewrap(&self, ino: u64, current: &Key, parent: (&Key, u32)) -> Result<Self, Error> {
-        // Proves `current` right before vouching for it under a new parent.
+        // Check that `current` is this node's key before wrapping it under
+        // a new parent.
         self.name_key(ino, current)?;
         let (wrapper, parent_version) = wrap(ino, self.version, current, Some(parent));
         Ok(Self {
@@ -168,8 +172,9 @@ impl NodeKeys {
         })
     }
 
-    /// The same record, its history cut to the versions from `keep_from`
-    /// on: for once nothing is sealed under the older ones any more.
+    /// Returns the record with its history cut to the versions from
+    /// `keep_from` up. Use this when nothing is sealed under the older
+    /// versions.
     pub fn pruned(&self, keep_from: u32) -> Self {
         let keep_from = keep_from.clamp(self.base(), self.version);
         let drop = (keep_from - self.base()) as usize;
@@ -179,8 +184,9 @@ impl NodeKeys {
         }
     }
 
-    /// Whether this is `before` with only its oldest history entries gone:
-    /// all a prune may change. Checkable without any key.
+    /// Whether this record is `before` with only its oldest history entries
+    /// removed. This is the only change a prune may make. The check needs
+    /// no key.
     pub fn is_pruning_of(&self, before: &NodeKeys) -> bool {
         self.version == before.version
             && self.parent_version == before.parent_version
@@ -232,8 +238,8 @@ impl NodeKeys {
         })
     }
 
-    /// `(version, parent_version)` of an encoded record, without the rest:
-    /// all the server needs.
+    /// Reads only `(version, parent_version)` from an encoded record. The
+    /// server needs nothing else.
     pub fn versions(bytes: &[u8]) -> Result<(u32, u32), Error> {
         let what = "a node key record";
         let mut r = Reader(bytes);
@@ -288,7 +294,7 @@ mod tests {
         assert_eq!(v3.older(3, &k3, 3).unwrap(), k3);
         assert_eq!(v3.older(3, &k3, 2).unwrap(), k2);
         assert_eq!(v3.older(3, &k3, 1).unwrap(), k1);
-        // The old keys get nowhere with the new record.
+        // The old keys cannot open anything in the new record.
         assert!(v3.name_key(3, &k2).is_err());
         assert!(v3.older(3, &k2, 1).is_err());
         assert!(v3.older(3, &k3, 4).is_err());
@@ -348,12 +354,13 @@ mod tests {
         assert!(none.is_pruning_of(&kept));
         assert_eq!(NodeKeys::decode(&none.encode()).unwrap(), none);
         assert_eq!(none.name_key(3, &k3).unwrap(), v3.name_key(3, &k3).unwrap());
-        // Rotating a pruned record carries on from where it was cut.
+        // A rotation of a pruned record continues from where the history
+        // was cut.
         let (v4, k4) = none.rotate(3, &k3, Some((&parent, 1))).unwrap();
         assert_eq!(v4.base(), 3);
         assert_eq!(v4.older(3, &k4, 3).unwrap(), k3);
 
-        // Anything but dropping old entries isn't a prune.
+        // Any change other than removing old entries is not a prune.
         let (other, _) = NodeKeys::create(3, Some((&parent, 1)));
         assert!(!other.is_pruning_of(&v1));
         assert!(!v2.pruned(2).is_pruning_of(&v3));

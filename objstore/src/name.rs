@@ -1,19 +1,19 @@
 //! Object names: `{prefix}{ino:016x}/{minted_ms:016x}-{random:032x}`.
 //!
-//! The server mints every name, so the inode in it is the inode the
-//! server checked a grant on, and the mint time is the server's clock.
-//! A pointer in the KV store holds only the mint time and the random
-//! part; the inode comes from the chunk key the pointer sits under. So a
-//! pointer can only ever name objects of its own inode, whatever a client
-//! commits -- and inode numbers are never reused, so neither is a name.
+//! - The server mints every name. So the inode in a name is the inode whose
+//!   grant the server checked, and the mint time comes from the server's
+//!   clock.
+//! - A KV pointer holds only the mint time and the random part. The inode
+//!   comes from the chunk key that holds the pointer. So a pointer can only
+//!   name objects of its own inode, whatever a client commits. Inode
+//!   numbers are never used again, so names are never used again either.
+//! - Garbage collection uses the mint time. After some time, a name can no
+//!   longer be committed. So if nothing points to an old object, nothing
+//!   ever will.
 //!
-//! The mint time is what garbage collection goes by: a name minted long
-//! enough ago can no longer be committed, so an object under it that
-//! nothing references never will be.
-//!
-//! Parsing is strict -- exact lengths, lowercase hex -- so a key has
-//! exactly one spelling, and anything else under the prefix (which this
-//! code never deletes) is told apart from an object of ours.
+//! Parsing is strict (exact lengths, lower-case hex), so each key has only
+//! one spelling. This also separates our objects from anything else under
+//! the prefix, which this code never deletes.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,8 @@ use crate::Error;
 
 pub const RANDOM_LEN: usize = 16;
 
-/// What follows the prefix: 16 hex digits, `/`, 16 hex digits, `-`, 32.
+/// The part after the prefix: 16 hex digits, `/`, 16 hex digits, `-`, 32
+/// hex digits.
 const SUFFIX_LEN: usize = 16 + 1 + 16 + 1 + 2 * RANDOM_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,7 +34,7 @@ pub struct ObjectName {
 }
 
 impl ObjectName {
-    /// A fresh name for an object of `ino`, minted at `now`.
+    /// A new name for an object of `ino`, minted at `now`.
     pub fn mint(ino: u64, now: SystemTime) -> Self {
         let mut random = [0; RANDOM_LEN];
         getrandom::getrandom(&mut random).expect("the OS has no randomness to give");
@@ -54,7 +55,8 @@ impl ObjectName {
         key
     }
 
-    /// The name `key` spells under `prefix`, or `None` if it isn't one.
+    /// Parses `key` under `prefix`. Returns `None` if it is not an object
+    /// name.
     pub fn parse(prefix: &str, key: &str) -> Option<Self> {
         let rest = key.strip_prefix(prefix)?;
         if rest.len() != SUFFIX_LEN {
@@ -76,7 +78,7 @@ impl ObjectName {
     }
 }
 
-/// The common prefix of every object of `ino` under `prefix`.
+/// The prefix that every object of `ino` under `prefix` starts with.
 pub fn inode_prefix(prefix: &str, ino: u64) -> String {
     format!("{prefix}{ino:016x}/")
 }
@@ -87,7 +89,7 @@ pub fn millis(t: SystemTime) -> u64 {
         .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
-/// Lowercase hex only: an uppercase digit would give one name two keys.
+/// Lower-case hex only: an upper-case digit would give one name two keys.
 fn hex(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
@@ -95,9 +97,10 @@ fn hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
-/// Whether `prefix` can hold objects: empty (the whole bucket), or a path
-/// of URL-safe characters ending in `/`, so one filesystem's objects never
-/// share a key prefix with another's that merely starts the same way.
+/// Whether `prefix` can hold objects. It must be empty (the whole bucket),
+/// or a path of URL-safe characters that ends in `/`. The `/` makes sure
+/// that one filesystem's objects never share a key prefix with another
+/// filesystem whose prefix only starts the same way.
 pub fn validate_prefix(prefix: &str) -> Result<(), Error> {
     if prefix.is_empty() {
         return Ok(());
@@ -165,7 +168,7 @@ mod tests {
         ] {
             assert_eq!(ObjectName::parse("fs/", &bad), None, "{bad}");
         }
-        // Another inode's objects aren't under this one's prefix.
+        // Another inode's objects are not under this inode's prefix.
         assert!(key.starts_with(&inode_prefix("fs/", 0x2a)));
         assert!(!key.starts_with(&inode_prefix("fs/", 0x2)));
     }

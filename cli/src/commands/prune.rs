@@ -11,23 +11,24 @@ use raft5fs_client::pruner::{describe, prune_entry};
 use raft5fs_client::vault::PruneStats;
 
 /// Seals everything still under an old version of a key again under the
-/// current one, then drops the old versions from the key's history. A key
-/// gets a new version whenever a share is revoked; what was sealed under
-/// the old one stays readable, given the ciphertext, by whoever was
-/// revoked, until it is pruned. Revoking queues the directory for it,
-/// which a running mount works through in the background.
+/// current version, then removes the old versions from the key's history. A
+/// key gets a new version when a share is revoked. Until a prune, a revoked
+/// user who has the ciphertext can still read what was sealed under the old
+/// version. Revoking adds the directory to a queue, which a running mount
+/// works through in the background.
 #[derive(Args)]
 #[command(verbatim_doc_comment)]
 pub struct PruneArgs {
-    /// Directories to prune now, instead of what is queued.
+    /// Directories to prune now, in place of the queue.
     pub paths: Vec<String>,
-    /// Prune everything shared with this account writably, now.
+    /// Prune everything shared with this account with write access, now.
     #[arg(long, conflicts_with = "paths")]
     pub all: bool,
-    /// With paths or --all: count what would be done, changing nothing.
+    /// With paths or --all: count what would be done, and change nothing.
     #[arg(long)]
     pub dry_run: bool,
-    /// Show what is queued, and how each prune is going; changes nothing.
+    /// Show what is queued, and the progress of each prune. Changes
+    /// nothing.
     #[arg(long, conflicts_with_all = ["paths", "all", "dry_run"])]
     pub status: bool,
 }
@@ -47,7 +48,7 @@ fn report(what: &str, stats: &PruneStats, dry_run: bool) {
     }
 }
 
-/// How long ago `since` (seconds since the epoch) was, roughly.
+/// About how long ago `since` (seconds since the epoch) was.
 fn ago(since: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,7 +140,7 @@ pub fn run(connect: &ConnectArgs, args: PruneArgs) -> Outcome {
         let stats = runtime.block_on(vault.prune_tree(ino, args.dry_run));
         report(&what, &stats, args.dry_run);
         skipped |= !stats.skipped.is_empty();
-        // Done by hand: no need for it to stay queued.
+        // Pruned by hand, so it need not stay in the queue.
         if !args.dry_run && stats.skipped.is_empty() {
             let _ = queue.remove(ino);
         }

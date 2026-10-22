@@ -1,4 +1,4 @@
-//! The WebDAV server end to end: real HTTP on loopback, through
+//! Tests the WebDAV server end to end: real HTTP on loopback, through
 //! `dav_server` and the session, into a real store and servers.
 
 use std::sync::Arc;
@@ -16,8 +16,8 @@ fn server_process_mode() {
     raft5fs_testkit::serve_if_requested();
 }
 
-/// A WebDAV server as `TESTER`, over a fresh backend. Dropping it stops
-/// the server -- storing what it buffered -- before the backend goes.
+/// A WebDAV server as `TESTER`, on a new backend. Dropping it stops the
+/// server (and stores what it buffered) before the backend stops.
 struct Dav {
     url: String,
     auth: Auth,
@@ -96,7 +96,7 @@ impl Dav {
         self.body(self.request("GET", path))
     }
 
-    /// The names a depth-1 PROPFIND of `path` lists, as hrefs.
+    /// The names that a depth-1 PROPFIND of `path` lists, as hrefs.
     fn listing(&self, path: &str) -> String {
         let (status, body) = self.body(self.request("PROPFIND", path).header("Depth", "1"));
         assert_eq!(status, StatusCode::MULTI_STATUS, "PROPFIND {path}");
@@ -133,7 +133,7 @@ fn only_the_password_on_a_loopback_name_gets_in() {
         .basic_auth(TESTER, Some("guess"));
     assert_eq!(dav.status(wrong), StatusCode::UNAUTHORIZED);
 
-    // A page that points a name of its own at 127.0.0.1.
+    // A page that points its own name at 127.0.0.1.
     let rebound = dav.request("PROPFIND", "/").header("Host", "evil.example");
     assert_eq!(dav.status(rebound), StatusCode::FORBIDDEN);
     let cross_origin = dav
@@ -171,7 +171,7 @@ fn put_and_get_a_file_of_several_batches() {
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(part, &data[70000..70100]);
 
-    // Replacing it truncates.
+    // Replacing the file truncates it.
     assert_eq!(dav.put("/v/f", b"short".to_vec()), StatusCode::NO_CONTENT);
     assert_eq!(dav.get("/v/f"), (StatusCode::OK, b"short".to_vec()));
 }
@@ -220,7 +220,7 @@ fn move_and_copy() {
     assert_eq!(dav.status(copied), StatusCode::CREATED);
     assert_eq!(dav.get("/v/c"), (StatusCode::OK, b"aaa".to_vec()));
 
-    // A directory copy, which `dav_server` walks itself.
+    // A directory copy, which `dav_server` does itself.
     dav.mkcol("/v/d");
     assert_eq!(dav.put("/v/d/x", b"xx".to_vec()), StatusCode::CREATED);
     let tree = dav
@@ -266,7 +266,7 @@ fn snapshots_are_read_only() {
         StatusCode::FORBIDDEN
     );
 
-    // Restoring is copying out.
+    // To restore is to copy out of the snapshot.
     let restore = dav
         .request("COPY", "/.snapshot/s1/v/f")
         .header("Destination", format!("{}/v/restored", dav.url));

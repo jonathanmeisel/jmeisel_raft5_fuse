@@ -1,6 +1,6 @@
-//! Talking to the object store through URLs a server signed: what a mount
-//! does to read and write blocks, and what `S3Store` builds its own
-//! requests on.
+//! Access to the object store through URLs that a server signed. Mounts use
+//! this to read and write blocks, and `S3Store` builds its own requests on
+//! it.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,19 +13,19 @@ use rustls::pki_types::pem::PemObject;
 
 use crate::{Error, status_error};
 
-/// The client the functions here take, as `client` builds it.
+/// The client type that these functions take, as `client` builds it.
 pub use reqwest::Client;
 
-/// How a client reaches the object store.
+/// How a client connects to the object store.
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
-    /// Certificates to trust beyond the system's, PEM: for a store behind
-    /// a private CA, such as a MinIO deployment.
+    /// Certificates to trust in addition to the system's, in PEM. Use this
+    /// for a store behind a private CA, such as a MinIO deployment.
     pub extra_roots_pem: Option<Vec<u8>>,
-    /// Whether `http://` URLs may be used. Only ever for tests and local
-    /// setups: the URLs themselves are bearer credentials.
+    /// Whether `http://` URLs are allowed. Use only for tests and local
+    /// setups, because the URLs are bearer credentials.
     pub allow_plaintext: bool,
-    /// How long one request may take, start to finish.
+    /// The longest time that one request can take, from start to finish.
     pub timeout: Duration,
 }
 
@@ -39,9 +39,9 @@ impl Default for HttpConfig {
     }
 }
 
-/// An HTTP client for the object store: TLS through rustls and `ring`
-/// (the provider the rest of the workspace uses), the system's roots plus
-/// any extra ones, and plaintext refused unless allowed.
+/// An HTTP client for the object store. It uses TLS through rustls and
+/// `ring` (the provider that the rest of the workspace uses), trusts the
+/// system's roots and any extra ones, and refuses plaintext unless allowed.
 pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut extra = Vec::new();
@@ -71,7 +71,7 @@ pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
         .map_err(|e| Error::Config(format!("HTTP client: {e}")))
 }
 
-/// Bytes `range` of the object a presigned GET `url` names.
+/// Fetches bytes `range` of the object that a presigned GET `url` names.
 pub async fn get_range(
     client: &reqwest::Client,
     url: &str,
@@ -100,10 +100,10 @@ pub async fn get_range(
     Ok(body.to_vec())
 }
 
-/// Uploads `body` through a presigned PUT `url`, which signed exactly
-/// this length and `If-None-Match: *` (see `S3Store::presign_put`); the
-/// body sets the length.
-/// `Error::AlreadyExists` if the URL has been used already.
+/// Uploads `body` through a presigned PUT `url`. The URL signed exactly
+/// this length and `If-None-Match: *` (see `S3Store::presign_put`), and the
+/// body sets the length. Returns `Error::AlreadyExists` if the URL was
+/// already used.
 pub async fn put(client: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<(), Error> {
     let response = client
         .put(url)

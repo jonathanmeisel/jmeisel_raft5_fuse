@@ -1,18 +1,18 @@
-//! Who a node is granted to, sealed under the node's own key.
+//! The users a node is granted to, sealed under the node's own key.
 //!
-//! The server keeps the grants, and says who holds them -- but a server
-//! that could add a name to that list would have the next rotation seal
-//! the node's new key to whoever it liked. So beside the grants the server
-//! keeps this list, which only the node's key holders can make: each
+//! The server keeps the grants and says who has them. But if the server
+//! could add a name to that list, the next rotation would seal the node's
+//! new key to any user the server chose. So the server also keeps this
+//! list, which only the node's key holders can make. It holds each
 //! grantee's name, the public key their grant was sealed to, and whether
-//! it lets them write. A rotation re-seals grants only to who is on it,
-//! with the keys on it. The server can still drop a grant (it can always
-//! refuse access), but never add one.
+//! they can write. A rotation seals grants again only to the users on this
+//! list, with the keys on it. The server can still remove a grant (it can
+//! always refuse access), but it cannot add one.
 //!
-//! The list starts with the key version it was sealed under, unencrypted,
-//! like chunks and names: one sealed under an old version is one a
-//! revoked user could have written, so only one under the node's current
-//! version counts.
+//! Like chunks and names, the list starts with the key version it was
+//! sealed under, not encrypted. A revoked user could have written a list
+//! under an old version, so only a list under the node's current version
+//! counts.
 
 use crate::identity::PUBLIC_KEY_LEN;
 use crate::{Error, Key, Reader, aad, open, put_bytes, seal};
@@ -29,8 +29,9 @@ fn grantees_aad(ino: u64, version: u32) -> Vec<u8> {
     aad("grantees", &[&ino.to_be_bytes(), &version.to_be_bytes()])
 }
 
-/// `entries`, as the grantees of `ino`, sealed under its key at `version`.
-/// Sorted by name first, so one set of grantees always encodes the same.
+/// Seals `entries` as the grantees of `ino`, under its key at `version`. It
+/// sorts the entries by name first, so the same grantees always give the
+/// same encoding.
 pub fn seal_grantees(key: &Key, version: u32, ino: u64, entries: &[GranteeEntry]) -> Vec<u8> {
     let mut sorted: Vec<&GranteeEntry> = entries.iter().collect();
     sorted.sort_by(|a, b| a.user.cmp(&b.user));
@@ -46,9 +47,9 @@ pub fn seal_grantees(key: &Key, version: u32, ino: u64, entries: &[GranteeEntry]
     out
 }
 
-/// Opens `ino`'s grantee list with its key at the version the list was
-/// sealed under (see `data::sealed_version`). A list naming anyone twice
-/// isn't one an honest client made.
+/// Opens `ino`'s grantee list with its key at the version that the list was
+/// sealed under (see `data::sealed_version`). Fails if the list names a
+/// user twice, because an honest client does not make such a list.
 pub fn open_grantees(key: &Key, ino: u64, blob: &[u8]) -> Result<Vec<GranteeEntry>, Error> {
     let what = "a grantee list";
     let mut r = Reader(blob);

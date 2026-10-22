@@ -1,7 +1,6 @@
 //! End-to-end tests: a real single-node raft5 cluster, a real `Raft5Fs`
-//! mounted through the kernel's FUSE interface, and plain `std::fs`
-//! calls against the mountpoint -- see `support` for how both are
-//! wired up.
+//! mounted through the kernel's FUSE interface, and plain `std::fs` calls
+//! on the mountpoint. See `support` for how they connect.
 
 mod support;
 
@@ -14,17 +13,17 @@ use raft5fs_core::{
     dirent_prefix, resolve_chunk_size, tombstone_key,
 };
 
-/// Not really a test: the entry point that lets the harness run a
-/// filesystem server as a separate process (see `support::TestServer`).
-/// Returns at once in a normal run.
+/// Not a real test: the entry point that lets the harness run a filesystem
+/// server as a separate process (see `support::TestServer`). Returns at
+/// once in a normal run.
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
 }
 
-/// Position-dependent bytes, so a chunk landing at the wrong offset (or
-/// in the wrong order) fails loudly instead of matching by luck. 251 is
-/// prime, so it never divides a power-of-two chunk size and the pattern
+/// Bytes that depend on their position, so a chunk at the wrong offset (or
+/// in the wrong order) fails clearly and does not match by luck. 251 is
+/// prime, so it never divides a power-of-two chunk size, and the pattern
 /// never lines up with a chunk boundary.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
@@ -34,9 +33,9 @@ fn ino_of(path: &std::path::Path) -> u64 {
     fs::metadata(path).expect("stat").ino()
 }
 
-/// Compares buffers by reporting the first offset that differs. A plain
-/// `assert_eq!` on multi-chunk buffers dumps megabytes and buries the one
-/// fact worth knowing: where it went wrong.
+/// Compares buffers and reports the first offset that differs. A plain
+/// `assert_eq!` on multi-chunk buffers prints megabytes and hides the one
+/// useful fact: where it went wrong.
 #[track_caller]
 fn assert_same_bytes(got: &[u8], want: &[u8]) {
     assert_eq!(got.len(), want.len(), "length mismatch");
@@ -61,9 +60,9 @@ fn root_directory_starts_empty() {
     assert!(entries.is_empty(), "expected no entries, got {entries:?}");
 }
 
-/// There are no owners -- grants decide access -- so a mount shows the
-/// local user who made it as the owner of everything, and won't give
-/// anything to anyone else.
+/// There are no owners (grants decide access), so a mount shows the local
+/// user who made it as the owner of everything, and does not give anything
+/// to anyone else.
 #[test]
 fn everything_seems_to_belong_to_the_mounting_user() {
     let h = support::setup();
@@ -234,10 +233,10 @@ fn multi_chunk_file_round_trips_byte_for_byte() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// The rest of the suite runs at a small chunk size for speed. This one
-/// uses the real default, so the size an actual mount gets is covered
-/// too -- including the blind whole-chunk write path, which only opens
-/// up when a write op lines up with a chunk exactly.
+/// The rest of the suite uses a small chunk size for speed. This test uses
+/// the real default, so the size a real mount gets is tested too, including
+/// the blind whole-chunk write, which happens only when a write lines up
+/// exactly with a chunk.
 #[test]
 fn the_default_chunk_size_handles_a_multi_megabyte_file() {
     let h = support::setup_with_chunk_size(DEFAULT_CHUNK_SIZE);
@@ -250,9 +249,9 @@ fn the_default_chunk_size_handles_a_multi_megabyte_file() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// A chunk this size only fits in a transaction because each chunk is
-/// stored on its own: an overwrite straddling a boundary rewrites two
-/// full chunks, which together exceed what one transaction may hold.
+/// A chunk this size fits in a transaction only because each chunk is
+/// stored alone. An overwrite across a boundary rewrites two full chunks,
+/// which together are more than one transaction can hold.
 #[test]
 fn the_max_chunk_size_survives_an_overwrite_across_a_boundary() {
     let h = support::setup_with_chunk_size(MAX_CHUNK_SIZE);
@@ -318,9 +317,9 @@ fn truncate_down_then_up_reads_zeros() {
 
     let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
     file.set_len(c / 2).unwrap();
-    // Growing back must not resurrect the bytes that were past the new
-    // end -- the boundary chunk has to have been cut back, not just the
-    // recorded size.
+    // Growing the file again must not bring back the bytes that were past
+    // the new end. The boundary chunk must be cut, not only the recorded
+    // size.
     file.set_len(c * 2).unwrap();
     drop(file);
 
@@ -373,8 +372,8 @@ fn sparse_write_far_past_eof() {
     );
     assert_eq!(&got[at as usize..], b"tail");
 
-    // The hole is absent, not materialized: only the chunk actually
-    // written to should exist.
+    // The hole is absent, not stored: only the chunk that was written
+    // should exist.
     let keys = h.keys_with_prefix(&chunk_prefix(ino_of(&path)));
     assert_eq!(keys.len(), 1, "a hole should not have been written out");
 }
@@ -409,8 +408,8 @@ fn truncating_overwrite_removes_tail_chunks() {
     fs::write(&path, pattern(c * 3)).unwrap();
     let ino = ino_of(&path);
 
-    // O_TRUNC, so this shrinks to 5 bytes and everything past chunk 0
-    // should go.
+    // O_TRUNC, so this shrinks the file to 5 bytes, and everything after
+    // chunk 0 should be removed.
     fs::write(&path, b"small").unwrap();
 
     assert_eq!(fs::read(&path).unwrap(), b"small");
@@ -423,7 +422,7 @@ fn truncating_overwrite_removes_tail_chunks() {
 #[test]
 fn a_fresh_store_adopts_the_requested_chunk_size() {
     let h = support::setup_with_chunk_size(32 * 1024);
-    // Force the INIT handshake to have completed before reading it back.
+    // Make sure the INIT handshake is complete before reading it back.
     let _ = fs::read_dir(h.path()).unwrap().count();
 
     let recorded = h.read_key(CHUNK_SIZE_KEY).expect("chunk size not recorded");
@@ -437,8 +436,8 @@ fn an_existing_store_keeps_its_chunk_size() {
     let data = pattern(32 * 1024 * 3);
     fs::write(&path, &data).unwrap();
 
-    // Remounting with a different request must not reinterpret the chunk
-    // boundaries the file was written with.
+    // A mount that asks for a different size must not change the chunk
+    // boundaries that the file was written with.
     h.remount(128 * 1024);
 
     let path = h.path().join("carried-over.bin");
@@ -452,8 +451,8 @@ fn an_out_of_range_stored_chunk_size_is_refused() {
     let h = support::setup();
     let _ = fs::read_dir(h.path()).unwrap().count();
 
-    // Bigger than a transaction can hold or the client can read back, so
-    // adopting it would produce chunks nothing could store or fetch.
+    // Bigger than a transaction can hold or the client can read back. Using
+    // it would make chunks that nothing could store or fetch.
     h.write_key(CHUNK_SIZE_KEY, Some(&(MAX_CHUNK_SIZE * 2).to_be_bytes()));
 
     let err = h
@@ -465,9 +464,9 @@ fn an_out_of_range_stored_chunk_size_is_refused() {
 
 // ------------------------------------------------- write buffer / read cache
 
-/// The inode of `name` in the mount's root, learned from `readdir` --
-/// unlike `stat`, that doesn't make the filesystem store buffered writes,
-/// so it can be used to look at the store while a file still has some.
+/// The inode of `name` in the mount's root, from `readdir`. Unlike `stat`,
+/// this does not make the filesystem store buffered writes, so a test can
+/// use it to look at the store while a file still has buffered writes.
 fn ino_from_readdir(dir: &std::path::Path, name: &str) -> u64 {
     use std::os::unix::fs::DirEntryExt;
     fs::read_dir(dir)
@@ -522,10 +521,10 @@ fn buffered_writes_reach_the_store_on_fsync_and_close() {
     let path = h.path().join("buffered.bin");
 
     let mut f = fs::File::create(&path).unwrap();
-    // Before the write, not after: `ino_from_readdir` costs a round trip
-    // per entry, and "still buffered" only holds for `AUTO_FLUSH_DELAY`.
-    // Learning the inode first leaves one fast key scan between the write
-    // and the assertion instead of a whole readdir.
+    // Get the inode before the write, not after: `ino_from_readdir` costs
+    // one round trip for each entry, and the data is "still buffered" only
+    // for `AUTO_FLUSH_DELAY`. So only one fast key scan is between the
+    // write and the assertion, not a whole readdir.
     let ino = ino_from_readdir(h.path(), "buffered.bin");
     f.write_all(&pattern(4096)).unwrap();
     assert!(
@@ -544,10 +543,10 @@ fn buffered_writes_reach_the_store_on_fsync_and_close() {
     assert_same_bytes(&fs::read(&path).unwrap(), &want);
 }
 
-/// Waits for `ino` to have at least `want` chunk keys stored, giving up
-/// after `within`. A deadline rather than a sleep because storing happens
-/// in the background, and a short one is how a test distinguishes the
-/// size trigger from the 500 ms timer.
+/// Waits until `ino` has at least `want` chunk keys stored, and gives up
+/// after `within`. A deadline, not a sleep, because storing happens in the
+/// background, and a short deadline is how a test tells the size trigger
+/// from the 500 ms timer.
 fn await_chunk_keys(
     h: &support::Harness,
     ino: u64,
@@ -569,14 +568,14 @@ fn await_chunk_keys(
     }
 }
 
-/// A run that fills a batch is handed off as soon as the `write` that
-/// completed it returns -- not left for the timer.
+/// A run that fills a batch is sent as soon as the `write` that completed
+/// it returns. It is not left for the timer.
 ///
-/// Run at the smallest chunk size so a batch is only 64 KiB: the deadline
-/// has to stay comfortably under `AUTO_FLUSH_DELAY` for this to be
-/// testing the size trigger at all, and a small batch commits well inside
-/// it. Written in chunk-sized pieces so no single `write` is big enough to
-/// take the bypass.
+/// - It uses the smallest chunk size, so a batch is only 64 KiB. The
+///   deadline must stay well below `AUTO_FLUSH_DELAY` for this to test the
+///   size trigger, and a small batch commits well within it.
+/// - It writes in chunk-sized pieces, so no single `write` is big enough to
+///   skip the buffer.
 #[test]
 fn a_full_batch_is_stored_without_waiting_for_close() {
     let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
@@ -601,19 +600,18 @@ fn a_full_batch_is_stored_without_waiting_for_close() {
 }
 
 /// A run too short to fill a batch, which the application never closes,
-/// syncs or reads, still reaches the store on its own. Without the
-/// auto-flush timer it would sit in memory until one of those happened.
+/// syncs, or reads, still reaches the store by itself. Without the
+/// auto-flush timer, it would stay in memory until one of those happened.
 ///
-/// Run on its own this isolates the timer, and fails without it. Run
-/// alongside other tests it does not, and the reason is worth recording:
-/// the kernel sends a FUSE flush on *every* `close` of a descriptor,
-/// including the copies a child process inherits. `fuser` fork+execs
-/// `fusermount3` to mount and unmount, so any other test starting or
-/// ending makes the child's close-on-exec generate a flush against every
-/// open file in every mount this process holds -- which stores this
-/// buffer early, by a route that has nothing to do with the timer. So
-/// what this asserts under concurrency is the weaker, still useful claim
-/// in the first paragraph.
+/// Run alone, this tests only the timer, and fails without it. Run with
+/// other tests, it does not, for this reason: the kernel sends a FUSE flush
+/// on every `close` of a descriptor, including the copies that a child
+/// process inherits. `fuser` forks and execs `fusermount3` to mount and
+/// unmount. So when any other test starts or ends, the child's
+/// close-on-exec sends a flush for every open file in every mount of this
+/// process. That stores this buffer early, in a way that has nothing to do
+/// with the timer. So with other tests running, this checks only the weaker
+/// (still useful) claim in the first paragraph.
 #[test]
 fn an_idle_partial_batch_reaches_the_store_on_its_own() {
     let h = support::setup();
@@ -637,9 +635,9 @@ fn an_idle_partial_batch_reaches_the_store_on_its_own() {
     drop(f);
 }
 
-/// Many chunks, several batches' worth, written in small pieces --
-/// exercises the batch splitting in `write_range` and that the bytes land
-/// in order across it.
+/// Many chunks, several batches, written in small pieces. Tests the batch
+/// splitting in `write_range`, and that the bytes are stored in order
+/// across it.
 #[test]
 fn many_small_writes_across_several_batches_round_trip_in_order() {
     let h = support::setup();
@@ -657,7 +655,7 @@ fn many_small_writes_across_several_batches_round_trip_in_order() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// A read must see writes that are still buffered, not yet committed.
+/// A read must see writes that are still buffered and not yet committed.
 #[test]
 fn reads_wait_for_buffered_writes() {
     let h = support::setup();
@@ -667,17 +665,17 @@ fn reads_wait_for_buffered_writes() {
     let data = pattern(c * 6);
     let mut f = fs::File::create(&path).unwrap();
     f.write_all(&data).unwrap();
-    // Still open, nothing closed or synced.
+    // Still open: nothing is closed or synced.
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
     drop(f);
 }
 
-/// Deleting a file with several batches' worth of writes on it must not
-/// leave any chunks behind: a chunk stored after the delete's scan would
-/// have nothing left to find it. Each batch commits synchronously as
-/// `write_all` fills it, so by the time `remove_file` runs, only the last,
-/// still-partial run is actually buffered -- the rest is already
-/// committed and has to be cleaned up like any other stored data.
+/// Deleting a file with several batches of writes must not leave any
+/// chunks: nothing could find a chunk stored after the delete's scan. Each
+/// batch commits synchronously when `write_all` fills it. So when
+/// `remove_file` runs, only the last, partial run is still buffered. The
+/// rest is already committed, and must be removed like any other stored
+/// data.
 #[test]
 fn unlinking_a_file_with_several_buffered_batches_leaves_nothing() {
     let h = support::setup();
@@ -807,7 +805,7 @@ fn reads_see_writes_made_after_the_chunk_was_cached() {
     let path = h.path().join("fresh.bin");
     fs::write(&path, pattern(c * 2)).unwrap();
 
-    // Populate the cache for both chunks.
+    // Fill the cache for both chunks.
     assert_same_bytes(&fs::read(&path).unwrap(), &pattern(c * 2));
 
     let mut want = pattern(c * 2);
@@ -818,7 +816,7 @@ fn reads_see_writes_made_after_the_chunk_was_cached() {
     want[c - 10..c + 10].fill(0xEE);
     assert_same_bytes(&fs::read(&path).unwrap(), &want);
 
-    // Truncate then grow must read zeros, not the cached old bytes.
+    // A truncate then a grow must read zeros, not the old cached bytes.
     let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
     f.set_len(c as u64 + 5).unwrap();
     f.set_len(c as u64 * 2).unwrap();
@@ -844,9 +842,9 @@ fn buffered_data_survives_a_remount() {
 
 // ------------------------------------------------------- multiple mounts
 
-/// A read cache only one mount can see must not outlive the bytes it
-/// holds: another mount's write is invisible here, so a hit has to be
-/// confirmed against the store's seq before it is served.
+/// A read cache that only one mount can see must not outlive the bytes it
+/// holds. This mount cannot see another mount's write, so it must confirm a
+/// hit against the store's seq before it uses it.
 #[test]
 fn another_mount_sees_an_overwrite_after_caching_the_old_bytes() {
     let h = support::setup();
@@ -862,17 +860,17 @@ fn another_mount_sees_an_overwrite_after_caching_the_old_bytes() {
     // The other mount reads the whole file, which caches every chunk.
     assert_same_bytes(&fs::read(&theirs).unwrap(), &first);
 
-    // Same length, so nothing about the *size* it cached changes -- only
-    // the bytes, which is the part a stale cache would get wrong.
+    // The same length, so the cached *size* does not change. Only the bytes
+    // change, which is what a stale cache would get wrong.
     let second: Vec<u8> = first.iter().map(|b| !b).collect();
     fs::write(&mine, &second).unwrap();
 
     assert_same_bytes(&fs::read(&theirs).unwrap(), &second);
 }
 
-/// The same, for a chunk cached as a hole. Seq 0 is the store's
-/// "never written" sentinel, so this is the one version a cached chunk
-/// can hold that was never assigned to anything.
+/// The same, for a chunk cached as a hole. Seq 0 is the store's "never
+/// written" value, so it is the one version that a cached chunk can have
+/// that was never given to anything.
 #[test]
 fn another_mount_sees_a_write_into_a_chunk_it_cached_as_a_hole() {
     let h = support::setup();
@@ -882,11 +880,11 @@ fn another_mount_sees_a_write_into_a_chunk_it_cached_as_a_hole() {
     let mine = h.path().join("sparse.bin");
     let theirs = other.path.join("sparse.bin");
 
-    // Three chunks of size, none of them stored.
+    // A size of three chunks, with none of them stored.
     fs::File::create(&mine).unwrap().set_len(c * 3).unwrap();
     assert_same_bytes(&fs::read(&theirs).unwrap(), &vec![0u8; c as usize * 3]);
 
-    // Filled in from the other side, inside the existing size.
+    // Written from the other mount, inside the existing size.
     let patch = pattern(c as usize);
     let mut f = fs::OpenOptions::new().write(true).open(&mine).unwrap();
     f.seek(SeekFrom::Start(c * 2)).unwrap();
@@ -900,8 +898,8 @@ fn another_mount_sees_a_write_into_a_chunk_it_cached_as_a_hole() {
 
 // ------------------------------------------------------- batched commits
 
-/// A single write covering more than one batch is split across
-/// transactions; the seams between them must not lose or duplicate bytes.
+/// A single write that covers more than one batch is split across
+/// transactions. No bytes may be lost or repeated where they join.
 #[test]
 fn a_write_spanning_more_than_one_batch_round_trips() {
     let h = support::setup();
@@ -915,9 +913,9 @@ fn a_write_spanning_more_than_one_batch_round_trips() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// The same, misaligned at both ends, so the first and last chunk of each
-/// batch take the read-modify-write path inside the transaction rather
-/// than the whole-chunk blind write.
+/// The same, not aligned at either end, so the first and last chunk of each
+/// batch use the read-modify-write path in the transaction, not the
+/// whole-chunk blind write.
 #[test]
 fn an_unaligned_write_spanning_batches_round_trips() {
     let h = support::setup();
@@ -939,10 +937,10 @@ fn an_unaligned_write_spanning_batches_round_trips() {
     assert_same_bytes(&fs::read(&path).unwrap(), &expected);
 }
 
-/// At the smallest chunk size the chunk-count cap is what keeps a batch
-/// inside the server's transaction budget -- the byte budget alone would
-/// admit a thousand keys. A transaction over the limit is refused
-/// outright, so writing several batches' worth at all is the assertion.
+/// At the smallest chunk size, the chunk-count limit keeps a batch inside
+/// the server's transaction limit. The byte limit alone would allow a
+/// thousand keys. The server refuses a transaction over the limit, so
+/// writing several batches at all is the test.
 #[test]
 fn a_batch_never_exceeds_the_transaction_budget() {
     let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
@@ -954,19 +952,19 @@ fn a_batch_never_exceeds_the_transaction_budget() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// Unmounting inside `AUTO_FLUSH_DELAY` must not lose buffered bytes: the
-/// timer has not fired yet, so `destroy` draining every buffer is the only
-/// thing that stores them. The file is deliberately left open, since
-/// closing it would flush by itself and prove nothing.
+/// An unmount within `AUTO_FLUSH_DELAY` must not lose buffered bytes. The
+/// timer has not fired yet, so only `destroy`, which empties every buffer,
+/// stores them. The file is left open on purpose, because closing it would
+/// flush it and prove nothing.
 #[test]
 fn unmounting_before_the_timer_fires_loses_nothing() {
     let mut h = support::setup();
     let path = h.path().join("racing-unmount.bin");
 
     let mut f = fs::File::create(&path).unwrap();
-    // Everything slow happens before the write, so that what follows it
-    // stays well inside `AUTO_FLUSH_DELAY` -- otherwise the timer could
-    // store the bytes and this would pass without `destroy` doing a thing.
+    // Do everything slow before the write, so what follows stays well
+    // inside `AUTO_FLUSH_DELAY`. Otherwise the timer could store the bytes,
+    // and this would pass without `destroy` doing anything.
     let ino = ino_from_readdir(h.path(), "racing-unmount.bin");
     f.write_all(&pattern(4096)).unwrap();
     assert!(
@@ -977,8 +975,8 @@ fn unmounting_before_the_timer_fires_loses_nothing() {
     // Drops the old session, which unmounts and so runs `destroy`.
     h.remount(h.chunk_size);
 
-    // Read from the store rather than through a mount: what is being
-    // tested is that the bytes were stored, not that anyone can see them.
+    // Read from the store, not through a mount: the test is that the bytes
+    // were stored, not that someone can see them.
     assert!(
         !h.keys_with_prefix(&chunk_prefix(ino)).is_empty(),
         "unmounting lost a buffered write the timer had not reached yet"
@@ -986,13 +984,11 @@ fn unmounting_before_the_timer_fires_loses_nothing() {
     drop(f);
 }
 
-/// The whole point of batching: every chunk of one batch is written by one
-/// transaction, so they all land at the same sequence number, and the next
-/// batch lands at a different one.
-///
-/// This is the assertion that would catch a regression to a transaction
-/// per chunk -- which would still round-trip the bytes correctly, and so
-/// slip past every other test here.
+/// The reason for batching: one transaction writes every chunk of a batch,
+/// so they all get the same sequence number, and the next batch gets a
+/// different one. This test would catch a change back to one transaction
+/// for each chunk. That change would still return the bytes correctly, so
+/// every other test here would pass.
 #[test]
 fn the_chunks_of_one_batch_share_a_commit() {
     let h = support::setup();
@@ -1029,23 +1025,25 @@ fn the_chunks_of_one_batch_share_a_commit() {
 
 // ------------------------------------------------------------- deletion
 
-/// One mount unlinks a file while another keeps committing writes to it.
-/// Deleting the chunks takes several transactions, so without the
-/// deletion mark a commit landing between them stores a chunk the
-/// deletion has already scanned past -- leaked, with nothing left that
-/// could find it -- and a writer that keeps landing commits can stop the
-/// deletion's rescans from ever finishing. The two mounts share no process
-/// state, so nothing but the store can order them.
+/// One mount unlinks a file while another mount continues to commit writes
+/// to it.
 ///
-/// The writer has a deadline so that a regression fails rather than hangs:
-/// with the mark working, its writes are refused as soon as the unlink's
-/// first step commits, long before then.
+/// Deleting the chunks takes several transactions. Without the deletion
+/// mark, a commit between them would store a chunk that the deletion's scan
+/// has already passed. That chunk would leak, with nothing left to find it.
+/// A writer that continues to commit could also stop the deletion's scans
+/// from ever finishing.
+///
+/// The two mounts share no process state, so only the store can order them.
+/// The writer has a deadline, so a regression fails and does not hang. With
+/// the mark working, its writes are refused as soon as the unlink's first
+/// step commits, long before the deadline.
 #[test]
 fn unlinking_from_one_mount_while_another_writes_leaks_no_chunks() {
     let h = support::setup_with_chunk_size(MIN_CHUNK_SIZE);
     let other = h.second_mount();
     let batch = batch_bytes(MIN_CHUNK_SIZE) as usize;
-    // Enough chunks that the deletion's scan spans several transactions.
+    // Enough chunks that the deletion's scan takes several transactions.
     let span = batch * 32;
 
     for round in 0..3 {
@@ -1057,8 +1055,8 @@ fn unlinking_from_one_mount_while_another_writes_leaks_no_chunks() {
         let writer = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut f = fs::OpenOptions::new().write(true).open(&path).unwrap();
-            // A batch-sized write commits immediately, so commits keep
-            // landing until one is refused because the file is gone.
+            // A batch-sized write commits at once, so commits continue
+            // until one is refused because the file is gone.
             let mut offset = 0u64;
             while std::time::Instant::now() < deadline {
                 if f.seek(SeekFrom::Start(offset)).is_err() || f.write_all(&pattern(batch)).is_err()
@@ -1085,10 +1083,10 @@ fn unlinking_from_one_mount_while_another_writes_leaks_no_chunks() {
     }
 }
 
-/// A deletion that stops after its first step -- dirent gone, Entry
-/// marked, tombstone written -- as a crash would leave it. The inode is
-/// unreachable by name, so only the tombstone says it exists; the next
-/// mount to start must find it and finish the job.
+/// A deletion that stops after its first step (dirent removed, Entry
+/// marked, tombstone written), as a crash would leave it. No name can reach
+/// the inode, so only the tombstone says it exists. The next mount to start
+/// must find it and finish the deletion.
 #[test]
 fn an_interrupted_deletion_is_finished_by_the_next_mount() {
     let mut h = support::setup();
@@ -1098,7 +1096,7 @@ fn an_interrupted_deletion_is_finished_by_the_next_mount() {
     let ino = ino_from_readdir(h.path(), name);
 
     // The first step of an unlink, by hand. The link count is bytes 19..23
-    // of the Entry record (after kind, perm, uid, gid and size).
+    // of the Entry record (after kind, perm, uid, gid, and size).
     let mut attr_key = vec![0x01];
     attr_key.extend_from_slice(&ino.to_be_bytes());
     let mut entry = h.read_key(&attr_key).unwrap();
@@ -1112,7 +1110,8 @@ fn an_interrupted_deletion_is_finished_by_the_next_mount() {
     assert!(!h.keys_with_prefix(&chunk_prefix(ino)).is_empty());
 
     h.remount(h.chunk_size);
-    // Any request waits for the mount's `init`, which is where it reaps.
+    // Any request waits for the mount's `init`, which is where it finishes
+    // deletions.
     let _ = fs::read_dir(h.path()).unwrap().count();
 
     assert!(
@@ -1125,11 +1124,11 @@ fn an_interrupted_deletion_is_finished_by_the_next_mount() {
 
 // ------------------------------------------------------- server failover
 
-/// The mount's server goes away part-way through a write. Servers hold no
-/// write state -- unstored bytes are in the client's buffer -- so the
-/// client resends to the other server and nothing is lost. Writes are
-/// safe to resend: a batch commits whole or not at all, and the same
-/// bytes at the same offset store the same thing twice.
+/// The mount's server stops during a write. Servers keep no write state
+/// (unstored bytes are in the client's buffer), so the client sends the
+/// write again to the other server, and nothing is lost. Writes are safe to
+/// send again: a batch commits completely or not at all, and the same bytes
+/// at the same offset store the same data twice.
 #[test]
 fn a_mount_fails_over_when_its_server_goes_away() {
     let mut h = support::setup();
@@ -1141,8 +1140,8 @@ fn a_mount_fails_over_when_its_server_goes_away() {
     let mut f = fs::File::create(&path).unwrap();
     f.write_all(before).unwrap();
 
-    // The mount starts on the first server. Take it away, and make sure
-    // it is really gone rather than still answering an open connection.
+    // The mount starts on the first server. Stop it, and make sure it is
+    // really gone and not still answering an open connection.
     let server = h.servers.remove(0);
     let gone = server.address.trim_start_matches("https://").to_string();
     drop(server);
@@ -1160,14 +1159,12 @@ fn a_mount_fails_over_when_its_server_goes_away() {
     assert_same_bytes(&fs::read(&path).unwrap(), &data);
 }
 
-/// Bytes a `write` was told are written, lost when a later commit carrying
-/// them fails, must surface at `fsync` -- even though by then the buffer
-/// is empty and there is nothing left to commit. The commit that failed
-/// took them out of the buffer, so without the stashed error `fsync`
-/// would find nothing wrong and report success over lost data.
-///
-/// A mount with a single server, so stopping it makes the commit fail
-/// rather than fail over.
+/// Bytes that a `write` was told are written, and then lost when a later
+/// commit with them fails, must show at `fsync`, even though the buffer is
+/// empty by then. The failed commit took them out of the buffer, so without
+/// the stored error, `fsync` would find no problem and report success over
+/// lost data. The mount has only one server, so stopping it makes the
+/// commit fail, not fail over.
 #[test]
 fn a_lost_acknowledged_write_is_reported_by_fsync() {
     let mut h = support::setup();
@@ -1177,15 +1174,15 @@ fn a_lost_acknowledged_write_is_reported_by_fsync() {
     let path = lone.path.join("acknowledged.bin");
     let mut f = fs::File::create(&path).unwrap();
 
-    // Gone before the writes, so they run back to back with nothing slow
-    // between them: the auto-flush timer (500 ms) can't store the first
-    // one on its own before the second makes it fail.
+    // Stop the server before the writes, so they run one after the other
+    // with nothing slow between them. Then the auto-flush timer (500 ms)
+    // cannot store the first write before the second makes it fail.
     drop(h.servers.remove(0));
 
-    // Only buffered, so it is acknowledged without reaching any server.
+    // Only buffered, so it succeeds without reaching any server.
     f.write_all(&pattern(4096)).unwrap();
-    // Crosses a batch boundary, so this commits the bytes above too --
-    // and fails, with nowhere to fail over to.
+    // This crosses a batch boundary, so it also commits the bytes above,
+    // and fails with no server to fail over to.
     assert!(
         f.write_all(&pattern(batch)).is_err(),
         "the commit should have failed with the server gone"
@@ -1230,8 +1227,8 @@ fn a_wrong_password_is_refused() {
     connect_as(&h, "alice", &support::password("alice")).unwrap();
 }
 
-/// Users get at the filesystem only through the servers. The store talks
-/// only to holders of a client certificate, which users don't have...
+/// Users reach the filesystem only through the servers. The store accepts
+/// only clients with a client certificate, which users do not have...
 #[test]
 fn users_cannot_connect_to_the_store_at_all() {
     let h = support::setup();
@@ -1246,7 +1243,7 @@ fn users_cannot_connect_to_the_store_at_all() {
             .login("alice", &support::password("alice"))
             .await
             .unwrap_err();
-        // Refused at the handshake, before any RPC: to the client that
+        // Refused at the handshake, before any RPC. To the client, this
         // looks like a store that never answers.
         assert!(
             matches!(refused, raft5_client::Error::Unavailable(_)),
@@ -1255,9 +1252,9 @@ fn users_cannot_connect_to_the_store_at_all() {
     });
 }
 
-/// ...and even holding one, and a store account of their own -- which
-/// filesystem users don't need -- they couldn't read the filesystem's
-/// keys, let alone write them.
+/// ...and even with a certificate and their own store account (which
+/// filesystem users do not need), they cannot read the filesystem's keys,
+/// or write them.
 #[test]
 fn users_cannot_reach_the_filesystems_keys_directly() {
     let h = support::setup();
@@ -1288,9 +1285,9 @@ fn users_cannot_reach_the_filesystems_keys_directly() {
     assert_eq!(h.read_key(CHUNK_SIZE_KEY).unwrap().len(), 8);
 }
 
-/// A mount whose session stops being accepted -- here because the servers
-/// now sign with another key, as after a rotation; an expiry looks the
-/// same -- logs in again by itself and carries on.
+/// A mount whose session stops being accepted logs in again by itself and
+/// continues. Here the servers now sign with another key, as after a
+/// rotation. An expiry looks the same.
 #[test]
 fn a_refused_session_is_renewed_by_logging_in_again() {
     let mut h = support::setup();
@@ -1304,8 +1301,8 @@ fn a_refused_session_is_renewed_by_logging_in_again() {
     assert_eq!(fs::read(h.path().join("g")).unwrap(), b"after");
 }
 
-/// Servers keep nothing about open files, so a descriptor survives every
-/// server being restarted under it.
+/// Servers keep nothing about open files, so a descriptor stays valid when
+/// every server restarts under it.
 #[test]
 fn an_open_file_survives_its_servers_restarting() {
     let mut h = support::setup();
@@ -1329,7 +1326,7 @@ fn an_open_file_survives_its_servers_restarting() {
 }
 
 /// Creating a file read-only and filling it through the descriptor that
-/// created it is ordinary -- `cp` does it for every read-only file.
+/// created it is normal: `cp` does it for every read-only file.
 #[test]
 fn a_file_created_read_only_can_be_written_through_its_creating_descriptor() {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1346,7 +1343,7 @@ fn a_file_created_read_only_can_be_written_through_its_creating_descriptor() {
     drop(f);
 
     assert_eq!(fs::read(&path).unwrap(), b"cont");
-    // The mode is kept and shown, but grants decide: this one is writable.
+    // The mode is kept and shown, but grants decide: this file is writable.
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o444);
     fs::OpenOptions::new().write(true).open(&path).unwrap();
 }
@@ -1387,7 +1384,7 @@ fn rename_across_directories_moves_files_and_whole_trees() {
     assert_eq!(fs::read(p.join("dst/file")).unwrap(), b"file");
     assert_eq!(fs::read(p.join("dst/tree/deep/f")).unwrap(), b"deep");
     assert_eq!(fs::read_dir(p.join("src")).unwrap().count(), 0);
-    // A fresh mount resolves the new paths from the store alone.
+    // A new mount resolves the new paths from the store alone.
     let other = h.second_mount();
     assert_eq!(
         fs::read(other.path.join("dst/tree/deep/f")).unwrap(),
@@ -1412,8 +1409,8 @@ fn rename_over_a_file_replaces_it_and_frees_its_data() {
     assert!(h.read_key(&tombstone_key(old)).is_none());
 }
 
-/// The data stays where it is: chunks are keyed by inode, so moving a
-/// large file rewrites none of them.
+/// The data does not move: chunks are keyed by inode, so moving a large
+/// file rewrites none of them.
 #[test]
 fn rename_copies_no_data() {
     let h = support::setup();
@@ -1464,7 +1461,7 @@ fn a_directory_cannot_be_moved_into_itself() {
     assert_errno(fs::rename(p.join("a"), p.join("a/b/c/a")), libc::EINVAL);
     assert_errno(fs::rename(p.join("a"), p.join("a/a")), libc::EINVAL);
     assert!(p.join("a/b/c").is_dir());
-    // Moving one level up out of itself is fine.
+    // Moving one level up, out of itself, is allowed.
     fs::rename(p.join("a/b/c"), p.join("c")).unwrap();
     assert!(p.join("c").is_dir());
 }
@@ -1532,9 +1529,9 @@ fn rmdir_and_a_concurrent_create_cannot_both_succeed() {
     }
 }
 
-/// Two renames that would each be fine alone, but together would make a
-/// loop -- `a` into `b` and `b` into `a` -- that nothing could reach.
-/// Exactly one must win.
+/// Two renames that are each valid alone, but together would make a loop
+/// (`a` into `b` and `b` into `a`) that nothing could reach. Exactly one
+/// must succeed.
 #[test]
 fn opposite_renames_cannot_make_a_loop() {
     let h = support::setup();
@@ -1560,7 +1557,8 @@ fn opposite_renames_cannot_make_a_loop() {
             (ab.join().unwrap(), ba.join().unwrap())
         });
         assert!(ab != ba, "round {round}: a->b/a {ab}, b->a/b {ba}");
-        // Whichever won, both are still reachable from the root.
+        // Whichever rename succeeded, both are still reachable from the
+        // root.
         let fresh = h.second_mount();
         let base = fresh.path.join(&x);
         let reachable = if ab {

@@ -1,15 +1,16 @@
-//! An in-memory stand-in for an S3 bucket, for tests.
+//! An in-memory S3 bucket for tests. It supports the S3 requests that this
+//! crate sends: GET with a range, PUT, ListObjectsV2, and DeleteObjects.
 //!
-//! It speaks just enough of S3 for everything this crate sends -- GET
-//! with a range, PUT, ListObjectsV2, DeleteObjects -- and, unlike a
-//! mock, checks every request the way S3 would: the SigV4 signature
-//! against its own credentials (so a header a URL signed must be sent,
-//! with the value signed), the URL's expiry, `If-None-Match`, and
-//! DeleteObjects' `Content-MD5`. Tests drive the real `S3Store` and
-//! `http` code against it.
+//! Unlike a mock, it checks every request as S3 does:
 //!
-//! Its clock can be moved forward (`advance`), so expiry is tested
-//! without waiting.
+//! - the SigV4 signature, against its own credentials (so a header that a
+//!   URL signed must be sent, with the signed value);
+//! - the URL's expiry;
+//! - `If-None-Match`;
+//! - DeleteObjects' `Content-MD5`.
+//!
+//! Tests run the real `S3Store` and `http` code against it. Its clock can
+//! move forward (`advance`), so tests can check expiry without waiting.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -32,12 +33,12 @@ pub const ACCESS_KEY: &str = "fake-access-key";
 pub const SECRET_KEY: &str = "fake-secret-key";
 pub const REGION: &str = "fake-region";
 
-/// What the store has been asked to do, for tests that count requests.
+/// What the store was asked to do, for tests that count requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
     pub puts: u64,
     pub gets: u64,
-    /// Bytes sent back by GETs.
+    /// Bytes that GETs returned.
     pub bytes_read: u64,
     pub lists: u64,
     pub deleted: u64,
@@ -48,9 +49,9 @@ pub struct Stats {
 struct State {
     bucket: String,
     objects: BTreeMap<String, Vec<u8>>,
-    /// How many keys one listing page holds (S3's default is 1000).
+    /// How many keys one listing page holds. S3's default is 1000.
     page_size: usize,
-    /// How far this store's clock runs ahead of the real one.
+    /// How far this store's clock is ahead of the real clock.
     skew: Duration,
     stats: Stats,
 }
@@ -62,8 +63,8 @@ pub struct FakeStore {
 }
 
 impl FakeStore {
-    /// Starts a store holding one empty bucket, on a local port, served
-    /// from the current Tokio runtime.
+    /// Starts a store with one empty bucket on a local port, served from
+    /// the current Tokio runtime.
     pub async fn start(bucket: &str) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -89,7 +90,8 @@ impl FakeStore {
         format!("http://{}", self.addr)
     }
 
-    /// Settings that reach this store, with the credentials it checks.
+    /// Settings that connect to this store, with the credentials that it
+    /// checks.
     pub fn config(&self, prefix: &str) -> S3Config {
         S3Config {
             endpoint: self.endpoint(),
@@ -111,8 +113,8 @@ impl FakeStore {
         self.state.lock().unwrap().objects.get(key).cloned()
     }
 
-    /// Puts an object straight in, as something other than this crate
-    /// might have.
+    /// Puts an object directly into the bucket, as if something other than
+    /// this crate stored it.
     pub fn insert(&self, key: &str, bytes: Vec<u8>) {
         self.state.lock().unwrap().objects.insert(key.into(), bytes);
     }
@@ -238,10 +240,10 @@ fn handle(
     }
 }
 
-/// Checks a presigned request as S3 does: the credential is ours, the
-/// URL hasn't expired at `now`, and the signature is the one our secret
-/// gives over the method, path, query and every signed header's value
-/// as the request carries it.
+/// Checks a presigned request as S3 does: the credential is ours, the URL
+/// is not expired at `now`, and the signature matches the one that our
+/// secret gives over the method, path, query, and the value of every signed
+/// header in the request.
 fn check_signature(
     method: &Method,
     url: &url::Url,
@@ -365,7 +367,8 @@ fn list(state: &State, prefix: &str, after: Option<&str>) -> Response {
         "<KeyCount>{count}</KeyCount><IsTruncated>{truncated}</IsTruncated>"
     ));
     if truncated && let Some(last) = last {
-        // The token is just where the next page starts; S3's are opaque.
+        // The token is the key where the next page starts. S3's tokens are
+        // opaque.
         xml.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             escape(&last)
@@ -407,7 +410,7 @@ fn delete(state: &mut State, headers: &HeaderMap, body: &[u8]) -> Response {
     xml_response(xml)
 }
 
-/// `bytes=a-b` (or `bytes=a-`) within an object of `total` bytes, as a
+/// Parses `bytes=a-b` (or `bytes=a-`) in an object of `total` bytes, as a
 /// half-open range.
 fn parse_range(v: &str, total: u64) -> Option<(u64, u64)> {
     let (start, end) = v.strip_prefix("bytes=")?.split_once('-')?;
@@ -448,7 +451,7 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Percent-encodes everything but unreserved characters and `/`, as S3
+/// Percent-encodes everything except unreserved characters and `/`, as S3
 /// does for `encoding-type=url`.
 fn url_encode(s: &str) -> String {
     let mut out = String::new();

@@ -1,19 +1,18 @@
-//! Shared setup for integration tests: a real single-node raft5 cluster
-//! (a real `raft5_server` node with authentication and mTLS on, listening
-//! on real localhost sockets), and filesystem servers over it (over TLS),
-//! deployed the way a real installation is meant to be -- for each front
-//! end's tests to put a mount, a WebDAV server or a bare session on top
-//! of (see `Backend`).
+//! Shared setup for integration tests: a real single-node raft5 cluster,
+//! and filesystem servers on it, set up as a real installation is. The
+//! cluster is a real `raft5_server` node with authentication and mTLS on,
+//! on real localhost sockets, and the filesystem servers use TLS. Each
+//! front end's tests put a mount, a WebDAV server, or a bare session on top
+//! (see `Backend`).
 //!
-//! Everything -- the cluster's server task, the `raft5_client::Client`,
-//! and every `block_on` a front end does -- shares one multi-threaded
-//! `Runtime`: `Handle::block_on` from an arbitrary OS thread is only
-//! guaranteed to work against a multi-threaded runtime, and resources
-//! created on one runtime (the client's connections) can't safely be
-//! driven by another.
+//! Everything shares one multi-threaded `Runtime`: the cluster's server
+//! task, the `raft5_client::Client`, and every `block_on` a front end does.
+//! `Handle::block_on` from any OS thread is only guaranteed to work on a
+//! multi-threaded runtime, and resources made on one runtime (the client's
+//! connections) cannot safely be driven by another.
 //!
-//! Filesystem servers run as processes of their own: the test binary
-//! again, in server mode. So every test binary using this must have
+//! Filesystem servers run as their own processes: the test binary again, in
+//! server mode. So every test binary that uses this must have:
 //!
 //! ```ignore
 //! #[test]
@@ -46,24 +45,24 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{ClientTlsConfig, ServerTlsConfig};
 
-// Generous: every test spins up its own single-node cluster and front
-// end, and they all run concurrently by default, so under load a
-// node's first `Bootstrap` attempt can be waiting well behind others for
-// CPU time rather than for anything actually wrong.
+// Long on purpose: every test starts its own single-node cluster and front
+// end, and they all run at the same time by default. Under load, a node's
+// first `Bootstrap` attempt can wait a long time for CPU, with nothing
+// actually wrong.
 const DEADLINE: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-/// Small enough that a "several chunks" test moves kilobytes rather than
-/// megabytes, while still exercising every boundary the real default
-/// would.
+/// Small enough that a "several chunks" test moves kilobytes, not
+/// megabytes, but still tests every boundary that the real default would.
 pub const TEST_CHUNK_SIZE: u64 = 64 * 1024;
 
 /// With object storage (`setup_with_objects`): hybrid files' blocks start
 /// this many chunks in, and hold this many chunks each. Small, so a test
-/// crosses into blocks, and between them, with a few hundred kilobytes.
+/// reaches the blocks, and crosses between them, with a few hundred
+/// kilobytes.
 pub const TEST_OBJECT_FROM_CHUNKS: u64 = 2;
 pub const TEST_BLOCK_CHUNKS: u64 = 4;
-/// The fake object store's bucket, and the prefix the servers keep
+/// The fake object store's bucket, and the prefix that the servers keep
 /// objects under in it.
 pub const TEST_BUCKET: &str = "bucket";
 pub const TEST_OBJECT_PREFIX: &str = "fs/";
@@ -71,24 +70,24 @@ pub const TEST_OBJECT_PREFIX: &str = "fs/";
 /// The cluster's token secret and startup administrator.
 const STORE_SECRET: &[u8] = b"test store secret";
 const ADMIN: &str = "admin";
-/// The store account the filesystem servers work as: the only one the
-/// empty-prefix ACL lets at the filesystem's keys.
+/// The store account that the filesystem servers use. The empty-prefix ACL
+/// lets only this account reach the filesystem's keys.
 pub const SERVICE_USER: &str = "raft5fs";
-/// What the filesystem servers sign sessions and handles with, unless a
-/// test asks for another.
+/// The key that the filesystem servers sign sessions and handles with,
+/// unless a test asks for another.
 pub const TOKEN_KEY: &str = "test token key, at least 32 bytes long";
-/// The user every mount logs in as unless told otherwise. Acts as
-/// whoever runs the tests, and owns the root directory.
+/// The user that every mount logs in as by default. Acts as the user who
+/// runs the tests, and owns the root directory.
 pub const TESTER: &str = "tester";
 
 const CERT_ENV: &str = "RAFT5FS_TEST_CERT_PEM";
 const KEY_ENV: &str = "RAFT5FS_TEST_KEY_PEM";
 
-/// One self-signed certificate for everything in a test run: the store
-/// serves its client API with it and requires it of clients (mTLS), the
-/// filesystem servers present it to the store and serve with it, and
-/// every client trusts it. Made by the first test that needs it and
-/// handed to server processes through the environment, so all agree.
+/// One self-signed certificate for everything in a test run. The store
+/// serves its client API with it and requires it from clients (mTLS). The
+/// filesystem servers present it to the store and serve with it. Every
+/// client trusts it. The first test that needs it makes it, and server
+/// processes get it through the environment, so all of them agree.
 struct TestCert {
     cert: String,
     key: String,
@@ -116,30 +115,30 @@ fn identity() -> Identity {
     Identity::from_pem(&cert().cert, &cert().key)
 }
 
-/// How a client reaches the test store: trusting its certificate, and
-/// presenting it, since the store requires one.
+/// How a client connects to the test store: it trusts the store's
+/// certificate, and presents it, because the store requires one.
 pub fn store_tls() -> ClientTls {
     ClientTls::new(Certificate::from_pem(&cert().cert)).identity(identity())
 }
 
-/// Like `store_tls`, but presenting no certificate -- as a user who was
-/// never given one.
+/// Like `store_tls`, but presents no certificate, as a user who never got
+/// one.
 pub fn store_tls_without_identity() -> ClientTls {
     ClientTls::new(Certificate::from_pem(&cert().cert))
 }
 
-/// How a client reaches a test filesystem server.
+/// How a client connects to a test filesystem server.
 pub fn fs_tls() -> ClientTlsConfig {
     ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&cert().cert))
 }
 
-/// Every test account's password: its name, backwards, so a test that
-/// wants a wrong one can just use the name.
+/// Every test account's password: its name, backwards. A test that wants a
+/// wrong password can use the name.
 pub fn password(user: &str) -> String {
     user.chars().rev().collect()
 }
 
-/// `user`'s credentials, accepting the cheap key stretching test
+/// `user`'s credentials. They accept the low-cost key stretching that test
 /// accounts are enrolled with.
 pub fn credentials(user: &str) -> Credentials {
     credentials_with(user, &password(user))
@@ -157,24 +156,25 @@ pub fn credentials_with(user: &str, password: &str) -> Credentials {
     }
 }
 
-/// A single-node raft5 cluster running for one test, on its own
-/// temporary database directory and ephemeral ports. Dropping it stops
-/// the server and deletes the database.
+/// A single-node raft5 cluster for one test, on its own temporary database
+/// directory and ephemeral ports. Dropping it stops the server and deletes
+/// the database.
 pub struct TestCluster {
     cancel: CancellationToken,
     task: Option<JoinHandle<()>>,
     db_dir: PathBuf,
-    /// The node's client API, for anything else that needs to reach it.
+    /// The node's client API address, for anything else that needs to reach
+    /// it.
     pub client_address: String,
-    /// Logged in as the cluster's administrator, for managing accounts.
+    /// Logged in as the cluster's administrator, to manage accounts.
     pub admin: Client,
 }
 
 impl TestCluster {
-    /// Starts a fresh node on `runtime` and bootstraps it into a
-    /// single-node cluster with authentication on, locked down the way a
-    /// real deployment is (only `SERVICE_USER` may touch any key).
-    /// Returns it alongside a client logged in as `SERVICE_USER`.
+    /// Starts a new node on `runtime` and bootstraps it into a single-node
+    /// cluster with authentication on, locked down as a real deployment is
+    /// (only `SERVICE_USER` can touch any key). Returns it with a client
+    /// logged in as `SERVICE_USER`.
     pub fn start(runtime: &Runtime) -> (Self, Client) {
         let client_addr = free_local_addr();
         let peer_addr = free_local_addr();
@@ -196,9 +196,9 @@ impl TestCluster {
                 password_hash,
             }),
         );
-        // Minted here rather than asked for: a login sent before the node
-        // is bootstrapped waits out the client's search for a cluster
-        // that doesn't exist yet, which costs every test ten seconds.
+        // Made here and not requested: a login sent before the node is
+        // bootstrapped waits while the client searches for a cluster that
+        // does not exist yet, which costs every test ten seconds.
         let (admin_token, _) = auth.issue(ADMIN).expect("issue the administrator a token");
         let task = runtime.spawn(async move {
             let config = ServerConfig {
@@ -216,12 +216,11 @@ impl TestCluster {
                 }),
             };
             let result = serve_config(config, cancel_clone).await;
-            // Swallowing this turns "the port was taken, so nothing ever
-            // listened" into a bare 30 s bootstrap timeout, which says
-            // nothing about why. Reported unconditionally: `serve` cancels
-            // the token itself on its way out (a bind failure on either
-            // port brings the node down), so gating this on the token
-            // would hide precisely the failure worth seeing.
+            // If this error were ignored, "the port was taken, so nothing
+            // listened" would show only as a 30 s bootstrap timeout, with
+            // no reason. Always report it: `serve` cancels the token itself
+            // when it exits (a bind failure on either port stops the node),
+            // so checking the token first would hide exactly this failure.
             if let Err(e) = result {
                 eprintln!("test cluster on {client_addr} never served: {e}");
             }
@@ -234,10 +233,9 @@ impl TestCluster {
             admin.login_with_token(admin_token);
 
             // The node's gRPC service exists as soon as `serve` binds its
-            // listeners, but its state machine may not have reached
-            // `Uninitialized` internally yet, so an immediate `Bootstrap`
-            // can transiently race that -- retry rather than assume the
-            // first attempt lands.
+            // listeners, but its state machine might not be `Uninitialized`
+            // yet. So an immediate `Bootstrap` can race it for a short
+            // time. Retry, and do not assume that the first attempt works.
             let until = Instant::now() + DEADLINE;
             loop {
                 match admin.bootstrap(&id, None).await {
@@ -285,22 +283,22 @@ impl Drop for TestCluster {
     }
 }
 
-/// How many filesystem servers each test runs. More than one, so every
-/// test also exercises servers sharing a store: mounts start on different
-/// instances, and nothing a test does relies on hitting the same one.
+/// How many filesystem servers each test runs. More than one, so every test
+/// also tests servers that share a store: mounts start on different
+/// instances, and no test depends on reaching the same one.
 const SERVERS: usize = 2;
 
-/// A filesystem server over the test cluster, run as a separate process
-/// -- this test binary again, in server mode (see `serve_if_requested`).
-/// Dropping it kills the process, which is exactly what a crashed server
-/// looks like: its sockets close at once, connections and all.
+/// A filesystem server on the test cluster, run as a separate process: this
+/// test binary again, in server mode (see `serve_if_requested`). Dropping
+/// it kills the process, which is exactly how a crashed server looks: its
+/// sockets and connections close at once.
 ///
-/// In-process servers can't promise that. This process also hosts FUSE
-/// mounts, and every mount and unmount forks `fusermount3`; a fork hands
-/// the child a copy of every descriptor here -- a server's listening
-/// socket included -- so a "stopped" in-process server's port could go on
-/// accepting connections that nothing would ever answer. A server process
-/// never forks, so nothing can outlive it.
+/// An in-process server cannot promise that. This process also hosts FUSE
+/// mounts, and every mount and unmount forks `fusermount3`. A fork gives
+/// the child a copy of every descriptor here, including a server's
+/// listening socket. So a "stopped" in-process server's port could continue
+/// to accept connections that nothing would answer. A server process never
+/// forks, so nothing can outlive it.
 pub struct TestServer {
     child: Option<std::process::Child>,
     pub address: String,
@@ -312,26 +310,25 @@ const SERVER_LISTEN_ENV: &str = "RAFT5FS_TEST_SERVER_LISTEN";
 const SERVER_TOKEN_KEY_ENV: &str = "RAFT5FS_TEST_SERVER_TOKEN_KEY";
 /// The fake object store's endpoint, for a server that keeps objects.
 const SERVER_OBJECTS_ENV: &str = "RAFT5FS_TEST_SERVER_OBJECTS";
-/// Set for a server that leaves every unreferenced object to the sweeps.
+/// Set for a server that leaves every object with no pointer to the sweeps.
 const SERVER_NO_PROMPT_DELETE_ENV: &str = "RAFT5FS_TEST_SERVER_NO_PROMPT_DELETE";
 
-/// Where a server keeps objects, and whether it deletes one as soon as
-/// nothing points at it (see `ObjectSettings::prompt_delete`).
+/// Where a server keeps objects, and whether it deletes an object as soon
+/// as nothing points to it (see `ObjectSettings::prompt_delete`).
 #[derive(Debug, Clone)]
 pub struct ServerObjects {
     pub endpoint: String,
     pub prompt_delete: bool,
 }
-/// The test that is really the server-mode entry point; see
-/// `serve_if_requested`.
+/// The test that is the server-mode entry point; see `serve_if_requested`.
 const SERVER_MODE_TEST: &str = "server_process_mode";
 
 impl TestServer {
-    /// Starts a server process over the cluster at `cluster_address` and
-    /// waits until it is accepting connections. It opens the filesystem on
-    /// the way (settling the chunk size, finishing interrupted deletions).
-    /// With `objects`, a (fake) object store, it keeps hybrid files'
-    /// blocks there.
+    /// Starts a server process on the cluster at `cluster_address`, and
+    /// waits until it accepts connections. On the way, it opens the
+    /// filesystem (sets the chunk size, finishes interrupted deletions).
+    /// With `objects`, a fake object store, it keeps hybrid files' blocks
+    /// there.
     pub fn start(cluster_address: &str, chunk_size: u64, objects: Option<&ServerObjects>) -> Self {
         for _ in 0..20 {
             if let Some(server) = Self::try_start(
@@ -347,8 +344,8 @@ impl TestServer {
         panic!("could not start a filesystem server on any port");
     }
 
-    /// Starts a server on `listen`, signing with `token_key`; `None` if
-    /// the port turned out to be taken.
+    /// Starts a server on `listen` that signs with `token_key`. Returns
+    /// `None` if the port was taken.
     fn try_start(
         cluster_address: &str,
         chunk_size: u64,
@@ -383,8 +380,8 @@ impl TestServer {
                 .expect("start a server process");
             let deadline = Instant::now() + DEADLINE;
             loop {
-                // Exiting before it ever accepted means its port was taken
-                // between choosing and binding it; try another.
+                // If it exited before it accepted anything, its port was
+                // taken between choosing and binding it. Try another port.
                 if let Ok(Some(_)) = child.try_wait() {
                     return None;
                 }
@@ -421,9 +418,9 @@ impl Drop for TestServer {
     }
 }
 
-/// Server mode: if this process was started by `TestServer::start`, serve
-/// the filesystem until killed and never return. Otherwise return at once,
-/// so the test that calls this passes trivially in a normal run.
+/// Server mode: if `TestServer::start` started this process, serve the
+/// filesystem until killed, and never return. Otherwise return at once, so
+/// the test that calls this passes in a normal run.
 pub fn serve_if_requested() {
     let Ok(cluster) = std::env::var(SERVER_CLUSTER_ENV) else {
         return;
@@ -434,8 +431,8 @@ pub fn serve_if_requested() {
     let objects = std::env::var(SERVER_OBJECTS_ENV).ok();
     let prompt_delete = std::env::var(SERVER_NO_PROMPT_DELETE_ENV).is_err();
 
-    // Die with the test that started us, even if it never gets to kill us:
-    // a panicking test unwinds past `Drop`s only so far.
+    // Exit with the test that started this process, even if the test never
+    // kills it: a panicking test runs only some `Drop`s as it unwinds.
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
@@ -466,12 +463,13 @@ pub fn serve_if_requested() {
                 std::process::exit(1);
             });
         let Ok(listener) = tokio::net::TcpListener::bind(listen).await else {
-            // Taken since the parent chose it; the parent will pick another.
+            // The port was taken after the parent chose it. The parent will
+            // choose another.
             std::process::exit(2);
         };
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
-        // Look accounts up on every request, so a test that removes one
-        // sees it at once.
+        // Check accounts on every request, so a test that removes one sees
+        // the result at once.
         let fs = FsService::new(Arc::new(core), signer, Duration::ZERO).with_timing_header(true);
         if let Err(e) = raft5fs_server::serve(
             fs,
@@ -487,8 +485,8 @@ pub fn serve_if_requested() {
     });
 }
 
-/// What a test server keeps objects with: the fake store at `endpoint`,
-/// on the test grid, its settings changed as `edit` says.
+/// The object settings for a test server: the fake store at `endpoint`, on
+/// the test grid, with changes from `edit`.
 fn object_settings(
     endpoint: String,
     chunk_size: u64,
@@ -530,23 +528,22 @@ pub fn start_servers(
         .collect()
 }
 
-/// The volume tests make, which most of them work in as if it were the
-/// root of an ordinary filesystem.
+/// The volume that tests make. Most tests use it as if it were the root of
+/// a normal filesystem.
 pub const VOLUME: &str = "v";
 
-/// A cluster and filesystem servers over it, with `TESTER` enrolled, for
-/// one test: everything but the front end.
-///
-/// Field order is the drop order, and it matters: the servers come down
-/// before the cluster they talk to, and everything before the runtime it
-/// all runs on. A front end over these has to be dropped first.
+/// A cluster and filesystem servers on it, with `TESTER` enrolled, for one
+/// test: everything except the front end. Fields drop in order, and the
+/// order matters: the servers stop before the cluster they use, and
+/// everything stops before its runtime. A front end on these must be
+/// dropped first.
 pub struct Backend {
     pub servers: Vec<TestServer>,
     pub client: Client,
     pub cluster: TestCluster,
-    /// The object store the servers keep blocks in, if they do.
+    /// The object store where the servers keep blocks, if they do.
     pub objects: Option<FakeStore>,
-    /// Whether the servers delete an object as soon as nothing points at
+    /// Whether the servers delete an object as soon as nothing points to
     /// it, or leave it for garbage collection.
     pub prompt_delete: bool,
     pub runtime: Runtime,
@@ -556,9 +553,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// A fresh cluster, servers over it asking for `chunk_size` -- keeping
-    /// hybrid files' blocks in a fake object store if `with_objects` --
-    /// and `TESTER` enrolled.
+    /// A new cluster, servers on it that ask for `chunk_size`, and `TESTER`
+    /// enrolled. With `with_objects`, the servers keep hybrid files' blocks
+    /// in a fake object store.
     pub fn start(chunk_size: u64, with_objects: bool, prompt_delete: bool) -> Self {
         let runtime = Runtime::new().expect("failed to start tokio runtime");
         let (cluster, client) = TestCluster::start(&runtime);
@@ -586,9 +583,10 @@ impl Backend {
         }
     }
 
-    /// Replaces the servers with new ones asking for `chunk_size`, as a
-    /// restart of everything but the store would. Returns the old ones,
-    /// for the caller to drop once its front end is done with them.
+    /// Replaces the servers with new ones that ask for `chunk_size`, as a
+    /// restart of everything except the store would. Returns the old
+    /// servers, for the caller to drop after its front end is done with
+    /// them.
     pub fn replace_servers(&mut self, chunk_size: u64) -> Vec<TestServer> {
         let servers = start_servers(&self.cluster, chunk_size, self.server_objects().as_ref());
         std::mem::replace(&mut self.servers, servers)
@@ -602,7 +600,7 @@ impl Backend {
         })
     }
 
-    /// The fake object store the servers keep blocks in. Only with
+    /// The fake object store where the servers keep blocks. Only with
     /// `setup_with_objects`.
     pub fn store(&self) -> &FakeStore {
         self.objects
@@ -610,15 +608,14 @@ impl Backend {
             .expect("this harness has no object store; use setup_with_objects")
     }
 
-    /// A filesystem core in this process, over the same store and object
-    /// store as the servers: for tests to run garbage collection on
-    /// demand, at whatever time they say. It deletes nothing but by
-    /// sweeping.
+    /// A filesystem core in this process, on the same store and object
+    /// store as the servers, so tests can run garbage collection when and
+    /// at the time they choose. It deletes only by sweeping.
     pub fn gc_core(&self) -> FsCore {
         self.gc_core_with(|_| {})
     }
 
-    /// `gc_core`, its object store settings changed as `edit` says.
+    /// `gc_core`, with its object store settings changed by `edit`.
     pub fn gc_core_with(&self, edit: impl FnOnce(&mut S3Config)) -> FsCore {
         let settings = object_settings(self.store().endpoint(), self.chunk_size, false, edit);
         self.runtime
@@ -645,7 +642,7 @@ impl Backend {
 
     /// Every key in the store that starts with `prefix`. `key_iterator`
     /// walks to the end of the keyspace, so the caller's prefix is what
-    /// bounds it.
+    /// limits it.
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.runtime.block_on(async {
             let mut iter = self.client.key_iterator(prefix);
@@ -669,9 +666,9 @@ impl Backend {
             .value
     }
 
-    /// The sequence number `key`'s current value was written at. Every
-    /// key a transaction writes lands at the same seq, so this is how a
-    /// test can tell which writes shared a commit.
+    /// The sequence number that `key`'s current value was written at. Every
+    /// key that a transaction writes gets the same seq, so a test can use
+    /// this to tell which writes shared a commit.
     pub fn key_version(&self, key: &[u8]) -> u64 {
         self.runtime
             .block_on(self.client.read_versions(&[key], Consistency::Stale))
@@ -687,8 +684,8 @@ impl Backend {
             .expect("write failed");
     }
 
-    /// Pins, in memory, of `TESTER`'s key: what every other test user has
-    /// checked out of band, so grants from `TESTER` are trusted.
+    /// In-memory pins of `TESTER`'s key, as if every other test user
+    /// checked it on another channel. So grants from `TESTER` are trusted.
     pub fn known_keys(&self) -> KnownKeys {
         let known = KnownKeys::in_memory();
         known
@@ -720,17 +717,16 @@ impl Backend {
         self.enrol(name);
     }
 
-    /// Enrols `name` with password
-    /// `password(name)`, through the real enrolment RPC, and returns their
-    /// public key.
+    /// Enrols `name` with password `password(name)` through the real
+    /// enrolment RPC, and returns their public key.
     pub fn enrol(&self, name: &str) -> [u8; 32] {
         enrol(&self.runtime, &self.client, &self.addresses(), name)
     }
 
-    /// Restarts every server in place -- same addresses, so the front ends
-    /// carry on with them -- signing with `token_key` from then on. To a
-    /// front end that is every session it holds turning invalid at once, as
-    /// an expiry or a key rotation would make them.
+    /// Restarts every server in place (same addresses, so the front ends
+    /// continue to use them), signing with `token_key` from then on. For a
+    /// front end, every session it holds becomes invalid at once, as after
+    /// an expiry or a key rotation.
     pub fn restart_servers_with_key(&mut self, token_key: &str) {
         let objects = self.server_objects();
         for server in &mut self.servers {
@@ -760,8 +756,8 @@ impl Backend {
     }
 }
 
-/// Issues `name` an enrolment code and enrols them with it, with
-/// password `password(name)` and cheap key-stretching settings.
+/// Issues `name` an enrolment code and enrols them with it, with password
+/// `password(name)` and low-cost key stretching settings.
 pub fn enrol(runtime: &Runtime, client: &Client, addresses: &[String], name: &str) -> [u8; 32] {
     runtime.block_on(async {
         let code = accounts::issue_code(client, name)
@@ -779,31 +775,31 @@ pub fn enrol(runtime: &Runtime, client: &Client, addresses: &[String], name: &st
     })
 }
 
-/// An address for a test cluster to listen on, such that no two tests in
-/// this process are ever handed the same one.
+/// An address for a test cluster to listen on, never the same for two tests
+/// in this process.
 ///
 /// Binding `127.0.0.1:0` and reading the port back cannot do this. The
-/// listener is dropped to free the port for the server, and two tests
-/// starting at once are then readily handed the *same* port by the
-/// kernel. The loser's `serve` fails to bind while its client, pointed at
-/// that port, connects to the winner's cluster -- so two tests silently
-/// share one store. That surfaces as a test seeing keys it never wrote,
-/// or as a node that never manages to bootstrap.
+/// listener is dropped to free the port for the server, and the kernel then
+/// often gives two tests that start at the same time the *same* port. The
+/// loser's `serve` fails to bind, while its client, pointed at that port,
+/// connects to the winner's cluster. So two tests share one store without
+/// notice. That shows as a test that sees keys it never wrote, or as a node
+/// that never bootstraps.
 ///
-/// So the port comes from a counter instead, which cannot repeat, and is
-/// only probed to confirm nothing outside this process already holds it.
+/// So the port comes from a counter, which cannot repeat. It is only probed
+/// to check that nothing outside this process already has it.
 fn free_local_addr() -> SocketAddr {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    // Offset per process as well, so two concurrent `cargo test` runs of
-    // this suite do not line up with each other.
+    // Also offset for each process, so two `cargo test` runs of this suite
+    // at the same time do not use the same ports.
     let base = u64::from(std::process::id()) * 8;
     for _ in 0..1_000 {
         let n = base + NEXT.fetch_add(1, Ordering::Relaxed);
         // Below `ip_local_port_range` (32768 on Linux by default). Inside
-        // it, a port confirmed free here can be taken by one of the many
-        // outgoing gRPC connections these tests open before the server
-        // gets to bind it -- which shows up only as a node that never
-        // becomes reachable.
+        // that range, a port confirmed free here can be taken by one of the
+        // many outgoing gRPC connections that these tests open before the
+        // server binds it. That shows only as a node that never becomes
+        // reachable.
         let port = 10_000 + (n % 22_000);
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
         if TcpListener::bind(addr).is_ok() {

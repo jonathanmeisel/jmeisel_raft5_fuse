@@ -1,49 +1,49 @@
-//! The client end of the raft5fs protocol: the same operations as
+//! The client side of the raft5fs protocol: the same operations as
 //! `FsCore`, answered by whichever of several servers is reachable.
 //!
-//! Servers are stateless, so any of them can answer any request. What may
-//! be resent to another after a failure depends on the request (see
-//! `Retry`):
+//! **Failover.** Servers are stateless, so any server can answer any
+//! request. Whether a request can be sent again to another server after a
+//! failure depends on the request (see `Retry`):
 //!
-//! - Read-only requests are resent on any failure: running them twice
+//! - Read-only requests are sent again on any failure. Running them twice
 //!   changes nothing.
-//! - Writes and attribute changes are resent unless the request timed
-//!   out. Resending one that already landed is harmless -- the same bytes
-//!   at the same offset, the same mode -- but not one that might still be
-//!   *running*: a server that merely timed out could commit after the
-//!   resend and after a later write to the same range, silently putting
-//!   the older bytes back. Every other failure means the request is not
-//!   running anywhere -- the server was unreachable, or its connection
-//!   broke under the request (which tonic reports as `Unknown`, not
-//!   `Unavailable`), and the server itself never answers with a status,
-//!   since filesystem errors travel inside the response. So only a
-//!   timeout reports `EIO` rather than failing over.
-//! - Create, mkdir, unlink, rmdir and rename are never resent: if one reached the
-//!   old server, a retry would report a false `EEXIST` or `ENOENT`. They
-//!   fail with `EIO`, and the next request starts from the next server.
+//! - Writes and attribute changes are sent again unless the request timed
+//!   out. Sending one again after it was stored does no harm (the same
+//!   bytes at the same offset, the same mode). But a request that might
+//!   still be *running* must not be sent again. A server that only timed
+//!   out could commit after the resend, and after a later write to the same
+//!   range, and so put the older bytes back without notice. Every other
+//!   failure means that the request is not running anywhere: the server was
+//!   not reachable, or its connection broke during the request (tonic
+//!   reports this as `Unknown`, not `Unavailable`). The server itself never
+//!   answers with a status, because filesystem errors come inside the
+//!   response. So only a timeout gives `EIO` in place of a failover.
+//! - Create, mkdir, unlink, rmdir, and rename are never sent again. If one
+//!   reached the old server, a retry would report a false `EEXIST` or
+//!   `ENOENT`. They fail with `EIO`, and the next request starts at the
+//!   next server.
 //!
-//! Every request has a deadline, so a server that stops answering can't
-//! hang a FUSE handler -- which would wedge the mount, and anything that
-//! touches it.
+//! Every request has a deadline, so a server that stops answering cannot
+//! hang a FUSE handler. A hung handler would block the mount, and anything
+//! that touches it.
 //!
-//! A mount logs in as one user, when connecting, and every request
-//! carries that session. A session that has expired (or that a server
-//! otherwise refuses) is renewed by logging in again with the same
-//! credentials, and the request then retried -- which is why they are
+//! **Sessions.** A mount logs in as one user when it connects, and every
+//! request sends that session. When a server refuses a session (for
+//! example, because it expired), the client logs in again with the same
+//! credentials and retries the request. That is why the credentials are
 //! kept for the life of the mount.
 //!
-//! The password itself never goes to a server. The first login stretches
-//! it (with the salt Prelogin hands out) into
-//! `auth`, which is what logs in, and a key that opens the account's
-//! private key from the login's reply. From then on only `auth` is kept,
-//! for renewals; the password is dropped.
+//! **The password** never goes to a server. The first login stretches it
+//! (with the salt from Prelogin) into `auth`, which logs in, and into a key
+//! that opens the account's private key from the login's reply. After that,
+//! only `auth` is kept, for renewals, and the password is dropped.
 //!
-//! `auth` and the session are as good as the password to whoever sees
-//! them -- `auth` is a guess-checker for it, offline -- so they only travel
-//! over TLS: an address that isn't `https://`, or a connection without
-//! TLS settings, is refused unless the credentials explicitly allow
-//! plaintext (`Credentials::allow_plaintext`), which only tests and
-//! throwaway setups should.
+//! `auth` and the session are as good as the password to anyone who sees
+//! them: `auth` lets an attacker check password guesses offline. So they
+//! only go over TLS. An address that is not `https://`, or a connection
+//! without TLS settings, is refused unless the credentials allow plaintext
+//! (`Credentials::allow_plaintext`). Use that only for tests and temporary
+//! setups.
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -77,39 +77,40 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::timing::Timed;
 
-/// The largest message the client sends: one write batch, which is at most
-/// one maximum-size chunk (8 MiB), plus framing.
+/// The largest message that the client sends: one write batch, which is at
+/// most one maximum-size chunk (8 MiB), plus framing.
 const MAX_MESSAGE_BYTES: usize = 9 << 20;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Generous: a write commits a batch of up to 8 MiB through raft, and
-/// may retry under contention. A request that takes longer is treated as
-/// a failure of that server.
+/// Long on purpose: a write commits a batch of up to 8 MiB through raft,
+/// and can retry under contention. A request that takes longer counts as a
+/// failure of that server.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Pings on idle connections, so a server that died silently is noticed
-/// before the next request has to time out on it.
+/// Sends pings on idle connections, so the client notices a server that
+/// stopped without a message before the next request times out on it.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Who a mount logs in as.
+/// The user that a mount logs in as.
 #[derive(Clone)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
-    /// The weakest key stretching a login will accept from a server (see
+    /// The weakest key stretching that a login accepts from a server (see
     /// `KdfParams::check`).
     pub min_kdf: KdfParams,
-    /// Whether to talk to servers without TLS at all. Off unless asked:
-    /// see the module doc.
+    /// Whether to connect to servers without TLS. Off unless asked for; see
+    /// the module doc.
     pub allow_plaintext: bool,
-    /// How to reach the object store large files' blocks are in, through
-    /// the URLs servers sign: which CAs to trust, and whether `http://`
-    /// will do (by default, it won't -- the URLs are bearer credentials).
+    /// How to connect to the object store that holds large files' blocks,
+    /// through the URLs that servers sign: which CAs to trust, and whether
+    /// `http://` is allowed. By default it is not, because the URLs are
+    /// bearer credentials.
     pub objects: HttpConfig,
 }
 
 impl Credentials {
-    /// `username` and `password`, accepting no weaker stretching than new
+    /// `username` and `password`. Accepts no weaker stretching than new
     /// accounts get.
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
@@ -122,10 +123,10 @@ impl Credentials {
     }
 }
 
-/// The session token every request carries; empty until the first login.
+/// The session token that every request sends. Empty until the first login.
 type Session = Arc<RwLock<String>>;
 
-/// Stamps every request with the current session.
+/// Adds the current session to every request.
 #[derive(Clone)]
 struct Authorize(Session);
 
@@ -144,8 +145,8 @@ impl Interceptor for Authorize {
 
 type Client = FsClient<InterceptedService<Timed<Channel>, Authorize>>;
 
-/// What a login presents: the password, until the first login has turned
-/// it into `auth`.
+/// What a login sends: the password, until the first login turns it into
+/// `auth`.
 enum Secret {
     Password(Zeroizing<String>),
     Auth(Zeroizing<[u8; AUTH_LEN]>),
@@ -156,10 +157,10 @@ pub struct Remote {
     username: String,
     secret: RwLock<Secret>,
     min_kdf: KdfParams,
-    /// The account's key pair, once a login has opened it.
+    /// The account's key pair, after a login opens it.
     identity: RwLock<Option<Arc<Identity>>>,
-    /// How many chunks have been asked for: for tests of the client's
-    /// cache, which should keep this from growing.
+    /// How many chunks were asked for. Tests of the client's cache check
+    /// that the cache keeps this low.
     chunk_reads: AtomicU64,
     session: Session,
     /// Where to start: the last server that answered.
@@ -169,18 +170,19 @@ pub struct Remote {
     /// How hybrid files group chunks into blocks, if the filesystem keeps
     /// data in object storage.
     grid: Option<ObjectGrid>,
-    /// What fetches blocks from object storage.
+    /// The client that fetches blocks from object storage.
     objects: http::Client,
-    /// Whether reads say this client can fetch chunks from object storage
-    /// (see `ReadChunksRequest.objects_ok`). Off only to test what a
-    /// client that can't is told.
+    /// Whether reads say that this client can fetch chunks from object
+    /// storage (see `ReadChunksRequest.objects_ok`). Off only to test what
+    /// a client that cannot is told.
     objects_ok: bool,
-    /// The snapshot this client reads at, or empty for the live
-    /// filesystem. One at a snapshot only reads (see `at`).
+    /// The snapshot that this client reads at, or empty for the live
+    /// filesystem. A client at a snapshot only reads (see `at`).
     snapshot: String,
 }
 
-/// Stretches `password` off the async threads: Argon2 is slow on purpose.
+/// Stretches `password` away from the async threads, because Argon2 is slow
+/// on purpose.
 async fn derive(
     password: &str,
     username: &str,
@@ -197,8 +199,8 @@ async fn derive(
     .map_err(|e| FsError::new(libc::EIO, e.to_string()))
 }
 
-/// What the server keeps for an account whose password is `password` and
-/// key pair `identity`, under a fresh salt; and the `auth` it will take.
+/// What the server keeps for an account with password `password` and key
+/// pair `identity`, under a new salt, and the `auth` that it will accept.
 async fn account_keys(
     username: &str,
     password: &str,
@@ -217,12 +219,12 @@ async fn account_keys(
     Ok((account, Zeroizing::new(keys.auth)))
 }
 
-/// When a request may be resent to another server; see the module doc.
+/// When a request can be sent again to another server; see the module doc.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Retry {
     /// After any failure.
     ReadOnly,
-    /// After any failure but a timeout.
+    /// After any failure except a timeout.
     Idempotent,
     /// Never.
     Once,
@@ -239,9 +241,9 @@ impl Retry {
 }
 
 impl Remote {
-    /// Connects to whichever of `addresses` (`https://host:port`, or
-    /// `http://` without `tls`) answers first, learns the filesystem's
-    /// chunk geometry from it, and logs in with `credentials`.
+    /// Connects to whichever of `addresses` answers first
+    /// (`https://host:port`, or `http://` without `tls`), gets the
+    /// filesystem's chunk layout from it, and logs in with `credentials`.
     pub async fn connect(
         addresses: &[String],
         credentials: Credentials,
@@ -333,11 +335,11 @@ impl Remote {
         Ok(remote)
     }
 
-    /// Enrols `credentials.username` on the filesystem at `addresses`,
-    /// with the one-time `code` an administrator issued: makes the account
-    /// a key pair, and stores it wrapped under what `credentials.password`
-    /// yields. Returns the new public key, for the user to note its
-    /// fingerprint.
+    /// Enrols `credentials.username` on the filesystem at `addresses`, with
+    /// the one-time `code` from an administrator. It makes a key pair for
+    /// the account, and stores it wrapped under the key from
+    /// `credentials.password`. Returns the new public key, so the user can
+    /// note its fingerprint.
     pub async fn enrol(
         addresses: &[String],
         tls: Option<ClientTlsConfig>,
@@ -358,8 +360,8 @@ impl Remote {
             code: code.to_string(),
             keys: Some(keys),
         };
-        // Never resent: a code is used up by the first enrolment, so a
-        // resend of one that landed would report a false refusal.
+        // Never sent again: the first enrolment uses up the code, so a
+        // resend after it was stored would report a false refusal.
         remote
             .call(Retry::Once, |mut c| {
                 let req = req.clone();
@@ -371,8 +373,9 @@ impl Remote {
     }
 
     /// Changes this account's password to `new_password`. The key pair
-    /// stays -- only its wrapping changes -- so everything shared with it
-    /// stays readable. Needs a login, which proves the old one.
+    /// stays the same (only its wrapping changes), so everything shared
+    /// with it stays readable. Needs a login, which proves the old
+    /// password.
     pub async fn change_password(
         &self,
         new_password: &str,
@@ -404,10 +407,9 @@ impl Remote {
         Ok(())
     }
 
-    /// The account's key pair: there after a login.
-    /// A client for reading snapshot `name`: the same servers, and the
-    /// same session -- a renewal by either is the other's too -- but
-    /// every read made as of the snapshot, and every write refused with
+    /// A client that reads snapshot `name`. It uses the same servers and
+    /// the same session (a renewal by either client works for both). Every
+    /// read is made at the snapshot, and every write is refused with
     /// `EROFS` before it is sent.
     pub fn at(&self, name: &str) -> Remote {
         let secret = match &*self.secret.read().unwrap() {
@@ -432,39 +434,40 @@ impl Remote {
         }
     }
 
-    /// The snapshot this client reads at, if it isn't the live one.
+    /// The snapshot that this client reads at, if it is not the live
+    /// filesystem.
     pub fn snapshot(&self) -> Option<&str> {
         (!self.snapshot.is_empty()).then_some(self.snapshot.as_str())
     }
 
-    /// The account this client logs in as.
+    /// The account that this client logs in as.
     pub fn username(&self) -> &str {
         &self.username
     }
 
+    /// The account's key pair. `None` until a login opens it.
     pub fn identity(&self) -> Option<Arc<Identity>> {
         self.identity.read().unwrap().clone()
     }
 
-    /// How many chunks this client has asked a server for, unchanged ones
-    /// not counted.
+    /// How many chunks this client asked a server for, not counting
+    /// unchanged ones.
     pub fn chunk_reads(&self) -> u64 {
         self.chunk_reads.load(Ordering::Relaxed)
     }
 
-    /// Logs in, on whichever server answers, and keeps the session for
-    /// every request after. A refusal (a wrong password, an account with
-    /// no filesystem identity) comes back as the server's errno.
-    ///
-    /// Not through `call`, which logs in itself when a session is
-    /// refused: this has to work with no session, and must not recurse.
+    /// Logs in on whichever server answers, and keeps the session for every
+    /// later request. A refusal (a wrong password, or an account with no
+    /// filesystem identity) comes back as the server's errno. This does not
+    /// use `call`, which logs in itself when a session is refused: a login
+    /// must work with no session, and must not recurse.
     async fn login(&self) -> Result<(), FsError> {
         let mut req = LoginRequest {
             username: self.username.clone(),
             auth: Vec::new(),
         };
-        // The first login: the keys the password yields, kept until the
-        // server has accepted them.
+        // The first login: the keys from the password, kept until the
+        // server accepts them.
         let mut derived = None;
         let password = match &*self.secret.read().unwrap() {
             Secret::Auth(auth) => {
@@ -500,8 +503,9 @@ impl Remote {
             .await?
             .into_result()?;
         if let Some(keys) = derived {
-            // The server took `auth`, so the password was right: what
-            // fails to open now was tampered with, not mistyped.
+            // The server accepted `auth`, so the password was correct. If
+            // the private key does not open now, it was changed, not
+            // mistyped.
             let identity =
                 Identity::unwrap(&keys.kek, &self.username, &session.wrapped_private_key)
                     .map_err(|e| FsError::new(libc::EIO, format!("login: {e}")))?;
@@ -512,10 +516,10 @@ impl Remote {
         Ok(())
     }
 
-    /// The first answer any server gives `request`, trying each in turn
-    /// from the current one. For the requests that come before a session
-    /// -- not through `call`, which logs in itself when a session is
-    /// refused, and so must never be what a login goes through.
+    /// The first answer that any server gives to `request`, trying each
+    /// server in turn from the current one. For requests that come before a
+    /// session. A login must not go through `call`, which logs in itself
+    /// when a session is refused.
     async fn first_answer<T, Fut>(
         &self,
         what: &str,
@@ -556,22 +560,24 @@ impl Remote {
         self.grid
     }
 
-    /// What fetches from object storage, through URLs the servers sign.
+    /// The client that fetches from object storage, through URLs that the
+    /// servers sign.
     pub fn objects(&self) -> &http::Client {
         &self.objects
     }
 
-    /// This client, reading as one that can't fetch from object storage:
-    /// for tests of what such a client is told.
+    /// This client, reading as a client that cannot fetch from object
+    /// storage. For tests of what such a client is told.
     pub fn without_object_reads(mut self) -> Self {
         self.objects_ok = false;
         self
     }
 
-    /// Runs `request` against the current server, moving through the rest
-    /// as `retry` allows. A gRPC status always means no filesystem answer
-    /// came back -- filesystem errors travel inside the response -- so
-    /// every status is a failure of the server, never of the request.
+    /// Runs `request` on the current server, and moves through the other
+    /// servers as `retry` allows. A gRPC status always means that no
+    /// filesystem answer came back, because filesystem errors come inside
+    /// the response. So every status is a failure of the server, never of
+    /// the request.
     async fn call<T, Fut>(
         &self,
         retry: Retry,
@@ -591,12 +597,12 @@ impl Remote {
             let i = (start + attempt) % n;
             let (address, client) = &self.servers[i];
             let mut outcome = request(client.clone()).await;
-            // The one status about the request rather than the server:
-            // the session is no good. Renewed once per call -- a request
-            // refused straight after a fresh login has a problem a second
-            // login won't fix -- and the request sent again. That is safe
-            // even for requests that are never resent: one refused for its
-            // session was never carried out.
+            // The only status about the request and not the server: the
+            // session is not valid. Renew it once for each call (a request
+            // refused just after a new login has a problem that a second
+            // login will not fix), and send the request again. This is safe
+            // even for requests that are never sent again, because a
+            // request refused for its session was never run.
             if let Err(status) = &outcome
                 && status.code() == Code::Unauthenticated
                 && !renewed
@@ -619,7 +625,7 @@ impl Remote {
                 Err(status) => {
                     failures.push(format!("{address}: {}", status.message()));
                     // Whatever happens next, the next request should start
-                    // somewhere else.
+                    // at a different server.
                     self.current.store((i + 1) % n, Ordering::Relaxed);
                     if !retry.allows(&status) {
                         break;
@@ -646,9 +652,9 @@ impl Remote {
         .into_result()
     }
 
-    /// The entry `name` (a tag) in `parent`: its attributes, and its name
-    /// sealed as the listing has it -- for the caller to check, since only
-    /// that proves the entry names the inode the server says.
+    /// The entry `name` (a tag) in `parent`: its attributes, and its sealed
+    /// name as the listing has it. The caller must check the name, because
+    /// only that proves that the entry names the inode the server says.
     pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<(Attr, Vec<u8>), FsError> {
         let req = NameRequest {
             parent,
@@ -691,8 +697,8 @@ impl Remote {
         .into_result()
     }
 
-    /// Changes mode, size or times. Cutting a file short needs its last
-    /// chunk re-sealed first (see `Vault::setattr`).
+    /// Changes mode, size, or times. To make a file shorter, the client
+    /// must first seal its new last chunk again (see `Vault::setattr`).
     pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
         let req = SetAttrRequest::new(ino, changes);
         self.call(
@@ -714,8 +720,8 @@ impl Remote {
         }
     }
 
-    /// `name` is the tag, and `new` the reserved inode, its key record and
-    /// its sealed name (see `vault`).
+    /// `name` is the tag, and `new` holds the reserved inode, its key
+    /// record, and its sealed name (see `vault`).
     pub async fn mkdir(
         &self,
         parent: u64,
@@ -732,7 +738,7 @@ impl Remote {
         .into_result()
     }
 
-    /// As `mkdir`, for a file.
+    /// Same as `mkdir`, for a file.
     pub async fn create(
         &self,
         parent: u64,
@@ -749,7 +755,7 @@ impl Remote {
         .into_result()
     }
 
-    /// Removes a file, returning the inode it was.
+    /// Removes a file and returns its inode.
     pub async fn unlink(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let req = NameRequest {
             parent,
@@ -764,9 +770,9 @@ impl Remote {
         .into_result()
     }
 
-    /// Moves a name, returning the inode it replaced, if any. `sealed`:
-    /// the moved inode, its new name sealed, and on a move to another
-    /// directory its key record re-wrapped (see `SealedMove`).
+    /// Moves a name and returns the inode it replaced, if any. `sealed` has
+    /// the moved inode, its new name sealed, and, for a move to another
+    /// directory, its key record wrapped again (see `SealedMove`).
     pub async fn rename(
         &self,
         parent: u64,
@@ -796,7 +802,7 @@ impl Remote {
         Ok((replaced != 0).then_some(replaced))
     }
 
-    /// Removes an empty directory, returning the inode it was.
+    /// Removes an empty directory and returns its inode.
     pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<u64, FsError> {
         let req = NameRequest {
             parent,
@@ -811,8 +817,8 @@ impl Remote {
         .into_result()
     }
 
-    /// An inode number reserved for this account's next create. Resending
-    /// only reserves another, which nothing then uses.
+    /// An inode number reserved for this account's next create. A resend
+    /// only reserves another number, which nothing uses.
     pub async fn allocate_inode(&self) -> Result<u64, FsError> {
         self.call(Retry::Idempotent, |mut c| async move {
             c.allocate_inode(NoArgs {}).await
@@ -821,7 +827,7 @@ impl Remote {
         .into_result()
     }
 
-    /// This account's grant over `ino`, and the key records from the
+    /// This account's grant above `ino`, and the key records from the
     /// granted directory down to it.
     pub async fn key_path(&self, ino: u64) -> Result<KeyPath, FsError> {
         let req = InodeRequest {
@@ -849,7 +855,7 @@ impl Remote {
         .into_result()
     }
 
-    /// Every snapshot there is, oldest first.
+    /// Every snapshot, oldest first.
     pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>, FsError> {
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_snapshots(NoArgs {}).await
@@ -871,11 +877,11 @@ impl Remote {
         .into_result()
     }
 
-    /// Grants `grant.ino` to `user`, with the node's grantee list as it
-    /// leaves it, sealed under its key, replacing the one at
-    /// `expected_grantees_seq` (`EAGAIN` if it changed meanwhile). A
-    /// resend of one that landed is refused so, for the list it changed --
-    /// which the caller then reads again, finding the grant there.
+    /// Grants `grant.ino` to `user`, with the node's new grantee list
+    /// sealed under its key. It replaces the list at
+    /// `expected_grantees_seq` (`EAGAIN` if that changed in the meantime).
+    /// A resend after the grant was stored gets `EAGAIN` for the same
+    /// reason. The caller then reads again and finds the grant there.
     pub async fn grant(
         &self,
         user: &str,
@@ -936,10 +942,10 @@ impl Remote {
         .into_result()
     }
 
-    /// Up to a batch's worth of `ino`'s sealed chunks from `first` on,
-    /// and its attributes. May return fewer than `count`. `known_seqs[i]`,
-    /// if not 0, is the seq chunk `first + i` is cached at here: still at
-    /// it, it comes back `unchanged`, without its bytes.
+    /// Reads up to one batch of `ino`'s sealed chunks from `first`, and its
+    /// attributes. Can return fewer than `count`. `known_seqs[i]`, if not
+    /// 0, is the seq that chunk `first + i` is cached at here. A chunk
+    /// still at that seq comes back `unchanged`, without its bytes.
     pub async fn read_chunks(
         &self,
         ino: u64,
@@ -967,11 +973,11 @@ impl Remote {
         Ok(read)
     }
 
-    /// Stores sealed chunks of `ino`, if each is as its `expected_seq`
-    /// says, and grows the file to `end`; returns its attributes and the
-    /// seq the chunks are now at. Resent after any failure but a timeout
-    /// (see the module doc): every chunk is replaced whole, or guarded by
-    /// its seq, so a resend of one that landed changes nothing more.
+    /// Stores sealed chunks of `ino` if each one is at its `expected_seq`,
+    /// and grows the file to `end`. Returns its attributes and the chunks'
+    /// new seq. Sent again after any failure except a timeout (see the
+    /// module doc): every chunk is replaced whole or guarded by its seq, so
+    /// a resend after it was stored changes nothing more.
     pub async fn write_chunks(
         &self,
         ino: u64,
@@ -991,8 +997,8 @@ impl Remote {
         .into_result()
     }
 
-    /// Names and upload URLs for new blocks of `ino`, one per block in
-    /// `blocks`. Resending only mints names nothing uses, which garbage
+    /// Names and upload URLs for new blocks of `ino`, one for each block in
+    /// `blocks`. A resend only mints names that nothing uses, which garbage
     /// collection removes.
     pub async fn prepare_uploads(
         &self,
@@ -1011,7 +1017,7 @@ impl Remote {
         .into_result()
     }
 
-    /// Every node at or under `top` that is granted to anyone.
+    /// Every node at or below `top` that is granted to anyone.
     pub async fn grants_under(&self, top: u64) -> Result<Vec<GrantedNode>, FsError> {
         let req = InodeRequest {
             ino: top,
@@ -1025,9 +1031,9 @@ impl Remote {
         .into_result()
     }
 
-    /// Gives nodes new keys (see `FsCore::rotate`). A resend of one that
-    /// landed finds the versions moved on and answers `EAGAIN`, which the
-    /// caller already handles by looking again.
+    /// Gives nodes new keys (see `FsCore::rotate`). A resend after it was
+    /// stored finds new versions and gets `EAGAIN`, which the caller
+    /// already handles by checking again.
     pub async fn rotate(&self, rotations: Vec<Rotation>) -> Result<(), FsError> {
         let req = RotateRequest {
             rotations: rotations.into_iter().map(Into::into).collect(),
@@ -1041,9 +1047,9 @@ impl Remote {
     }
 
     /// Seals chunks of `ino` again under its current key version (see
-    /// `FsCore::reseal_chunks`). Each is guarded by its seq, so a resend
-    /// of one that landed is refused with `EAGAIN`, and the caller reads
-    /// again -- finding them already done.
+    /// `FsCore::reseal_chunks`). Each chunk is guarded by its seq, so a
+    /// resend after it was stored gets `EAGAIN`. The caller then reads
+    /// again and finds the work done.
     pub async fn reseal_chunks(&self, ino: u64, chunks: &[ChunkWrite]) -> Result<(), FsError> {
         let req = ResealChunksRequest {
             ino,
@@ -1057,8 +1063,8 @@ impl Remote {
         .into_result()
     }
 
-    /// Seals entry names of `dir` again under its current key version
-    /// (see `FsCore::reseal_names`). Storing the same names twice changes
+    /// Seals entry names of `dir` again under its current key version (see
+    /// `FsCore::reseal_names`). Storing the same names twice changes
     /// nothing more.
     pub async fn reseal_names(&self, dir: u64, names: &[ResealedName]) -> Result<(), FsError> {
         let req = ResealNamesRequest {
@@ -1073,9 +1079,8 @@ impl Remote {
         .into_result()
     }
 
-    /// Cuts `ino`'s key history short (see `FsCore::prune_keys`). A
-    /// resend of one that landed finds the record already cut, and does
-    /// nothing.
+    /// Cuts `ino`'s key history short (see `FsCore::prune_keys`). A resend
+    /// after it was stored finds the record already cut, and does nothing.
     pub async fn prune_keys(
         &self,
         ino: u64,

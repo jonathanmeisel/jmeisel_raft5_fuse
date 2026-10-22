@@ -1,13 +1,14 @@
-//! Working through the prune queue (`prune_queue`): in a mount's
-//! background, unhurried, or all at once in the foreground
-//! (`raft5fs prune`).
+//! Works through the prune queue (`prune_queue`): slowly in a mount's
+//! background, or all at once in the foreground (`raft5fs prune`).
 //!
-//! Each entry is a directory to prune whole (`Vault::prune_tree`). It
-//! leaves the queue only once a prune of it skips nothing; one that does
-//! is tried again later -- in the background, after a wait that grows each
-//! time. Pruning was made to run beside writes (the server refuses a cut
-//! that would lose anything, and the walk comes back to it), so a mount
-//! pruning in the background needs nothing more than its own vault.
+//! - Each entry is a directory to prune completely (`Vault::prune_tree`).
+//! - An entry leaves the queue only after a prune of it skips nothing. If a
+//!   prune skips something, the entry is tried again later. In the
+//!   background, the wait gets longer each time.
+//!
+//! Pruning can run at the same time as writes: the server refuses a cut
+//! that would lose data, and the walk comes back to it. So a mount that
+//! prunes in the background needs only its own vault.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -18,16 +19,16 @@ use tokio::task::JoinHandle;
 use crate::prune_queue::PruneQueue;
 use crate::vault::{PruneStats, Vault};
 
-/// How a background pruner paces itself.
+/// How fast a background pruner works.
 #[derive(Debug, Clone, Copy)]
 pub struct PrunerConfig {
-    /// How often an empty queue is looked at again.
+    /// How often to check an empty queue again.
     pub poll: Duration,
-    /// The wait after each node pruned, leaving the store to the mount's
-    /// own reads and writes.
+    /// The wait after each pruned node, so the mount's own reads and writes
+    /// can use the store.
     pub pace: Duration,
-    /// The first wait before trying again an entry whose prune skipped
-    /// something; it doubles each time, up to `max_backoff`.
+    /// The first wait before an entry whose prune skipped something is
+    /// tried again. It doubles each time, up to `max_backoff`.
     pub backoff: Duration,
     pub max_backoff: Duration,
 }
@@ -43,7 +44,7 @@ impl Default for PrunerConfig {
     }
 }
 
-/// One line on how a prune went, or is going.
+/// One line about how a prune went, or is going.
 pub fn describe(stats: &PruneStats) -> String {
     let mut line = format!(
         "{} nodes; re-sealed {} chunks and {} names; rotated {} stale children; \
@@ -59,9 +60,9 @@ pub fn describe(stats: &PruneStats) -> String {
     line
 }
 
-/// Prunes queued entry `ino` -- recording how it goes as its status, at
-/// most once a second -- and takes it off the queue if nothing was
-/// skipped. Returns what the prune did.
+/// Prunes queued entry `ino`, and records its progress as its status, at
+/// most once a second. Removes it from the queue if nothing was skipped.
+/// Returns what the prune did.
 pub async fn prune_entry(
     vault: &Vault,
     queue: &PruneQueue,
@@ -89,10 +90,10 @@ pub async fn prune_entry(
     stats
 }
 
-/// Starts working through `queue` in the background, on `rt`, with
-/// `vault` (best its own, not the one the mount serves requests with:
-/// a prune drops the keys it holds often). Runs until aborted; whatever is
-/// left stays queued.
+/// Starts to work through `queue` in the background, on `rt`, with `vault`.
+/// Best give it its own vault, not the one that serves the mount's
+/// requests, because a prune often drops the keys it holds. Runs until
+/// aborted. Anything left stays in the queue.
 pub fn spawn(rt: &Handle, vault: Vault, queue: PruneQueue, config: PrunerConfig) -> JoinHandle<()> {
     rt.spawn(async move {
         let mut retry: HashMap<u64, (Instant, Duration)> = HashMap::new();

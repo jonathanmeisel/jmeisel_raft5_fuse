@@ -1,5 +1,5 @@
-//! The client/server protocol, and the plain types shared by core, the
-//! server and the client.
+//! The client/server protocol, and the plain types that core, the server,
+//! and the client share.
 
 pub mod convert;
 pub mod errno;

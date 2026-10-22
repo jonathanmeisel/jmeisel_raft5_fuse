@@ -1,4 +1,5 @@
-//! `S3Store` and the `http` helpers against the signature-checking fake.
+//! Tests `S3Store` and the `http` helpers against the fake store, which
+//! checks signatures.
 
 use std::time::{Duration, SystemTime};
 
@@ -48,7 +49,7 @@ async fn upload_then_read_ranges() {
             .unwrap()
             .is_empty()
     );
-    // Past the end: the store can't give what was asked for.
+    // A range past the end: the store cannot return what was asked for.
     assert!(http::get_range(&client, &get, 9_000..10_001).await.is_err());
     assert!(
         http::get_range(&client, &get, 20_000..20_001)
@@ -90,7 +91,7 @@ async fn an_upload_without_the_signed_condition_is_refused() {
     let (fake, store, client) = setup().await;
     let n = name(7);
     let url = store.presign_put(&n, 3, TTL);
-    // Not through `http::put`, which always sends If-None-Match.
+    // Do not use `http::put`, which always sends If-None-Match.
     let response = client.put(&url).body(b"abc".to_vec()).send().await.unwrap();
     assert_eq!(response.status(), 403);
     assert!(fake.keys().is_empty());
@@ -106,8 +107,8 @@ async fn urls_expire() {
         http::put(&client, &put, b"abc".to_vec()).await,
         Err(Error::Status { status: 403, .. })
     ));
-    // The store's clock is now 61 s ahead of ours, so a URL signed now
-    // has to outlast that gap.
+    // The store's clock is now 61 s ahead of ours, so a URL signed now must
+    // stay valid for longer than that.
     let put = store.presign_put(&n, 3, Duration::from_secs(600));
     http::put(&client, &put, b"abc".to_vec()).await.unwrap();
 
@@ -190,7 +191,7 @@ async fn deleting_is_by_name_and_repeatable() {
     let mut left = vec!["fs/not-one-of-ours".to_string(), names[2].key(PREFIX)];
     left.sort();
     assert_eq!(fake.keys(), left);
-    // Already gone: still fine.
+    // Deleting objects that are already gone still succeeds.
     store.delete(&names[..2]).await.unwrap();
     store.delete(&[]).await.unwrap();
     assert_eq!(fake.stats().deleted, 2);

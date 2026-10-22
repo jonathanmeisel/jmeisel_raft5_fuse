@@ -1,11 +1,11 @@
-//! The session as a `dav_server` filesystem: paths resolved through the
-//! session (see `raft5fs_client::paths`), and everything else exactly what
-//! a mount does, by inode.
+//! The session as a `dav_server` filesystem. Paths are resolved through the
+//! session (see `raft5fs_client::paths`), and everything else works by
+//! inode, as a mount does.
 //!
-//! Each call runs in a task of its own. hyper drops a request's future
-//! when its client goes away, and a session future dropped halfway can
-//! leave a write buffer's commit half done (see `Session`); a task runs
-//! on to the end whoever is still waiting for it.
+//! Each call runs in its own task. hyper drops a request's future when its
+//! client goes away, and a session future dropped half way can leave a
+//! write buffer's commit half done (see `Session`). A task runs to the end,
+//! whether or not anyone still waits for it.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -24,14 +24,14 @@ use futures_util::{FutureExt, StreamExt, stream};
 use raft5fs_client::session::Session;
 use raft5fs_proto::types::{Attr, FsError, Kind, SetAttr, SetTime};
 
-/// What new files and directories are made with.
+/// The mode for new files and directories.
 const FILE_PERM: u16 = 0o644;
 const DIR_PERM: u16 = 0o755;
 
-/// How many entries' attributes a listing asks for at once.
+/// How many entries' attributes a listing asks for at the same time.
 const LISTING_CONCURRENCY: usize = 16;
 
-/// What `e` is to a WebDAV client: `dav_server` makes a status of it.
+/// Converts `e` for a WebDAV client: `dav_server` makes a status from it.
 fn dav_err(e: FsError) -> DavError {
     match e.errno {
         libc::ENOENT => DavError::NotFound,
@@ -51,7 +51,7 @@ fn dav_err(e: FsError) -> DavError {
     }
 }
 
-/// Runs `fut` to the end in a task of its own (see the module's comment).
+/// Runs `fut` to the end in its own task (see the module doc).
 async fn run<T: Send + 'static>(
     fut: impl Future<Output = Result<T, FsError>> + Send + 'static,
 ) -> FsResult<T> {
@@ -64,8 +64,8 @@ async fn run<T: Send + 'static>(
     }
 }
 
-/// The session as `dav_server` wants a filesystem: cheap to clone, one
-/// per handler.
+/// The session in the form `dav_server` wants for a filesystem: cheap to
+/// clone, one for each handler.
 #[derive(Clone)]
 pub struct DavFs {
     session: Arc<Session>,
@@ -76,7 +76,8 @@ impl DavFs {
         Self { session }
     }
 
-    /// Runs `op` with the session and `path`'s bytes, owned, in a task.
+    /// Runs `op` in a task, with the session and an owned copy of `path`'s
+    /// bytes.
     fn with_path<'a, T, F, Fut>(&self, path: &DavPath, op: F) -> FsFuture<'a, T>
     where
         T: Send + 'static,
@@ -88,7 +89,7 @@ impl DavFs {
     }
 }
 
-/// An inode's attributes, as `dav_server` asks for them.
+/// An inode's attributes, in the form that `dav_server` asks for.
 #[derive(Debug, Clone)]
 struct Meta(Attr);
 
@@ -117,8 +118,9 @@ impl DavMetaData for Meta {
         Ok(self.0.perm & 0o100 != 0)
     }
 
-    /// The inode too, unlike `dav_server`'s own: a file replaced by one
-    /// of the same size within a microsecond is still a different file.
+    /// Includes the inode, unlike `dav_server`'s own etag: a file replaced
+    /// by another of the same size within a microsecond is still a
+    /// different file.
     fn etag(&self) -> Option<String> {
         let at = self.0.mtime.duration_since(UNIX_EPOCH).ok()?;
         Some(format!(
@@ -146,7 +148,7 @@ impl DavDirEntry for Entry {
     }
 }
 
-/// The access an open with `options` asks for, as an access(2) mask.
+/// The access that an open with `options` asks for, as an access(2) mask.
 fn open_mask(options: &OpenOptions) -> u32 {
     let mut mask = 0;
     if options.read {
@@ -158,8 +160,8 @@ fn open_mask(options: &OpenOptions) -> u32 {
     mask as u32
 }
 
-/// The file `path` names, opened as `options` says: made if it isn't
-/// there and they say to, and emptied if they say that.
+/// Opens the file that `path` names, as `options` says: makes it if it is
+/// missing and the options say to, and empties it if they say to.
 async fn open(
     session: Arc<Session>,
     path: Vec<u8>,
@@ -175,7 +177,8 @@ async fn open(
             Err(e) if e.errno == libc::ENOENT && (options.create || options.create_new) => {
                 let (parent, name) = session.resolve_parent(&path).await?;
                 match session.create(parent, &name, FILE_PERM).await {
-                    // Made by someone else meanwhile: open theirs.
+                    // Another client made it in the meantime: open their
+                    // file.
                     Err(e) if e.errno == libc::EEXIST && !options.create_new => continue,
                     created => break created?,
                 }
@@ -200,8 +203,8 @@ async fn open(
     })
 }
 
-/// A directory's entries, `.` and `..` left out, each with its attributes
-/// -- asked for a few at a time, rather than one round trip after another.
+/// A directory's entries without `.` and `..`, each with its attributes. It
+/// asks for a few at a time, not one round trip after another.
 async fn list(session: Arc<Session>, path: Vec<u8>) -> Result<Vec<Entry>, FsError> {
     let dir = session.resolve(&path).await?;
     if dir.kind != Kind::Directory {
@@ -227,7 +230,7 @@ async fn list(session: Arc<Session>, path: Vec<u8>) -> Result<Vec<Entry>, FsErro
                 name: name.into_encoded_bytes(),
                 meta: Meta(attr),
             }),
-            // Gone since the listing: as if it had been gone before.
+            // Removed after the listing: treat it as if it was gone before.
             Err(e) if e.errno == libc::ENOENT => {}
             Err(e) => return Err(e),
         }
@@ -298,7 +301,7 @@ impl DavFileSystem for DavFs {
         })
     }
 
-    /// In the root, a new volume.
+    /// Makes a directory, or in the root, a new volume.
     fn create_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
         self.with_path(path, |session, path| async move {
             let (parent, name) = session.resolve_parent(&path).await?;
@@ -320,8 +323,8 @@ impl DavFileSystem for DavFs {
         })
     }
 
-    /// `dav_server` has already removed what `to` named, if the request
-    /// said to overwrite it, and refused the request if not.
+    /// `dav_server` already removed what `to` named if the request said to
+    /// overwrite it, and refused the request if not.
     fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         let to = to.as_bytes().to_vec();
         self.with_path(from, move |session, from| async move {
@@ -332,7 +335,7 @@ impl DavFileSystem for DavFs {
         })
     }
 
-    /// A file only: `dav_server` copies a directory itself, making each
+    /// Files only: `dav_server` copies a directory itself, by making each
     /// directory and copying each file in it.
     fn copy<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
         let to = to.as_bytes().to_vec();
@@ -353,7 +356,7 @@ impl DavFileSystem for DavFs {
         self.with_path(path, move |session, path| set_time(session, path, at, true))
     }
 
-    /// Used and available, as `dav_server` reports them.
+    /// Bytes used and available, as `dav_server` reports them.
     fn get_quota(&self) -> FsFuture<'_, (u64, Option<u64>)> {
         let stats = self.session.statfs();
         let used = stats.total_bytes - stats.free_bytes;
@@ -361,14 +364,14 @@ impl DavFileSystem for DavFs {
     }
 }
 
-/// An open file: an inode and a position in it. Nothing is held open
-/// with the servers -- each read and write goes by inode, as a mount's do.
+/// An open file: an inode and a position in it. Nothing stays open on the
+/// servers: each read and write goes by inode, as a mount's do.
 struct Handle {
     session: Arc<Session>,
     ino: u64,
     pos: u64,
-    /// Whether anything was written through this handle, for dropping it
-    /// to release what is buffered.
+    /// Whether anything was written through this handle, so dropping it
+    /// releases what is buffered.
     wrote: bool,
 }
 
@@ -451,8 +454,8 @@ impl DavFile for Handle {
         })
     }
 
-    /// Stores everything written, and reports it if any of it was lost:
-    /// a PUT answers only once its body is stored.
+    /// Stores everything written, and reports an error if any of it was
+    /// lost. A PUT answers only after its body is stored.
     fn flush(&mut self) -> FsFuture<'_, ()> {
         let session = Arc::clone(&self.session);
         let ino = self.ino;
@@ -461,8 +464,8 @@ impl DavFile for Handle {
 }
 
 impl Drop for Handle {
-    /// The last of the file's users through here is done with it: what it
-    /// left buffered is stored, and the buffer forgotten.
+    /// The file's last user through this handle is done with it: store what
+    /// it left buffered, and forget the buffer.
     fn drop(&mut self) {
         if !self.wrote {
             return;

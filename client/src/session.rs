@@ -1,17 +1,20 @@
-//! The filesystem as a front end serves it: everything a FUSE mount and a
-//! WebDAV server have in common, by inode, async, with errors as errnos.
-//! All store logic lives behind the servers, and sealing and opening in
-//! the vault (see `vault`); what is here is what belongs to a client --
-//! the write buffers, the auto-flush timer, the virtual root, and which
-//! changes the virtual root and `/.snapshot` refuse.
+//! The filesystem as a front end serves it: everything that a FUSE mount
+//! and a WebDAV server share. It works by inode, is async, and returns
+//! errors as errnos.
 //!
-//! `/.snapshot`, which the root doesn't list, holds the filesystem's
-//! snapshots, read-only (see `snapshot_tree`).
+//! All store logic is behind the servers, and sealing and opening are in
+//! the vault (see `vault`). This module has what belongs only to a client:
 //!
-//! Every future here must be driven to completion: one dropped halfway
-//! can leave a write buffer's commit half done, with nowhere for its error
-//! to go. A front end that may drop them -- hyper does, when a client goes
-//! away mid-request -- runs them in tasks of their own.
+//! - the write buffers and the auto-flush timer;
+//! - the virtual root, and which changes the virtual root and `/.snapshot`
+//!   refuse;
+//! - `/.snapshot`, which the root does not list, with the filesystem's
+//!   snapshots, read-only (see `snapshot_tree`).
+//!
+//! Every future here must run to completion. A future dropped half way can
+//! leave a write buffer's commit half done, with no place to report its
+//! error. A front end that can drop futures (hyper does, when a client goes
+//! away during a request) must run them in their own tasks.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -31,40 +34,40 @@ use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
 
-/// How long buffered bytes may sit unstored when nothing else flushes
-/// them. A writer that stops short of a full batch, and neither closes nor
-/// syncs, would otherwise leave them in memory indefinitely.
+/// How long buffered bytes can wait, not stored, when nothing else flushes
+/// them. Without this, a writer that stops before a full batch, and does
+/// not close or sync, would leave them in memory with no time limit.
 const AUTO_FLUSH_DELAY: Duration = Duration::from_millis(500);
 
-/// What `statfs` reports as the filesystem's size, and all of it free:
-/// there are no quotas, and nothing to measure the store against.
+/// The filesystem size that `statfs` reports, all of it free: there are no
+/// quotas, and nothing to measure the store against.
 const REPORTED_BYTES: u64 = 1 << 50;
 
-/// The longest name `statfs` reports a directory entry may have.
+/// The longest directory entry name that `statfs` reports.
 const NAME_MAX: u32 = 255;
 
 /// How to open a session.
 pub struct SessionConfig {
-    /// Servers to use, `https://host:port`; any of them will do.
+    /// Servers to use, as `https://host:port`. Any of them will do.
     pub servers: Vec<String>,
-    /// Who the session logs in as.
+    /// The user that the session logs in as.
     pub credentials: Credentials,
-    /// How to reach the servers over TLS; `None` for plaintext.
+    /// How to connect to the servers over TLS. `None` for plaintext.
     pub tls: Option<ClientTlsConfig>,
     /// How much decrypted file data to cache.
     pub cache_bytes: usize,
-    /// Where public keys are pinned -- whose pins also decide which grants
-    /// the session trusts enough to write under -- or in memory only.
+    /// Where public keys are pinned, or `None` for memory only. The pins
+    /// also decide which grants the session trusts enough to write under.
     pub known_keys: Option<KnownKeys>,
     /// The prune queue to work through in the background while the session
     /// is open, and how (see `pruner`).
     pub prune_queue: Option<(PruneQueue, PrunerConfig)>,
-    /// Whether small sequential writes are buffered into batches.
+    /// Whether to buffer small sequential writes into batches.
     pub write_buffering: bool,
-    /// Whether to refuse creating the files macOS keeps its metadata in
-    /// (`._*` and `.DS_Store`) where there are no extended attributes to
-    /// keep it in instead: each would otherwise be one more node sealed and
-    /// stored next to every file its user so much as looks at.
+    /// Whether to refuse to create the files where macOS keeps its metadata
+    /// (`._*` and `.DS_Store`) when there are no extended attributes for
+    /// it. Otherwise each one is one more node sealed and stored next to
+    /// every file that its user only looks at.
     pub hide_apple_double: bool,
 }
 
@@ -93,8 +96,8 @@ pub struct FsStats {
 type Slot = Arc<tokio::sync::Mutex<WriteBuf>>;
 
 /// What a committed run means for its caller: success, or the error to
-/// report. A short write counts as failure here -- a buffered run is
-/// either stored or not, from the point of view of whoever is waiting.
+/// report. A short write counts as a failure here: for the caller that
+/// waits on it, a buffered run is stored or not.
 fn commit_result(ino: u64, start: u64, result: Result<Attr, WriteError>) -> Result<(), FsError> {
     result.map(|_| ()).map_err(|e| {
         eprintln!("write to inode {ino} at offset {start} failed: {}", e.error);
@@ -102,9 +105,9 @@ fn commit_result(ino: u64, start: u64, result: Result<Attr, WriteError>) -> Resu
     })
 }
 
-/// The result of an unbuffered write of `total` bytes: all of them, a
-/// short count if some batches landed before a failure, or the error if
-/// none did.
+/// The result of an unbuffered write of `total` bytes: all of them, a short
+/// count if some batches were stored before a failure, or the error if none
+/// were.
 fn direct_write_result(result: Result<Attr, WriteError>, total: usize) -> Result<usize, FsError> {
     match result {
         Ok(_) => Ok(total),
@@ -113,7 +116,7 @@ fn direct_write_result(result: Result<Attr, WriteError>, total: usize) -> Result
     }
 }
 
-/// Whether `name` is one of the files macOS keeps metadata in.
+/// Whether `name` is one of the files where macOS keeps metadata.
 fn is_apple_double(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
     name.starts_with(b"._") || name == b".DS_Store"
@@ -121,27 +124,27 @@ fn is_apple_double(name: &OsStr) -> bool {
 
 pub struct Session {
     vault: Arc<Vault>,
-    /// The task working through the prune queue, if there is one.
+    /// The task that works through the prune queue, if there is one.
     pruner: Mutex<Option<JoinHandle<()>>>,
     /// The virtual root's timestamps: when the session was opened.
     opened_at: SystemTime,
-    /// Per-inode buffers of accepted-but-unstored writes. The map lock is
-    /// only held to find or insert a slot, never across an `.await`; the
-    /// slot's own lock is what serializes a file's writes and flushes, and
-    /// is held across the commit's round trip.
+    /// Buffers of writes that were accepted but not stored, one for each
+    /// inode. The map lock is only held to find or insert a slot, never
+    /// across an `.await`. The slot's own lock puts a file's writes and
+    /// flushes in order, and is held across the commit's round trip.
     write_bufs: Mutex<HashMap<u64, Slot>>,
     write_buffering: bool,
     hide_apple_double: bool,
-    /// `/.snapshot` and everything under it.
+    /// `/.snapshot` and everything below it.
     snapshots: SnapshotTree,
-    /// Names resolved by path, for front ends that work by path.
+    /// Names resolved by path, for front ends that use paths.
     pub(crate) dentries: Dentries,
 }
 
 impl Session {
-    /// Connects to the servers, logs in and opens the account's keys. With
-    /// no server reachable there is no filesystem to serve, and no chunk
-    /// size to buffer writes against.
+    /// Connects to the servers, logs in, and opens the account's keys.
+    /// Fails if no server is reachable: then there is no filesystem to
+    /// serve, and no chunk size to buffer writes against.
     pub async fn open(config: SessionConfig) -> Result<Arc<Self>, FsError> {
         let remote = Remote::connect(&config.servers, config.credentials, config.tls)
             .await
@@ -196,7 +199,7 @@ impl Session {
     }
 
     /// The virtual root's attributes: a directory, as the root of a local
-    /// filesystem would seem to whoever opened the session.
+    /// filesystem would look to the user who opened the session.
     pub fn root_attr(&self) -> Attr {
         Attr {
             ino: VIRTUAL_ROOT,
@@ -224,17 +227,17 @@ impl Session {
         self.write_bufs.lock().unwrap().get(&ino).cloned()
     }
 
-    /// Commits whatever `buf` holds, holding its lock for the round trip,
-    /// so that at most one commit of a file is ever in flight.
+    /// Commits what `buf` holds, and holds its lock for the round trip, so
+    /// at most one commit of a file is in progress.
     ///
-    /// The bytes in a buffer were already reported written to the `write`
-    /// calls that put them there, so a failed commit loses data those
-    /// callers believe is safe. Returning the error only tells whoever
-    /// happened to trigger the commit; it is also stashed in `buf.err`,
-    /// where every later `write`, `flush` (and so `close`) and `fsync`
-    /// reports it until `fsync` or the last close takes it -- the same
-    /// promise the kernel makes for writeback errors. Without this, a later
-    /// commit succeeding would let `fsync` report success over the gap.
+    /// The `write` calls that put bytes in a buffer already reported them
+    /// as written. So a failed commit loses data that those callers think
+    /// is safe. The returned error only tells the caller that triggered the
+    /// commit. So the error is also stored in `buf.err`, and every later
+    /// `write`, `flush` (and so `close`), and `fsync` reports it until
+    /// `fsync` or the last close takes it. The kernel makes the same
+    /// promise for writeback errors. Without this, a later successful
+    /// commit would let `fsync` report success over the lost data.
     async fn commit_buf(&self, buf: &mut WriteBuf) -> Result<(), FsError> {
         let Some((start, data)) = buf.take() else {
             return Ok(());
@@ -250,18 +253,20 @@ impl Session {
         committed
     }
 
-    /// Arranges for `ino`'s buffer to be committed within `AUTO_FLUSH_DELAY`
-    /// even if nothing else asks for it, so a writer that stops short of a
-    /// full batch and neither closes nor syncs does not leave its bytes in
-    /// memory indefinitely. Called when a buffer goes from empty to
-    /// holding something.
+    /// Makes sure that `ino`'s buffer is committed within
+    /// `AUTO_FLUSH_DELAY`, even if nothing else asks for it. So a writer
+    /// that stops before a full batch, and does not close or sync, does not
+    /// leave its bytes in memory with no time limit. Called when a buffer
+    /// goes from empty to not empty.
     ///
-    /// One-shot, and nothing cancels it: if the buffer is flushed by any
-    /// other route first, the timer finds it empty and does nothing. If a
-    /// later run has started by then, flushing that one early is harmless
-    /// -- sooner is always safe -- and the timer it scheduled for itself
-    /// then finds nothing to do. `shutdown` drains every buffer before the
-    /// session ends, so correctness never rests on this firing.
+    /// - It runs one time, and nothing cancels it. If something else
+    ///   flushes the buffer first, the timer finds it empty and does
+    ///   nothing.
+    /// - If a later run has started by then, flushing it early does no harm
+    ///   (sooner is always safe), and that run's own timer then finds
+    ///   nothing to do.
+    /// - `shutdown` empties every buffer before the session ends, so
+    ///   correctness never depends on this timer.
     fn schedule_auto_flush(&self, slot: Slot) {
         let vault = Arc::clone(&self.vault);
         tokio::spawn(async move {
@@ -272,28 +277,28 @@ impl Session {
             };
             let stored = vault.write(buf.ino, start, &data).await;
             if let Err(e) = commit_result(buf.ino, start, stored) {
-                // No one is synchronously waiting on this commit, so the
-                // failure has nowhere to go but back into the buffer, for
-                // the next flush/fsync/write to report.
+                // No caller waits on this commit, so the only place for the
+                // failure is back in the buffer, for the next flush, fsync,
+                // or write to report.
                 buf.err.get_or_insert(e);
             }
         });
     }
 
-    /// Commits `ino`'s buffered writes, if any. Called before anything
-    /// that must observe them: reads, attribute queries, truncation -- and
-    /// on every `close()`, which is what lets a failure reach the
-    /// application that wrote them. A stashed error (from an earlier failed
-    /// commit) is reported but left in place for `fsync` or `release` to
-    /// take, matching how a `read` surfaces a pending write failure without
-    /// being the thing that clears it.
+    /// Commits `ino`'s buffered writes, if any. Call it before anything
+    /// that must see them (reads, attribute queries, truncation), and on
+    /// every `close()`, so that a failure reaches the application that
+    /// wrote the bytes.
     ///
-    /// Not taking it matters for FUSE's FLUSH, which comes from *every*
-    /// close of *any* copy of a descriptor -- including the copies a forked
-    /// child inherits and closes on exec, which happens whenever some other
-    /// process on the machine forks. If this took the error, a stranger's
-    /// close could receive it and drop it, and the application's own
-    /// `fsync` would then report success over lost data.
+    /// It reports a stored error (from an earlier failed commit) but leaves
+    /// it in place for `fsync` or `release` to take, as a `read` reports a
+    /// pending write failure without clearing it. This matters for FUSE's
+    /// FLUSH, which comes from every close of every copy of a descriptor.
+    /// That includes the copies that a forked child inherits and closes on
+    /// exec, which happens whenever another process on the machine forks.
+    /// If this took the error, an unrelated process's close could get it
+    /// and drop it, and the application's own `fsync` would then report
+    /// success over lost data.
     pub async fn flush(&self, ino: u64) -> Result<(), FsError> {
         if let Some(slot) = self.existing_write_slot(ino) {
             let mut buf = slot.lock().await;
@@ -305,43 +310,42 @@ impl Session {
         Ok(())
     }
 
-    /// `flush`, but takes the error it reports.
+    /// Same as `flush`, but it also takes the error that it reports.
     pub async fn fsync(&self, ino: u64) -> Result<(), FsError> {
         let Some(slot) = self.existing_write_slot(ino) else {
             return Ok(());
         };
         let mut buf = slot.lock().await;
         let committed = self.commit_buf(&mut buf).await;
-        // Taken whether or not this commit failed: if it did, the error
-        // is stashed too, and this is the call that reports it.
+        // Take the error whether or not this commit failed. If it failed,
+        // its error is stored too, and this call reports it.
         match buf.err.take() {
             Some(e) => Err(e),
             None => committed,
         }
     }
 
-    /// The last user of `ino` is done with it, so this is where a pending
-    /// error is finally taken: no one is left to report it to.
+    /// The last user of `ino` is done with it, so take any pending error
+    /// here: there is no one left to report it to.
     pub async fn release(&self, ino: u64) -> Result<(), FsError> {
         let result = self.fsync(ino).await;
         self.prune_slot(ino);
         result
     }
 
-    /// Drops `ino`'s buffered writes because the file has been deleted.
-    ///
-    /// Not what keeps chunks from leaking -- the store's deletion mark
-    /// does that, for every client at once, and a buffer committed after
-    /// it just gets `ENOENT` back. This only spares that wasted commit and
-    /// the error it would leave stashed.
+    /// Drops `ino`'s buffered writes because the file was deleted. This
+    /// does not stop chunks from leaking: the store's deletion mark does
+    /// that for every client, and a buffer committed after it gets
+    /// `ENOENT`. This only saves that wasted commit and the error it would
+    /// store.
     async fn discard_ino(&self, ino: u64) {
         if let Some(slot) = self.existing_write_slot(ino) {
             slot.lock().await.discard();
         }
     }
 
-    /// Forgets `ino`'s slot once nothing is using it or waiting in it, so
-    /// the map doesn't grow with every file ever written.
+    /// Removes `ino`'s slot when nothing uses it or waits on it, so the map
+    /// does not grow with every file ever written.
     fn prune_slot(&self, ino: u64) {
         let mut bufs = self.write_bufs.lock().unwrap();
         if let Some(slot) = bufs.get(&ino)
@@ -354,15 +358,16 @@ impl Session {
         }
     }
 
-    /// Accepts `data` at `offset` into `ino`'s buffer, committing the run
-    /// when it fills a batch or stops being contiguous -- or, failing
-    /// both, when `AUTO_FLUSH_DELAY` has passed. A write already big
-    /// enough to fill a batch is committed directly, since there is
-    /// nothing left to coalesce it with.
+    /// Accepts `data` at `offset` into `ino`'s buffer.
     ///
-    /// Returns how many bytes were durably accepted: all of them on
-    /// success, or on a failed commit just the bytes from earlier in this
-    /// same call whose own commit (if any) already succeeded.
+    /// - Commits the run when it fills a batch or stops being contiguous,
+    ///   or else after `AUTO_FLUSH_DELAY`.
+    /// - Commits a write that already fills a batch directly, because there
+    ///   is nothing to join it with.
+    ///
+    /// Returns how many bytes were accepted for certain: all of them on
+    /// success. On a failed commit, only the bytes from earlier in this
+    /// call whose own commit (if any) already succeeded.
     async fn buffered_write(
         &self,
         ino: u64,
@@ -371,44 +376,44 @@ impl Session {
     ) -> Result<usize, FsError> {
         let slot = self.write_slot(ino);
         let mut buf = slot.lock().await;
-        // Reported, not taken: until `fsync` (or the last close) takes it,
-        // every write fails. Taking it here would let one write absorb a
-        // loss that earlier writes were told was safe -- often one the
-        // kernel issued on its own to finish a short write -- and then
-        // `fsync`, the call that promises durability and the one many
-        // programs actually check, would report success over it.
+        // Report the error but do not take it: every write fails until
+        // `fsync` (or the last close) takes it. If a write took it, that
+        // write would hide a loss that earlier writes were told was safe
+        // (often a write that the kernel sent itself to finish a short
+        // write). Then `fsync`, which promises durability and which many
+        // programs check, would report success over it.
         if let Some(e) = &buf.err {
             return Err(e.clone());
         }
 
-        // The run of the file stored together with `offset`: a batch, or
-        // past a hybrid file's grid start, a block.
+        // The part of the file stored together with `offset`: a batch, or a
+        // block after a hybrid file's grid start.
         let batch = self.vault.batch_at(ino, offset).await?;
         if data.len() as u64 >= batch.end - batch.start {
-            // Committed directly, so whatever was buffered ahead of it has
-            // to land first.
+            // This write is committed directly, so anything buffered before
+            // it must be stored first.
             self.commit_buf(&mut buf).await?;
             return direct_write_result(self.vault.write(ino, offset, data).await, data.len());
         }
 
-        // Only ever appended for iterations of this call whose own commit
-        // (if one was triggered) has already succeeded, so it is always
-        // safe to report as written.
+        // Only counts bytes from iterations of this call whose own commit
+        // (if any) already succeeded, so it is always safe to report them
+        // as written.
         let mut written = 0usize;
         while !data.is_empty() {
-            // Can only be true on this loop's first iteration: `offset` is
-            // otherwise always exactly what the previous iteration just
-            // appended, which `accepts` by construction.
+            // This can only be true on the loop's first iteration. After
+            // that, `offset` is always exactly what the previous iteration
+            // appended, which `accepts` allows by design.
             if !buf.accepts(offset)
                 && let Err(e) = self.commit_buf(&mut buf).await
             {
                 return if written > 0 { Ok(written) } else { Err(e) };
             }
-            // Stepping to the batch grid rather than the chunk grid is
-            // what lets a run span chunks, and keeps the batch it becomes
-            // aligned: a sequential writer then fills every chunk of its
-            // batch completely, so storing it reads nothing back -- and a
-            // block it fills is uploaded once.
+            // Step on the batch grid, not the chunk grid. This lets a run
+            // span chunks and keeps its batch aligned. A sequential writer
+            // then fills every chunk of its batch completely, so storing it
+            // reads nothing back, and a block that it fills is uploaded
+            // once.
             let batch = match self.vault.batch_at(ino, offset).await {
                 Ok(batch) => batch,
                 Err(e) => return if written > 0 { Ok(written) } else { Err(e) },
@@ -427,11 +432,12 @@ impl Session {
                 && let Err(e) = self.commit_buf(&mut buf).await
             {
                 // A batch that held only this call's bytes lost nothing
-                // anyone else was told about: this call reports it, as a
-                // short write or an error, so the stash would only make
-                // later writes and `fsync` fail spuriously. One that
-                // started earlier (`!idle`) held bytes previous calls were
-                // told are written, and keeps its stash.
+                // that another caller was told about. This call reports it,
+                // as a short write or an error, so storing the error would
+                // only make later writes and `fsync` fail for no reason. A
+                // batch that started earlier (`!idle`) held bytes that
+                // earlier calls were told are written, so it keeps its
+                // stored error.
                 if idle {
                     buf.err = None;
                 }
@@ -442,10 +448,10 @@ impl Session {
         Ok(written)
     }
 
-    /// Ends the session: nothing after this can store what is still
+    /// Ends the session. Nothing after this can store what is still
     /// buffered, so it is stored now.
     pub async fn shutdown(&self) {
-        // Whatever it was pruning stays queued, for next time.
+        // Anything it was pruning stays in the queue for next time.
         if let Some(pruner) = self.pruner.lock().unwrap().take() {
             pruner.abort();
         }
@@ -470,8 +476,8 @@ impl Session {
         } else {
             self.vault.lookup(parent, name).await?
         };
-        // Buffered writes can make the stored size stale; store them and
-        // look again so the caller learns the size it will see.
+        // Buffered writes can make the stored size stale. Store them and
+        // look again, so the caller gets the size it will see.
         if self.existing_write_slot(attr.ino).is_some() {
             self.flush(attr.ino).await?;
             attr = self.remote().getattr(attr.ino).await?;
@@ -497,14 +503,14 @@ impl Session {
         if ino == VIRTUAL_ROOT {
             return Err(FsError::errno(libc::EPERM));
         }
-        // Buffered bytes predate this change, so they have to be stored
-        // before it applies (a truncate must cut them, not be undone by
-        // them landing afterwards).
+        // Buffered bytes are older than this change, so they must be stored
+        // before it. A truncate must cut them, and not be undone when they
+        // are stored later.
         self.flush(ino).await?;
         self.vault.setattr(ino, changes).await
     }
 
-    /// A directory -- in the virtual root, a new volume.
+    /// Makes a directory, or in the virtual root, a new volume.
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         if is_snapshot_ino(parent) {
             return Err(read_only());
@@ -516,7 +522,7 @@ impl Session {
         }
     }
 
-    /// Removes an empty directory -- in the virtual root, a volume.
+    /// Removes an empty directory, or in the virtual root, a volume.
     pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<(), FsError> {
         if is_snapshot_ino(parent) || (parent == VIRTUAL_ROOT && is_snapshot_dir(name)) {
             return Err(read_only());
@@ -540,13 +546,13 @@ impl Session {
         let ino = self.vault.unlink(parent, name).await;
         self.dentries.forget(parent, name);
         // Anything still buffered for it can only fail now (the store
-        // refuses writes to a deleted inode); drop it rather than leave
-        // that failure stashed.
+        // refuses writes to a deleted inode). Drop it, so no failure is
+        // stored.
         self.discard_ino(ino?).await;
         Ok(())
     }
 
-    /// Moves `name` in `parent` to `new_name` in `new_parent`, replacing
+    /// Moves `name` in `parent` to `new_name` in `new_parent`, and replaces
     /// what is there unless `noreplace`.
     pub async fn rename(
         &self,
@@ -556,15 +562,15 @@ impl Session {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<(), FsError> {
-        // Out of a snapshot into the live filesystem, or the reverse, is a
-        // move between filesystems, which `mv` knows to do as a copy; within
-        // one, nothing moves.
+        // A move from a snapshot into the live filesystem, or the reverse,
+        // is a move between filesystems, which `mv` does as a copy. Inside
+        // a snapshot, nothing moves.
         match (is_snapshot_ino(parent), is_snapshot_ino(new_parent)) {
             (true, true) => return Err(read_only()),
             (true, false) | (false, true) => return Err(FsError::errno(libc::EXDEV)),
             (false, false) => {}
         }
-        // The virtual root's entries are grants, not names to move.
+        // The virtual root's entries are grants, not names that can move.
         if parent == VIRTUAL_ROOT || new_parent == VIRTUAL_ROOT {
             return Err(FsError::errno(libc::EPERM));
         }
@@ -574,7 +580,7 @@ impl Session {
             .await;
         self.dentries.forget(parent, name);
         self.dentries.forget(new_parent, new_name);
-        // As for `unlink`: what was buffered for a replaced file can only
+        // As for `unlink`: anything buffered for a replaced file can only
         // fail now.
         if let Some(ino) = renamed? {
             self.discard_ino(ino).await;
@@ -582,10 +588,10 @@ impl Session {
         Ok(())
     }
 
-    /// A new, empty file. It is open for both reading and writing whatever
-    /// its new mode says: writing a read-only file through the descriptor
-    /// that created it is ordinary (it is how `cp` copies one). Nothing
-    /// checks the mode anyway -- grants decide.
+    /// Makes a new, empty file. It is open for reading and writing whatever
+    /// its mode says: writing a read-only file through the descriptor that
+    /// created it is normal (it is how `cp` copies one). Nothing checks the
+    /// mode anyway, because grants decide.
     pub async fn create(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
         if is_snapshot_ino(parent) {
             return Err(read_only());
@@ -602,8 +608,8 @@ impl Session {
         self.vault.create(parent, name, perm).await
     }
 
-    /// access(2): whether the grant allows what `mask` asks. Anyone may
-    /// list the virtual root, and make volumes in it.
+    /// access(2): whether the grant allows what `mask` asks. Anyone can
+    /// list the virtual root and make volumes in it.
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
         if ino == VIRTUAL_ROOT {
             return Ok(());
@@ -615,8 +621,8 @@ impl Session {
         }
     }
 
-    /// Checks the grant allows opening file `ino` for `mask`, so an open
-    /// fails up front as it does locally. Reads and writes are checked
+    /// Checks that the grant allows opening file `ino` for `mask`, so an
+    /// open fails early, as it does locally. Reads and writes are checked
     /// again on their own, so nothing is kept open.
     pub async fn open_file(&self, ino: u64, mask: u32) -> Result<(), FsError> {
         if ino == VIRTUAL_ROOT {
@@ -641,8 +647,8 @@ impl Session {
     }
 
     /// Writes `data` at `offset`, buffered unless the session was opened
-    /// without: how many bytes were accepted, all of them unless a commit
-    /// failed partway.
+    /// without buffering. Returns how many bytes were accepted: all of them
+    /// unless a commit failed part way.
     pub async fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, FsError> {
         if is_snapshot_ino(ino) {
             return Err(read_only());
@@ -654,13 +660,13 @@ impl Session {
         }
     }
 
-    /// The run of `ino` stored together with `offset` (see
-    /// `Vault::batch_at`): the most a write there can store in one go.
+    /// The part of `ino` stored together with `offset` (see
+    /// `Vault::batch_at`): the most that a write there can store at once.
     pub async fn batch_at(&self, ino: u64, offset: u64) -> Result<std::ops::Range<u64>, FsError> {
         self.vault.batch_at(ino, offset).await
     }
 
-    /// A directory's entries, `.` and `..` included.
+    /// A directory's entries, including `.` and `..`.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         if is_snapshot_ino(ino) {
             return self.snapshots.readdir(&self.vault, VIRTUAL_ROOT, ino).await;
@@ -684,8 +690,8 @@ impl Session {
                 .collect());
         }
         let mut items = self.vault.readdir(ino).await?;
-        // A grant's `..` is the virtual root: what is really above it isn't
-        // this account's to see.
+        // A grant's `..` is the virtual root: what is really above it is
+        // not this account's to see.
         if self.vault.is_grant_root(ino) {
             for item in &mut items {
                 if item.name == ".." {
@@ -704,9 +710,9 @@ impl Session {
         }
     }
 
-    /// Copies file `src` to a new file `name` in `parent`, a batch at a
-    /// time, and stores it before returning its attributes. From a
-    /// snapshot into the live filesystem, it is how a file is restored.
+    /// Copies file `src` to a new file `name` in `parent`, one batch at a
+    /// time, and stores it before it returns its attributes. A copy from a
+    /// snapshot into the live filesystem is how a file is restored.
     pub async fn copy_file(&self, src: u64, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
         let from = self.getattr(src).await?;
         if from.kind != Kind::File {

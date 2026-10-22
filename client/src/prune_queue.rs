@@ -1,19 +1,22 @@
 //! The directories waiting to be pruned, kept on this machine for one
-//! account: what a revocation leaves (see `Vault::prune_tree`), for a
-//! mount to work through in the background, or `raft5fs prune` in the
-//! foreground, whichever gets there first.
+//! account. A revocation adds them (see `Vault::prune_tree`). A mount works
+//! through them in the background, or `raft5fs prune` does in the
+//! foreground, whichever comes first.
 //!
-//! Until a directory is pruned, what was written under it before the
-//! revocation is still sealed under keys whoever was revoked holds -- so
-//! the queue survives restarts, and an entry goes only once its prune has
-//! left nothing behind.
+//! Until a directory is pruned, data written below it before the revocation
+//! is still sealed under keys that the revoked user has. So the queue
+//! survives restarts, and an entry leaves only after its prune left nothing
+//! behind.
 //!
-//! Three files in one directory, readable by their owner alone:
-//! `queue` (`ino seconds-since-epoch note`, one a line: the note says what
-//! the directory was, for people), `status` (`ino what`,
-//! the last word on each entry), and `lock`, which every change to the
-//! other two holds -- a mount and a CLI may be at them at once. They
-//! reveal inode numbers, which the server knows anyway.
+//! It is three files in one directory, readable only by their owner:
+//!
+//! - `queue`: one line for each entry, `ino seconds-since-epoch note`. The
+//!   note says what the directory was, for people.
+//! - `status`: `ino what`, the latest status of each entry.
+//! - `lock`: every change to the other two files holds it, because a mount
+//!   and the CLI can change them at the same time.
+//!
+//! The files show inode numbers, which the server knows anyway.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -31,7 +34,7 @@ pub struct Queued {
     pub ino: u64,
     /// When it was queued, in seconds since the Unix epoch.
     pub since: u64,
-    /// What it was, for people: a path and why, say.
+    /// What it was, for people: for example, a path and a reason.
     pub note: String,
 }
 
@@ -39,7 +42,7 @@ pub struct PruneQueue {
     dir: PathBuf,
 }
 
-/// An exclusive hold on the queue's lock file, released when dropped.
+/// An exclusive lock on the queue's lock file, released when dropped.
 struct Locked(File);
 
 impl Drop for Locked {
@@ -50,7 +53,7 @@ impl Drop for Locked {
 }
 
 impl PruneQueue {
-    /// The queue kept in `dir`, which needn't exist yet.
+    /// The queue in `dir`, which does not have to exist yet.
     pub fn at(dir: PathBuf) -> Self {
         Self { dir }
     }
@@ -105,7 +108,8 @@ impl PruneQueue {
         replace_private(&self.dir.join(name), text.as_bytes())
     }
 
-    /// Queues `ino`, noting what it is, unless it is queued already.
+    /// Adds `ino` to the queue with a note about what it is, unless it is
+    /// already queued.
     pub fn add(&self, ino: u64, note: &str) -> io::Result<()> {
         let _held = self.lock()?;
         let mut queue = self.read_lines("queue")?;
@@ -119,7 +123,7 @@ impl PruneQueue {
         self.write_lines("queue", &queue)
     }
 
-    /// What is waiting, oldest inode number first.
+    /// The waiting entries, lowest inode number first.
     pub fn entries(&self) -> io::Result<Vec<Queued>> {
         let _held = self.lock()?;
         Ok(self
@@ -136,7 +140,7 @@ impl PruneQueue {
             .collect())
     }
 
-    /// Takes `ino` off the queue, done, with its status.
+    /// Removes `ino` from the queue as done, with its status.
     pub fn remove(&self, ino: u64) -> io::Result<()> {
         let _held = self.lock()?;
         let mut queue = self.read_lines("queue")?;
@@ -147,7 +151,7 @@ impl PruneQueue {
         self.write_lines("status", &status)
     }
 
-    /// Records the last word on `ino`'s prune (one line).
+    /// Records the latest status of `ino`'s prune (one line).
     pub fn set_status(&self, ino: u64, what: &str) -> io::Result<()> {
         let _held = self.lock()?;
         let mut status = self.read_lines("status")?;
@@ -155,7 +159,7 @@ impl PruneQueue {
         self.write_lines("status", &status)
     }
 
-    /// The last word on each entry that has one.
+    /// The latest status of each entry that has one.
     pub fn statuses(&self) -> io::Result<BTreeMap<u64, String>> {
         let _held = self.lock()?;
         self.read_lines("status")

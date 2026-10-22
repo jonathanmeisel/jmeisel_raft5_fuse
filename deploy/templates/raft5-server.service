@@ -1,8 +1,8 @@
-# One node of the raft5 store. Rendered by deploy/render.sh.
+# One node of the raft5 store. deploy/render.sh renders this file.
 [Unit]
 Description=raft5 store node @NODE@
-# The store's ports are bound to the WireGuard address, which only
-# exists once wg0 is up.
+# The store's ports are bound to the WireGuard address, which exists only
+# after wg0 is up.
 Requires=wg-quick@wg0.service
 After=wg-quick@wg0.service network-online.target
 Wants=network-online.target
@@ -13,9 +13,9 @@ User=raft5
 Group=raft5
 StateDirectory=raft5
 StateDirectoryMode=0700
-# Only present while the cluster is being bootstrapped (install.sh
-# --bootstrap): the first administrator's login, which stops working
-# once the cluster exists.
+# Present only while the cluster is being bootstrapped (install.sh
+# --bootstrap): the first administrator's login, which stops working after
+# the cluster exists.
 EnvironmentFile=-/etc/raft5/bootstrap.env
 ExecStart=/usr/local/bin/raft5-server --id @NODE@ --db /var/lib/raft5/db \
     --client-addr @WG_IP@:27051 --peer-addr @WG_IP@:27052 \

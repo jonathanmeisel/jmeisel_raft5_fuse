@@ -1,144 +1,153 @@
-// The filesystem protocol between FUSE clients and filesystem servers.
+// The filesystem protocol between clients and filesystem servers.
 //
-// Filesystem errors travel in-band, as `Error { errno, message }` inside
-// each response, so the client can hand the kernel the exact errno. A
-// gRPC status, by contrast, always means the request didn't get a
-// filesystem answer at all -- the server was unreachable or failed --
-// which is what tells the client it may try another server.
+// **Errors.** Filesystem errors come back inside each response, as `Error {
+// errno, message }`, so the client can give the kernel the exact errno. A
+// gRPC status always means that the request got no filesystem answer: the
+// server was not reachable or failed. That tells the client it can try
+// another server.
 //
-// Every request but Hello, Prelogin, Login, Enrol and ChangePassword
-// carries a session token from Login, as `authorization: Bearer <token>`
-// metadata; who the request is from is whoever that session belongs to.
-// A missing, forged or expired session is refused with UNAUTHENTICATED --
-// the one status that is about the request rather than the server, and
-// the client's cue to log in again.
+// **Sessions.** Every request except Hello, Prelogin, Login, Enrol, and
+// ChangePassword sends a session token from Login, as `authorization:
+// Bearer <token>` metadata. The request comes from the user that the
+// session belongs to. A missing, forged, or expired session gets
+// UNAUTHENTICATED. This is the only status about the request and not the
+// server, and it tells the client to log in again.
 //
-// Everything is encrypted on the client (raft5fs-crypto): the server
-// stores and hands back what it can't open. Access is by grant: a user
-// reaches a directory, and everything under it, through a grant of it to
-// them, and only what lies under their grants -- checked on every
-// request. Every inode has a key record (raft5fs-crypto's `NodeKeys`),
-// opaque to the server but for its version numbers; a grant carries the
-// granted directory's key sealed to the grantee. Every `name` is a tag:
-// an HMAC of the real name under the directory's name key, which lets the
-// server find an entry without learning what it is called.
+// **Encryption and access.** The client encrypts everything
+// (raft5fs-crypto). The server stores and returns data that it cannot open.
 //
-// Snapshots: the read-only requests (GetAttr, Lookup, Access, ReadDir,
-// GetKeyPath, ListGrants, ReadChunks) take a `snapshot`, the name of one
-// ListSnapshots lists, to read the filesystem as it was when it was taken
-// rather than as it is -- all of it, the grants that decide access
-// included, so what a user sees in one is what they could see then.
-// Empty reads the present. One that doesn't exist is ENOENT, and anything
-// that would write at one EROFS. Snapshots are taken and removed by the
-// store's administrator, not through this protocol.
+// - Access is by grant: a grant of a directory gives a user that directory
+//   and everything below it, and nothing else. The server checks this on
+//   every request.
+// - Each inode has a key record (raft5fs-crypto's `NodeKeys`). The server
+//   can read only its version numbers. A grant holds the granted
+//   directory's key, sealed to the grantee.
+// - Each `name` is a tag: an HMAC of the real name under the directory's
+//   name key. The server can find an entry without learning its name.
+//
+// **Snapshots.** The read-only requests (GetAttr, Lookup, Access, ReadDir,
+// GetKeyPath, ListGrants, ReadChunks) take a `snapshot`, a name from
+// ListSnapshots. They then read the filesystem as it was when the snapshot
+// was taken, including the grants that control access. So a user sees in a
+// snapshot what they could see at that time. An empty name reads the
+// present. A missing snapshot gives ENOENT, and a write to a snapshot gives
+// EROFS. The store's administrator takes and removes snapshots, not this
+// protocol.
 syntax = "proto3";
 
 package raft5fs;
 
 service Fs {
-  // What the client needs to know before buffering writes.
+  // What the client needs to know before it buffers writes.
   rpc Hello(HelloRequest) returns (HelloResponse);
 
-  // The password never reaches the server: the client stretches it with
-  // the salt and parameters from Prelogin and logs in with the `auth`
-  // half (see raft5fs-crypto's `password`).
+  // The password never goes to the server. The client stretches it with the
+  // salt and settings from Prelogin, and logs in with the `auth` half (see
+  // raft5fs-crypto's `password`).
   rpc Prelogin(PreloginRequest) returns (PreloginResponse);
   rpc Login(LoginRequest) returns (LoginResponse);
-  // Sets up an account's keys, once, with a code an administrator issued.
+  // Sets up an account's keys, one time, with a code from an administrator.
   rpc Enrol(EnrolRequest) returns (EmptyResponse);
-  // Replaces an account's password-derived material; the key pair stays.
+  // Replaces the parts of an account that come from the password. The key
+  // pair does not change.
   rpc ChangePassword(ChangePasswordRequest) returns (EmptyResponse);
 
   rpc GetAttr(InodeRequest) returns (AttrResponse);
-  // The entry's attributes, with its sealed name, for the client to check
-  // the name really names that inode.
+  // Returns the entry's attributes and its sealed name, so the client can
+  // check that the name points to that inode.
   rpc Lookup(NameRequest) returns (LookupResponse);
-  // Whether the caller may access the inode as `mask` asks: any grant
-  // over it reads, a writable one writes.
+  // Whether the caller can access the inode as `mask` asks. Any grant above
+  // the inode allows reads, and a writable grant allows writes.
   rpc Access(AccessRequest) returns (EmptyResponse);
   rpc ReadDir(InodeRequest) returns (ReadDirResponse);
   rpc SetAttr(SetAttrRequest) returns (AttrResponse);
   rpc Mkdir(CreateRequest) returns (AttrResponse);
   rpc Create(CreateRequest) returns (AttrResponse);
-  // Both return the inode removed.
+  // Both return the inode that was removed.
   rpc Unlink(NameRequest) returns (InoResponse);
   rpc Rmdir(NameRequest) returns (InoResponse);
-  // Returns the inode the move replaced, or 0 if it replaced nothing.
+  // Returns the inode that the move replaced, or 0 if it replaced nothing.
   rpc Rename(RenameRequest) returns (InoResponse);
 
-  // An inode number to create with: a node's key record is bound to its
-  // inode, so the client needs the number before it can make one.
+  // Returns an inode number for a create. A node's key record is bound to
+  // its inode, so the client needs the number before it can make the
+  // record.
   rpc AllocateInode(NoArgs) returns (InoResponse);
-  // The caller's grant over `ino`, and the key record of every node from
-  // that grant's directory down to `ino`: what it takes to unwrap `ino`'s
-  // key from scratch.
+  // Returns the caller's grant above `ino`, and the key record of every
+  // node from that grant's directory down to `ino`. This is all the client
+  // needs to unwrap `ino`'s key.
   rpc GetKeyPath(InodeRequest) returns (KeyPathResponse);
   // Every grant made to the caller: the entries of their root.
   rpc ListGrants(ListGrantsRequest) returns (GrantListResponse);
   // Every snapshot there is, oldest first.
   rpc ListSnapshots(NoArgs) returns (SnapshotListResponse);
   rpc PublicKey(PublicKeyRequest) returns (PublicKeyResponse);
-  // Grants a directory (and all under it) to a user, replacing any grant
-  // of it they had. Needs read-write access to it.
+  // Grants a directory, and everything below it, to a user. It replaces any
+  // grant of it that the user had. Needs read-write access to the
+  // directory.
   rpc Grant(GrantRequest) returns (EmptyResponse);
-  // A new top-level directory, granted read-write to its creator.
+  // Makes a new top-level directory, granted read-write to its creator.
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
-  // Removes an empty volume, and every grant of it.
+  // Removes an empty volume and every grant of it.
   rpc DeleteVolume(InodeRequest) returns (EmptyResponse);
 
-  // File data, which the client seals chunk by chunk (raft5fs-crypto's
-  // `data`), so the server can neither read it nor patch it: the client
-  // reads, changes and re-seals whole chunks.
+  // File data. The client seals it chunk by chunk (raft5fs-crypto's
+  // `data`), so the server cannot read or change it. The client reads,
+  // changes, and seals whole chunks again.
   rpc ReadChunks(ReadChunksRequest) returns (ReadChunksResponse);
   // Stores whole sealed chunks, each sealed under the file's current key
-  // version. A chunk with an `expected_seq` is stored only if it is still
-  // as the client read it -- otherwise nothing is, and the answer is
-  // EAGAIN, for the client to read again and redo its change.
+  // version. A chunk with an `expected_seq` is stored only if it did not
+  // change since the client read it. If any chunk changed, nothing is
+  // stored and the answer is EAGAIN: the client reads again and makes its
+  // change again.
   rpc WriteChunks(WriteChunksRequest) returns (WriteChunksResponse);
-  // Names and upload URLs for new blocks of a file in object storage
-  // (see ObjectGrid), one per block asked for. The client seals each
-  // block, uploads it, then stores a BlockRef to it with WriteChunks.
-  // Needs a writable grant, like WriteChunks; ENOTSUP if the filesystem
-  // keeps no data in object storage.
+  // Returns names and upload URLs for new blocks of a file in object
+  // storage (see ObjectGrid), one for each block asked for. The client
+  // seals each block, uploads it, and then stores a BlockRef to it with
+  // WriteChunks. Needs a writable grant, like WriteChunks. Returns ENOTSUP
+  // if the filesystem keeps no data in object storage.
   rpc PrepareUploads(PrepareUploadsRequest) returns (PrepareUploadsResponse);
 
-  // Every node at or under a directory that is granted to anyone, with
-  // the path down to it and who holds the grants: what rotating the
-  // directory's key -- and keeping every grant below it fresh -- needs.
+  // Returns every node at or below a directory that is granted to anyone,
+  // with the path to it and the users that hold its grants. A rotation of
+  // the directory's key needs this to keep every grant below it fresh.
   // Needs read-write access to the directory.
   rpc GrantsUnder(InodeRequest) returns (GrantsUnderResponse);
-  // Gives nodes new keys, in one transaction, top down. Each must still be
-  // at its expected version, its new key record one version on and
-  // wrapped under its parent's key as it is now (or as this same request
-  // leaves it), and every grant of it re-sealed -- or, sealed empty,
-  // removed, which is how a grant is revoked. Anything changed meanwhile
-  // is EAGAIN.
+  // Gives nodes new keys in one transaction, from the top down. Each node:
   //
-  // Writes that hand out or depend on a node's key are refused with
-  // EKEYEXPIRED while any node from it up to its volume is wrapped under
-  // an older version of its parent's key: someone who held that older key
-  // -- someone revoked -- could still open it. The writer rotates the
-  // stale nodes with this, then writes again.
+  // - must still be at its expected version;
+  // - gets a new key record one version higher, wrapped under its parent's
+  //   current key (or the key that this request gives the parent);
+  // - has every grant sealed again, or sealed empty to remove it. This is
+  //   how a grant is revoked.
+  //
+  // If anything changed in the meantime, the answer is EAGAIN.
+  //
+  // Writes that give out or depend on a node's key fail with EKEYEXPIRED
+  // while any node from it up to its volume is wrapped under an older
+  // version of its parent's key. A user who had that older key, such as a
+  // revoked user, could still open it. The writer rotates the stale nodes
+  // with this request, then writes again.
   rpc Rotate(RotateRequest) returns (EmptyResponse);
 
-  // Pruning: dropping key versions nothing is sealed under any more (see
-  // raft5fs-crypto's `NodeKeys::pruned`). Everything still under an old
-  // version is first sealed again under the current one:
+  // Pruning removes key versions that nothing is sealed under (see
+  // raft5fs-crypto's `NodeKeys::pruned`). First, everything still under an
+  // old version is sealed again under the current one:
   //
-  // Re-seals existing chunks of a file under its current key version,
-  // each only if still at its `expected_seq` (which is required) --
-  // otherwise none are, and the answer is EAGAIN. The file's size and
-  // times stay as they were: its contents haven't changed.
+  // Seals existing chunks of a file again under its current key version.
+  // Each chunk must still be at its `expected_seq`, which is required. If
+  // any chunk changed, none are stored and the answer is EAGAIN. The file's
+  // size and times do not change, because its contents do not change.
   rpc ResealChunks(ResealChunksRequest) returns (EmptyResponse);
-  // Re-seals directory entries' names under the directory's current key
-  // version, each only if its tag still names the same inode (EAGAIN if
-  // not). The directory's times stay as they were.
+  // Seals directory entry names again under the directory's current key
+  // version. Each tag must still point to the same inode, or the answer is
+  // EAGAIN. The directory's times do not change.
   rpc ResealNames(ResealNamesRequest) returns (EmptyResponse);
-  // Replaces a node's key record with the same record cut short: only
-  // its oldest history entries gone, anything else EINVAL. Refused with
-  // EBUSY while anything -- a chunk, an entry name, a child's key, a grant
-  // -- is still sealed under a version it drops, and EAGAIN if the record
-  // changed meanwhile. Needs read-write access to the node.
+  // Replaces a node's key record with the same record with only its oldest
+  // history entries removed. Any other change gives EINVAL. Returns EBUSY
+  // while anything (a chunk, an entry name, a child's key, or a grant) is
+  // still sealed under a version that the prune removes, and EAGAIN if the
+  // record changed in the meantime. Needs read-write access to the node.
   rpc PruneKeys(PruneKeysRequest) returns (EmptyResponse);
 }
 
@@ -160,7 +169,7 @@ enum Kind {
   KIND_DIRECTORY = 1;
 }
 
-// No owners: access goes by grants, and a mount shows its own user as the
+// No owners: grants control access, and a mount shows its own user as the
 // owner of everything.
 message Attr {
   uint64 ino = 1;
@@ -171,35 +180,36 @@ message Attr {
   Timestamp atime = 8;
   Timestamp mtime = 9;
   Timestamp ctime = 10;
-  // Where the file's data lives; see ObjectGrid. Fixed at creation.
+  // Where the file's data is stored; see ObjectGrid. It does not change
+  // after the file is made.
   Layout layout = 11;
 }
 
 enum Layout {
-  // Every chunk in the store: all files made before object storage was
-  // turned on, and every directory.
+  // Every chunk is in the store. This is the layout of every directory, and
+  // of every file made before object storage was turned on.
   LAYOUT_INLINE = 0;
-  // Chunks below the grid's `from_index` in the store, the rest in
-  // object-storage blocks.
+  // Chunks below the grid's `from_index` are in the store, and the rest are
+  // in object-storage blocks.
   LAYOUT_HYBRID = 1;
 }
 
 message HelloRequest {}
 
 message HelloResponse {
-  // Fixed for the filesystem's lifetime.
+  // It never changes for the filesystem.
   uint64 chunk_size = 1;
-  // How much contiguous data one write transaction stores: the client
+  // How much contiguous data one write transaction stores. The client
   // buffers up to this much and aligns its batches to multiples of it.
   uint64 batch_bytes = 2;
-  // How hybrid-layout files split their data, fixed for the filesystem's
-  // lifetime; absent if no data lives in object storage.
+  // How hybrid-layout files split their data. It never changes for the
+  // filesystem. Absent if no data is in object storage.
   ObjectGrid grid = 3;
 }
 
-// From chunk `from_index` on, a hybrid file's chunks are stored
-// `per_block` at a time as one object: block b holds chunks
-// [from_index + b * per_block, from_index + (b + 1) * per_block).
+// From chunk `from_index` up, a hybrid file stores its chunks `per_block`
+// at a time, in one object. Block b holds chunks [from_index + b *
+// per_block, from_index + (b + 1) * per_block).
 message ObjectGrid {
   uint64 from_index = 1;
   uint32 per_block = 2;
@@ -209,8 +219,8 @@ message PreloginRequest {
   string username = 1;
 }
 
-// How to stretch a password. An account that doesn't exist gets made-up
-// settings, the same every time, so this doesn't say which accounts do.
+// How to stretch a password. An account that does not exist gets made-up
+// settings, the same each time, so this does not show which accounts exist.
 message KdfSettings {
   bytes salt = 1;
   bytes params = 2;
@@ -230,9 +240,10 @@ message LoginRequest {
 
 message Session {
   string token = 1;
-  // When the token stops being accepted, in seconds since the Unix epoch.
+  // When the server stops accepting the token, in seconds since the Unix
+  // epoch.
   uint64 expires_at = 2;
-  // The account's private key, wrapped under the key only the password
+  // The account's private key, wrapped under a key that only the password
   // opens.
   bytes wrapped_private_key = 3;
 }
@@ -244,8 +255,8 @@ message LoginResponse {
   }
 }
 
-// What the server keeps for an account: it can check a login against
-// `verifier`, and opens nothing.
+// What the server keeps for an account. It can check a login against
+// `verifier`, and it can open nothing.
 message AccountKeys {
   bytes salt = 1;
   bytes kdf_params = 2;
@@ -260,7 +271,7 @@ message EnrolRequest {
   AccountKeys keys = 3;
 }
 
-// `keys` must keep the account's public key: only the wrapping changes.
+// `keys` must keep the account's public key. Only the wrapping changes.
 message ChangePasswordRequest {
   string username = 1;
   bytes old_auth = 2;
@@ -269,13 +280,13 @@ message ChangePasswordRequest {
 
 message InodeRequest {
   uint64 ino = 1;
-  // Read as of this snapshot; see the top of this file. Only the
-  // read-only requests take one.
+  // Read from this snapshot; see the top of this file. Only the read-only
+  // requests take one.
   string snapshot = 2;
 }
 
-// `mask` is access(2)'s: R_OK (4), W_OK (2) and X_OK (1) ORed, or 0 to
-// ask only whether the inode exists.
+// `mask` is the same as for access(2): R_OK (4), W_OK (2), and X_OK (1)
+// ORed together, or 0 to ask only whether the inode exists.
 message AccessRequest {
   uint64 ino = 1;
   uint32 mask = 2;
@@ -295,12 +306,11 @@ message CreateRequest {
   // The new entry's tag.
   bytes name = 2;
   uint32 perm = 3;
-  // The inode AllocateInode gave, and its key record, wrapped under the
+  // The inode from AllocateInode, and its key record, wrapped under the
   // parent's current key.
   uint64 ino = 4;
   bytes node_keys = 5;
-  // The real name, sealed under the parent's key, which listings hand
-  // back.
+  // The real name, sealed under the parent's key. Listings return it.
   bytes sealed_name = 6;
 }
 
@@ -309,14 +319,15 @@ message RenameRequest {
   bytes name = 2;
   uint64 new_parent = 3;
   bytes new_name = 4;
-  // Fail with EEXIST rather than replace an existing `new_name`.
+  // Fail with EEXIST if `new_name` exists, and do not replace it.
   bool noreplace = 5;
-  // When the parent changes: the moved node's key record, re-wrapped
-  // under the new parent's current key.
+  // If the parent changes: the moved node's key record, wrapped again under
+  // the new parent's current key.
   bytes node_keys = 6;
-  // The inode moving -- the move is refused if `name` no longer names it.
+  // The inode that moves. The server refuses the move if `name` no longer
+  // points to it.
   uint64 moved_ino = 7;
-  // `new_name`'s real name, sealed under the new parent's key.
+  // The real name of `new_name`, sealed under the new parent's key.
   bytes sealed_new_name = 8;
 }
 
@@ -330,7 +341,8 @@ message SetTime {
 message SetAttrRequest {
   uint64 ino = 1;
   optional uint32 mode = 2;
-  // A shrink's last chunk the client has re-sealed, cut short, already.
+  // To make a file shorter, the client first seals its new last chunk
+  // again, cut short.
   optional uint64 size = 5;
   SetTime atime = 6;
   SetTime mtime = 7;
@@ -345,7 +357,7 @@ message AttrResponse {
 
 message LookedUp {
   Attr attr = 1;
-  // As the directory listing has it: sealed under the parent's key, bound
+  // As in the directory listing: sealed under the parent's key, and bound
   // to the tag and the inode.
   bytes sealed_name = 2;
 }
@@ -374,7 +386,7 @@ message DirItem {
   Kind kind = 2;
   // The entry's tag.
   bytes name = 3;
-  // The real name, sealed; empty for `.` and `..`.
+  // The real name, sealed. Empty for `.` and `..`.
   bytes sealed_name = 4;
 }
 
@@ -392,11 +404,12 @@ message ReadDirResponse {
 message GrantInfo {
   uint64 ino = 1;
   bool writable = 2;
-  // The version of the directory's key the grant holds.
+  // The version of the directory's key that the grant holds.
   uint32 key_version = 3;
   // The key, sealed to the grantee.
   bytes sealed_key = 4;
-  // What the grant shows up as in the grantee's root, sealed to them.
+  // The label that the grant shows as in the grantee's root, sealed to
+  // them.
   bytes sealed_label = 5;
 }
 
@@ -407,7 +420,7 @@ message NodeRecord {
 
 message KeyPath {
   GrantInfo grant = 1;
-  // From the granted directory down to the inode asked about.
+  // From the granted directory down to the inode in the request.
   repeated NodeRecord nodes = 2;
 }
 
@@ -435,7 +448,7 @@ message ListGrantsRequest {
 
 message SnapshotInfo {
   string name = 1;
-  // When it was taken, by the clock of whoever took it.
+  // When the snapshot was taken, by the clock of the machine that took it.
   Timestamp created = 2;
 }
 
@@ -464,11 +477,12 @@ message PublicKeyResponse {
 message GrantRequest {
   string username = 1;
   GrantInfo grant = 2;
-  // The node's grantees with this one added, sealed under its current key.
+  // The node's grantees with this grantee added, sealed under the node's
+  // current key.
   bytes sealed_grantees = 3;
-  // The seq of the list this one was made from (GrantedNode's): refused
-  // if it changed meanwhile, so no grant made at the same time is lost
-  // from it.
+  // The seq of the list that this list was made from (GrantedNode's). The
+  // server refuses the grant if the list changed, so a grant made at the
+  // same time is not lost.
   uint64 expected_grantees_seq = 4;
 }
 
@@ -481,52 +495,53 @@ message CreateVolumeRequest {
   // The creator's grant: key version 1, sealed to them.
   bytes sealed_key = 4;
   bytes sealed_label = 5;
-  // Its grantees, the creator alone, sealed under key version 1.
+  // Its grantees (only the creator), sealed under key version 1.
   bytes sealed_grantees = 6;
 }
 
 message ReadChunksRequest {
   uint64 ino = 1;
   uint64 first = 2;
-  // At most what one write batch holds; more is cut short, and the client
-  // asks again from where the answer stopped.
+  // At most one write batch. The server cuts a larger request short, and
+  // the client asks again from where the answer stopped.
   uint32 count = 3;
-  // For chunk `first + i`, the seq the client already holds it at, or 0.
-  // A chunk still at it comes back `unchanged`, without its bytes.
+  // For chunk `first + i`, the seq that the client already has it at, or 0.
+  // A chunk still at that seq comes back `unchanged`, without its bytes.
   repeated uint64 known_seqs = 4;
   string snapshot = 5;
-  // The client can fetch chunks from object storage. Without it, a chunk
-  // that lives there is ENOTSUP rather than coming back as a hole.
+  // The client can fetch chunks from object storage. If this is false, a
+  // chunk in object storage gives ENOTSUP, not a hole.
   bool objects_ok = 6;
 }
 
 message SealedChunk {
   uint64 index = 1;
-  // The store's sequence number for the chunk as read: what a write of it
-  // expects, to be sure nothing changed it meanwhile. For a chunk in a
-  // block, the block's.
+  // The store's sequence number for the chunk as read. A write of the chunk
+  // sends it, so the server can check that nothing changed the chunk. For a
+  // chunk in a block, this is the block's seq.
   uint64 seq = 2;
-  // Neither, for a chunk that was never written -- a hole, all zeros --
-  // or one `unchanged`.
+  // Neither is set for a chunk that was never written (a hole, all zeros),
+  // or for an `unchanged` chunk.
   oneof body {
     // The chunk, sealed.
     bytes blob = 3;
     // Where in object storage the sealed chunk is.
     Segment segment = 5;
   }
-  // Still at the seq the client said it held.
+  // The chunk is still at the seq that the client has.
   bool unchanged = 4;
 }
 
-// Segment `segment` of the object `ChunkList.blocks[block]` names.
+// Segment `segment` of the object that `ChunkList.blocks[block]` names.
 message Segment {
   uint32 block = 1;
   uint32 segment = 2;
 }
 
-// An object holding one block: `nseg` sealed chunks, each zero-padded to
-// the chunk size before sealing, so segment j is at byte j * (chunk size
-// + sealing overhead). All sealed under key version `version`.
+// An object that holds one block: `nseg` sealed chunks, all under key
+// version `version`. Each chunk is padded with zeros to the chunk size
+// before sealing, so segment j starts at byte j * (chunk size + sealing
+// overhead).
 message BlockRef {
   uint32 version = 1;
   uint64 minted_ms = 2;
@@ -536,7 +551,7 @@ message BlockRef {
 
 message BlockUrl {
   BlockRef block = 1;
-  // A presigned GET for the object, good for any range of it.
+  // A presigned GET for the object. It works for any range of the object.
   string url = 2;
 }
 
@@ -544,7 +559,7 @@ message ChunkList {
   // The file's attributes, for its size.
   Attr attr = 1;
   repeated SealedChunk chunks = 2;
-  // The blocks `chunks` refer to.
+  // The blocks that `chunks` refer to.
   repeated BlockUrl blocks = 3;
 }
 
@@ -557,11 +572,11 @@ message ReadChunksResponse {
 
 message ChunkWrite {
   uint64 index = 1;
-  // Absent for a chunk being replaced whole, whatever it held.
+  // Absent for a chunk that the write replaces completely.
   optional uint64 expected_seq = 2;
   oneof body {
     bytes blob = 3;
-    // A block uploaded through PrepareUploads, at a block's first index.
+    // A block uploaded through PrepareUploads, at the block's first index.
     BlockRef block = 4;
   }
 }
@@ -569,14 +584,14 @@ message ChunkWrite {
 message WriteChunksRequest {
   uint64 ino = 1;
   repeated ChunkWrite chunks = 2;
-  // The file grows to at least this, the end of what was written; 0 to
-  // leave its size alone.
+  // The file grows to at least this size, the end of what was written. 0
+  // leaves the size as it is.
   uint64 end = 3;
 }
 
 message ChunksWritten {
   Attr attr = 1;
-  // The seq every chunk written is now at.
+  // The seq of every chunk written.
   uint64 seq = 2;
 }
 
@@ -589,20 +604,21 @@ message WriteChunksResponse {
 
 message Grantee {
   string username = 1;
-  // As the server has it: check it against what was pinned before.
+  // The key that the server has. Check it against the key pinned before.
   bytes public_key = 2;
   bool writable = 3;
 }
 
 message GrantedNode {
   uint64 ino = 1;
-  // From the directory asked about down to this node, both included.
+  // From the directory in the request down to this node, both included.
   repeated uint64 path = 2;
   repeated Grantee grantees = 3;
-  // Who its key holders say it is granted to, sealed under its key.
+  // The users that its key holders say it is granted to, sealed under its
+  // key.
   bytes sealed_grantees = 4;
-  // The store's sequence number for that list: what a grant changing it
-  // says it started from.
+  // The store's sequence number for that list. A grant that changes the
+  // list sends the seq it started from.
   uint64 grantees_seq = 5;
 }
 
@@ -619,7 +635,7 @@ message GrantsUnderResponse {
 
 message ResealedGrant {
   string username = 1;
-  // The node's new key sealed to them; empty to remove their grant.
+  // The node's new key, sealed to the grantee. Empty to remove their grant.
   bytes sealed_key = 2;
 }
 
@@ -628,8 +644,8 @@ message Rotation {
   uint32 expected_version = 2;
   bytes node_keys = 3;
   repeated ResealedGrant grants = 4;
-  // Its grantees as the rotation leaves them, sealed under the new key;
-  // empty if it leaves none.
+  // Its grantees after the rotation, sealed under the new key. Empty if no
+  // grantees are left.
   bytes sealed_grantees = 5;
 }
 
@@ -646,7 +662,7 @@ message PrepareUploadsRequest {
 message BlockUpload {
   // The block's first chunk index.
   uint64 index = 1;
-  // How many segments the object will hold, which fixes its length.
+  // How many segments the object holds. This sets its length.
   uint32 nseg = 2;
 }
 
@@ -654,7 +670,7 @@ message PreparedUpload {
   // The object's name, for the BlockRef that stores it.
   uint64 minted_ms = 1;
   bytes random = 2;
-  // A presigned PUT, for exactly the block's length, usable once.
+  // A presigned PUT for exactly the block's length. It works one time.
   string url = 3;
 }
 
@@ -675,9 +691,9 @@ message ResealChunksRequest {
 }
 
 message ResealedName {
-  // The entry's tag, as it is filed under.
+  // The tag that the entry is filed under.
   bytes name = 1;
-  // The inode it must still name.
+  // The inode that the entry must still point to.
   uint64 ino = 2;
   bytes sealed_name = 3;
 }
@@ -689,7 +705,7 @@ message ResealNamesRequest {
 
 message PruneKeysRequest {
   uint64 ino = 1;
-  // The version the record is at: anything else is EAGAIN.
+  // The record's current version. Any other version gives EAGAIN.
   uint32 expected_version = 2;
   bytes node_keys = 3;
 }
