@@ -3,30 +3,63 @@
 # It installs the bundle and starts or restarts what changed. Debian or
 # Ubuntu.
 #
-#   remote-install.sh [--bootstrap]
+#   remote-install.sh [--bootstrap] [--dry-run]
 #
 # --bootstrap starts the store node with the first administrator's login, to
 # bootstrap the cluster. Without it, any such login left from a bootstrap is
 # removed.
+#
+# --dry-run changes nothing. It says which files would change and which
+# services would restart. It names files only, never their contents.
 set -eu
 cd "$(dirname "$0")"
 . ./node.conf
 
 bootstrap=false
-[ "${1:-}" = --bootstrap ] && bootstrap=true
+dry=false
+for arg in "$@"; do
+    case $arg in
+    --bootstrap) bootstrap=true ;;
+    --dry-run) dry=true ;;
+    *) echo "remote-install.sh: unknown option $arg" >&2 && exit 2 ;;
+    esac
+done
 
 say() { echo "[$NODE] $*"; }
 
+# Whether --dry-run found anything to do.
+would=false
+
+# Runs a command that changes the node, or with --dry-run says it would.
+act() {
+    if $dry; then
+        say "would run: $*"
+        would=true
+    else
+        "$@"
+    fi
+}
+
 # -- packages and users -------------------------------------------------
-if ! command -v wg-quick >/dev/null || ! command -v ufw >/dev/null; then
-    say "installing wireguard-tools and ufw"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -q
-    apt-get install -yq wireguard-tools ufw openssl
+missing=""
+for pkg in wireguard-tools ufw openssl unattended-upgrades; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+done
+if [ -n "$missing" ]; then
+    if $dry; then
+        say "would install:$missing"
+        would=true
+    else
+        say "installing$missing"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -q
+        # shellcheck disable=SC2086
+        apt-get install -yq $missing
+    fi
 fi
 for user in raft5 raft5fs; do
     id "$user" >/dev/null 2>&1 ||
-        useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
+        act useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
 done
 
 # -- files ----------------------------------------------------------------
@@ -39,18 +72,45 @@ changed=""
 put() {
     src=$1 dest=$2 mode=$3 owner=$4 service=$5
     if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+        if $dry; then
+            [ "$(stat -c '%a %U:%G' "$dest")" = "$(printf '%o' "0$mode") $owner" ] ||
+                say "would fix the mode or owner of $dest"
+            return
+        fi
         chmod "$mode" "$dest"
         chown "$owner" "$dest"
         return
     fi
+    changed="$changed $service"
+    if $dry; then
+        say "would change $dest"
+        return
+    fi
     install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$src" "$dest.new"
     mv -f "$dest.new" "$dest"
-    changed="$changed $service"
 }
 
-install -d -m 0750 -o root -g raft5 /etc/raft5
-install -d -m 0750 -o root -g raft5fs /etc/raft5fs
-install -d -m 0700 /etc/wireguard
+# Removes DEST, if it exists, for SERVICE.
+unput() {
+    dest=$1 service=$2
+    [ -e "$dest" ] || return 0
+    changed="$changed $service"
+    if $dry; then
+        say "would remove $dest"
+    else
+        say "removing $dest"
+        rm -f "$dest"
+    fi
+}
+
+for d in "0750 raft5 /etc/raft5" "0750 raft5fs /etc/raft5fs" "0700 root /etc/wireguard"; do
+    # shellcheck disable=SC2086
+    set -- $d
+    # Also sets the mode of a directory that exists.
+    if ! $dry || [ ! -d "$3" ]; then
+        act install -d -m "$1" -o root -g "$2" "$3"
+    fi
+done
 
 for bin in raft5-server raft; do
     put "bin/$bin" "/usr/local/bin/$bin" 0755 root:root raft5-server
@@ -85,10 +145,10 @@ if $bootstrap; then
     printf '%s\n' 'RAFT5_BOOTSTRAP_ARGS=--initial-admin-user admin --initial-admin-password-file /etc/raft5/admin.pw' \
         >bootstrap.env
     put bootstrap.env /etc/raft5/bootstrap.env 0640 root:raft5 raft5-server
-elif [ -e /etc/raft5/bootstrap.env ] || [ -e /etc/raft5/admin.pw ]; then
-    say "removing the bootstrap login"
-    rm -f /etc/raft5/bootstrap.env /etc/raft5/admin.pw
-    changed="$changed raft5-server"
+else
+    # The bootstrap login stops working once the cluster exists.
+    unput /etc/raft5/bootstrap.env raft5-server
+    unput /etc/raft5/admin.pw raft5-server
 fi
 
 put wg0.conf /etc/wireguard/wg0.conf 0600 root:root wg0
@@ -99,11 +159,87 @@ done
 for unit in raft5fs-cert-check.service raft5fs-cert-check.timer; do
     put "systemd/$unit" "/etc/systemd/system/$unit" 0644 root:root cert-check
 done
-for script in raft5fs-admin raft5-shell raft5fs-cert-check; do
+for unit in raft5fs-nightly-backup.service raft5fs-nightly-backup.timer; do
+    put "systemd/$unit" "/etc/systemd/system/$unit" 0644 root:root nightly-backup
+done
+for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup; do
     put "sbin/$script" "/usr/local/sbin/$script" 0755 root:root scripts
 done
 
+# -- hardening ------------------------------------------------------------
+# Security updates install daily; nothing reboots by itself.
+put harden/apt.conf /etc/apt/apt.conf.d/52raft5fs 0644 root:root apt
+
+# The admin user that SSH_USER switches to, with your keys and sudo.
+if [ -n "$ADMIN_USER" ]; then
+    if ! id "$ADMIN_USER" >/dev/null 2>&1; then
+        act useradd --create-home --shell /bin/bash "$ADMIN_USER"
+    fi
+    home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+    home=${home:-/home/$ADMIN_USER}
+    [ -d "$home/.ssh" ] || act install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$home/.ssh"
+    put harden/authorized_keys "$home/.ssh/authorized_keys" 0600 "$ADMIN_USER:$ADMIN_USER" admin-user
+    # A broken sudoers file stops sudo working for everyone: check it first.
+    visudo -cqf harden/sudoers || { say "the sudoers line for $ADMIN_USER doesn't parse" && exit 1; }
+    put harden/sudoers /etc/sudoers.d/raft5fs-admin 0440 root:root admin-user
+else
+    unput /etc/sudoers.d/raft5fs-admin admin-user
+fi
+
+# SSH: keys only, no root login. Only with a working admin user, or no one
+# could log in.
+if [ "$SSH_HARDEN" = yes ]; then
+    if [ -z "$ADMIN_USER" ]; then
+        say "not hardening SSH: no ADMIN_USER to log in as"
+        exit 1
+    fi
+    # Its keys were installed just above; with --dry-run they may not be yet.
+    if ! $dry && [ ! -s "$home/.ssh/authorized_keys" ]; then
+        say "not hardening SSH: $ADMIN_USER has no authorized_keys"
+        exit 1
+    fi
+    put harden/sshd.conf /etc/ssh/sshd_config.d/10-raft5fs.conf 0644 root:root ssh
+else
+    unput /etc/ssh/sshd_config.d/10-raft5fs.conf ssh
+fi
+
 has() { case " $changed " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Whether the nightly backup timer should run here.
+backups_wanted() { [ "$NIGHTLY_BACKUPS" = yes ] && [ -f raft5fs/backup.env ]; }
+
+if $dry; then
+    if backups_wanted && ! systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
+        say "would turn nightly backups on"
+        would=true
+    elif ! backups_wanted && systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
+        say "would turn nightly backups off"
+        would=true
+    fi
+    restarts=""
+    for s in wg0 raft5-server raft5fs-server ssh; do
+        case $s in
+        raft5-server | raft5fs-server) systemctl is-active -q "$s" || changed="$changed $s" ;;
+        esac
+        has "$s" && restarts="$restarts $s"
+    done
+    if [ -z "$changed" ] && ! $would; then
+        say "nothing would change"
+    elif [ -n "$restarts" ]; then
+        say "would restart or reload:$restarts"
+    fi
+    exit 0
+fi
+
+if has ssh; then
+    if ! sshd -t; then
+        rm -f /etc/ssh/sshd_config.d/10-raft5fs.conf
+        say "sshd rejected the new settings; removed them"
+        exit 1
+    fi
+    say "reloading ssh"
+    systemctl try-reload-or-restart ssh
+fi
 
 # -- WireGuard -------------------------------------------------------------
 if systemctl is-active -q wg-quick@wg0; then
@@ -136,6 +272,12 @@ ufw --force enable >/dev/null
 systemctl daemon-reload
 systemctl enable -q raft5-server raft5fs-server raft5fs-cert-check.timer
 systemctl start raft5fs-cert-check.timer
+if backups_wanted; then
+    systemctl enable -q --now raft5fs-nightly-backup.timer
+elif systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
+    say "turning nightly backups off"
+    systemctl disable -q --now raft5fs-nightly-backup.timer
+fi
 
 if has raft5-server || ! systemctl is-active -q raft5-server; then
     say "restarting raft5-server"

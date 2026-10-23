@@ -1,0 +1,10 @@
+# Takes and prunes the nightly backup (see raft5fs-nightly-backup). Fails,
+# shown in `systemctl --failed` and the journal, if the backup does.
+[Unit]
+Description=raft5fs nightly backup
+After=raft5fs-server.service wg-quick@wg0.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/raft5fs-nightly-backup

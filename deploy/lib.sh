@@ -1,11 +1,20 @@
-# Shared by the scripts here: reads cluster.conf and gives the paths for
-# files. Source it; do not run it.
+# shellcheck shell=bash
+# Shared by the scripts here: reads the cluster's settings and gives the
+# paths for files. Source it; do not run it.
+#
+# The cluster lives in its own repository (README "Cluster repo"):
+# RAFT5FS_CLUSTER names the directory that holds cluster.conf and
+# secrets/. Secret files there are sops-encrypted (*.sops). `open_secrets`
+# decrypts them into a temporary directory in memory, which is deleted
+# when the script exits.
 
 set -euo pipefail
 
 DEPLOY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Used by the scripts that source this file.
+# shellcheck disable=SC2034
 REPO=$(cd "$DEPLOY/.." && pwd)
-SECRETS=$DEPLOY/secrets
+# shellcheck disable=SC2034
 OUT=$DEPLOY/out
 
 die() {
@@ -13,10 +22,102 @@ die() {
     exit 1
 }
 
-[[ -f $DEPLOY/cluster.conf ]] ||
-    die "no cluster.conf: copy cluster.conf.example to cluster.conf and edit it"
+[[ -n ${RAFT5FS_CLUSTER:-} ]] ||
+    die "set RAFT5FS_CLUSTER to the cluster's directory in the cluster repo (README \"Cluster repo\")"
+CLUSTER=$(cd "$RAFT5FS_CLUSTER" && pwd) || die "RAFT5FS_CLUSTER ($RAFT5FS_CLUSTER) isn't a directory"
+[[ -f $CLUSTER/cluster.conf ]] || die "no cluster.conf in $CLUSTER"
+# The encrypted secrets. `open_secrets` sets SECRETS to their plaintext.
+STORE=$CLUSTER/secrets
+SECRETS=
 # shellcheck source=cluster.conf.example
-. "$DEPLOY/cluster.conf"
+. "$CLUSTER/cluster.conf"
+
+# Whether path $1 (under secrets/) holds a secret, so it is kept only
+# sops-encrypted. Everything else (certificates, public keys) is public.
+is_secret() {
+    case $1 in
+    *.key | *.pw | *.secret | *.env) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+# Whether path $1 is sealed to the offline CA identity, not the deploy one:
+# it opens only after `unlock --ca`.
+needs_ca_identity() {
+    case $1 in
+    internal-ca.key | fs-ca.key | operator/*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+# sops on one secret file, run from the cluster directory so that sops
+# finds .sops.yaml above it. The files hold raw bytes, so the plaintext
+# side is "binary"; the encrypted side is sops's JSON.
+sops_decrypt() {
+    (cd "$CLUSTER" && sops decrypt --input-type json --output-type binary "$1")
+}
+
+# Encrypts stdin as secrets/$1.sops, with the recipients that .sops.yaml
+# gives that path.
+sops_encrypt() {
+    local rel=$1 dest=$STORE/$1.sops
+    mkdir -p "$(dirname "$dest")"
+    (cd "$CLUSTER" && sops encrypt --input-type binary --output-type json \
+        --filename-override "secrets/$rel.sops" /dev/stdin) >"$dest.new"
+    mv -f "$dest.new" "$dest"
+}
+
+# Decrypts the cluster's secrets into a new temporary directory in memory,
+# and points SECRETS at it. Removed when the script exits, however it
+# exits. Files sealed to the CA identity are skipped unless it is unlocked.
+open_secrets() {
+    command -v sops >/dev/null || die "sops isn't installed"
+    [[ -d $STORE ]] || die "no secrets in $CLUSTER yet: run ./certs.sh"
+    [[ -n ${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-} ]] ||
+        die "the secrets are locked: run  eval \"\$(./unlock)\"  first"
+    SECRETS=$(mktemp -d -p "${XDG_RUNTIME_DIR:-/dev/shm}" raft5fs-secrets.XXXXXX)
+    trap 'rm -rf "$SECRETS"' EXIT
+    local rel plain
+    while IFS= read -r rel; do
+        if [[ $rel == *.sops ]]; then
+            plain=${rel%.sops}
+            mkdir -p "$SECRETS/$(dirname "$plain")"
+            if ! sops_decrypt "secrets/$rel" >"$SECRETS/$plain" 2>/dev/null; then
+                rm -f "$SECRETS/$plain"
+                needs_ca_identity "$plain" && continue
+                die "cannot decrypt secrets/$rel with the unlocked identities"
+            fi
+        else
+            mkdir -p "$SECRETS/$(dirname "$rel")"
+            cp -p "$STORE/$rel" "$SECRETS/$rel"
+        fi
+    done < <(cd "$STORE" && find . -type f | sed 's|^\./||' | sort)
+    # What each file held, so `seal_secrets` writes back only what changed.
+    (cd "$SECRETS" && find . -type f -exec sha256sum {} + | sed 's|  \./|  |') >"$SECRETS/.opened"
+}
+
+# Writes new and changed files in SECRETS back to the cluster: secrets
+# sops-encrypted, everything else as it is. Unchanged files are left alone,
+# because each encryption differs and would show as a change in git. Sets
+# SEALED to how many files it wrote.
+SEALED=0
+seal_secrets() {
+    local rel sum
+    SEALED=0
+    while IFS= read -r rel; do
+        sum=$(sha256sum <"$SECRETS/$rel")
+        grep -qxF "${sum%% *}  $rel" "$SECRETS/.opened" && continue
+        if is_secret "$rel"; then
+            sops_encrypt "$rel" <"$SECRETS/$rel"
+            echo "sealed secrets/$rel.sops"
+        else
+            mkdir -p "$STORE/$(dirname "$rel")"
+            cp -p "$SECRETS/$rel" "$STORE/$rel"
+            echo "wrote secrets/$rel"
+        fi
+        SEALED=$((SEALED + 1))
+    done < <(cd "$SECRETS" && find . -type f ! -name .opened | sed 's|^\./||' | sort)
+}
 
 # Every node, one line each: name public_ip wg_ip public_name.
 nodes() {
@@ -36,7 +137,7 @@ first_node() {
 node_field() {
     local line
     line=$(nodes | awk -v n="$1" '$1 == n') || true
-    [[ -n $line ]] || die "no node $1 in cluster.conf"
+    [[ -n $line ]] || die "no node $1 in $CLUSTER/cluster.conf"
     awk -v f="$2" '{print $f}' <<<"$line"
 }
 
@@ -96,6 +197,8 @@ public_address() {
 ssh_node() {
     local node=$1
     shift
+    # The command runs on the node, so it is meant to expand there.
+    # shellcheck disable=SC2029
     ssh "$SSH_USER@$(node_field "$node" 2)" "$@"
 }
 

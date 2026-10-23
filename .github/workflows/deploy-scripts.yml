@@ -1,0 +1,16 @@
+# Runs shellcheck on the deploy scripts whenever they change.
+name: deploy scripts
+
+on:
+  push:
+    paths: ["deploy/**", ".github/workflows/deploy-scripts.yml"]
+  pull_request:
+    paths: ["deploy/**", ".github/workflows/deploy-scripts.yml"]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y shellcheck
+      - run: deploy/check.sh

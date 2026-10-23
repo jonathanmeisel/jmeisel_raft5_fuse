@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Unlocks the cluster's secrets for this shell. It decrypts the deploy age
+# identity (asking for its passphrase once) and prints the line that hands
+# it to sops. Run it through eval, so the identity lives only in this
+# shell's environment, never in a file:
+#
+#   eval "$(./unlock)"                     deploy identity: everyday work
+#   eval "$(./unlock --ca <file>)"         also the offline CA identity:
+#                                          signing certificates, the
+#                                          operator backup key
+#
+# The deploy identity is ~/.config/raft5fs/age/deploy.age, or
+# RAFT5FS_AGE_IDENTITY. An identity file may be passphrase-protected
+# (`age -p`) or plain.
+set -euo pipefail
+
+die() {
+    echo "unlock: $*" >&2
+    exit 1
+}
+
+command -v age >/dev/null || die "age isn't installed"
+
+deploy=${RAFT5FS_AGE_IDENTITY:-$HOME/.config/raft5fs/age/deploy.age}
+ca=
+while (($#)); do
+    case $1 in
+    --ca)
+        ca=${2:?usage: unlock [--ca <file>]}
+        shift 2
+        ;;
+    *) die "usage: unlock [--ca <file>]" ;;
+    esac
+done
+
+# The identities in file $1: as they are if it is a plain identity file,
+# otherwise decrypted (age asks for the passphrase on the terminal).
+identities() {
+    [[ -f $1 ]] || die "no identity file $1"
+    if grep -q '^AGE-SECRET-KEY-' "$1"; then
+        grep '^AGE-SECRET-KEY-' "$1"
+    else
+        age --decrypt "$1" | grep '^AGE-SECRET-KEY-' || die "cannot decrypt $1"
+    fi
+}
+
+keys=$(identities "$deploy")
+if [[ -n $ca ]]; then
+    keys+=$'\n'$(identities "$ca")
+fi
+printf 'export SOPS_AGE_KEY=%q\n' "$keys"
+echo "unlocked$([[ -n $ca ]] && echo " (with the CA identity)")" >&2

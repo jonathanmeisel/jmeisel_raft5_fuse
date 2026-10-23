@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Opens the raft5 store's admin shell (`raft`) as the store's administrator,
 # on a node (the first node, unless one is named). It asks for admin's
-# password: secrets/admin.pw.
+# password: ./secrets.sh show admin.pw.
 #
 #   ./admin-shell.sh [<node>]
 . "$(dirname "$0")/lib.sh"

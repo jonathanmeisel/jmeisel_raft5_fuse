@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Puts together each node's bundle (binaries, certificates, secrets, units,
-# WireGuard config) in out/<node>/, from cluster.conf, secrets/, and
-# templates/. install.sh runs it. Run it alone to see what would be
-# installed.
+# WireGuard config) in DIR/<node>/, from the cluster's settings and
+# secrets, and templates/. install.sh runs it into a temporary directory
+# in memory. Run it alone to see what would be installed, and remove DIR
+# after: the bundles hold the secrets in plaintext.
 #
-#   ./render.sh [<node>...]     every node if none are named
+#   ./render.sh --out DIR [<node>...]     every node if none are named
 . "$(dirname "$0")/lib.sh"
+
+[[ ${1:-} == --out && -n ${2:-} ]] || die "usage: render.sh --out DIR [<node>...]"
+BUNDLES=$2
+shift 2
+mkdir -p "$BUNDLES"
+open_secrets
 
 [[ -f $SECRETS/internal-ca.pem ]] || die "no secrets yet: run ./certs.sh first"
 if [[ -n ${S3_BUCKET:-} ]]; then
     [[ -f $SECRETS/s3.env ]] ||
-        die "S3_BUCKET is set: put the bucket's credentials in secrets/s3.env (README \"Large files\")"
+        die "S3_BUCKET is set: add the bucket's credentials with ./secrets.sh edit s3.env (README \"Large files\")"
     for var in RAFT5FS_OBJECT_ACCESS_KEY RAFT5FS_OBJECT_SECRET_KEY; do
         grep -q "^$var=" "$SECRETS/s3.env" || die "secrets/s3.env has no $var="
     done
@@ -18,15 +25,33 @@ if [[ -n ${S3_BUCKET:-} ]]; then
 fi
 if [[ -n ${BACKUP_BUCKET:-} ]]; then
     [[ -f $SECRETS/backup.env ]] ||
-        die "BACKUP_BUCKET is set: put the backup bucket's credentials in secrets/backup.env (README \"Backups\")"
+        die "BACKUP_BUCKET is set: add the backup bucket's credentials with ./secrets.sh edit backup.env (README \"Backups\")"
     for var in RAFT5FS_BACKUP_ACCESS_KEY RAFT5FS_BACKUP_SECRET_KEY; do
         grep -q "^$var=" "$SECRETS/backup.env" || die "secrets/backup.env has no $var="
     done
     [[ -f $SECRETS/backup.pub ]] ||
-        die "BACKUP_BUCKET is set: put the operator public key in secrets/backup.pub (README \"Backups\")"
+        die "BACKUP_BUCKET is set: put the operator public key in the cluster's secrets/backup.pub (README \"Backups\")"
     [[ $BACKUP_BUCKET != "${S3_BUCKET:-}" ]] || die "BACKUP_BUCKET must not be S3_BUCKET"
     backup_options >/dev/null
 fi
+# Node hardening (README "Hardening the nodes"). Off unless set.
+ADMIN_USER=${ADMIN_USER:-}
+SSH_HARDEN=${SSH_HARDEN:-no}
+NIGHTLY_BACKUPS=${NIGHTLY_BACKUPS:-no}
+BACKUP_KEEP=${BACKUP_KEEP:-14}
+if [[ -n $ADMIN_USER ]]; then
+    [[ $ADMIN_USER =~ ^[a-z][a-z0-9_-]*$ ]] || die "ADMIN_USER ($ADMIN_USER) isn't a valid user name"
+    [[ -s $CLUSTER/authorized_keys ]] ||
+        die "ADMIN_USER is set: put the SSH public keys it accepts in $CLUSTER/authorized_keys"
+fi
+if [[ $SSH_HARDEN == yes ]]; then
+    [[ -n $ADMIN_USER ]] || die "SSH_HARDEN=yes needs ADMIN_USER, or no one could log in"
+fi
+if [[ $NIGHTLY_BACKUPS == yes ]]; then
+    [[ -n ${BACKUP_BUCKET:-} ]] || die "NIGHTLY_BACKUPS=yes needs the backup space (BACKUP_BUCKET)"
+    [[ $BACKUP_KEEP =~ ^[1-9][0-9]*$ ]] || die "BACKUP_KEEP must be at least 1"
+fi
+
 for bin in raft5-server raft raft5fs-server; do
     [[ -x $OUT/bin/$bin ]] || die "no $OUT/bin/$bin: run ./build.sh first"
 done
@@ -42,17 +67,27 @@ fill() {
         -e "s|@INVITE_SERVERS@|$(invite_servers)|g" \
         -e "s|@OBJECT_OPTIONS@|$(object_options)|g" \
         -e "s|@BACKUP_OPTIONS@|$(backup_options)|g" \
+        -e "s|@BACKUP_KEEP@|$BACKUP_KEEP|g" \
+        -e "s|@BACKUP_TIME@|$(backup_time "$2")|g" \
         "$DEPLOY/templates/$1"
 }
 
+# When node $1 runs the nightly backup: 03:00 for the first node, then 20
+# minutes later for each one after, so one node does the work.
+backup_time() {
+    local i
+    i=$(node_names | grep -nx -- "$1" | cut -d: -f1)
+    printf '%02d:%02d:00' $((3 + (i - 1) * 20 / 60)) $(((i - 1) * 20 % 60))
+}
+
 render() {
-    local node=$1 dir=$OUT/$1 wg_ip
+    local node=$1 dir=$BUNDLES/$1 wg_ip
     wg_ip=$(node_field "$node" 3)
     [[ -f $SECRETS/nodes/$node.pem ]] ||
         die "no certificate for $node: run ./certs.sh after adding it to cluster.conf"
     umask 077
     rm -rf "$dir"
-    mkdir -p "$dir"/{bin,raft5,raft5fs,systemd,sbin}
+    mkdir -p "$dir"/{bin,raft5,raft5fs,systemd,sbin,harden}
 
     cp "$OUT/bin/"{raft5-server,raft,raft5fs-server} "$dir/bin/"
 
@@ -107,23 +142,46 @@ render() {
     } >"$dir/wg0.conf"
 
     for unit in raft5-server.service raft5fs-server.service \
-        raft5fs-cert-check.service raft5fs-cert-check.timer; do
+        raft5fs-cert-check.service raft5fs-cert-check.timer \
+        raft5fs-nightly-backup.service raft5fs-nightly-backup.timer; do
         fill "$unit" "$node" >"$dir/systemd/$unit"
     done
-    for script in raft5fs-admin raft5-shell raft5fs-cert-check; do
+    for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup; do
         fill "$script" "$node" >"$dir/sbin/$script"
     done
     fill remote-install.sh "$node" >"$dir/remote-install.sh"
+
+    # Hardening. remote-install.sh uses each only when its setting is on.
+    if [[ -n $ADMIN_USER ]]; then
+        cp "$CLUSTER/authorized_keys" "$dir/harden/authorized_keys"
+        echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" >"$dir/harden/sudoers"
+    fi
+    printf '%s\n' \
+        '# raft5fs: SSH keys only, and no root login (deploy/README.md).' \
+        'PermitRootLogin no' \
+        'PasswordAuthentication no' \
+        'KbdInteractiveAuthentication no' >"$dir/harden/sshd.conf"
+    printf '%s\n' \
+        '// raft5fs: install security updates daily; never reboot by itself' \
+        '// (deploy/reboot.sh reboots one node at a time).' \
+        'APT::Periodic::Update-Package-Lists "1";' \
+        'APT::Periodic::Unattended-Upgrade "1";' \
+        'Unattended-Upgrade::Automatic-Reboot "false";' >"$dir/harden/apt.conf"
+
     {
         echo "NODE=$node"
         echo "SSH_PORT=$SSH_PORT"
         echo "WG_PORT=$WG_PORT"
+        echo "ADMIN_USER=$ADMIN_USER"
+        echo "SSH_HARDEN=$SSH_HARDEN"
+        echo "NIGHTLY_BACKUPS=$NIGHTLY_BACKUPS"
     } >"$dir/node.conf"
     echo "rendered $dir"
 }
 
 if (($# == 0)); then
-    set -- $(node_names)
+    mapfile -t all < <(node_names)
+    set -- "${all[@]}"
 fi
 for node in "$@"; do
     render "$node"

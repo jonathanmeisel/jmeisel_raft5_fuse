@@ -1,4 +1,6 @@
-# Your cluster's own settings, keys and built bundles: never committed.
+# Built binaries. A cluster's settings and secrets live in the cluster
+# repo (README "Cluster repo"); the two entries below only guard against
+# committing an old plaintext copy left here by mistake.
+/out/
 /cluster.conf
 /secrets/
-/out/

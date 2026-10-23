@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Makes all the secrets that the cluster needs, in secrets/. Keep a backup
-# of that directory in a safe place, offline: it is the only copy of the CA
-# keys and the passwords.
+# Makes all the secrets that the cluster needs, in the cluster repo's
+# secrets/ (RAFT5FS_CLUSTER). Secret files are written sops-encrypted;
+# certificates and public keys as they are. Commit and push the cluster
+# repo after.
 #
 #   ./certs.sh          make whatever is missing: both CAs, every
 #                       certificate, the WireGuard keys, the shared secrets
 #                       and the passwords. Safe to run again, e.g. after
 #                       adding a node to cluster.conf.
+#                       Signing a certificate needs the CA identity:
+#                       eval "$(./unlock --ca <file>)" first.
 #   ./certs.sh renew    issue every certificate again (the CAs stay), for
 #                       renewal or after the nodes' names or addresses
 #                       changed. Then install.sh each node, one at a time.
@@ -33,14 +36,21 @@ command -v openssl >/dev/null || die "openssl isn't installed"
 command -v wg >/dev/null || die "wg isn't installed (the wireguard-tools package)"
 
 umask 077
+mkdir -p "$STORE"
+open_secrets
 mkdir -p "$SECRETS/nodes" "$SECRETS/wg"
+
+# A path for messages: relative to secrets/, not the temporary directory.
+shown() {
+    echo "secrets/${1#"$SECRETS"/}"
+}
 
 # A random secret, written one time.
 secret() {
     local file=$1 bytes=$2
     [[ -f $file ]] && return
     head -c "$bytes" /dev/urandom | base64 -w0 >"$file"
-    echo "made $file"
+    echo "made $(shown "$file")"
 }
 
 # A self-signed CA, made one time.
@@ -52,7 +62,7 @@ ca() {
         -addext "basicConstraints=critical,CA:TRUE" \
         -addext "keyUsage=critical,keyCertSign,cRLSign" \
         -keyout "$SECRETS/$name.key" -out "$SECRETS/$name.pem" 2>/dev/null
-    echo "made $SECRETS/$name.pem"
+    echo "made $(shown "$SECRETS/$name.pem")"
 }
 
 # A certificate $out.pem / $out.key from CA $ca, for subjectAltName $san and
@@ -60,6 +70,8 @@ ca() {
 leaf() {
     local out=$1 ca=$2 cn=$3 san=$4 eku=$5
     if [[ -f $out.pem ]] && ! $renew; then return; fi
+    [[ -f $SECRETS/$ca.key ]] ||
+        die "issuing $(shown "$out.pem") needs the CA identity: eval \"\$(./unlock --ca <file>)\""
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -subj "/CN=$cn" -keyout "$out.key" -out "$out.csr" 2>/dev/null
     printf '%s\n' \
@@ -70,7 +82,7 @@ leaf() {
     openssl x509 -req -in "$out.csr" -CA "$SECRETS/$ca.pem" -CAkey "$SECRETS/$ca.key" \
         -CAcreateserial -days "$CERT_DAYS" -extfile "$out.ext" -out "$out.pem" 2>/dev/null
     rm -f "$out.csr" "$out.ext"
-    echo "issued $out.pem ($san)"
+    echo "issued $(shown "$out.pem") ($san)"
 }
 
 ca internal-ca "raft5fs internal CA"
@@ -105,6 +117,11 @@ fi
 leaf "$SECRETS/fs" fs-ca raft5fs "$san" serverAuth
 echo "$san" >"$SECRETS/fs.san"
 
+seal_secrets
 echo
-echo "secrets are in $SECRETS -- back the directory up, offline."
-echo "users mount with --ca fs-ca.pem: $SECRETS/fs-ca.pem"
+if ((SEALED)); then
+    echo "commit and push the cluster repo ($CLUSTER)."
+else
+    echo "nothing to make or renew."
+fi
+echo "users mount with --ca fs-ca.pem: $STORE/fs-ca.pem"

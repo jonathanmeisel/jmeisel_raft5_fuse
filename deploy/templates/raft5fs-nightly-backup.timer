@@ -1,0 +1,11 @@
+# Runs the nightly backup. Each node's time is a little apart, so one node
+# does the work and the others find it done (see raft5fs-nightly-backup).
+[Unit]
+Description=raft5fs nightly backup
+
+[Timer]
+OnCalendar=*-*-* @BACKUP_TIME@ UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,69 @@
+#!/bin/sh
+# raft5fs-nightly-backup: snapshots the filesystem and backs the snapshot
+# up to the backup space, as nightly-<date>, then keeps only the newest
+# @BACKUP_KEEP@ nightly backups. raft5fs-nightly-backup.timer runs it on every
+# node, a little apart. The first node to start does the work; the others
+# find it done or under way, and exit successfully. A real failure fails
+# the unit (`systemctl --failed`, the journal).
+set -eu
+keep=@BACKUP_KEEP@
+name=nightly-$(date -u +%F)
+admin=/usr/local/sbin/raft5fs-admin
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+# Runs raft5fs-admin, showing its output and keeping it in $out to look at.
+run() {
+    status=0
+    "$admin" "$@" >"$out" 2>&1 || status=$?
+    cat "$out"
+    return $status
+}
+
+said() { grep -q "$1" "$out"; }
+
+# Whether `list` output in $1 names $2 in its first column.
+names() { printf '%s\n' "$1" | cut -f1 | grep -qx "$2"; }
+
+# Failing to list is a real failure (e.g. bad credentials): stop here.
+backups=$("$admin" backup list)
+snapshots=$("$admin" snapshot list)
+
+# Snapshots from earlier nights whose backup failed. Only this script makes
+# nightly-* snapshots, and only tonight's can be in use, so the rest go:
+# the store holds at most 32, and each keeps old data.
+for old in $(printf '%s\n' "$snapshots" | cut -f1 | grep '^nightly-' | grep -vx "$name" || true); do
+    echo "removing $old, left by a failed night"
+    run snapshot del "$old"
+done
+
+if names "$backups" "$name"; then
+    echo "$name is already backed up"
+else
+    if ! run snapshot create "$name"; then
+        said "already exists" || exit 1
+    fi
+    if ! run backup create "$name"; then
+        if said "another backup job is running"; then
+            echo "another node is backing $name up; leaving it to finish"
+            exit 0
+        fi
+        said "already has a backup" || exit 1
+    fi
+fi
+
+# The backup holds everything the snapshot did, so the snapshot can go.
+if names "$("$admin" snapshot list)" "$name"; then
+    run snapshot del "$name"
+fi
+
+# Old nightly backups, beyond the newest $keep. Names sort by date.
+backups=$("$admin" backup list)
+printf '%s\n' "$backups" | cut -f1 | grep '^nightly-' | sort | head -n -"$keep" |
+    while read -r old; do
+        if ! run backup del "$old"; then
+            said "another backup job is running" || exit 1
+            echo "another backup job is running; $old goes next time"
+            break
+        fi
+    done
