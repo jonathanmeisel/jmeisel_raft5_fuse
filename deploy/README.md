@@ -33,12 +33,13 @@ repository.
 | `render.sh` | Assembles each node's bundle into `out/<node>/`. `install.sh` runs it for you. |
 | `install.sh` | Installs or upgrades nodes over SSH, one at a time, checking each is serving before moving on. |
 | `admin-shell.sh` | Opens the store's admin shell (`raft`) on a node. |
-| `fsadmin.sh` | Manages users and snapshots: `user add/del/list`, `snapshot create/del/list`. |
-| `backup.sh` | Copies a node's store database off the cluster. |
+| `fsadmin.sh` | Manages users, snapshots and backups: `user add/del/list`, `snapshot create/del/list`, `backup create/del/list/restore-objects`. |
 | `templates/` | The systemd units, the scripts installed on the nodes, and the node-side installer. |
 
-`cluster.conf`, `secrets/`, `out/` and `backups/` are git-ignored. With
-large files in a bucket (below), `secrets/s3.env` holds its credentials.
+`cluster.conf`, `secrets/` and `out/` are git-ignored. With
+large files in a bucket (below), `secrets/s3.env` holds its credentials;
+with backups, `secrets/backup.env` and `secrets/backup.pub` hold the
+backup bucket's credentials and the operator public key.
 **`secrets/` is the only copy of the CA keys and passwords: back it up
 somewhere safe and offline.**
 
@@ -125,11 +126,14 @@ raft> add_server https://10.10.0.3:27052
 raft> endpoints
 raft> create_user raft5fs
 raft> acl_set "" user:raft5fs=write
+raft> group_add backup-operators user:raft5fs
 raft> quit
 ```
 
 `endpoints` should list all three nodes. `acl_set ""` locks every key to
 the filesystem servers' account, as in SETUP.txt section 3.
+`backup-operators` lets that account take and remove snapshots and
+backups, so day-to-day admin never needs the store administrator.
 
 **6. Finish.** Reinstall node1 without `--bootstrap`, which removes the
 bootstrap login, then check every node:
@@ -163,7 +167,8 @@ mkdir -p ~/raft5fs && raft5fs mount ~/raft5fs
 | Task | Command |
 |---|---|
 | Users | `./fsadmin.sh user add\|del\|list ...` |
-| Snapshots | `./fsadmin.sh snapshot create\|del\|list ...` (asks for `secrets/admin.pw`) |
+| Snapshots | `./fsadmin.sh snapshot create\|del\|list ...` |
+| Backups | `./fsadmin.sh backup create\|del\|list ...` (see "Backups") |
 | Store admin shell | `./admin-shell.sh [node]` |
 | Upgrade | `./build.sh && ./install.sh --all`, one node at a time, each checked |
 | Renew certificates | `./certs.sh renew && ./install.sh --all` |
@@ -217,10 +222,11 @@ to set up. The store must support conditional writes (`If-None-Match`),
 which AWS S3 and current MinIO do. That is what stops a URL from
 overwriting an object once it is there.
 
-**2. Turn on versioning, with a lifecycle rule** that expires noncurrent
-versions after at least as long as you keep backups (below). Garbage
-collection deletes objects nothing points at any more. A restored backup
-may point at some of them again, and versioning is what still has them.
+**2. Optionally, turn on versioning, with a lifecycle rule** that expires
+noncurrent versions after a few days. Garbage collection deletes objects
+nothing points at any more, and versioning is a safety net against
+mistakes there. Backups (below) copy the objects they need, so they
+don't depend on it.
 
 **3. Configure.** In `cluster.conf`, set `S3_BUCKET`, `S3_ENDPOINT` and
 `S3_REGION` (and `S3_PATH_STYLE=yes` for MinIO). Then put the key in
@@ -260,25 +266,82 @@ first server has used them.
 
 The cluster keeps three copies, which protects against a dead disk but
 not against mistakes: a bad deletion or a bug is copied to every node at
-once. Snapshots help with deletions, but they live on the same cluster.
-So also copy the store off it regularly:
+once. Snapshots help with deletions, but they live on the cluster and in
+the same bucket. A backup copies a snapshot to a separate bucket: the
+store's contents, sealed to an operator key, and every object the
+snapshot points to. Contents and names are sealed by the mounts already,
+so the backup bucket sees nothing it couldn't before; the operator key
+protects what the store itself holds in clear (accounts, sizes).
+
+**1. Make a backup bucket and a key for it.** Use a different bucket
+from `S3_BUCKET`, ideally in another region. The key needs reading,
+writing, deleting and listing under `BACKUP_PREFIX`, as for the large
+files bucket.
+
+**2. Make the operator key pair** on your own machine, and keep the
+private key offline, away from the nodes: it is the only way to open the
+store contents of a backup.
 
 ```sh
-./backup.sh node3                 # to backups/node3-<time>.tar.gz
+./out/bin/raft5fs-server backup keygen ~/offline/raft5fs-backup.key
+cp ~/offline/raft5fs-backup.key.pub secrets/backup.pub
 ```
 
-This stops that node's store for the duration of the copy while the
-other two carry on. Run it only with the whole cluster healthy (the
-script checks first). The copy holds only what the servers can see, so
-it's fine to keep it off-site, for example in object storage. It
-doesn't include the bucket's objects (see "Large files"): the bucket's
-versioning is what keeps those restorable. Keep
-`secrets/` separately, offline. With the copy alone, nobody can log in.
+**3. Configure.** In `cluster.conf`, set `BACKUP_BUCKET`,
+`BACKUP_ENDPOINT` and `BACKUP_REGION` (and `BACKUP_PATH_STYLE=yes` for
+MinIO). Put the key in `secrets/backup.env`:
 
-**Restoring is untested.** A store database records the cluster's
-membership and its node's place in it. Before relying on these backups,
-practise restoring one into a scratch cluster of three nodes with the
-same names.
+```sh
+RAFT5FS_BACKUP_ACCESS_KEY=...
+RAFT5FS_BACKUP_SECRET_KEY=...
+```
+
+For a private CA, put its certificate in `secrets/backup-ca.pem`. Then
+`./install.sh --all`. The store account must be in `backup-operators`
+(bootstrap step 5); on an older cluster, run
+`group_add backup-operators user:raft5fs` in `./admin-shell.sh`.
+
+**4. Back up.** Take a snapshot, then back it up under its name:
+
+```sh
+./fsadmin.sh snapshot create nightly-2026-10-23
+./fsadmin.sh backup create nightly-2026-10-23
+./fsadmin.sh backup list
+```
+
+Backups share objects, so each copies only what is new since the last
+one. Once a backup is made, you can remove its snapshot to free what it
+holds on the cluster (`./fsadmin.sh snapshot del ...`). Remove old
+backups with `./fsadmin.sh backup del NAME`, which also deletes the
+objects no other backup uses and cleans up after a backup that failed
+part way. Only one backup job runs at a time. For a schedule, a cron job
+on your machine can run the two commands in turn.
+
+**5. Restore**, after losing the cluster or the bucket, into a cluster
+installed as in steps 1 to 4 of "First deployment" (with `--bootstrap`
+on node1) but not yet bootstrapped. Copy the objects back first, so
+nothing is served before they are there:
+
+```sh
+./fsadmin.sh backup restore-objects nightly-2026-10-23
+# On your machine, with the backup bucket's credentials in the environment:
+./out/bin/raft5fs-server backup fetch-kv nightly-2026-10-23 store.backup \
+    --backup-private-key ~/offline/raft5fs-backup.key \
+    --backup-endpoint ... --backup-bucket ... --backup-region ...
+scp store.backup node1:/root/
+./admin-shell.sh node1
+raft> bootstrap node1 --restore-from /root/store.backup
+raft> add_server https://10.10.0.2:27052
+raft> add_server https://10.10.0.3:27052
+raft> quit
+```
+
+Then finish with step 6. `restore-objects` copies the backup's objects
+into `S3_BUCKET` under `S3_PREFIX`, which must be what the backed-up
+filesystem used. Accounts, ACLs and groups come back with the store;
+snapshots don't. Delete `store.backup`, here and on node1: it holds the
+store's contents in clear. **Practise this once** on a scratch cluster
+before relying on it.
 
 ## Adding a node later
 

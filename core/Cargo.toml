@@ -7,7 +7,8 @@ edition.workspace = true
 [dependencies]
 getrandom = "0.2"
 libc = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros"] }
+prost = { workspace = true }
 raft5-client = { workspace = true }
 raft5-shared = { workspace = true }
 raft5fs-crypto = { workspace = true }

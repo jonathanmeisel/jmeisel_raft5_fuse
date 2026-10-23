@@ -70,6 +70,15 @@ if [ -f raft5fs/s3-ca.pem ]; then
     put raft5fs/s3-ca.pem /etc/raft5fs/s3-ca.pem 0644 root:root raft5fs-server
 fi
 put raft5fs/fs-ca.pem /etc/raft5fs/fs-ca.pem 0644 root:root raft5fs-admin
+# The backup space's settings (cluster.conf's BACKUP_* settings), for
+# raft5fs-admin alone.
+if [ -f raft5fs/backup.env ]; then
+    put raft5fs/backup.env /etc/raft5fs/backup.env 0600 root:root raft5fs-admin
+    put raft5fs/backup.pub /etc/raft5fs/backup.pub 0644 root:root raft5fs-admin
+fi
+if [ -f raft5fs/backup-ca.pem ]; then
+    put raft5fs/backup-ca.pem /etc/raft5fs/backup-ca.pem 0644 root:root raft5fs-admin
+fi
 
 if $bootstrap; then
     put bootstrap/admin.pw /etc/raft5/admin.pw 0640 root:raft5 raft5-server

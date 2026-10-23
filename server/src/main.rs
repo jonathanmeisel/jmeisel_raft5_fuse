@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use raft5_client::{Certificate, Client, ClientTls, Identity};
+use raft5fs_core::backup::{self, BackupStore};
 use raft5fs_core::gc::DEFAULT_GC_INTERVAL;
 use raft5fs_core::objects::{
     DEFAULT_GET_TTL, DEFAULT_OBJECT_BLOCK, DEFAULT_OBJECT_FROM, DEFAULT_PUT_TTL, ObjectSettings,
 };
 use raft5fs_core::{DEFAULT_CHUNK_SIZE, FsCore, accounts, snapshots, validate_chunk_size};
+use raft5fs_crypto::backup::{BACKUP_KEY_LEN, BackupKeyPair};
 use raft5fs_objstore::http::HttpConfig;
 use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_proto::invite::{Invite, pem_to_der};
@@ -30,6 +32,16 @@ usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
        raft5fs-server snapshot create [<NAME>] <store options> <kv-seed-address>...
        raft5fs-server snapshot del <NAME> <store options> <kv-seed-address>...
        raft5fs-server snapshot list <store options> <kv-seed-address>...
+       raft5fs-server backup create <SNAPSHOT> <store options> <object options>
+                      <backup options> <kv-seed-address>...
+       raft5fs-server backup del <NAME> <store options> <backup options>
+                      <kv-seed-address>...
+       raft5fs-server backup list <backup options>
+       raft5fs-server backup keygen <PRIVATE-KEY-FILE>
+       raft5fs-server backup fetch-kv <NAME> <OUT-FILE>
+                      --backup-private-key <FILE> <backup options>
+       raft5fs-server backup restore-objects <NAME> <object options>
+                      <backup options>
 
 Serving:
   --listen <ADDR>      address to serve clients on, e.g. 0.0.0.0:7700.
@@ -112,8 +124,47 @@ out), and every mount shows it, read-only, at /.snapshot/NAME. What each
 user sees there is what they could see when it was taken. Until `snapshot
 del` removes it, a snapshot keeps every version of everything changed
 since, and the store holds at most 32. Taking and removing them needs a
-store administrator's account (e.g. --store-user admin), not the
-filesystem servers' own.
+store account in raft5's backup-operators group (or admins): add the
+filesystem servers' account to backup-operators.
+
+Backups: `backup create` copies a snapshot to a backup space, an
+S3-compatible bucket that is not the one the servers keep objects in. It
+holds the store's own backup of the snapshot, sealed to an operator key,
+and every object the snapshot points to. Take the snapshot first, then
+back it up under the same name:
+  raft5fs-server snapshot create nightly-1 ...
+  raft5fs-server backup create nightly-1 ...
+Backups share their objects, so each one copies only objects that no
+earlier backup has. A backup is whole once its manifest is written; one
+that fails part way is cleaned up by the next `backup del`. `backup del`
+deletes a backup and every object no other backup uses; it leaves the
+snapshot. Only one backup job runs at a time.
+  `backup keygen FILE` makes the operator key pair: it writes the private
+key to FILE, and the public key to FILE.pub. Give the servers only the
+public key (--backup-public-key), and keep the private key offline: it
+opens every backup's store contents.
+  To restore: `backup fetch-kv NAME OUT` opens the store backup with the
+private key; `raft bootstrap <id> --restore-from OUT` starts a new store
+from it; `backup restore-objects NAME` copies the objects into the
+bucket the restored servers will use (--object-* options, same prefix
+as before). Then start the servers. The restored store has no snapshots.
+
+Backup options:
+  --backup-endpoint <URL>, --backup-bucket <NAME>, --backup-region <NAME>,
+  --backup-path-style, --backup-ca <PEM>
+                       the backup space, as for the --object-* options.
+                       Its credentials are read from
+                       RAFT5FS_BACKUP_ACCESS_KEY and
+                       RAFT5FS_BACKUP_SECRET_KEY.
+  --backup-prefix <PATH>
+                       what every key in the backup space starts with,
+                       ending in '/' (default raft5fs-backup/).
+  --backup-public-key <FILE>
+                       the operator public key to seal backups to (from
+                       `backup keygen`). Needed by `backup create`.
+  --backup-private-key <FILE>
+                       the operator private key. Needed by
+                       `backup fetch-kv`.
 
 Invite options (user add):
   --invite-server <URL>
@@ -210,6 +261,14 @@ struct Args {
     object_ca: Option<String>,
     gc_interval: Option<Duration>,
     no_prompt_delete: bool,
+    backup_endpoint: Option<String>,
+    backup_bucket: Option<String>,
+    backup_region: Option<String>,
+    backup_path_style: bool,
+    backup_prefix: Option<String>,
+    backup_ca: Option<String>,
+    backup_public_key: Option<String>,
+    backup_private_key: Option<String>,
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
@@ -272,6 +331,14 @@ fn parse_args() -> Args {
                 a.gc_interval = Some(Duration::from_secs(secs.into()));
             }
             "--no-prompt-delete" => a.no_prompt_delete = true,
+            "--backup-endpoint" => a.backup_endpoint = Some(value("--backup-endpoint")),
+            "--backup-bucket" => a.backup_bucket = Some(value("--backup-bucket")),
+            "--backup-region" => a.backup_region = Some(value("--backup-region")),
+            "--backup-path-style" => a.backup_path_style = true,
+            "--backup-prefix" => a.backup_prefix = Some(value("--backup-prefix")),
+            "--backup-ca" => a.backup_ca = Some(value("--backup-ca")),
+            "--backup-public-key" => a.backup_public_key = Some(value("--backup-public-key")),
+            "--backup-private-key" => a.backup_private_key = Some(value("--backup-private-key")),
             "--invite-server" => a.invite_servers.push(value("--invite-server")),
             "--invite-ca" => a.invite_ca = Some(value("--invite-ca")),
             "--invite-server-name" => a.invite_server_name = Some(value("--invite-server-name")),
@@ -314,58 +381,125 @@ fn store_tls(a: &Args) -> Option<ClientTls> {
     Some(tls)
 }
 
-/// Where to keep large files' data, if the object options ask for object
-/// storage.
-fn object_settings(a: &Args) -> Option<ObjectSettings> {
-    let Some(bucket) = &a.object_bucket else {
-        if a.object_endpoint.is_some() {
-            usage("--object-endpoint needs --object-bucket");
+/// One S3-compatible space's options, from `--object-*` or `--backup-*`.
+struct SpaceOptions<'a> {
+    /// The options' start, `--object` or `--backup`.
+    flag: &'a str,
+    endpoint: &'a Option<String>,
+    bucket: &'a Option<String>,
+    region: &'a Option<String>,
+    path_style: bool,
+    ca: &'a Option<String>,
+    /// The start of the credential variables' names.
+    env: &'a str,
+}
+
+/// The settings and HTTP client for a space, if its options name a
+/// bucket.
+fn space(o: SpaceOptions, prefix: String) -> Option<(S3Config, raft5fs_objstore::http::Client)> {
+    let flag = o.flag;
+    let Some(bucket) = o.bucket else {
+        if o.endpoint.is_some() {
+            usage(&format!("{flag}-endpoint needs {flag}-bucket"));
         }
         return None;
     };
-    let endpoint = a
-        .object_endpoint
+    let endpoint = o
+        .endpoint
         .clone()
-        .unwrap_or_else(|| usage("--object-bucket needs --object-endpoint"));
-    let credential = |var: &str| {
-        env::var(var).unwrap_or_else(|_| usage(&format!("--object-bucket needs {var} set")))
+        .unwrap_or_else(|| usage(&format!("{flag}-bucket needs {flag}-endpoint")));
+    let credential = |var: String| {
+        env::var(&var).unwrap_or_else(|_| usage(&format!("{flag}-bucket needs {var} set")))
     };
     let http = raft5fs_objstore::http::client(&HttpConfig {
-        extra_roots_pem: a.object_ca.as_deref().map(read_file),
+        extra_roots_pem: o.ca.as_deref().map(read_file),
         allow_plaintext: endpoint.starts_with("http://"),
         ..HttpConfig::default()
     })
     .unwrap_or_else(|e| fail(e));
     if endpoint.starts_with("http://") {
         eprintln!(
-            "warning: reaching the object store without TLS; the URLs it signs \
-             cross the network in the clear"
+            "warning: reaching {endpoint} without TLS; what is signed for it crosses the \
+             network in the clear"
         );
     }
-    let store = S3Store::new(
-        &S3Config {
-            endpoint,
-            bucket: bucket.clone(),
-            region: a
-                .object_region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".into()),
+    let config = S3Config {
+        endpoint,
+        bucket: bucket.clone(),
+        region: o.region.clone().unwrap_or_else(|| "us-east-1".into()),
+        path_style: o.path_style,
+        access_key: credential(format!("{}_ACCESS_KEY", o.env)),
+        secret_key: credential(format!("{}_SECRET_KEY", o.env)),
+        prefix,
+    };
+    Some((config, http))
+}
+
+fn store_for(config: &S3Config, http: raft5fs_objstore::http::Client) -> S3Store {
+    S3Store::new(config, http).unwrap_or_else(|e| usage(&e.to_string()))
+}
+
+fn object_space(a: &Args) -> Option<(S3Config, raft5fs_objstore::http::Client)> {
+    space(
+        SpaceOptions {
+            flag: "--object",
+            endpoint: &a.object_endpoint,
+            bucket: &a.object_bucket,
+            region: &a.object_region,
             path_style: a.object_path_style,
-            access_key: credential("RAFT5FS_OBJECT_ACCESS_KEY"),
-            secret_key: credential("RAFT5FS_OBJECT_SECRET_KEY"),
-            prefix: a.object_prefix.clone().unwrap_or_else(|| "raft5fs/".into()),
+            ca: &a.object_ca,
+            env: "RAFT5FS_OBJECT",
         },
-        http,
+        a.object_prefix.clone().unwrap_or_else(|| "raft5fs/".into()),
     )
-    .unwrap_or_else(|e| usage(&e.to_string()));
+}
+
+/// Where to keep large files' data, if the object options ask for object
+/// storage.
+fn object_settings(a: &Args) -> Option<ObjectSettings> {
+    let (config, http) = object_space(a)?;
     Some(ObjectSettings {
-        store,
+        store: store_for(&config, http),
         object_from: a.object_from.unwrap_or(DEFAULT_OBJECT_FROM),
         object_block: a.object_block.unwrap_or(DEFAULT_OBJECT_BLOCK),
         put_ttl: a.object_put_ttl.unwrap_or(DEFAULT_PUT_TTL),
         get_ttl: a.object_get_ttl.unwrap_or(DEFAULT_GET_TTL),
         prompt_delete: !a.no_prompt_delete,
     })
+}
+
+/// The backup space from the backup options, which a backup command needs.
+/// It refuses a backup space that is the serving space: a backup must
+/// outlive what happens to that.
+fn backup_store(a: &Args, serving: Option<&S3Config>) -> BackupStore {
+    let prefix = a
+        .backup_prefix
+        .clone()
+        .unwrap_or_else(|| "raft5fs-backup/".into());
+    let (config, http) = space(
+        SpaceOptions {
+            flag: "--backup",
+            endpoint: &a.backup_endpoint,
+            bucket: &a.backup_bucket,
+            region: &a.backup_region,
+            path_style: a.backup_path_style,
+            ca: &a.backup_ca,
+            env: "RAFT5FS_BACKUP",
+        },
+        prefix.clone(),
+    )
+    .unwrap_or_else(|| usage("a backup command needs --backup-endpoint and --backup-bucket"));
+    if let Some(serving) = serving
+        && serving.bucket == config.bucket
+        && serving.endpoint.trim_end_matches('/') == config.endpoint.trim_end_matches('/')
+    {
+        usage("the backup space must be another bucket than the one objects are served from");
+    }
+    let pool = S3Config {
+        prefix: format!("{prefix}objects/"),
+        ..config.clone()
+    };
+    BackupStore::new(store_for(&pool, http.clone()), store_for(&config, http))
 }
 
 /// A client logged in as the store account.
@@ -512,6 +646,143 @@ async fn snapshot_command(a: Args) {
     result.unwrap_or_else(|e| fail(e));
 }
 
+/// Reads a key file that `backup keygen` wrote: the key in hex.
+fn read_key_file(path: &str) -> [u8; BACKUP_KEY_LEN] {
+    let text = String::from_utf8(read_file(path)).unwrap_or_default();
+    let text = text.trim();
+    let bytes: Option<Vec<u8>> = (text.len() == 2 * BACKUP_KEY_LEN)
+        .then(|| {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+                .collect()
+        })
+        .flatten();
+    bytes
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or_else(|| fail(format!("{path} doesn't hold a backup key")))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Writes `text` to a new file at `path` that only its owner can read.
+fn write_secret_file(path: &str, text: &str) {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .unwrap_or_else(|e| fail(format!("cannot write {path}: {e}")));
+}
+
+async fn backup_command(a: Args) {
+    let mut positional = a.positional.iter().skip(1);
+    let command = positional.next().map(String::as_str);
+    let mut arg = |what: &str| {
+        positional
+            .next()
+            .cloned()
+            .unwrap_or_else(|| usage(&format!("which {what}?")))
+    };
+    match command {
+        Some("keygen") => {
+            let path = arg("file");
+            let pair = BackupKeyPair::generate();
+            let public = hex(&pair.public_key());
+            write_secret_file(&path, &format!("{}\n", hex(pair.to_bytes().as_ref())));
+            let public_path = format!("{path}.pub");
+            std::fs::write(&public_path, format!("{public}\n"))
+                .unwrap_or_else(|e| fail(format!("cannot write {public_path}: {e}")));
+            println!("private key written to {path}: keep it offline");
+            println!("public key written to {public_path}: {public}");
+        }
+        Some("create") => {
+            let snapshot = arg("snapshot");
+            let seeds = positional.cloned().collect();
+            let public_key = read_key_file(
+                a.backup_public_key
+                    .as_deref()
+                    .unwrap_or_else(|| usage("backup create needs --backup-public-key")),
+            );
+            let serving = object_space(&a);
+            let backup = backup_store(&a, serving.as_ref().map(|(c, _)| c));
+            let serving = serving.map(|(config, http)| Arc::new(store_for(&config, http)));
+            let client = store_client(&a, seeds).await;
+            let stats = backup::create(&client, serving, &backup, &public_key, &snapshot)
+                .await
+                .unwrap_or_else(|e| fail(format!("backup of {snapshot} failed: {e}")));
+            println!(
+                "backed up {snapshot}: {} objects ({} new), {} bytes of store contents",
+                stats.objects, stats.copied, stats.kv_bytes
+            );
+        }
+        Some("del") => {
+            let name = arg("backup");
+            let seeds = positional.cloned().collect();
+            let backup = backup_store(&a, None);
+            let client = store_client(&a, seeds).await;
+            let stats = backup::delete(&client, &backup, &name)
+                .await
+                .unwrap_or_else(|e| fail(e));
+            if !stats.existed {
+                eprintln!("there was no backup {name}");
+            }
+            println!(
+                "deleted {} unused objects and {} failed backups",
+                stats.objects_deleted, stats.leftovers_deleted
+            );
+        }
+        Some("list") => {
+            let backup = backup_store(&a, None);
+            for b in backup::list(&backup).await.unwrap_or_else(|e| fail(e)) {
+                let secs = b
+                    .created
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                println!(
+                    "{}\t{secs}\t{} objects\t{} object bytes\t{} store bytes",
+                    b.name, b.objects, b.object_bytes, b.kv_bytes
+                );
+            }
+        }
+        Some("fetch-kv") => {
+            let name = arg("backup");
+            let out = arg("output file");
+            let private_key = read_key_file(
+                a.backup_private_key
+                    .as_deref()
+                    .unwrap_or_else(|| usage("backup fetch-kv needs --backup-private-key")),
+            );
+            let backup = backup_store(&a, None);
+            let pair = BackupKeyPair::from_bytes(private_key);
+            let written = backup::fetch_kv(&backup, &pair, &name, std::path::Path::new(&out))
+                .await
+                .unwrap_or_else(|e| fail(e));
+            println!(
+                "wrote {written} bytes to {out}; restore with `raft bootstrap <id> --restore-from {out}`"
+            );
+        }
+        Some("restore-objects") => {
+            let name = arg("backup");
+            let (config, http) = object_space(&a)
+                .unwrap_or_else(|| usage("backup restore-objects needs the --object-* options"));
+            let backup = backup_store(&a, Some(&config));
+            let serving = Arc::new(store_for(&config, http));
+            let count = backup::restore_objects(&backup, serving, &name)
+                .await
+                .unwrap_or_else(|e| fail(e));
+            println!("copied {count} objects into {}", config.bucket);
+        }
+        _ => usage("backup takes create, del, list, keygen, fetch-kv or restore-objects"),
+    }
+}
+
 /// Logs through `tracing` as RAFT5FS_LOG says, if it is set.
 fn init_logging() {
     let Ok(filter) = env::var("RAFT5FS_LOG") else {
@@ -595,6 +866,7 @@ fn main() {
     match args.positional.first().map(String::as_str) {
         Some("user") => runtime.block_on(user_command(args)),
         Some("snapshot") => runtime.block_on(snapshot_command(args)),
+        Some("backup") => runtime.block_on(backup_command(args)),
         _ => runtime.block_on(serve_command(args)),
     }
 }

@@ -48,6 +48,16 @@ OBJECT_BLOCK=16M
 # How often, in seconds, to delete objects that nothing points to.
 GC_INTERVAL=3600
 
+# Backups of snapshots to another S3-compatible bucket (README "Backups").
+# Optional: leave BACKUP_BUCKET empty for none. It must not be S3_BUCKET.
+# The credentials go in secrets/backup.env, and the operator public key in
+# secrets/backup.pub, never here.
+BACKUP_BUCKET=
+BACKUP_ENDPOINT=https://s3.eu-west-1.amazonaws.com
+BACKUP_REGION=eu-west-1
+BACKUP_PATH_STYLE=no
+BACKUP_PREFIX=raft5fs-backup/
+
 # How long the certificates that certs.sh issues are valid, in days. The CAs
 # are valid for ten years.
 CERT_DAYS=397

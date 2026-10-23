@@ -15,6 +15,6 @@ raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true, features = ["fake"] }
 raft5fs-server = { workspace = true }
 rcgen = "0.14"
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["fs", "net"] }
 tokio-util = { workspace = true }
 tonic = { workspace = true }

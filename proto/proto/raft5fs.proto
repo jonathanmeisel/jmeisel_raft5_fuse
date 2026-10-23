@@ -709,3 +709,38 @@ message PruneKeysRequest {
   uint32 expected_version = 2;
   bytes node_keys = 3;
 }
+
+// A backup's manifest, stored in the backup space after everything else
+// the backup holds (see raft5fs-core's `backup`). A backup exists if and
+// only if its manifest does. Not part of the protocol: only servers and
+// admin tools read it.
+message BackupManifest {
+  uint32 format = 1;
+  // The snapshot the backup was taken from, which is also its name.
+  string name = 2;
+  uint64 snapshot_seq = 3;
+  uint64 created_unix_ms = 4;
+  // The filesystem's object grid, if it keeps blocks in object storage.
+  uint64 grid_from_index = 5;
+  uint32 grid_per_block = 6;
+  // The data key, sealed to the operator's public key.
+  bytes sealed_data_key = 7;
+  repeated BackupPart parts = 8;
+  repeated BackupObject objects = 9;
+}
+
+// One part of the store's backup file, sealed under the data key.
+message BackupPart {
+  uint64 plain_len = 1;
+  uint64 sealed_len = 2;
+  // SHA-256 of the sealed part.
+  bytes sha256 = 3;
+}
+
+// An object the backup's snapshot points to, in the backup's object pool.
+message BackupObject {
+  uint64 ino = 1;
+  uint64 minted_ms = 2;
+  bytes random = 3;
+  uint64 size = 4;
+}

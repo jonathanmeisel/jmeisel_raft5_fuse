@@ -8,14 +8,16 @@
 #   ./fsadmin.sh [<node>] snapshot create [<NAME>]
 #   ./fsadmin.sh [<node>] snapshot del <NAME>
 #   ./fsadmin.sh [<node>] snapshot list
-#
-# Snapshot commands ask for admin's store password (secrets/admin.pw).
+#   ./fsadmin.sh [<node>] backup create <SNAPSHOT>
+#   ./fsadmin.sh [<node>] backup del <NAME>
+#   ./fsadmin.sh [<node>] backup list
+#   ./fsadmin.sh [<node>] backup restore-objects <NAME>
 . "$(dirname "$0")/lib.sh"
 node=$(first_node)
 if (($#)) && node_names | grep -qx -- "$1"; then
     node=$1
     shift
 fi
-(($#)) || die "usage: fsadmin.sh [<node>] (user | snapshot) ..."
+(($#)) || die "usage: fsadmin.sh [<node>] (user | snapshot | backup) ..."
 args=$(printf '%q ' "$@")
 as_root_tty "$node" "/usr/local/sbin/raft5fs-admin $args"

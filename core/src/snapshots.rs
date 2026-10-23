@@ -2,9 +2,10 @@
 //! filesystem as it was when it was taken, and mounts show it read-only
 //! under `/.snapshot/<name>`.
 //!
-//! - Only the store administrator can take or remove a snapshot. raft5
-//!   allows no one else, because a snapshot keeps every version of every
-//!   key changed after it until it is removed.
+//! - Only an account in raft5's `admins` or `backup-operators` group can
+//!   take or remove a snapshot, because a snapshot keeps every version of
+//!   every key changed after it until it is removed. The filesystem
+//!   servers' account is put in `backup-operators` for this.
 //! - The filesystem servers' account can list and read snapshots like any
 //!   other read.
 //! - A read at a snapshot reads everything as it was then, including the
@@ -68,8 +69,8 @@ pub async fn exists(client: &Client, name: &[u8]) -> Result<bool, FsError> {
 }
 
 /// Takes a snapshot of the filesystem as it is now, named `name`, or named
-/// by the time if `None`. `client` must be logged in as a store
-/// administrator.
+/// by the time if `None`. `client`'s account must be in `admins` or
+/// `backup-operators`.
 pub async fn create(client: &Client, name: Option<&str>) -> Result<SnapshotInfo, String> {
     if let Some(name) = name {
         validate_name(name)?;
@@ -81,8 +82,8 @@ pub async fn create(client: &Client, name: Option<&str>) -> Result<SnapshotInfo,
     info(made).ok_or_else(|| "the store named the snapshot something unusable".to_string())
 }
 
-/// Removes snapshot `name` and frees what it held. `client` must be logged
-/// in as a store administrator.
+/// Removes snapshot `name` and frees what it held. `client`'s account must
+/// be in `admins` or `backup-operators`.
 pub async fn remove(client: &Client, name: &str) -> Result<(), String> {
     client
         .remove_snapshot(name.as_bytes())

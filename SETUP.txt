@@ -129,6 +129,7 @@ account and lock the store down. create_user asks for its password.
   raft> bootstrap n1
   raft> create_user raft5fs
   raft> acl_set "" user:raft5fs=write
+  raft> group_add backup-operators user:raft5fs
   raft> quit
 
   - raft5fs  is the service account the filesystem servers work as.
@@ -137,6 +138,9 @@ account and lock the store down. create_user asks for its password.
   - acl_set ""  puts an ACL on the empty prefix, which governs every
              key: only raft5fs may read or write anything. Without it,
              every key is open to any logged-in account.
+  - group_add backup-operators  lets raft5fs take and remove snapshots
+             (section 8) and backups (section 13). It can already read
+             every key, so this gives it nothing new to read.
 
 The --initial-admin-* flags only matter until the bootstrap. After that
 the stored admin account takes over, and they can be left off.
@@ -441,18 +445,13 @@ by a server. --known-keys puts them elsewhere.
 -------------------------------------------------------------------------
 
 A snapshot pins the whole filesystem as it is at that moment, for every
-user to look back at. Taking and removing them needs the store's
-administrator -- not the raft5fs account the servers use -- so with the
-store options from section 4, but --store-user admin and admin's
-password:
+user to look back at. Taking and removing them needs a store account in
+backup-operators, such as raft5fs (section 3), so with the store options
+from section 4:
 
-  export RAFT5FS_STORE_PASSWORD='<the admin password>'
-  ADMIN="--store-user admin --store-ca cert.pem \
-         --store-cert cert.pem --store-key key.pem"
-
-  raft5fs-server snapshot create daily-2026-10-06 $ADMIN https://127.0.0.1:27051
-  raft5fs-server snapshot list $ADMIN https://127.0.0.1:27051
-  raft5fs-server snapshot del daily-2026-10-06 $ADMIN https://127.0.0.1:27051
+  raft5fs-server snapshot create daily-2026-10-06 $STORE https://127.0.0.1:27051
+  raft5fs-server snapshot list $STORE https://127.0.0.1:27051
+  raft5fs-server snapshot del daily-2026-10-06 $STORE https://127.0.0.1:27051
 
 A name is letters, digits, '.', '_', '-', ':' and '+'; leave it out of
 `create` to name the snapshot by the time. `list` prints each name with
@@ -708,9 +707,10 @@ The bucket needs:
 
   - conditional writes (If-None-Match), which AWS S3 and current MinIO
     support: what stops an upload URL being used to overwrite an object;
-  - versioning, with noncurrent versions kept at least as long as
-    backups of the store: restoring an older store brings back pointers
-    to objects that garbage collection has since deleted;
+  - optionally, versioning, as a safety net for garbage collection.
+    Backups (section 13) copy the objects they need, so they don't
+    depend on it. A copy of the store made some other way does: its
+    pointers may name objects deleted since;
   - a key allowed to get, put, delete and list under the prefix, and
     nothing else. Every URL the servers sign acts with its rights;
   - the servers' clocks kept right (NTP): upload names carry the time
@@ -723,3 +723,78 @@ uploads it. Large files written front to back, and read back, are what
 this is for. Small random writes into large files (databases, VM images)
 do better with a smaller --object-block, or in a filesystem without a
 bucket.
+
+
+-------------------------------------------------------------------------
+13. BACKUPS
+-------------------------------------------------------------------------
+
+A backup copies a snapshot to a backup space: an S3-compatible bucket
+that is not the one the servers keep objects in, ideally somewhere else.
+It holds:
+
+  - the store's own backup of the snapshot (every key, account, group
+    and ACL), sealed to an operator key pair;
+  - every object the snapshot points to (section 12). Backups share
+    these, so each copies only objects that no earlier backup has.
+
+Everything the mounts sealed stays sealed. The operator key also seals
+what the store holds in clear (accounts' verifiers, sizes, layout), so
+whoever can read the backup space can't use those either.
+
+The operator key pair. Make it on a machine you trust, give the servers
+only the public key, and keep the private key offline: it opens the
+store contents of every backup.
+
+  raft5fs-server backup keygen backup.key   # also writes backup.key.pub
+
+The backup options, with the space's credentials in
+RAFT5FS_BACKUP_ACCESS_KEY and RAFT5FS_BACKUP_SECRET_KEY:
+
+  BACKUP="--backup-endpoint https://... --backup-bucket raft5fs-backups \
+          --backup-region ... --backup-public-key backup.key.pub"
+
+  --backup-prefix  what every key starts with (default raft5fs-backup/).
+  --backup-path-style, --backup-ca  as for the --object-* options.
+
+Taking one. Snapshot first, then back the snapshot up under its name,
+with the store options from section 4 and, if the filesystem keeps
+objects, the --object-* options from section 12 ($OBJECTS):
+
+  raft5fs-server snapshot create nightly-1 $STORE https://127.0.0.1:27051
+  raft5fs-server backup create nightly-1 $STORE $OBJECTS $BACKUP https://127.0.0.1:27051
+  raft5fs-server backup list $BACKUP
+
+A backup is whole once its manifest is written, last. One that fails
+part way leaves files with no manifest, which `backup del` cleans up. An
+object the snapshot points to that is missing fails the backup, rather
+than leaving a backup that can't be restored. Once it is made, the
+snapshot can go (`snapshot del`).
+
+  raft5fs-server backup del nightly-1 $STORE $BACKUP https://127.0.0.1:27051
+
+deletes the backup, then every object in the space that no other backup
+needs. One backup job (create or del) runs at a time; another waits for
+it to finish, or for its lease to run out after ten minutes.
+
+Restoring, into a new store and an empty bucket:
+
+  1. Copy the objects into the bucket the restored servers will use,
+     under the same prefix as before:
+
+       raft5fs-server backup restore-objects nightly-1 $OBJECTS $BACKUP
+
+  2. Open the store contents with the private key:
+
+       raft5fs-server backup fetch-kv nightly-1 store.backup \
+         --backup-private-key backup.key $BACKUP
+
+  3. Start a new, empty store node (section 3) and bootstrap it from
+     them instead of creating accounts by hand:
+
+       raft> bootstrap n1 --restore-from store.backup
+
+  4. Start the servers (section 4). Users log in as before.
+
+Accounts, groups and ACLs come back with the store; snapshots don't.
+Delete store.backup when done: it holds the store's contents in clear.

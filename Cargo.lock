@@ -2470,6 +2470,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "libc",
+ "prost",
  "raft5-client",
  "raft5-shared",
  "raft5fs-crypto",

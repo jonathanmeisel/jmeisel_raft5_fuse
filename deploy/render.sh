@@ -16,6 +16,17 @@ if [[ -n ${S3_BUCKET:-} ]]; then
     done
     object_options >/dev/null
 fi
+if [[ -n ${BACKUP_BUCKET:-} ]]; then
+    [[ -f $SECRETS/backup.env ]] ||
+        die "BACKUP_BUCKET is set: put the backup bucket's credentials in secrets/backup.env (README \"Backups\")"
+    for var in RAFT5FS_BACKUP_ACCESS_KEY RAFT5FS_BACKUP_SECRET_KEY; do
+        grep -q "^$var=" "$SECRETS/backup.env" || die "secrets/backup.env has no $var="
+    done
+    [[ -f $SECRETS/backup.pub ]] ||
+        die "BACKUP_BUCKET is set: put the operator public key in secrets/backup.pub (README \"Backups\")"
+    [[ $BACKUP_BUCKET != "${S3_BUCKET:-}" ]] || die "BACKUP_BUCKET must not be S3_BUCKET"
+    backup_options >/dev/null
+fi
 for bin in raft5-server raft raft5fs-server; do
     [[ -x $OUT/bin/$bin ]] || die "no $OUT/bin/$bin: run ./build.sh first"
 done
@@ -30,6 +41,7 @@ fill() {
         -e "s|@CHUNK_SIZE@|$CHUNK_SIZE|g" \
         -e "s|@INVITE_SERVERS@|$(invite_servers)|g" \
         -e "s|@OBJECT_OPTIONS@|$(object_options)|g" \
+        -e "s|@BACKUP_OPTIONS@|$(backup_options)|g" \
         "$DEPLOY/templates/$1"
 }
 
@@ -58,6 +70,14 @@ render() {
         grep -E '^RAFT5FS_OBJECT_(ACCESS|SECRET)_KEY=' "$SECRETS/s3.env" >>"$dir/raft5fs/store.env"
         if [[ -f $SECRETS/s3-ca.pem ]]; then
             cp "$SECRETS/s3-ca.pem" "$dir/raft5fs/"
+        fi
+    fi
+    # Only raft5fs-admin reads these, not the serving units.
+    if [[ -n ${BACKUP_BUCKET:-} ]]; then
+        grep -E '^RAFT5FS_BACKUP_(ACCESS|SECRET)_KEY=' "$SECRETS/backup.env" >"$dir/raft5fs/backup.env"
+        cp "$SECRETS/backup.pub" "$dir/raft5fs/"
+        if [[ -f $SECRETS/backup-ca.pem ]]; then
+            cp "$SECRETS/backup-ca.pem" "$dir/raft5fs/"
         fi
     fi
 

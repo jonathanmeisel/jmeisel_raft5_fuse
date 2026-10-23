@@ -8,42 +8,44 @@
 #   raft5fs-admin snapshot create [<NAME>]
 #   raft5fs-admin snapshot del <NAME>
 #   raft5fs-admin snapshot list
+#   raft5fs-admin backup create <SNAPSHOT>
+#   raft5fs-admin backup del <NAME>
+#   raft5fs-admin backup list
+#   raft5fs-admin backup restore-objects <NAME>
 #
-# `user` uses the filesystem servers' store account. `snapshot` needs the
-# store's administrator: it asks for admin's password, or reads it from
-# RAFT5FS_ADMIN_PASSWORD.
+# Every command uses the filesystem servers' store account, which is in
+# backup-operators. `backup` needs cluster.conf's BACKUP_* settings.
 set -eu
 STORE="--store-ca /etc/raft5fs/internal-ca.pem --store-cert /etc/raft5fs/node.pem --store-key /etc/raft5fs/node.key"
 # Every store node, unless RAFT5FS_SEEDS gives others.
 SEEDS="${RAFT5FS_SEEDS:-@SEEDS@}"
 
 case ${1:-} in
-user)
+user | snapshot)
     . /etc/raft5fs/store.env
     export RAFT5FS_STORE_PASSWORD
-    # shellcheck disable=SC2086
-    if [ "${2:-}" = add ]; then
+    if [ "$1 ${2:-}" = "user add" ]; then
         # shellcheck disable=SC2086
         set -- "$@" @INVITE_SERVERS@--invite-ca /etc/raft5fs/fs-ca.pem
     fi
     # shellcheck disable=SC2086
     exec /usr/local/bin/raft5fs-server "$@" --store-user raft5fs $STORE $SEEDS
     ;;
-snapshot)
-    if [ -z "${RAFT5FS_ADMIN_PASSWORD:-}" ]; then
-        printf "admin's store password: " >&2
-        stty -echo 2>/dev/null || true
-        read -r RAFT5FS_ADMIN_PASSWORD
-        stty echo 2>/dev/null || true
-        echo >&2
-    fi
-    RAFT5FS_STORE_PASSWORD=$RAFT5FS_ADMIN_PASSWORD
-    export RAFT5FS_STORE_PASSWORD
+backup)
+    [ -f /etc/raft5fs/backup.env ] || {
+        echo "no backup space set up: set BACKUP_BUCKET in cluster.conf" >&2
+        exit 1
+    }
+    set -a
+    . /etc/raft5fs/store.env
+    . /etc/raft5fs/backup.env
+    set +a
     # shellcheck disable=SC2086
-    exec /usr/local/bin/raft5fs-server "$@" --store-user admin $STORE $SEEDS
+    exec /usr/local/bin/raft5fs-server "$@" --store-user raft5fs $STORE \
+        @OBJECT_OPTIONS@@BACKUP_OPTIONS@$SEEDS
     ;;
 *)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
     ;;
 esac

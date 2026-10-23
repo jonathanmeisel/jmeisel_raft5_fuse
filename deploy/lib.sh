@@ -71,6 +71,21 @@ object_options() {
     if [[ -f $SECRETS/s3-ca.pem ]]; then printf -- '--object-ca /etc/raft5fs/s3-ca.pem '; fi
 }
 
+# raft5fs-server's backup options, from cluster.conf. None unless
+# BACKUP_BUCKET is set. Values must not contain spaces.
+backup_options() {
+    if [[ -z ${BACKUP_BUCKET:-} ]]; then
+        return 0
+    fi
+    [[ -n ${BACKUP_ENDPOINT:-} ]] || die "BACKUP_BUCKET is set but BACKUP_ENDPOINT isn't, in cluster.conf"
+    printf -- '--backup-endpoint %s --backup-bucket %s ' "$BACKUP_ENDPOINT" "$BACKUP_BUCKET"
+    if [[ -n ${BACKUP_REGION:-} ]]; then printf -- '--backup-region %s ' "$BACKUP_REGION"; fi
+    if [[ ${BACKUP_PATH_STYLE:-no} == yes ]]; then printf -- '--backup-path-style '; fi
+    if [[ -n ${BACKUP_PREFIX:-} ]]; then printf -- '--backup-prefix %s ' "$BACKUP_PREFIX"; fi
+    if [[ -f $SECRETS/backup-ca.pem ]]; then printf -- '--backup-ca /etc/raft5fs/backup-ca.pem '; fi
+    printf -- '--backup-public-key /etc/raft5fs/backup.pub '
+}
+
 # The address that users connect to for node $1.
 public_address() {
     local name

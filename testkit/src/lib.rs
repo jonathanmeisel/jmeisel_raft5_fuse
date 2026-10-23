@@ -22,16 +22,19 @@
 //! ```
 
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use raft5_client::{Certificate, Client, ClientTls, Consistency, Identity, Principal, Right};
+use raft5_client::{
+    BACKUP_OPERATORS_GROUP, Certificate, Client, ClientTls, Consistency, Identity, Principal, Right,
+};
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
 use raft5fs_client::remote::{Credentials, Remote};
 use raft5fs_client::vault::KnownKeys;
+use raft5fs_core::backup::BackupStore;
 use raft5fs_core::objects::{DEFAULT_GET_TTL, DEFAULT_PUT_TTL, ObjectSettings};
 use raft5fs_core::{FsCore, accounts};
 use raft5fs_crypto::password::KdfParams;
@@ -173,9 +176,19 @@ pub struct TestCluster {
 impl TestCluster {
     /// Starts a new node on `runtime` and bootstraps it into a single-node
     /// cluster with authentication on, locked down as a real deployment is
-    /// (only `SERVICE_USER` can touch any key). Returns it with a client
-    /// logged in as `SERVICE_USER`.
+    /// (only `SERVICE_USER` can touch any key, and it may take snapshots
+    /// and backups). Returns it with a client logged in as `SERVICE_USER`.
     pub fn start(runtime: &Runtime) -> (Self, Client) {
+        Self::start_with(runtime, None)
+    }
+
+    /// Like `start`, but the cluster holds the store backup at `backup`,
+    /// accounts and ACLs included, as a restore does.
+    pub fn start_from_backup(runtime: &Runtime, backup: &Path) -> (Self, Client) {
+        Self::start_with(runtime, Some(backup))
+    }
+
+    fn start_with(runtime: &Runtime, backup: Option<&Path>) -> (Self, Client) {
         let client_addr = free_local_addr();
         let peer_addr = free_local_addr();
         let db_dir = temp_dir("db");
@@ -238,21 +251,43 @@ impl TestCluster {
             // time. Retry, and do not assume that the first attempt works.
             let until = Instant::now() + DEADLINE;
             loop {
-                match admin.bootstrap(&id, None).await {
+                let done = match backup {
+                    None => admin.bootstrap(&id, None).await,
+                    Some(path) => {
+                        let file = tokio::fs::File::open(path)
+                            .await
+                            .expect("open the store backup");
+                        admin.bootstrap_from_backup(&id, None, file).await
+                    }
+                };
+                match done {
                     Ok(()) => break,
                     Err(_) if Instant::now() < until => tokio::time::sleep(RETRY_DELAY).await,
                     Err(e) => panic!("bootstrap never succeeded: {e}"),
                 }
             }
 
-            admin
-                .create_user(SERVICE_USER, &password(SERVICE_USER), false)
-                .await
-                .expect("create the service account");
-            admin
-                .set_acl(b"", &[(Principal::user(SERVICE_USER), Right::Write)])
-                .await
-                .expect("lock the store down to the service account");
+            // A restored cluster has these from the backup.
+            if backup.is_none() {
+                admin
+                    .create_user(SERVICE_USER, &password(SERVICE_USER), false)
+                    .await
+                    .expect("create the service account");
+                admin
+                    .set_acl(b"", &[(Principal::user(SERVICE_USER), Right::Write)])
+                    .await
+                    .expect("lock the store down to the service account");
+                admin
+                    .update_group(
+                        BACKUP_OPERATORS_GROUP,
+                        &[Principal::user(SERVICE_USER)],
+                        &[],
+                        &[],
+                        &[],
+                    )
+                    .await
+                    .expect("let the service account take snapshots and backups");
+            }
             let service = Client::with_tls([&address], store_tls())
                 .expect("failed to construct raft5 client");
             service
@@ -518,6 +553,27 @@ fn object_settings(
     }
 }
 
+/// An `S3Store` for `config`, on a fake store over plain HTTP.
+pub fn store_on(config: &S3Config) -> S3Store {
+    let http = raft5fs_objstore::http::client(&HttpConfig {
+        allow_plaintext: true,
+        ..HttpConfig::default()
+    })
+    .expect("an HTTP client for the object store");
+    S3Store::new(config, http).expect("the fake object store's settings")
+}
+
+/// The bucket and prefix that tests keep backups under.
+pub const TEST_BACKUP_BUCKET: &str = "backups";
+pub const TEST_BACKUP_PREFIX: &str = "bk/";
+
+/// A backup space in `space`, a fake store made with `TEST_BACKUP_BUCKET`,
+/// as `raft5fs-server backup` sets one up.
+pub fn backup_store(space: &FakeStore) -> BackupStore {
+    let pool = space.config(&format!("{TEST_BACKUP_PREFIX}objects/"));
+    BackupStore::new(store_on(&pool), store_on(&space.config(TEST_BACKUP_PREFIX)))
+}
+
 pub fn start_servers(
     cluster: &TestCluster,
     chunk_size: u64,
@@ -694,22 +750,25 @@ impl Backend {
         known
     }
 
-    /// Takes snapshot `name` of the filesystem, as the store's
-    /// administrator does (`raft5fs-server snapshot create`).
+    /// Takes snapshot `name` of the filesystem as the servers' account, as
+    /// `raft5fs-server snapshot create` does.
     pub fn snapshot(&self, name: &str) {
         self.runtime
-            .block_on(raft5fs_core::snapshots::create(
-                &self.cluster.admin,
-                Some(name),
-            ))
+            .block_on(raft5fs_core::snapshots::create(&self.client, Some(name)))
             .expect("take a snapshot");
     }
 
     /// Removes snapshot `name`, as `raft5fs-server snapshot del` does.
     pub fn drop_snapshot(&self, name: &str) {
         self.runtime
-            .block_on(raft5fs_core::snapshots::remove(&self.cluster.admin, name))
+            .block_on(raft5fs_core::snapshots::remove(&self.client, name))
             .expect("remove a snapshot");
+    }
+
+    /// The servers' object store, as a backup reads it. Only with
+    /// `setup_with_objects`.
+    pub fn serving_store(&self) -> Arc<S3Store> {
+        Arc::new(store_on(&self.store().config(TEST_OBJECT_PREFIX)))
     }
 
     /// Adds user `name`, enrolled with password `password(name)`.

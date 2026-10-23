@@ -1,6 +1,7 @@
 //! The filesystem's store logic, separate from how requests arrive.
 
 pub mod accounts;
+pub mod backup;
 mod entry;
 mod fs;
 pub mod gc;

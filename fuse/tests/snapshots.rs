@@ -1,4 +1,4 @@
-//! Tests snapshots end to end: the store's administrator takes them, every
+//! Tests snapshots end to end: the servers' store account takes them, every
 //! mount shows them read-only at `/.snapshot/<name>`, and each user sees
 //! what they could see when the snapshot was taken.
 

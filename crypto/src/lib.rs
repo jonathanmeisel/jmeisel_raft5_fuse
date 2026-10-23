@@ -13,6 +13,7 @@
 //!   so a key opens all older versions and no newer one.
 //! - `data`: file chunks and directory entry names, encrypted under their
 //!   node's key.
+//! - `backup`: the store backup file, sealed to an operator key pair.
 //! - `grantees`: the users a node is granted to, sealed under its key. The
 //!   server cannot add a user that a rotation would then seal the key to.
 //!
@@ -21,6 +22,7 @@
 //! another: a chunk moved to another index, or a wrapped key copied to
 //! another inode, does not open.
 
+pub mod backup;
 pub mod data;
 pub mod grantees;
 pub mod identity;

@@ -5,8 +5,9 @@
 //!   the server minted it. Garbage collection needs nothing else to know
 //!   about an object, so it never reads one.
 //! - `S3Store`: the filesystem servers' side. It signs the URLs that mounts
-//!   use (a GET to read a block, a PUT to make one), and lists and deletes
-//!   objects for garbage collection. Mounts never hold bucket credentials,
+//!   use (a GET to read a block, a PUT to make one), lists and deletes
+//!   objects for garbage collection, and copies objects and backup files
+//!   for backups. Mounts never hold bucket credentials,
 //!   only URLs that a server signed after it checked their grant.
 //! - `http`: the mounts' side. It fetches a range of an object, and uploads
 //!   one, through those URLs.
@@ -39,6 +40,8 @@ pub enum Error {
     /// An upload to a name that already has an object: the URL was used
     /// before.
     AlreadyExists,
+    /// No object has this key.
+    NotFound(String),
     /// The store answered, but the answer is not usable.
     Malformed(String),
     /// Some deletions in a batch failed, each with the store's reason.
@@ -58,6 +61,7 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::AlreadyExists => write!(f, "the object already exists"),
+            Error::NotFound(key) => write!(f, "no object {key}"),
             Error::Malformed(why) => write!(f, "object store answered oddly: {why}"),
             Error::NotDeleted(failures) => {
                 write!(

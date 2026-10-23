@@ -2080,7 +2080,9 @@ impl FsCore {
     /// only unfinished deletions, so this is cheap when there are none.
     async fn reap_tombstones(&self) -> Result<usize, FsError> {
         let mut inos = Vec::new();
-        let mut iter = self.client.key_iterator(TOMBSTONE_PREFIX, Consistency::Stale);
+        let mut iter = self
+            .client
+            .key_iterator(TOMBSTONE_PREFIX, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(TOMBSTONE_PREFIX) {
                 break;
@@ -2111,7 +2113,9 @@ impl FsCore {
         let grid = self.grid.filter(|_| layout == Layout::Hybrid);
         let mut dropped = Vec::new();
         loop {
-            let mut iter = self.client.key_iterator(&chunk_key(ino, first_index), Consistency::Stale);
+            let mut iter = self
+                .client
+                .key_iterator(&chunk_key(ino, first_index), Consistency::Stale);
             let mut batch = Vec::new();
             while batch.len() < DELETE_BATCH {
                 match next_key(&mut iter).await? {

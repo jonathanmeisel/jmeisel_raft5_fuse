@@ -28,6 +28,9 @@ pub(crate) const OBJECT_GRID_KEY: &[u8] = b"\x04object_grid";
 /// `gc`).
 pub(crate) const GC_LEASE_KEY: &[u8] = b"\x04gc_lease";
 
+/// Which server runs a backup job, and until when (see `backup`).
+pub(crate) const BACKUP_LEASE_KEY: &[u8] = b"\x04backup_lease";
+
 /// Marks a store as holding a filesystem in this raft5fs format (one byte,
 /// `STORE_FORMAT`). This raft5fs refuses a store with a root but no such
 /// key, or with another byte here (see `check_store`). 0 means an

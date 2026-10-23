@@ -1,8 +1,10 @@
 //! The filesystem servers' side of the object store: it signs what mounts
-//! can do, and lists and deletes objects for garbage collection.
+//! can do, lists and deletes objects for garbage collection, and copies
+//! objects and backup files for backups.
 
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use rusty_s3::actions::{DeleteObjects, ObjectIdentifier};
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 
@@ -132,11 +134,25 @@ impl S3Store {
     /// Every object under the prefix, in key order (so by inode, then by
     /// mint time).
     pub async fn list(&self) -> Result<Vec<Listed>, Error> {
+        Ok(self
+            .list_keys(&self.prefix)
+            .await?
+            .into_iter()
+            .map(|(key, size)| Listed {
+                name: ObjectName::parse(&self.prefix, &key),
+                key,
+                size,
+            })
+            .collect())
+    }
+
+    /// Every key that starts with `start`, with its size, in key order.
+    async fn list_keys(&self, start: &str) -> Result<Vec<(String, u64)>, Error> {
         let mut found = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
-            action.with_prefix(self.prefix.as_str());
+            action.with_prefix(start);
             if let Some(token) = &token {
                 action.with_continuation_token(token.as_str());
             }
@@ -146,11 +162,7 @@ impl S3Store {
             }
             let page = rusty_s3::actions::ListObjectsV2::parse_response(&response.text().await?)
                 .map_err(|e| Error::Malformed(format!("a listing: {e}")))?;
-            found.extend(page.contents.into_iter().map(|c| Listed {
-                name: ObjectName::parse(&self.prefix, &c.key),
-                key: c.key,
-                size: c.size,
-            }));
+            found.extend(page.contents.into_iter().map(|c| (c.key, c.size)));
             match page.next_continuation_token {
                 Some(next) if Some(&next) != token.as_ref() => token = Some(next),
                 Some(_) => return Err(Error::Malformed("a listing that doesn't advance".into())),
@@ -159,16 +171,97 @@ impl S3Store {
         }
     }
 
+    /// The whole object that `name` names. `Error::NotFound` if there is
+    /// none.
+    pub async fn get(&self, name: &ObjectName) -> Result<Vec<u8>, Error> {
+        self.get_key(&name.key(&self.prefix)).await
+    }
+
+    /// Stores `body` as `name`'s object, if the name has none yet.
+    /// `Error::AlreadyExists` if it has one. Names are written once, so the
+    /// object there is already this one.
+    pub async fn put(&self, name: &ObjectName, body: Vec<u8>) -> Result<(), Error> {
+        self.put_key(&name.key(&self.prefix), body, true).await
+    }
+
+    /// The file at `path`, under the prefix. Files are what a store holds
+    /// besides objects, such as a backup's parts and manifest.
+    pub async fn get_file(&self, path: &str) -> Result<Vec<u8>, Error> {
+        self.get_key(&self.file_key(path)).await
+    }
+
+    /// Stores `body` at `path`, under the prefix. With `exclusive`, only if
+    /// nothing is there yet (`Error::AlreadyExists` otherwise).
+    pub async fn put_file(&self, path: &str, body: Vec<u8>, exclusive: bool) -> Result<(), Error> {
+        self.put_key(&self.file_key(path), body, exclusive).await
+    }
+
+    /// Every file whose path starts with `start`, as its path under the
+    /// prefix and its size, in order.
+    pub async fn list_files(&self, start: &str) -> Result<Vec<(String, u64)>, Error> {
+        let keys = self.list_keys(&self.file_key(start)).await?;
+        Ok(keys
+            .into_iter()
+            .map(|(key, size)| (key[self.prefix.len()..].to_string(), size))
+            .collect())
+    }
+
+    /// Deletes the files at `paths`, under the prefix. A missing file is not
+    /// an error.
+    pub async fn delete_files(&self, paths: &[String]) -> Result<(), Error> {
+        let keys: Vec<String> = paths.iter().map(|p| self.file_key(p)).collect();
+        self.delete_keys(&keys).await
+    }
+
+    fn file_key(&self, path: &str) -> String {
+        format!("{}{path}", self.prefix)
+    }
+
+    async fn get_key(&self, key: &str) -> Result<Vec<u8>, Error> {
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), key)
+            .sign(CONTROL_TTL);
+        let response = self.http.get(url).send().await?;
+        match response.status() {
+            StatusCode::OK => Ok(response.bytes().await?.to_vec()),
+            StatusCode::NOT_FOUND => Err(Error::NotFound(key.to_string())),
+            _ => Err(status_error(response).await),
+        }
+    }
+
+    async fn put_key(&self, key: &str, body: Vec<u8>, exclusive: bool) -> Result<(), Error> {
+        let mut action = self.bucket.put_object(Some(&self.credentials), key);
+        if exclusive {
+            action.headers_mut().insert("if-none-match", "*");
+        }
+        let mut request = self.http.put(action.sign(CONTROL_TTL));
+        if exclusive {
+            request = request.header(reqwest::header::IF_NONE_MATCH, "*");
+        }
+        let response = request.body(body).send().await?;
+        match response.status() {
+            s if s.is_success() => Ok(()),
+            StatusCode::PRECONDITION_FAILED => Err(Error::AlreadyExists),
+            _ => Err(status_error(response).await),
+        }
+    }
+
     /// Deletes the objects that `names` name. It takes only names: a key
     /// under the prefix that does not parse as a name is not ours to
     /// delete. Deleting an object that is not there succeeds, so this is
     /// safe to repeat.
     pub async fn delete(&self, names: &[ObjectName]) -> Result<(), Error> {
+        let keys: Vec<String> = names.iter().map(|n| n.key(&self.prefix)).collect();
+        self.delete_keys(&keys).await
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> Result<(), Error> {
         let mut failures = Vec::new();
-        for batch in names.chunks(DELETE_BATCH) {
+        for batch in keys.chunks(DELETE_BATCH) {
             let ids: Vec<_> = batch
                 .iter()
-                .map(|n| ObjectIdentifier::new(n.key(&self.prefix)))
+                .map(|k| ObjectIdentifier::new(k.clone()))
                 .collect();
             let mut action = DeleteObjects::new(&self.bucket, Some(&self.credentials), ids.iter());
             // Ask the store to report only failures.

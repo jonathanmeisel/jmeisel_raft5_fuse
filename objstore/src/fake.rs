@@ -119,6 +119,12 @@ impl FakeStore {
         self.state.lock().unwrap().objects.insert(key.into(), bytes);
     }
 
+    /// Removes an object directly from the bucket, as if something other
+    /// than this crate deleted it.
+    pub fn remove(&self, key: &str) {
+        self.state.lock().unwrap().objects.remove(key);
+    }
+
     pub fn stats(&self) -> Stats {
         self.state.lock().unwrap().stats.clone()
     }

@@ -113,14 +113,14 @@ impl FsCore {
         let (Some(objects), Some(grid)) = (&self.objects, self.grid) else {
             return Ok(stats);
         };
-        if !self.take_lease(gc, now).await? {
+        if !take_lease(&self.client, GC_LEASE_KEY, gc.holder, now).await? {
             return Ok(stats);
         }
         stats.swept = true;
         let mark_start = now;
 
         let mut referenced = HashSet::new();
-        self.mark(View::live(&self.client), grid, &mut referenced)
+        mark(View::live(&self.client), grid, &mut referenced)
             .await
             .map_err(|e| format!("marking the live store: {e}"))?;
         let snapshots = self
@@ -129,7 +129,7 @@ impl FsCore {
             .await
             .map_err(|e| format!("listing snapshots: {e}"))?;
         for snapshot in &snapshots {
-            self.mark(View::at(&self.client, &snapshot.id), grid, &mut referenced)
+            mark(View::at(&self.client, &snapshot.id), grid, &mut referenced)
                 .await
                 .map_err(|e| {
                     format!(
@@ -137,7 +137,14 @@ impl FsCore {
                         String::from_utf8_lossy(&snapshot.id)
                     )
                 })?;
-            if !self.take_lease(gc, SystemTime::now().max(now)).await? {
+            if !take_lease(
+                &self.client,
+                GC_LEASE_KEY,
+                gc.holder,
+                SystemTime::now().max(now),
+            )
+            .await?
+            {
                 return Err("lost the lease while marking".into());
             }
         }
@@ -184,7 +191,14 @@ impl FsCore {
         stats.waiting = candidates.len();
 
         // Check the lease again at the last possible moment.
-        if !self.take_lease(gc, SystemTime::now().max(now)).await? {
+        if !take_lease(
+            &self.client,
+            GC_LEASE_KEY,
+            gc.holder,
+            SystemTime::now().max(now),
+        )
+        .await?
+        {
             return Err("lost the lease before deleting".into());
         }
         // From here, the candidates belong to this sweep even if a deletion
@@ -226,106 +240,129 @@ impl FsCore {
             }
         }
     }
+}
 
-    /// Takes or renews the lease for `gc` as of `now`, if no one holds it,
-    /// if its holder's time is up, or if `gc` already holds it.
-    async fn take_lease(&self, gc: &Gc, now: SystemTime) -> Result<bool, String> {
-        let client = &self.client;
-        let holder = gc.holder;
-        retrying(move || async move {
-            let txn = client.transaction(TXN_TTL).await?;
-            if let Some(value) = txn.read_one(GC_LEASE_KEY).await?.value
-                && let Some((other, expires_ms)) = decode_lease(&value)
-                && other != holder
-                && expires_ms > millis(now)
-            {
-                return Ok(false);
-            }
-            let expires = millis(now + LEASE_TTL);
-            let mut value = holder.to_vec();
-            value.extend_from_slice(&expires.to_be_bytes());
-            txn.write(GC_LEASE_KEY, Some(&value)).await?;
-            txn.commit().await?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| format!("taking the gc lease: {e}"))
-    }
-
-    /// Adds every object that a block pointer in `view` names to
-    /// `referenced`. Only a hybrid file's block starts can hold a pointer,
-    /// so only those values are read. The file's other chunks are skipped
-    /// by their key. If a chunk's file has no Entry (because it is being
-    /// deleted), the chunk is read anyway: a value that could be a pointer
-    /// counts.
-    async fn mark(
-        &self,
-        view: View<'_>,
-        grid: ObjectGrid,
-        referenced: &mut HashSet<ObjectName>,
-    ) -> Result<(), KvError> {
-        const CHUNKS: u8 = 0x02;
-        // Block starts, by inode, one window at a time: the files' Entries
-        // in one read, then the hybrid files' pointers in another.
-        let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut iter = view.key_iterator(&[CHUNKS]);
-        while let Some(key) = next_key(&mut iter).await? {
-            if key.first() != Some(&CHUNKS) {
-                break;
-            }
-            let Ok(key_bytes) = <[u8; 17]>::try_from(key.as_slice()) else {
-                continue;
-            };
-            let ino = u64::from_be_bytes(key_bytes[1..9].try_into().unwrap());
-            let index = u64::from_be_bytes(key_bytes[9..].try_into().unwrap());
-            if !grid.in_blocks(index) || grid.block_start(index) != index {
-                continue;
-            }
-            window.push((ino, key));
-            if window.len() == MARK_WINDOW {
-                self.mark_window(view, &mut window, referenced).await?;
-            }
+/// Takes or renews the lease at `key` for `holder` as of `now`, if no one
+/// holds it, if its holder's time is up, or if `holder` already holds it.
+/// Leases keep one server at a time doing a job: a GC sweep, or a backup.
+pub(crate) async fn take_lease(
+    client: &Client,
+    key: &[u8],
+    holder: [u8; 16],
+    now: SystemTime,
+) -> Result<bool, String> {
+    retrying(move || async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        if let Some(value) = txn.read_one(key).await?.value
+            && let Some((other, expires_ms)) = decode_lease(&value)
+            && other != holder
+            && expires_ms > millis(now)
+        {
+            return Ok(false);
         }
-        self.mark_window(view, &mut window, referenced).await
-    }
+        let expires = millis(now + LEASE_TTL);
+        let mut value = holder.to_vec();
+        value.extend_from_slice(&expires.to_be_bytes());
+        txn.write(key, Some(&value)).await?;
+        txn.commit().await?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| format!("taking the lease: {e}"))
+}
 
-    /// Runs `mark` for the block starts in `window`, and empties it.
-    async fn mark_window(
-        &self,
-        view: View<'_>,
-        window: &mut Vec<(u64, Vec<u8>)>,
-        referenced: &mut HashSet<ObjectName>,
-    ) -> Result<(), KvError> {
-        // Keys come in order, so each inode's keys are together.
-        let mut inos: Vec<u64> = window.iter().map(|&(ino, _)| ino).collect();
-        inos.dedup();
-        let attr_keys: Vec<Vec<u8>> = inos.iter().map(|&ino| attr_key(ino)).collect();
-        let hybrid: HashMap<u64, bool> = inos
-            .iter()
-            .zip(view.read_many(&attr_keys).await?)
-            .map(|(&ino, entry)| {
-                let hybrid = match entry.value {
-                    Some(bytes) => decode_entry(ino, &bytes).attr.layout == Layout::Hybrid,
-                    None => true,
-                };
-                (ino, hybrid)
-            })
-            .collect();
-        let (inos, keys): (Vec<u64>, Vec<Vec<u8>>) =
-            window.drain(..).filter(|(ino, _)| hybrid[ino]).unzip();
-        for (ino, entry) in inos.into_iter().zip(view.read_many(&keys).await?) {
-            if let Some(value) = entry.value
-                && let ChunkValue::Block(block) = ChunkValue::decode(value)
-            {
-                referenced.insert(ObjectName {
-                    ino,
-                    minted_ms: block.minted_ms,
-                    random: block.random,
-                });
-            }
+/// Gives up the lease at `key` if `holder` holds it, so the next job need
+/// not wait for it to expire.
+pub(crate) async fn release_lease(
+    client: &Client,
+    key: &[u8],
+    holder: [u8; 16],
+) -> Result<(), String> {
+    retrying(move || async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        if let Some(value) = txn.read_one(key).await?.value
+            && decode_lease(&value).is_some_and(|(other, _)| other == holder)
+        {
+            txn.write(key, None).await?;
         }
+        txn.commit().await?;
         Ok(())
+    })
+    .await
+    .map_err(|e| format!("releasing the lease: {e}"))
+}
+
+/// Adds every object that a block pointer in `view` names to
+/// `referenced`. Only a hybrid file's block starts can hold a pointer,
+/// so only those values are read. The file's other chunks are skipped
+/// by their key. If a chunk's file has no Entry (because it is being
+/// deleted), the chunk is read anyway: a value that could be a pointer
+/// counts.
+pub(crate) async fn mark(
+    view: View<'_>,
+    grid: ObjectGrid,
+    referenced: &mut HashSet<ObjectName>,
+) -> Result<(), KvError> {
+    const CHUNKS: u8 = 0x02;
+    // Block starts, by inode, one window at a time: the files' Entries
+    // in one read, then the hybrid files' pointers in another.
+    let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut iter = view.key_iterator(&[CHUNKS]);
+    while let Some(key) = next_key(&mut iter).await? {
+        if key.first() != Some(&CHUNKS) {
+            break;
+        }
+        let Ok(key_bytes) = <[u8; 17]>::try_from(key.as_slice()) else {
+            continue;
+        };
+        let ino = u64::from_be_bytes(key_bytes[1..9].try_into().unwrap());
+        let index = u64::from_be_bytes(key_bytes[9..].try_into().unwrap());
+        if !grid.in_blocks(index) || grid.block_start(index) != index {
+            continue;
+        }
+        window.push((ino, key));
+        if window.len() == MARK_WINDOW {
+            mark_window(view, &mut window, referenced).await?;
+        }
     }
+    mark_window(view, &mut window, referenced).await
+}
+
+/// Runs `mark` for the block starts in `window`, and empties it.
+async fn mark_window(
+    view: View<'_>,
+    window: &mut Vec<(u64, Vec<u8>)>,
+    referenced: &mut HashSet<ObjectName>,
+) -> Result<(), KvError> {
+    // Keys come in order, so each inode's keys are together.
+    let mut inos: Vec<u64> = window.iter().map(|&(ino, _)| ino).collect();
+    inos.dedup();
+    let attr_keys: Vec<Vec<u8>> = inos.iter().map(|&ino| attr_key(ino)).collect();
+    let hybrid: HashMap<u64, bool> = inos
+        .iter()
+        .zip(view.read_many(&attr_keys).await?)
+        .map(|(&ino, entry)| {
+            let hybrid = match entry.value {
+                Some(bytes) => decode_entry(ino, &bytes).attr.layout == Layout::Hybrid,
+                None => true,
+            };
+            (ino, hybrid)
+        })
+        .collect();
+    let (inos, keys): (Vec<u64>, Vec<Vec<u8>>) =
+        window.drain(..).filter(|(ino, _)| hybrid[ino]).unzip();
+    for (ino, entry) in inos.into_iter().zip(view.read_many(&keys).await?) {
+        if let Some(value) = entry.value
+            && let ChunkValue::Block(block) = ChunkValue::decode(value)
+        {
+            referenced.insert(ObjectName {
+                ino,
+                minted_ms: block.minted_ms,
+                random: block.random,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl FsCore {
