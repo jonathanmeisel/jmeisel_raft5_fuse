@@ -173,7 +173,13 @@ put harden/apt.conf /etc/apt/apt.conf.d/52raft5fs 0644 root:root apt
 # The admin user that SSH_USER switches to, with your keys and sudo.
 if [ -n "$ADMIN_USER" ]; then
     if ! id "$ADMIN_USER" >/dev/null 2>&1; then
-        act useradd --create-home --shell /bin/bash "$ADMIN_USER"
+        # Ubuntu ships an `admin` group: use a group of that name as the
+        # user's own, rather than fail to make it.
+        if getent group "$ADMIN_USER" >/dev/null; then
+            act useradd --create-home --shell /bin/bash --gid "$ADMIN_USER" "$ADMIN_USER"
+        else
+            act useradd --create-home --shell /bin/bash "$ADMIN_USER"
+        fi
     fi
     home=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
     home=${home:-/home/$ADMIN_USER}
