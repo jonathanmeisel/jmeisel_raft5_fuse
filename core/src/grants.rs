@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Mutex;
 
-use raft5_client::{Client, Error as KvError, Transaction};
+use raft5_client::{Client, Consistency, Error as KvError, Transaction};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 
@@ -460,7 +460,7 @@ fn two(values: Vec<Option<Vec<u8>>>) -> [Option<Vec<u8>>; 2] {
 /// key as the server has it, or an empty key if they no longer have keys.
 pub async fn grants_under(client: &Client, top: u64) -> Result<Vec<GrantedNode>, FsError> {
     let mut keys = Vec::new();
-    let mut iter = client.key_iterator(GRANTS_PREFIX);
+    let mut iter = client.key_iterator(GRANTS_PREFIX, Consistency::Stale);
     while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(GRANTS_PREFIX) {
             break;

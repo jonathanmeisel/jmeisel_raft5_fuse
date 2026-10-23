@@ -158,10 +158,7 @@ impl<'a> View<'a> {
     }
 
     pub(crate) fn key_iterator(&self, start: &[u8]) -> KeyIterator {
-        match self.at {
-            None => self.client.key_iterator(start),
-            Some(id) => self.client.key_iterator_at(id, start),
-        }
+        self.client.key_iterator(start, self.consistency())
     }
 }
 

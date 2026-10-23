@@ -645,7 +645,7 @@ impl Backend {
     /// limits it.
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.runtime.block_on(async {
-            let mut iter = self.client.key_iterator(prefix);
+            let mut iter = self.client.key_iterator(prefix, Consistency::Stale);
             let mut keys = Vec::new();
             while let Some(key) = iter.next().await.expect("key scan failed") {
                 if !key.starts_with(prefix) {

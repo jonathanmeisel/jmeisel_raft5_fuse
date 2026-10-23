@@ -15,7 +15,7 @@
 //! pair. Anything granted to the old key pair is then out of reach until
 //! someone grants it again.
 
-use raft5_client::{Client, Error as KvError, Transaction};
+use raft5_client::{Client, Consistency, Error as KvError, Transaction};
 use raft5fs_crypto::identity::PUBLIC_KEY_LEN;
 use raft5fs_crypto::password::{
     KdfParams, SALT_LEN, check_verifier, enrolment_code_hash, new_enrolment_code,
@@ -275,7 +275,7 @@ pub async fn change_password(
 pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     let prefix = crate::grants::index_prefix(user);
     let mut granted = Vec::new();
-    let mut iter = client.key_iterator(&prefix);
+    let mut iter = client.key_iterator(&prefix, Consistency::Stale);
     while let Some(key) = next_key(&mut iter).await? {
         if !key.starts_with(&prefix) {
             break;
@@ -306,7 +306,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
 pub async fn list(client: &Client) -> Result<Vec<(String, bool)>, FsError> {
     let mut accounts = std::collections::BTreeMap::new();
     for (prefix, enrolled) in [(ACCOUNT_KEYS_PREFIX, true), (ENROLMENT_PREFIX, false)] {
-        let mut iter = client.key_iterator(prefix);
+        let mut iter = client.key_iterator(prefix, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(prefix) {
                 break;

@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime};
 
-use raft5_client::{Client, Error as KvError, Transaction};
+use raft5_client::{Client, Consistency, Error as KvError, Transaction};
 use raft5_shared::MAX_KEYS_PER_READ;
 
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
@@ -1934,7 +1934,7 @@ impl FsCore {
         let kind = self.resolve(&self.live(), ino).await?.attr.kind;
         if kind == Kind::File {
             let prefix = chunk_prefix(ino);
-            let mut iter = self.client.key_iterator(&prefix);
+            let mut iter = self.client.key_iterator(&prefix, Consistency::Stale);
             let mut window = Vec::new();
             loop {
                 let key = next_key(&mut iter)
@@ -1970,7 +1970,7 @@ impl FsCore {
         } else {
             let prefix = dirent_prefix(ino);
             let mut keys = Vec::new();
-            let mut iter = self.client.key_iterator(&prefix);
+            let mut iter = self.client.key_iterator(&prefix, Consistency::Stale);
             while let Some(key) = next_key(&mut iter).await? {
                 if !key.starts_with(&prefix) {
                     break;
@@ -2009,7 +2009,7 @@ impl FsCore {
         }
         let prefix = grants::grant_prefix(ino);
         let mut keys = Vec::new();
-        let mut iter = self.client.key_iterator(&prefix);
+        let mut iter = self.client.key_iterator(&prefix, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(&prefix) {
                 break;
@@ -2080,7 +2080,7 @@ impl FsCore {
     /// only unfinished deletions, so this is cheap when there are none.
     async fn reap_tombstones(&self) -> Result<usize, FsError> {
         let mut inos = Vec::new();
-        let mut iter = self.client.key_iterator(TOMBSTONE_PREFIX);
+        let mut iter = self.client.key_iterator(TOMBSTONE_PREFIX, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
             if !key.starts_with(TOMBSTONE_PREFIX) {
                 break;
@@ -2111,7 +2111,7 @@ impl FsCore {
         let grid = self.grid.filter(|_| layout == Layout::Hybrid);
         let mut dropped = Vec::new();
         loop {
-            let mut iter = self.client.key_iterator(&chunk_key(ino, first_index));
+            let mut iter = self.client.key_iterator(&chunk_key(ino, first_index), Consistency::Stale);
             let mut batch = Vec::new();
             while batch.len() < DELETE_BATCH {
                 match next_key(&mut iter).await? {
