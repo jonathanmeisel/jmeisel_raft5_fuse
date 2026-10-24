@@ -45,8 +45,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// The realm that a 401 names.
 const REALM: &str = "raft5fs";
 
+/// The shortest password `Auth::with_password` takes. A generated one is
+/// 43 characters (32 random bytes).
+const MIN_PASSWORD_LEN: usize = 32;
+
 /// Who can use the server: the account's name, and a password made when the
-/// server started.
+/// server started, or kept from an earlier start.
 #[derive(Clone)]
 pub struct Auth {
     user: String,
@@ -61,6 +65,21 @@ impl Auth {
         Ok(Self {
             user: user.to_string(),
             password: URL_SAFE_NO_PAD.encode(secret),
+        })
+    }
+
+    /// `user`, with a password chosen earlier, such as one kept in a file
+    /// so that clients need not be told a new one each time. Refuses a
+    /// password too short to stand in for a generated one.
+    pub fn with_password(user: &str, password: &str) -> Result<Self, String> {
+        if password.len() < MIN_PASSWORD_LEN {
+            return Err(format!(
+                "a WebDAV password must be at least {MIN_PASSWORD_LEN} characters"
+            ));
+        }
+        Ok(Self {
+            user: user.to_string(),
+            password: password.to_string(),
         })
     }
 
@@ -301,6 +320,14 @@ mod tests {
             ]),
         );
         assert!(local_origin.is_none());
+    }
+
+    #[test]
+    fn a_kept_password_must_be_long() {
+        assert!(Auth::with_password("alice", "short").is_err());
+        let kept = Auth::generate("alice").unwrap();
+        let again = Auth::with_password("alice", kept.password()).unwrap();
+        assert_eq!(again.password(), kept.password());
     }
 
     #[test]

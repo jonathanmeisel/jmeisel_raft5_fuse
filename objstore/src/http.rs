@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::{IF_NONE_MATCH, RANGE};
+use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
@@ -42,6 +43,8 @@ impl Default for HttpConfig {
 /// An HTTP client for the object store. It uses TLS through rustls and
 /// `ring` (the provider that the rest of the workspace uses), trusts the
 /// system's roots and any extra ones, and refuses plaintext unless allowed.
+/// On Android, "the system's roots" are Mozilla's, built in (see
+/// `webpki_verifier`).
 pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut extra = Vec::new();
@@ -53,14 +56,18 @@ pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
             return Err(Error::Config("extra CA: no certificates in it".into()));
         }
     }
-    let verifier =
+    #[cfg(not(target_os = "android"))]
+    let verifier: Arc<dyn ServerCertVerifier> = Arc::new(
         rustls_platform_verifier::Verifier::new_with_extra_roots(extra, provider.clone())
-            .map_err(|e| Error::Config(format!("certificate verifier: {e}")))?;
+            .map_err(|e| Error::Config(format!("certificate verifier: {e}")))?,
+    );
+    #[cfg(target_os = "android")]
+    let verifier = webpki_verifier(extra, provider.clone())?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Config(format!("TLS: {e}")))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     reqwest::Client::builder()
@@ -69,6 +76,30 @@ pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
         .timeout(config.timeout)
         .build()
         .map_err(|e| Error::Config(format!("HTTP client: {e}")))
+}
+
+/// A verifier that trusts Mozilla's roots (`webpki-roots`, built into the
+/// binary) and `extra`. Android checks certificates through Java, which a
+/// plain program, as under Termux, can't reach; this needs nothing from the
+/// system. Elsewhere, `client` uses the system's own verifier.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn webpki_verifier(
+    extra: Vec<CertificateDer<'static>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, Error> {
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    for cert in extra {
+        roots
+            .add(cert)
+            .map_err(|e| Error::Config(format!("extra CA: {e}")))?;
+    }
+    let verifier =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()
+            .map_err(|e| Error::Config(format!("certificate verifier: {e}")))?;
+    Ok(verifier)
 }
 
 /// Fetches bytes `range` of the object that a presigned GET `url` names.
@@ -115,5 +146,28 @@ pub async fn put(client: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<(
         s if s.is_success() => Ok(()),
         StatusCode::PRECONDITION_FAILED => Err(Error::AlreadyExists),
         _ => Err(status_error(response).await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    #[test]
+    fn the_built_in_roots_make_a_verifier() {
+        webpki_verifier(Vec::new(), provider()).unwrap();
+    }
+
+    #[test]
+    fn a_bad_extra_root_is_refused() {
+        let bad = CertificateDer::from(vec![1, 2, 3]);
+        assert!(matches!(
+            webpki_verifier(vec![bad], provider()),
+            Err(Error::Config(_))
+        ));
     }
 }

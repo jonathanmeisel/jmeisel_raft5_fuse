@@ -13,14 +13,19 @@ getrandom = "0.2"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-platform-verifier = "0.7"
 rusty-s3 = "0.10"
 url = "2"
+webpki-roots = "1"
 
 axum = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 md-5 = { version = "0.10", optional = true }
 tokio = { workspace = true, features = ["net", "sync"], optional = true }
+
+# Android verifies certificates through Java, which a plain program (as
+# under Termux) can't reach. There, the client uses `webpki-roots` instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 raft5fs-objstore = { path = ".", features = ["fake"] }

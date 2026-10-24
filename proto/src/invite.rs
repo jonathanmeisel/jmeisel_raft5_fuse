@@ -20,6 +20,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
+use crate::wire::{Reader, put, put_u32};
+
 const PREFIX: &str = "raft5fs-invite:1:";
 
 /// What an invitation holds.
@@ -33,45 +35,13 @@ pub struct Invite {
     pub ca: Vec<u8>,
 }
 
-fn put(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    out.extend_from_slice(field);
-}
-
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.0.len() < n {
-            return Err("the invitation is cut short".to_string());
-        }
-        let (head, rest) = self.0.split_at(n);
-        self.0 = rest;
-        Ok(head)
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        String::from_utf8(self.bytes()?.to_vec())
-            .map_err(|_| "the invitation is garbled".to_string())
-    }
-}
-
 impl Invite {
     /// The invitation as one line.
     pub fn encode(&self) -> String {
         let mut out = Vec::new();
         put(&mut out, self.user.as_bytes());
         put(&mut out, self.code.as_bytes());
-        out.extend_from_slice(&(self.servers.len() as u32).to_be_bytes());
+        put_u32(&mut out, self.servers.len());
         for server in &self.servers {
             put(&mut out, server.as_bytes());
         }
@@ -97,7 +67,7 @@ impl Invite {
         let bytes = URL_SAFE_NO_PAD
             .decode(body)
             .map_err(|_| "the invitation is garbled".to_string())?;
-        let mut r = Reader(&bytes);
+        let mut r = Reader::new(&bytes, "invitation");
         let user = r.string()?;
         let code = r.string()?;
         let count = r.u32()?;
@@ -107,7 +77,7 @@ impl Invite {
         let servers = (0..count).map(|_| r.string()).collect::<Result<_, _>>()?;
         let name = r.string()?;
         let ca = r.bytes()?.to_vec();
-        if !r.0.is_empty() || ca.is_empty() {
+        if !r.rest.is_empty() || ca.is_empty() {
             return Err("the invitation is garbled".to_string());
         }
         crate::types::check_username(&user).map_err(|e| e.message)?;

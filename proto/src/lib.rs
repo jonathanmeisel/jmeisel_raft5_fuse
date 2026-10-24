@@ -4,8 +4,10 @@
 pub mod convert;
 pub mod errno;
 pub mod invite;
+pub mod link;
 pub mod timing;
 pub mod types;
+mod wire;
 
 /// Generated wire types and the tonic client and server.
 #[allow(clippy::all)]

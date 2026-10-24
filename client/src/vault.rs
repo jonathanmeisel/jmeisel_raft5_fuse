@@ -299,6 +299,19 @@ impl KnownKeys {
         }
     }
 
+    /// Every pinned key, by user name, sorted by name.
+    pub fn entries(&self) -> Vec<(String, [u8; PUBLIC_KEY_LEN])> {
+        let mut entries: Vec<_> = self
+            .keys
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(user, key)| (user.clone(), *key))
+            .collect();
+        entries.sort();
+        entries
+    }
+
     /// Removes `user`'s pinned key, so the vault trusts the next key it
     /// sees for them.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {

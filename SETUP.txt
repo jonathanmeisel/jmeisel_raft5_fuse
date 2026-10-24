@@ -342,9 +342,30 @@ page can't reach it through the browser.
 Finder litters every directory it opens with `.DS_Store` and `._*`
 files; they are refused unless --keep-apple-double is given.
 
+With --password-file FILE the password is kept: made and written to
+FILE (readable by alice only) the first time, and used again on every
+start after, so a client that saves passwords needs it only once:
+
+  raft5fs webdav --password-file ~/.config/raft5fs/webdav.pw
+
 A PUT is answered only once its body is stored, so a client that
 reports a copy done has had it stored. Ctrl-C (or SIGTERM) stops the
 server, storing what is still buffered.
+
+6.2 ANOTHER DEVICE
+
+An account works from any number of devices: the keys are unlocked by
+the password, wherever it is typed. A second device needs only the
+profile -- the servers, their CA, and the keys alice has pinned for
+other users (section 7) -- which one line carries:
+
+  raft5fs profile export                # on a device that has the profile
+  raft5fs profile import '<line>'       # on the new one
+
+Nothing in the line is secret, but it decides whom the new device
+trusts, so move it yourself: a CA swapped on the way would point it at
+other servers. A key the new device already pins for a user is kept
+over the line's, and said so.
 
 
 -------------------------------------------------------------------------
@@ -798,3 +819,78 @@ Restoring, into a new store and an empty bucket:
 
 Accounts, groups and ACLs come back with the store; snapshots don't.
 Delete store.backup when done: it holds the store's contents in clear.
+
+
+-------------------------------------------------------------------------
+14. ANDROID (TERMUX)
+-------------------------------------------------------------------------
+
+An Android phone can't mount, but it can run `raft5fs webdav` (section
+6.1) in Termux, for a WebDAV file manager on the same phone. Everything
+is decrypted on the phone, as on a computer; the servers see no more
+than before.
+
+Each release has the binary, raft5fs-android-aarch64 (64-bit ARM, the
+usual kind of phone), built without FUSE.
+
+Setting it up, once:
+
+  1. From F-Droid, install Termux (the Play Store's Termux is out of
+     date), and a file manager that speaks WebDAV: Material Files is
+     free; Solid Explorer and CX File Explorer work too.
+
+  2. In Android's settings, under Apps > Termux > Battery, choose
+     "Unrestricted". Otherwise Android stops the server in the
+     background, and the file manager finds nothing.
+
+  3. In Termux, install the binary, checking it against its checksum:
+
+       pkg update && pkg install curl
+       url=https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/latest/download
+       curl -LO $url/raft5fs-android-aarch64
+       curl -LO $url/raft5fs-android-aarch64.sha256
+       sha256sum -c raft5fs-android-aarch64.sha256
+       install -m 755 raft5fs-android-aarch64 $PREFIX/bin/raft5fs
+
+  4. Make the profile (section 6.2). On your computer:
+
+       raft5fs profile export
+
+     Get the line to the phone yourself (a note to yourself, a password
+     manager), then in Termux:
+
+       raft5fs profile import '<line>'
+
+     A new user, with no account yet, enrols on the phone instead:
+     raft5fs enrol '<invitation>' (section 5).
+
+  5. Start the server (step 6 below), then add it in the file manager:
+     a WebDAV server at host 127.0.0.1, port 8080, plain HTTP (not
+     HTTPS), path /; user: the account's name; password: what
+     `cat ~/.config/raft5fs/webdav.pw` shows in Termux.
+
+Each time the phone starts (the password is never stored, so this is
+done by hand):
+
+  6. In Termux:
+
+       termux-wake-lock
+       raft5fs webdav --password-file ~/.config/raft5fs/webdav.pw
+
+     and type the account's password. Leave Termux running; its
+     notification shows it is. The wake lock keeps the server running
+     with the screen off.
+
+  7. To stop it: Ctrl-C in Termux, which stores what is buffered first,
+     then termux-wake-unlock.
+
+To update, repeat step 3. To remove it: rm $PREFIX/bin/raft5fs and
+rm -r ~/.config/raft5fs.
+
+If the file manager can't connect: check Termux still shows the server
+running (Android may have stopped it: see step 2), that the address is
+http://, not https://, and that the password matches webdav.pw. If large
+files fail to open while small ones work, the phone can't reach the
+object store: check its network, and that the bucket's address in the
+servers' settings is reachable from outside.
+

@@ -252,6 +252,37 @@ impl Profile {
     }
 }
 
+/// Saves `profile` as profile `name` under `base`, with its CA certificate
+/// (`ca_pem`, if any) beside it as `profiles/<name>.ca.pem`. Neither may
+/// exist yet: nothing is overwritten.
+pub fn install_profile(
+    base: &Path,
+    name: &str,
+    mut profile: Profile,
+    ca_pem: Option<&[u8]>,
+) -> Result<PathBuf, String> {
+    check_profile_name(name)?;
+    let profile_path = Profile::path(base, name);
+    let ca_path = profile_ca_path(base, name);
+    if profile_path.exists() || ca_path.exists() {
+        return Err(format!(
+            "there is already a profile {name} ({}); choose another name",
+            profile_path.display()
+        ));
+    }
+    if let Some(pem) = ca_pem {
+        write_new_private(&ca_path, pem)
+            .map_err(|e| format!("cannot save {}: {e}", ca_path.display()))?;
+        profile.ca = Some(ca_path);
+    }
+    profile.save_new(base, name)
+}
+
+/// Where profile `name` keeps its CA certificate.
+pub fn profile_ca_path(base: &Path, name: &str) -> PathBuf {
+    base.join("profiles").join(format!("{name}.ca.pem"))
+}
+
 /// Profile names follow the same rule as account names, because they become
 /// file names.
 fn check_profile_name(name: &str) -> Result<(), String> {

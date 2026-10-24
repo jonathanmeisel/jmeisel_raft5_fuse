@@ -7,7 +7,8 @@ use raft5fs_proto::types::check_username;
 
 use super::{ConnectArgs, Outcome, runtime, show_fingerprint};
 use raft5fs_client::cli::{
-    Context, Profile, config_dir, password_from, prompt_password, tls_from_pem, write_new_private,
+    Context, Profile, config_dir, install_profile, password_from, profile_ca_path, prompt_password,
+    tls_from_pem,
 };
 use raft5fs_client::remote::{Credentials, Remote};
 
@@ -86,8 +87,7 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
     // Check this before the code is used up, so nothing is overwritten
     // after.
     let profile_path = Profile::path(&base, &name);
-    let ca_path = base.join("profiles").join(format!("{name}.ca.pem"));
-    if profile_path.exists() || ca_path.exists() {
+    if profile_path.exists() || profile_ca_path(&base, &name).exists() {
         return Err(format!(
             "there is already a profile {name} ({}); choose another name with --profile",
             profile_path.display()
@@ -110,18 +110,11 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
         ))
         .map_err(|e| format!("cannot enrol: {e}"))?;
 
-    let mut profile = profile;
-    if let Some(pem) = &ca_pem {
-        write_new_private(&ca_path, pem)
-            .map_err(|e| format!("enrolled, but cannot save {}: {e}", ca_path.display()))?;
-        profile.ca = Some(ca_path);
-    }
-    let saved = profile
-        .save_new(&base, &name)
+    let user = profile.user.clone();
+    let saved = install_profile(&base, &name, profile, ca_pem.as_deref())
         .map_err(|e| format!("enrolled, but {e}"))?;
     println!(
-        "enrolled {}; saved profile {name} ({})",
-        profile.user,
+        "enrolled {user}; saved profile {name} ({})",
         saved.display()
     );
     println!("your key's fingerprint -- give it to those you share with:");
