@@ -32,6 +32,9 @@ jobs:
       - name: Install protoc, the Android target and cargo-ndk
         run: |
           # raft5fs-proto's build script compiles the protocol with protoc.
+          # The runner's package list can be older than the mirror: refresh
+          # it, or the install asks for versions that are gone.
+          sudo apt-get update -q
           sudo apt-get install -y protobuf-compiler
           rustup target add aarch64-linux-android
           cargo install cargo-ndk --locked
