@@ -59,6 +59,24 @@ build the client without it and use WebDAV instead (section 6.1):
 
   cargo build --release -p raft5fs --no-default-features --features webdav
 
+Or download the client, `raft5fs`, already built. Each release on
+GitHub has one file per platform, plus SHA256SUMS to check them:
+
+  raft5fs-linux-x86_64      mount (FUSE 3) and WebDAV
+  raft5fs-macos-aarch64     WebDAV only (Apple Silicon)
+  raft5fs-android-aarch64   WebDAV only, for Termux (section 14)
+
+  url=https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/latest/download
+  curl -LO $url/raft5fs-linux-x86_64 -LO $url/SHA256SUMS
+  sha256sum -c SHA256SUMS --ignore-missing    # macOS: shasum -a 256 -c ...
+  install -m 755 raft5fs-linux-x86_64 ~/.local/bin/raft5fs
+
+`latest` is the newest release; put e.g. download/v0.2.0 in its place
+for a given one. A binary downloaded with curl runs as is; one
+downloaded with a browser on macOS is blocked until
+`xattr -d com.apple.quarantine raft5fs`, because it isn't signed. The
+servers aren't released this way: build them as above.
+
 The examples below assume these binaries are on your PATH.
 
 
@@ -847,9 +865,8 @@ Setting it up, once:
 
        pkg update && pkg install curl
        url=https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/latest/download
-       curl -LO $url/raft5fs-android-aarch64
-       curl -LO $url/raft5fs-android-aarch64.sha256
-       sha256sum -c raft5fs-android-aarch64.sha256
+       curl -LO $url/raft5fs-android-aarch64 -LO $url/SHA256SUMS
+       sha256sum -c SHA256SUMS --ignore-missing
        install -m 755 raft5fs-android-aarch64 $PREFIX/bin/raft5fs
 
   4. Make the profile (section 6.2). On your computer:
