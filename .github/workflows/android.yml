@@ -29,8 +29,10 @@ jobs:
       BINARY: raft5fs-android-aarch64
     steps:
       - uses: actions/checkout@v4
-      - name: Install the Android target and cargo-ndk
+      - name: Install protoc, the Android target and cargo-ndk
         run: |
+          # raft5fs-proto's build script compiles the protocol with protoc.
+          sudo apt-get install -y protobuf-compiler
           rustup target add aarch64-linux-android
           cargo install cargo-ndk --locked
       - name: Build
