@@ -345,7 +345,7 @@ async fn follows(r: &impl Reads, user: &str, path: &[u64]) -> Result<Option<Gran
         .flat_map(|&node| [attr_key(node), grant_key(node, user)])
         .collect();
     let values = r.get_many(&keys).await?;
-    for (i, (&node, level)) in path.iter().zip(values.chunks_exact(2)).enumerate() {
+    for (i, (&node, level)) in path.iter().zip(values.as_chunks::<2>().0).enumerate() {
         let Some(bytes) = &level[0] else {
             return Ok(None);
         };
