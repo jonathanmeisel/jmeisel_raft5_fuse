@@ -209,6 +209,46 @@ else
     unput /etc/ssh/sshd_config.d/10-raft5fs.conf ssh
 fi
 
+# -- swap -------------------------------------------------------------------
+# A swap file, so a memory spike (a large backup, say) slows the node down
+# rather than getting a server killed. Low swappiness: used only under
+# pressure. With SWAP_SIZE empty, swap is left as it is.
+if [ -n "${SWAP_SIZE:-}" ]; then
+    want=$(numfmt --from=iec "$SWAP_SIZE")
+    have=$(stat -c %s /swapfile 2>/dev/null || echo 0)
+    active=false
+    swapon --show=NAME --noheadings | grep -qx /swapfile && active=true
+    if [ "$have" != "$want" ]; then
+        if $dry; then
+            say "would make a $SWAP_SIZE swap file at /swapfile"
+            would=true
+        else
+            say "making a $SWAP_SIZE swap file at /swapfile"
+            if $active && ! swapoff /swapfile; then
+                say "can't swap the old /swapfile out (not enough free memory?); leaving it"
+                exit 1
+            fi
+            active=false
+            rm -f /swapfile
+            fallocate -l "$SWAP_SIZE" /swapfile
+            chmod 600 /swapfile
+            mkswap -q /swapfile
+        fi
+    fi
+    if ! grep -q '^/swapfile ' /etc/fstab; then
+        if $dry; then
+            say "would add /swapfile to /etc/fstab"
+            would=true
+        else
+            echo '/swapfile none swap sw 0 0' >>/etc/fstab
+        fi
+    fi
+    if ! $active && ! $dry; then
+        swapon /swapfile
+    fi
+    put harden/swap-sysctl.conf /etc/sysctl.d/60-raft5fs-swap.conf 0644 root:root sysctl
+fi
+
 has() { case " $changed " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Whether the nightly backup timer should run here.
@@ -245,6 +285,10 @@ if has ssh; then
     fi
     say "reloading ssh"
     systemctl try-reload-or-restart ssh
+fi
+
+if has sysctl; then
+    sysctl -q -p /etc/sysctl.d/60-raft5fs-swap.conf
 fi
 
 # -- WireGuard -------------------------------------------------------------

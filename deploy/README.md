@@ -35,6 +35,7 @@ raft5 store's repository.
 | `render.sh` | Assembles each node's bundle into a directory. `install.sh` runs it for you, in memory. |
 | `install.sh` | Installs or upgrades nodes over SSH, one at a time, checking each is serving before moving on. `--dry-run` shows what would change. |
 | `reboot.sh` | Reboots the nodes that need it after security updates, one at a time. |
+| `status.sh` | One look at the cluster's health: services, failed units, reboots, certificates, disk, memory, backups, drift. |
 | `check.sh` | Runs shellcheck on every script here (CI runs it too). |
 | `admin-shell.sh` | Opens the store's admin shell (`raft`) on a node. |
 | `fsadmin.sh` | Manages users, snapshots and backups: `user add/del/list`, `snapshot create/del/list`, `backup create/del/list/restore-objects`. |
@@ -248,6 +249,7 @@ mkdir -p ~/raft5fs && raft5fs mount ~/raft5fs
 | Snapshots | `./fsadmin.sh snapshot create\|del\|list ...` |
 | Backups | `./fsadmin.sh backup create\|del\|list ...` (see "Backups") |
 | Store admin shell | `./admin-shell.sh [node]` |
+| Check the cluster's health (weekly, say) | `./status.sh` |
 | See what an install would change | `./install.sh --dry-run --all` |
 | Upgrade | `./build.sh && ./install.sh --all`, one node at a time, each checked |
 | Renew certificates | `./certs.sh renew && ./install.sh --all` (needs `unlock --ca`) |
@@ -306,6 +308,27 @@ The first node to run does the work; the others find it done, and
 succeed. A failed backup fails the unit: check with `systemctl --failed`
 or `journalctl -u raft5fs-nightly-backup`. Backups you take by hand under
 other names are never deleted by it.
+
+**Swap.** Set `SWAP_SIZE=1G` (say) and `./install.sh --all`. Each node
+gets a swap file of that size at `/swapfile`, used only under memory
+pressure (`vm.swappiness = 10`). Without it, a memory spike, such as a
+large backup on a small node, gets a process killed, and that can be
+`raft5-server`. Changing the size swaps the old file out and makes a new
+one; leaving `SWAP_SIZE` empty leaves swap as it is.
+
+**Checking on it.** Nothing alerts yet, so run `./status.sh` now and then.
+For each node it shows:
+
+- its services, and any failed units (a failed nightly backup or
+  certificate check shows here)
+- a pending reboot
+- days until the first certificate expires
+- disk, memory and swap
+
+For the cluster, it shows the snapshot count and the newest backup's age.
+With the secrets unlocked, it also checks for drift
+(`install.sh --dry-run`); `--no-drift` skips that. It exits 1, and lists
+what needs attention, when anything does.
 
 **The DigitalOcean firewall.** `ufw` on each node is one layer. A cloud
 firewall in front of it is a second, and it also covers a node whose

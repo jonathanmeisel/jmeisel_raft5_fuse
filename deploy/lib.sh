@@ -197,9 +197,10 @@ public_address() {
 ssh_node() {
     local node=$1
     shift
-    # The command runs on the node, so it is meant to expand there.
+    # The command runs on the node, so it is meant to expand there. A node
+    # that doesn't answer fails in seconds, not minutes.
     # shellcheck disable=SC2029
-    ssh "$SSH_USER@$(node_field "$node" 2)" "$@"
+    ssh -o ConnectTimeout=15 "$SSH_USER@$(node_field "$node" 2)" "$@"
 }
 
 # Runs the rest as root on node $1, through sudo unless the login is root.

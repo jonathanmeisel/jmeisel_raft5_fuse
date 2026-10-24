@@ -39,6 +39,9 @@ ADMIN_USER=${ADMIN_USER:-}
 SSH_HARDEN=${SSH_HARDEN:-no}
 NIGHTLY_BACKUPS=${NIGHTLY_BACKUPS:-no}
 BACKUP_KEEP=${BACKUP_KEEP:-14}
+SWAP_SIZE=${SWAP_SIZE:-}
+[[ -z $SWAP_SIZE || $SWAP_SIZE =~ ^[1-9][0-9]*[MG]$ ]] ||
+    die "SWAP_SIZE ($SWAP_SIZE) must be a size like 512M or 1G"
 if [[ -n $ADMIN_USER ]]; then
     [[ $ADMIN_USER =~ ^[a-z][a-z0-9_-]*$ ]] || die "ADMIN_USER ($ADMIN_USER) isn't a valid user name"
     [[ -s $CLUSTER/authorized_keys ]] ||
@@ -167,6 +170,9 @@ render() {
         'APT::Periodic::Update-Package-Lists "1";' \
         'APT::Periodic::Unattended-Upgrade "1";' \
         'Unattended-Upgrade::Automatic-Reboot "false";' >"$dir/harden/apt.conf"
+    printf '%s\n' \
+        '# raft5fs: use the swap file only under memory pressure.' \
+        'vm.swappiness = 10' >"$dir/harden/swap-sysctl.conf"
 
     {
         echo "NODE=$node"
@@ -175,6 +181,7 @@ render() {
         echo "ADMIN_USER=$ADMIN_USER"
         echo "SSH_HARDEN=$SSH_HARDEN"
         echo "NIGHTLY_BACKUPS=$NIGHTLY_BACKUPS"
+        echo "SWAP_SIZE=$SWAP_SIZE"
     } >"$dir/node.conf"
     echo "rendered $dir"
 }

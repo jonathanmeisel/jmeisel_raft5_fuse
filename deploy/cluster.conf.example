@@ -73,6 +73,11 @@ BACKUP_KEEP=14
 ADMIN_USER=
 SSH_HARDEN=no
 
+# A swap file of this size on each node (e.g. 1G), so a memory spike, such
+# as a large backup, slows a node down rather than getting raft5-server
+# killed. Empty: leave swap as it is.
+SWAP_SIZE=
+
 # How long the certificates that certs.sh issues are valid, in days. The CAs
 # are valid for ten years.
 CERT_DAYS=397
