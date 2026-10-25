@@ -17,7 +17,7 @@ open_secrets
 [[ -f $SECRETS/internal-ca.pem ]] || die "no secrets yet: run ./certs.sh first"
 if [[ -n ${S3_BUCKET:-} ]]; then
     [[ -f $SECRETS/s3.env ]] ||
-        die "S3_BUCKET is set: add the bucket's credentials with ./secrets.sh edit s3.env (README \"Large files\")"
+        die "S3_BUCKET is set: add the bucket's credentials with ./secrets.sh edit s3.env (README \"Creating and deploying a new cluster\", step 5)"
     for var in RAFT5FS_OBJECT_ACCESS_KEY RAFT5FS_OBJECT_SECRET_KEY; do
         grep -q "^$var=" "$SECRETS/s3.env" || die "secrets/s3.env has no $var="
     done
@@ -25,16 +25,17 @@ if [[ -n ${S3_BUCKET:-} ]]; then
 fi
 if [[ -n ${BACKUP_BUCKET:-} ]]; then
     [[ -f $SECRETS/backup.env ]] ||
-        die "BACKUP_BUCKET is set: add the backup bucket's credentials with ./secrets.sh edit backup.env (README \"Backups\")"
+        die "BACKUP_BUCKET is set: add the backup bucket's credentials with ./secrets.sh edit backup.env (README \"Backup and recovery\")"
     for var in RAFT5FS_BACKUP_ACCESS_KEY RAFT5FS_BACKUP_SECRET_KEY; do
         grep -q "^$var=" "$SECRETS/backup.env" || die "secrets/backup.env has no $var="
     done
     [[ -f $SECRETS/backup.pub ]] ||
-        die "BACKUP_BUCKET is set: put the operator public key in the cluster's secrets/backup.pub (README \"Backups\")"
+        die "BACKUP_BUCKET is set: put the operator public key in the cluster's secrets/backup.pub (README \"Backup and recovery\")"
     [[ $BACKUP_BUCKET != "${S3_BUCKET:-}" ]] || die "BACKUP_BUCKET must not be S3_BUCKET"
     backup_options >/dev/null
 fi
-# Node hardening (README "Hardening the nodes"). Off unless set.
+# Node hardening (README "Creating and deploying a new cluster"). Off unless
+# set.
 ADMIN_USER=${ADMIN_USER:-}
 SSH_HARDEN=${SSH_HARDEN:-no}
 NIGHTLY_BACKUPS=${NIGHTLY_BACKUPS:-no}

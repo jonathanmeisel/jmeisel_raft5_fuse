@@ -1,5 +1,5 @@
 # Built binaries. A cluster's settings and secrets live in the cluster
-# repo (README "Cluster repo"); the two entries below only guard against
+# repo (README "Secrets"); the two entries below only guard against
 # committing an old plaintext copy left here by mistake.
 /out/
 /cluster.conf

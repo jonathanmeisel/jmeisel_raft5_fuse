@@ -39,7 +39,7 @@ fi
 # Hardening turns root login off. Logging in as root to do it would lock
 # out the next install: switch SSH_USER to ADMIN_USER first.
 if [[ ${SSH_HARDEN:-no} == yes && $SSH_USER == root ]]; then
-    die "SSH_HARDEN=yes turns root login off: set SSH_USER=${ADMIN_USER:-<ADMIN_USER>} first (README \"Hardening the nodes\")"
+    die "SSH_HARDEN=yes turns root login off: set SSH_USER=${ADMIN_USER:-<ADMIN_USER>} first (README \"Creating and deploying a new cluster\", step 10)"
 fi
 
 # The bundles hold the secrets in plaintext: render them into memory, and

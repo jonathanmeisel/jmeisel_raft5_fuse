@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Looks after the cluster repo's secrets (README "Cluster repo"). Secret
+# Looks after the cluster repo's secrets (README "Secrets"). Secret
 # files are kept only sops-encrypted, as secrets/<path>.sops; certificates
 # and public keys are kept as they are. Every command but `init` needs
 # RAFT5FS_CLUSTER, and every command that reads a secret needs

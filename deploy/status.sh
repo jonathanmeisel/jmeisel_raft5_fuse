@@ -81,7 +81,7 @@ for node in $(node_names); do
     [[ -z ${f[failed]} ]] || problem "$node: failed units: ${f[failed]}"
     [[ ${f[reboot]} == no ]] || problem "$node: needs a reboot (./reboot.sh)"
     if [[ -n ${f[certdays]} ]] && ((f[certdays] < 30)); then
-        problem "$node: a certificate expires in ${f[certdays]} days (README \"The certificates\")"
+        problem "$node: a certificate expires in ${f[certdays]} days (README \"Rotating certificates\")"
     fi
     ((f[disk] < 80)) || problem "$node: disk ${f[disk]}% full"
     ((f[memfree] >= 150)) || notes+=("low memory")

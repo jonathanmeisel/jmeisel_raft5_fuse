@@ -2,7 +2,7 @@
 # Shared by the scripts here: reads the cluster's settings and gives the
 # paths for files. Source it; do not run it.
 #
-# The cluster lives in its own repository (README "Cluster repo"):
+# The cluster lives in its own repository (README "Secrets"):
 # RAFT5FS_CLUSTER names the directory that holds cluster.conf and
 # secrets/. Secret files there are sops-encrypted (*.sops). `open_secrets`
 # decrypts them into a temporary directory in memory, which is deleted
@@ -23,7 +23,7 @@ die() {
 }
 
 [[ -n ${RAFT5FS_CLUSTER:-} ]] ||
-    die "set RAFT5FS_CLUSTER to the cluster's directory in the cluster repo (README \"Cluster repo\")"
+    die "set RAFT5FS_CLUSTER to the cluster's directory in the cluster repo (README \"Secrets\")"
 CLUSTER=$(cd "$RAFT5FS_CLUSTER" && pwd) || die "RAFT5FS_CLUSTER ($RAFT5FS_CLUSTER) isn't a directory"
 [[ -f $CLUSTER/cluster.conf ]] || die "no cluster.conf in $CLUSTER"
 # The encrypted secrets. `open_secrets` sets SECRETS to their plaintext.

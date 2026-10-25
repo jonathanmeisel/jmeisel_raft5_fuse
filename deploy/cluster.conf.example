@@ -1,5 +1,5 @@
 # The cluster's layout. Copy it to <cluster repo>/<cluster>/cluster.conf
-# and edit it (README "Cluster repo"). Every script here reads it, from
+# and edit it (README "Secrets"). Every script here reads it, from
 # RAFT5FS_CLUSTER. Shell syntax.
 
 # One line per node:  <name> <public IP> <WireGuard IP> <public DNS name or ->
@@ -33,10 +33,10 @@ RAFT5_REPO=../../jmeisel_raft5
 # filesystem, and it never changes (see SETUP.txt section 4).
 CHUNK_SIZE=1M
 
-# Large files in an S3-compatible bucket (README "Large files"; SETUP.txt
-# section 12). Optional: leave S3_BUCKET empty to keep everything in the
-# store. The credentials go in the cluster's secrets (./secrets.sh edit
-# s3.env), never here.
+# Large files in an S3-compatible bucket (README "Creating and deploying
+# a new cluster", step 5; SETUP.txt section 12). Optional: leave S3_BUCKET
+# empty to keep everything in the store. The credentials go in the
+# cluster's secrets (./secrets.sh edit s3.env), never here.
 S3_BUCKET=
 S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com
 S3_REGION=eu-west-1
@@ -51,9 +51,9 @@ OBJECT_BLOCK=16M
 # How often, in seconds, to delete objects that nothing points to.
 GC_INTERVAL=3600
 
-# Backups of snapshots to another S3-compatible bucket (README "Backups").
-# Optional: leave BACKUP_BUCKET empty for none. It must not be S3_BUCKET.
-# The credentials go in the cluster's secrets (./secrets.sh edit
+# Backups of snapshots to another S3-compatible bucket (README "Backup and
+# recovery"). Optional: leave BACKUP_BUCKET empty for none. It must not be
+# S3_BUCKET. The credentials go in the cluster's secrets (./secrets.sh edit
 # backup.env), and the operator public key in its secrets/backup.pub,
 # never here.
 BACKUP_BUCKET=
@@ -62,14 +62,14 @@ BACKUP_REGION=eu-west-1
 BACKUP_PATH_STYLE=no
 BACKUP_PREFIX=raft5fs-backup/
 # Take a backup every night on the nodes, as nightly-<date>, and keep the
-# newest BACKUP_KEEP of them (README "Hardening the nodes").
+# newest BACKUP_KEEP of them (README "Backup and recovery").
 NIGHTLY_BACKUPS=no
 BACKUP_KEEP=14
 
-# Hardening (README "Hardening the nodes"). ADMIN_USER is a sudo user that
-# accepts the SSH keys in the cluster's authorized_keys file. Once logging
-# in as it works, set SSH_USER to it, then SSH_HARDEN=yes: SSH keys only,
-# and no root login.
+# Hardening (README "Creating and deploying a new cluster", step 10).
+# ADMIN_USER is a sudo user that accepts the SSH keys in the cluster's
+# authorized_keys file. Once logging in as it works, set SSH_USER to it,
+# then SSH_HARDEN=yes: SSH keys only, and no root login.
 ADMIN_USER=
 SSH_HARDEN=no
 
