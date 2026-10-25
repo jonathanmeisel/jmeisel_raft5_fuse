@@ -184,6 +184,11 @@ function joined(user, { early }) {
 
 // ----------------------------------------------------------------- reading
 
+/// Previews' colours: the app's dark panels, behind transparent images
+/// and text.
+const PREVIEW_BACKGROUND = "#2a2b2d";
+const PREVIEW_TEXT = "rgba(255, 255, 255, 0.9)";
+
 /// How much of a text file its preview draws from.
 const TEXT_PREVIEW_BYTES = 8 << 10;
 
@@ -370,7 +375,7 @@ const methods = {
     const bytes = await readHead(path, kind === "text" ? TEXT_PREVIEW_BYTES : Infinity);
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#fff";
+    ctx.fillStyle = PREVIEW_BACKGROUND;
     ctx.fillRect(0, 0, width, height);
     if (kind === "image") {
       let bitmap;
@@ -384,7 +389,7 @@ const methods = {
       const h = Math.max(1, Math.round(bitmap.height * scale));
       canvas.width = w;
       canvas.height = h;
-      ctx.fillStyle = "#fff";
+      ctx.fillStyle = PREVIEW_BACKGROUND;
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(bitmap, 0, 0, w, h);
       bitmap.close();
@@ -392,7 +397,7 @@ const methods = {
       const text = asText(bytes);
       if (text === null) return null;
       // Large enough to read on a card, which shows it at about half size.
-      ctx.fillStyle = "#1d2330";
+      ctx.fillStyle = PREVIEW_TEXT;
       ctx.font = "22px ui-monospace, monospace";
       const lines = text.split("\n");
       const lineHeight = 28;

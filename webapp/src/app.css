@@ -1,13 +1,15 @@
 :root {
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --bg: #f6f7f9;
-  --panel: #fff;
-  --text: #1d2330;
-  --muted: #5b6475;
-  --border: #d8dce3;
+  /* Always dark, in the colours of SVAR's dark theme. */
+  --bg: #20262b;
+  --panel: #2a2b2d;
+  --text: rgba(255, 255, 255, 0.9);
+  --muted: #9fa1ae;
+  --border: #384047;
   --accent: #DF2F90;
-  --danger: #c0392b;
-  --warn-bg: #fff6e0;
+  --danger: #fe6158;
+  --warn-bg: #3b3424;
+  color-scheme: dark;
 }
 
 * {
@@ -100,9 +102,8 @@ label {
 
 /* SVAR's file manager in the app's accent. Two classes, so these win
    over the theme's own settings whatever order the styles load in. */
-.wx-theme.wx-willow-theme {
+.wx-theme.wx-willow-dark-theme {
   --wx-color-primary: var(--accent);
-  --wx-color-primary-selected: #f8d5e8;
+  --wx-color-primary-selected: rgba(223, 47, 144, 0.3);
   --wx-color-secondary-hover: rgba(223, 47, 144, 0.12);
-  --wx-color-info: var(--accent);
 }

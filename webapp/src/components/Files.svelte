@@ -3,7 +3,7 @@
   // intercepted and done in the Worker. SVAR's own change is cancelled,
   // and the folders involved are listed again, so what shows is what the
   // servers have. SVAR never gets a URL, so it fetches nothing itself.
-  import { Filemanager, Willow, getMenuOptions } from "@svar-ui/svelte-filemanager";
+  import { Filemanager, WillowDark, getMenuOptions } from "@svar-ui/svelte-filemanager";
   import Fingerprint from "./Fingerprint.svelte";
   import Dialog from "./Dialog.svelte";
   import ShareDialog from "./ShareDialog.svelte";
@@ -15,6 +15,7 @@
   import { kindOf, previews } from "../lib/previews.js";
 
   let { fs, me, storageError, onlogout } = $props();
+
 
   // svelte-ignore state_referenced_locally
   const preview = previews(fs);
@@ -269,7 +270,7 @@
 
   <div class="fm">
     {#if initial}
-      <Willow fonts={false}>
+      <WillowDark fonts={false}>
         <Filemanager
           data={initial}
           {init}
@@ -277,7 +278,7 @@
           icons="simple"
           previews={(file) => preview.url(file)}
         />
-      </Willow>
+      </WillowDark>
     {/if}
   </div>
 </div>
