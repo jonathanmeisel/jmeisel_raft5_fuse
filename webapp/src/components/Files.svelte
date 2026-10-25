@@ -244,7 +244,7 @@
     <button onclick={() => (dialog = { kind: "pending" })}>
       Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
     </button>
-    <button onclick={() => (dialog = { kind: "fingerprint" })}>Your fingerprint</button>
+    <button onclick={() => (dialog = { kind: "fingerprint" })}>My fingerprint</button>
     <button onclick={onlogout}>Log out</button>
   </header>
 
@@ -283,7 +283,7 @@
 </div>
 
 {#if dialog?.kind === "fingerprint"}
-  <Dialog title="Your fingerprint" onclose={() => (dialog = null)}>
+  <Dialog title="My fingerprint" onclose={() => (dialog = null)}>
     <p>Your key's fingerprint</p>
     <Fingerprint fingerprint={me.fingerprint} />
   </Dialog>
