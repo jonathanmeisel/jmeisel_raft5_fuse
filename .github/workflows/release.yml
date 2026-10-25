@@ -210,6 +210,9 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --title "raft5fs $GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" raft5fs-* SHA256SUMS --clobber
+          # Deleting a tag turns its release back into a draft, which
+          # releases/latest (get-raft5fs.sh) can't see: publish it again.
+          gh release edit "$GITHUB_REF_NAME" --draft=false --tag "$GITHUB_REF_NAME" --latest
 
   pages:
     if: startsWith(github.ref, 'refs/tags/v') && vars.PAGES == 'on'
