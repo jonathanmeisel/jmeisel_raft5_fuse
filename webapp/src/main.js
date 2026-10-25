@@ -9,4 +9,9 @@ if (window.top !== window.self) {
   document.body.textContent = "raft5fs doesn't run inside a frame.";
 } else {
   mount(App, { target: document.getElementById("app") });
+  // Streams video, audio, PDFs and downloads (public/sw.js). Without it,
+  // the app decrypts whole files instead.
+  navigator.serviceWorker
+    ?.register("/sw.js", { scope: "/", updateViaCache: "none" })
+    .catch(() => {});
 }

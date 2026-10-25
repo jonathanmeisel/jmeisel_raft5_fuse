@@ -524,6 +524,13 @@ What it trusts that the native client doesn't:
   ends it.
 - **Pruning after a revoke runs in the browser,** only while the app is
   open. A large folder is better pruned with `raft5fs prune`.
+- **A service worker** streams video, audio, PDFs and downloads. It stays
+  registered in the browser between visits and could see the app's
+  requests; it answers only `/stream/` URLs, and browsers check for a new
+  one on every visit, so a release replaces it. It holds no keys (it asks
+  the app's tab for each piece), and a file's type comes only from its
+  extension, so a stream can't become a page. Like the Worker, it runs
+  without the page's CSP.
 
 ### Setting it up
 

@@ -57,7 +57,10 @@ function csp(filesystems) {
     // SVAR sets inline style attributes.
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' blob: data:",
-    "media-src blob:",
+    // Video and audio, streamed (public/sw.js) or whole.
+    "media-src 'self' blob:",
+    // The browser's own PDF viewer, in the app's viewer.
+    "frame-src 'self' blob:",
     "font-src 'self'",
     `connect-src 'self' ${[...new Set(connect)].join(" ")}`,
     "base-uri 'none'",

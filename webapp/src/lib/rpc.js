@@ -55,9 +55,12 @@ export function connect({ onStorageError } = {}) {
     copy: (from, to) => call("copy", [from, to]),
     upload: (path, file, overwrite, progress) =>
       call("upload", [path, file, overwrite], progress),
-    download: (path, progress) => call("download", [path], progress),
+    download: (path, progress, type) => call("download", [path, type], progress),
     preview: (path, kind, width, height) => call("preview", [path, kind, width, height]),
     readText: (path, max) => call("readText", [path, max]),
+    openFile: (path) => call("openFile", [path]),
+    readFile: (handle, offset, len) => call("readFile", [handle, offset, len]),
+    closeFile: (handle) => call("closeFile", [handle]),
     isPinned: (user) => call("isPinned", [user]),
     share: (path, user, writable, label, fingerprint) =>
       call("share", [path, user, writable, label, fingerprint ?? null]),

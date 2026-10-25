@@ -26,17 +26,56 @@ const AT_ONCE = 2;
 const WIDTH = 400;
 const HEIGHT = 500;
 
+/// What the browser can show of other files, by extension, and as what
+/// type. A file's type always comes from here, never from its contents,
+/// so no file can open as a page in the app's origin.
+const MEDIA = {
+  mp4: ["video", "video/mp4"],
+  m4v: ["video", "video/mp4"],
+  mov: ["video", "video/quicktime"],
+  webm: ["video", "video/webm"],
+  mkv: ["video", "video/x-matroska"],
+  ogv: ["video", "video/ogg"],
+  mp3: ["audio", "audio/mpeg"],
+  m4a: ["audio", "audio/mp4"],
+  aac: ["audio", "audio/aac"],
+  ogg: ["audio", "audio/ogg"],
+  oga: ["audio", "audio/ogg"],
+  opus: ["audio", "audio/ogg"],
+  wav: ["audio", "audio/wav"],
+  flac: ["audio", "audio/flac"],
+  pdf: ["pdf", "application/pdf"],
+};
+const IMAGE_TYPES = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  avif: "image/avif",
+  ico: "image/x-icon",
+};
+
 function extension(name) {
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
-/// "image", "text", or null: what kind of preview a file can have.
+/// What the viewer can show of a file: "image", "text", "video", "audio",
+/// "pdf", or null.
 export function kindOf(name) {
   const ext = extension(name);
   if (IMAGE.has(ext)) return "image";
   if (TEXT.has(ext)) return "text";
-  return null;
+  return MEDIA[ext]?.[0] ?? null;
+}
+
+/// The type to give a file's bytes in the browser: from the extension
+/// alone, and a plain download for anything else.
+export function mimeOf(name) {
+  const ext = extension(name);
+  return IMAGE_TYPES[ext] ?? MEDIA[ext]?.[1] ?? "application/octet-stream";
 }
 
 export function previews(fs) {
@@ -83,7 +122,7 @@ export function previews(fs) {
     url(file) {
       if (file.type !== "file" || !(file.size > 0) || file.size > MAX_BYTES) return null;
       const kind = kindOf(file.name ?? file.id);
-      if (!kind) return null;
+      if (kind !== "image" && kind !== "text") return null;
       const key = keyOf(file);
       if (ready.has(key)) return ready.get(key) || null;
       if (!started.has(key)) {

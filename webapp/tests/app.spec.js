@@ -14,6 +14,59 @@ const localFsId = () =>
     .filesystems.find((f) => f.name === "local").fsId;
 const SLOW = { timeout: 60_000 };
 /// A 1x1 PNG.
+const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url));
+const WEBM = fixture("clip.webm");
+const PDF = fixture("page.pdf");
+
+/// Uploads the video and the PDF into the folder open in `page`.
+async function uploadMedia(page) {
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "clip.webm", mimeType: "video/webm", buffer: WEBM },
+    { name: "page.pdf", mimeType: "application/pdf", buffer: PDF },
+  ]);
+  await expect(item(page, "clip.webm")).toBeVisible(SLOW);
+  await expect(item(page, "page.pdf")).toBeVisible(SLOW);
+  await expect(page.getByText(/Uploading/)).toHaveCount(0, SLOW);
+}
+
+/// Opens the video in the viewer, checks it plays and seeks, and gives its
+/// source URL.
+async function playsVideo(page) {
+  await item(page, "clip.webm").dblclick();
+  const video = page.getByRole("dialog").locator("video");
+  await expect(video).toBeVisible(SLOW);
+  await expect.poll(() => video.evaluate((v) => v.readyState), SLOW).toBeGreaterThanOrEqual(2);
+  const at = await video.evaluate(
+    (v) =>
+      new Promise((resolve) => {
+        v.pause();
+        v.addEventListener("seeked", () => resolve(v.currentTime), { once: true });
+        v.currentTime = 2;
+      }),
+  );
+  expect(at).toBeCloseTo(2, 0);
+  const src = await video.getAttribute("src");
+  await page.getByRole("button", { name: "Close" }).click();
+  return src;
+}
+
+/// Opens the PDF in the viewer, checks it comes as a PDF, and gives its
+/// frame's source URL.
+async function showsPdf(page) {
+  await item(page, "page.pdf").dblclick();
+  const frame = page.getByRole("dialog").locator("iframe");
+  await expect(frame).toBeVisible(SLOW);
+  const src = await frame.getAttribute("src");
+  // A stream says its type; a blob: URL can't be fetched under the CSP,
+  // and the viewer typed it the same way.
+  if (!src.startsWith("blob:")) {
+    const type = await page.evaluate(async (url) => (await fetch(url)).headers.get("content-type"), src);
+    expect(type).toBe("application/pdf");
+  }
+  await page.getByRole("button", { name: "Close" }).click();
+  return src;
+}
+
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
   "base64",
@@ -129,6 +182,27 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     expect((await download(alice, "large.bin")).equals(large)).toBe(true);
   });
 
+  await test.step("video and PDFs stream through the service worker", async () => {
+    await uploadMedia(alice);
+    const video = await playsVideo(alice);
+    expect(video).toMatch(/^\/stream\//);
+    // A range, as a player asks for one, is exactly those bytes. The
+    // viewer closed its stream, so open one again for the check.
+    await item(alice, "clip.webm").dblclick();
+    const src = await alice.getByRole("dialog").locator("video").getAttribute("src");
+    const got = await alice.evaluate(async (url) => {
+      const r = await fetch(url, { headers: { Range: "bytes=100-199" } });
+      return { status: r.status, range: r.headers.get("content-range"), bytes: [...new Uint8Array(await r.arrayBuffer())] };
+    }, src);
+    expect(got.status).toBe(206);
+    expect(got.range).toBe(`bytes 100-199/${WEBM.length}`);
+    expect(Buffer.from(got.bytes).equals(WEBM.subarray(100, 200))).toBe(true);
+    await alice.getByRole("button", { name: "Close" }).click();
+    // The PDF too, as a PDF.
+    const pdf = await showsPdf(alice);
+    expect(pdf).toMatch(/^\/stream\//);
+  });
+
   await test.step("images and text get previews, and open in the viewer", async () => {
     await alice.locator("input[type=file]").setInputFiles([
       { name: "dot.png", mimeType: "image/png", buffer: PNG },
@@ -235,6 +309,21 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   });
 
   expect(problems.flat()).toEqual([]);
+});
+
+test("without a service worker, files open and download whole", async ({ browser }) => {
+  const context = await browser.newContext({ serviceWorkers: "block" });
+  const carol = await context.newPage();
+  const problems = watch(carol);
+  await enrol(carol, "carol");
+  await login(carol, "carol");
+  await addFolder(carol, "media");
+  await open(carol, "media");
+  await uploadMedia(carol);
+  expect(await playsVideo(carol)).toMatch(/^blob:/);
+  expect(await showsPdf(carol)).toMatch(/^blob:/);
+  expect((await download(carol, "page.pdf")).equals(PDF)).toBe(true);
+  expect(problems).toEqual([]);
 });
 
 test("the app refuses to run in a frame", async ({ page }) => {

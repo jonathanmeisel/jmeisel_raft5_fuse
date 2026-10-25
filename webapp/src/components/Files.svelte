@@ -12,16 +12,24 @@
   import PruneBar from "./PruneBar.svelte";
   import Viewer from "./Viewer.svelte";
   import { onDestroy } from "svelte";
-  import { kindOf, previews } from "../lib/previews.js";
+  import { kindOf, mimeOf, previews } from "../lib/previews.js";
+  import { streams } from "../lib/streams.js";
 
   let { fs, me, storageError, onlogout } = $props();
 
 
   // svelte-ignore state_referenced_locally
   const preview = previews(fs);
+  /// Streams through the service worker (see streams.js).
+  // svelte-ignore state_referenced_locally
+  const streaming = streams(fs);
+  onDestroy(() => streaming.end());
   onDestroy(() => preview.clear());
-  /// The largest image the viewer opens; bigger ones download.
-  const MAX_VIEW_BYTES = 50 << 20;
+  /// The largest file of each kind that the viewer opens whole (decrypted
+  /// into memory); bigger ones download, unless they can stream.
+  const MAX_VIEW_BYTES = { image: 50 << 20, text: 50 << 20, video: 500 << 20, audio: 500 << 20, pdf: 500 << 20 };
+  /// The kinds that can play or show from a stream (see streams.js).
+  const STREAMED = new Set(["video", "audio", "pdf"]);
 
   let api = null;
   let initial = $state(null);
@@ -128,11 +136,27 @@
   }
 
   async function download(path) {
+    const name = nameOf(path);
+    // Streamed straight to disk by the browser, which shows its progress.
+    // Through a hidden frame: a navigation reaches the service worker,
+    // where an <a download> click wouldn't, and the stream's
+    // `Content-Disposition: attachment` makes it a download.
+    if (streaming.available()) {
+      const { url } = await streaming.open(path, mimeOf(name), { download: true });
+      const frame = document.createElement("iframe");
+      frame.hidden = true;
+      frame.src = url;
+      document.body.append(frame);
+      setTimeout(() => frame.remove(), 60_000);
+      return;
+    }
     const { size } = await fs.stat(path);
     if (size > 1 << 30 && !confirm(
       `${nameOf(path)} is ${(size / (1 << 30)).toFixed(1)} GB. The browser holds all of it in memory while it downloads. Do you want to continue?`,
     )) return;
-    const blob = await transfer("down", nameOf(path), (progress) => fs.download(path, progress));
+    const blob = await transfer("down", nameOf(path), (progress) =>
+      fs.download(path, progress, mimeOf(nameOf(path))),
+    );
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -189,10 +213,13 @@
       act(() => download(id), []);
       return false;
     });
-    // Images and text open in the viewer; anything else downloads.
+    // Images, text, video, audio and PDFs open in the viewer; anything
+    // else downloads.
     api.intercept("open-file", ({ id }) => {
       const file = api.getFile(id);
-      if (kindOf(nameOf(id)) && !(file?.size > MAX_VIEW_BYTES)) {
+      const kind = kindOf(nameOf(id));
+      const streams = STREAMED.has(kind) && streaming?.available();
+      if (kind && (streams || !(file?.size > MAX_VIEW_BYTES[kind]))) {
         dialog = { kind: "view", path: id };
       } else {
         act(() => download(id), []);
@@ -292,6 +319,7 @@
   <Viewer
     {fs}
     path={dialog.path}
+    streams={streaming}
     ondownload={() => act(() => download(dialog.path), [])}
     onclose={() => (dialog = null)}
   />

@@ -348,8 +348,15 @@ const methods = {
     }
   },
 
-  /// The whole of file `path`, as a Blob.
-  async download(path) {
+  /// Open files, for streams (see streams.js): a handle, its bytes from
+  /// `offset` (fewer at the end), and closing it.
+  openFile: (path) => session().open(path, false, false),
+  readFile: (handle, offset, len) => session().read(handle, offset, len),
+  closeFile: (handle) => session().close(handle),
+
+  /// The whole of file `path`, as a Blob of `type` (see previews.js
+  /// `mimeOf`).
+  async download(path, type) {
     const s = session();
     const { size } = await s.stat(path);
     const handle = await s.open(path, false, false);
@@ -364,7 +371,7 @@ const methods = {
     } finally {
       await s.close(handle);
     }
-    return new Blob(parts);
+    return new Blob(parts, { type: type || "application/octet-stream" });
   },
 
   /// A preview of file `path`, as a small image Blob that fits in
