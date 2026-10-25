@@ -22,11 +22,11 @@ const PNG = Buffer.from(
 /// Enrols `user` through the page, and gives their fingerprint's words.
 async function enrol(page, user) {
   await page.goto("/");
-  await page.getByRole("link", { name: "Enrol" }).click();
+  await page.getByRole("link", { name: "Enroll with an invitation" }).click();
   await page.getByLabel("Invitation").fill(invites()[user]);
   await page.getByLabel("New password").fill(PASSWORD);
   await page.getByLabel("Again").fill(PASSWORD);
-  await page.getByRole("button", { name: "Enrol" }).click();
+  await page.getByRole("button", { name: "Enroll" }).click();
   await expect(page.getByText(`Enrolled ${user}`)).toBeVisible(SLOW);
   const words = (await page.locator(".words").innerText()).trim();
   await page.getByRole("button", { name: "Continue to log in" }).click();
@@ -39,7 +39,7 @@ async function login(page, user, stay = false) {
   await expect(page.getByLabel("Filesystem")).toHaveValue(localFsId());
   await page.getByLabel("User name").fill(user);
   await page.getByLabel("Password").fill(PASSWORD);
-  if (stay) await page.getByLabel(/Stay unlocked/).check();
+  if (stay) await page.getByLabel(/Stay logged in/).check();
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
 }
@@ -79,9 +79,20 @@ async function download(page, name) {
 }
 
 async function menu(page, name, option) {
-  await item(page, name).click({ button: "right" });
   // The first match is the option; a hotkey label can repeat its text.
-  await page.getByText(option, { exact: true }).first().click();
+  const choice = page.getByText(option, { exact: true }).first();
+  // A right-click while the list re-renders opens no menu: try again.
+  for (let tries = 0; ; tries++) {
+    await item(page, name).click({ button: "right" });
+    try {
+      await choice.waitFor({ timeout: 3_000 });
+      break;
+    } catch (e) {
+      if (tries === 4) throw e;
+      await page.keyboard.press("Escape");
+    }
+  }
+  await choice.click();
 }
 
 test("two people share a folder, then one revokes", async ({ browser }) => {
@@ -168,7 +179,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await bob.getByRole("button", { name: "Trust…" }).click();
     await bob.getByLabel("fingerprint").fill(aliceWords);
     await bob.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(bob.getByText(/Nothing pending/)).toBeVisible(SLOW);
+    await expect(bob.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Close" }).click();
     await open(bob, "docs");
     expect((await download(bob, "small.txt")).equals(small)).toBe(true);
@@ -200,10 +211,11 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.reload();
     await expect(alice.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
     await expect(item(alice, "docs")).toBeVisible(SLOW);
-    // A second tab can't open the same account.
+    // A second tab opens the same account too.
     const second = await alice.context().newPage();
     await second.goto("/");
-    await expect(second.getByText(/already open in another tab/)).toBeVisible(SLOW);
+    await expect(second.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+    await expect(item(second, "docs")).toBeVisible(SLOW);
     await second.close();
     // Logging out forgets the device.
     await alice.getByRole("button", { name: "Log out" }).click();

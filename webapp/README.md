@@ -8,8 +8,10 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
 
 ## Layout
 
-- `src/lib/worker.js`: the Worker. It holds the session, the account's Web
-  Lock (one tab at a time), and IndexedDB (pins and the prune queue only).
+- `src/lib/worker.js`: the Worker. It holds the session and IndexedDB
+  (pins, the prune queue, and a remembered login), keeps the account's
+  other tabs up to date with its saves, and runs the background prune
+  when it holds the account's prune lock (one tab at a time).
 - `src/lib/rpc.js`: the page's calls into the Worker.
 - `src/lib/previews.js`: thumbnails for images and text files (up to
   20 MB), which the Worker decrypts and draws. Showing a folder fetches

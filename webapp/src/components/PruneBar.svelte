@@ -1,19 +1,20 @@
 <script>
-  // What waits to be re-sealed after a revoke, and how it's going. The
-  // Worker prunes in the background while the app is open, and carries on
-  // at the next login.
+  // What waits to be re-sealed after a revoke, and how it's going. One
+  // tab per account prunes in the background while the app is open, and
+  // carries on at the next login.
   import { onDestroy } from "svelte";
 
   let { fs, onqueued } = $props();
   const POLL_MS = 3000;
 
   let queued = $state([]);
-  let running = $state(true);
+  /// "running", "paused", or "elsewhere" (another tab prunes).
+  let state = $state("running");
 
   async function poll() {
     try {
       queued = await fs.pruneStatus();
-      running = await fs.pruning();
+      state = await fs.pruning();
       onqueued(queued.length);
     } catch {}
   }
@@ -22,7 +23,7 @@
   onDestroy(() => clearInterval(timer));
 
   async function toggle() {
-    if (running) await fs.pausePruning();
+    if (state === "running") await fs.pausePruning();
     else await fs.resumePruning();
     poll();
   }
@@ -32,11 +33,16 @@
   <div class="prune">
     <div class="items">
       {#each queued as q}
-        <div><strong>Re-sealing {q.note}</strong>: {running ? q.status : "paused"}</div>
+        <div>
+          <strong>Re-sealing {q.note}</strong>:
+          {state === "running" ? q.status : state === "paused" ? "paused" : "running in another tab"}
+        </div>
       {/each}
       <div class="note">Keep this tab open until it's done; closing it pauses re-sealing until you next log in.</div>
     </div>
-    <button onclick={toggle}>{running ? "Pause" : "Resume"}</button>
+    {#if state !== "elsewhere"}
+      <button onclick={toggle}>{state === "running" ? "Pause" : "Resume"}</button>
+    {/if}
   </div>
 {/if}
 

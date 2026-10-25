@@ -7,8 +7,9 @@
 //! - Each save changes the copy, then goes to `persist`, the app's
 //!   function that writes it to IndexedDB. Saves reach it one at a time,
 //!   in order, so the last save of a blob is the one that stays.
-//! - The app lets only one tab at a time log in to an account (a Web
-//!   Lock), so no other tab changes the blobs under this copy.
+//! - Other tabs on the same account keep their own copies. The app sends
+//!   each save to them (a BroadcastChannel), and they apply it with
+//!   `refresh`, so no tab saves over a change that another one made.
 
 use std::collections::HashMap;
 use std::io;
@@ -50,6 +51,15 @@ impl BrowserStore {
             saves,
         }
     }
+
+    /// Takes another tab's save of blob `name` into this copy, without
+    /// saving it again.
+    pub fn refresh(&self, name: &str, data: &[u8]) {
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), data.to_vec());
+    }
 }
 
 impl Store for BrowserStore {
@@ -67,7 +77,7 @@ impl Store for BrowserStore {
             .map_err(|_| io::Error::other("the browser store is closed"))
     }
 
-    /// The Web Lock that the app holds covers other tabs; in this one,
+    /// Other tabs' changes arrive through `refresh`; in this one,
     /// everything runs on one thread.
     fn exclusive(&self, _lock: &str, f: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
         let _held = self.lock.lock().unwrap();

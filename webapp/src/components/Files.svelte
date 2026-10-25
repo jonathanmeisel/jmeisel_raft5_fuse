@@ -129,7 +129,7 @@
   async function download(path) {
     const { size } = await fs.stat(path);
     if (size > 1 << 30 && !confirm(
-      `${nameOf(path)} is ${(size / (1 << 30)).toFixed(1)} GB. The browser holds all of it in memory while it downloads. Go on?`,
+      `${nameOf(path)} is ${(size / (1 << 30)).toFixed(1)} GB. The browser holds all of it in memory while it downloads. Do you want to continue?`,
     )) return;
     const blob = await transfer("down", nameOf(path), (progress) => fs.download(path, progress));
     const url = URL.createObjectURL(blob);
@@ -239,7 +239,6 @@
 
 <div class="layout">
   <header>
-    <strong>raft5fs</strong>
     <span class="who">{me.user}{__RAFT5FS_FILESYSTEMS__.length > 1 ? ` on ${me.filesystem}` : ""}</span>
     <span class="spacer"></span>
     <button onclick={() => (dialog = { kind: "pending" })}>
@@ -250,7 +249,7 @@
   </header>
 
   {#if storageError}
-    <div class="banner">This browser couldn't save the prune queue or your pins: {storageError}</div>
+    <div class="banner" title={storageError}>Unable to persist state to browser storage</div>
   {/if}
   {#if error}
     <div class="banner error-banner">
@@ -285,7 +284,7 @@
 
 {#if dialog?.kind === "fingerprint"}
   <Dialog title="Your fingerprint" onclose={() => (dialog = null)}>
-    <p>Read these words to people who share with you, so they know the key is yours.</p>
+    <p>Your key's fingerprint</p>
     <Fingerprint fingerprint={me.fingerprint} />
   </Dialog>
 {:else if dialog?.kind === "view"}
@@ -313,10 +312,21 @@
 <style>
   .layout { display: flex; flex-direction: column; height: 100%; }
   header {
-    display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px 14px;
     background: var(--panel); border-bottom: 1px solid var(--border);
   }
-  .who { color: var(--muted); }
+  .who {
+    color: var(--muted);
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  header button { white-space: nowrap; }
+  /* Phones: the name on its own line, the buttons sharing the row below. */
+  @media (max-width: 600px) {
+    header { padding: 8px 10px; }
+    .who { flex: 1 0 100%; }
+    .spacer { display: none; }
+    header button { flex: 1 1 auto; padding: 6px 8px; font-size: 0.9em; }
+  }
   .spacer { flex: 1; }
   .banner {
     padding: 8px 14px; background: var(--warn-bg); border-bottom: 1px solid var(--border);

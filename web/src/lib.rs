@@ -172,8 +172,14 @@ pub fn fs_id(ca: &[u8]) -> String {
 /// enrol with that filesystem's servers.
 #[wasm_bindgen(js_name = invitationFsId)]
 pub fn invitation_fs_id(invitation: &str) -> Result<String, JsValue> {
-    let invite = Invite::decode(invitation).map_err(|why| failure("EINVAL", &why))?;
+    let invite = Invite::decode(invitation).map_err(|_| invalid_invitation())?;
     Ok(raft5fs_client::fs_id(&invite.ca))
+}
+
+/// One message for every invitation that doesn't parse: the user can only
+/// ask for a new one anyway.
+fn invalid_invitation() -> JsValue {
+    failure("EINVAL", "not a valid invitation")
 }
 
 /// Whether `password` is good enough for a new account; rejects with why
@@ -196,7 +202,7 @@ pub async fn enrol(
     password: String,
 ) -> Result<JsValue, JsValue> {
     let config = Config::parse(config)?;
-    let invite = Invite::decode(&invitation).map_err(|why| failure("EINVAL", &why))?;
+    let invite = Invite::decode(&invitation).map_err(|_| invalid_invitation())?;
     if raft5fs_client::fs_id(&invite.ca) != config.fs_id {
         return Err(failure(
             "EINVAL",
@@ -213,7 +219,12 @@ pub async fn enrol(
         KdfParams::DEFAULT,
     )
     .await
-    .map_err(fs_failure)?;
+    // The servers refuse a used or wrong code with EACCES, in their own
+    // words.
+    .map_err(|e| match e.errno {
+        errno::EACCES => failure("EACCES", "invalid enrollment code"),
+        _ => fs_failure(e),
+    })?;
     #[derive(Serialize)]
     struct Enrolled {
         user: String,
@@ -279,7 +290,8 @@ async fn open(
             blobs.insert(name, bytes.to_vec());
         }
     });
-    let store: Arc<dyn Store> = Arc::new(BrowserStore::new(blobs, persist));
+    let browser = Arc::new(BrowserStore::new(blobs, persist));
+    let store: Arc<dyn Store> = browser.clone();
     let known = KnownKeys::open(Arc::clone(&store), PINS)
         .map_err(|e| failure("EIO", &format!("the pinned keys in this browser: {e}")))?;
     let queue = PruneQueue::new(store);
@@ -299,15 +311,16 @@ async fn open(
             ),
         ));
     }
-    let fs = Fs(Rc::new(Inner {
+    // The app starts the background prune (`resumePruning`) once this tab
+    // is the one to run it.
+    Ok(Fs(Rc::new(Inner {
         session,
+        store: browser,
         queue,
         pruner: RefCell::new(None),
         handles: RefCell::new(HashMap::new()),
         next_handle: Cell::new(1),
-    }));
-    fs.0.start_pruner().map_err(fs_failure)?;
-    Ok(fs)
+    })))
 }
 
 /// A logged-in session.
@@ -316,6 +329,8 @@ pub struct Fs(Rc<Inner>);
 
 struct Inner {
     session: Arc<Session>,
+    /// This tab's copy of the account's pins and prune queue.
+    store: Arc<BrowserStore>,
     queue: PruneQueue,
     /// The background prune of the queue, while it runs.
     pruner: RefCell<Option<AbortHandle>>,
@@ -861,6 +876,12 @@ impl Fs {
                 .add(ino, &format!("{path} (pruned again)"))
                 .map_err(|e| FsError::new(errno::EIO, e.to_string()))
         })
+    }
+
+    /// Takes another tab's save of blob `name` (see `store`).
+    #[wasm_bindgen(js_name = storeUpdated)]
+    pub fn store_updated(&self, name: String, data: Vec<u8>) {
+        self.0.store.refresh(&name, &data);
     }
 
     /// Stops the background prune; what it was doing stays queued.

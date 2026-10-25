@@ -37,7 +37,7 @@
 
 {#if enrolled}
   <p>Enrolled <strong>{enrolled.user}</strong>.</p>
-  <p>Your key's fingerprint. Read it to people who share with you, so they know the key is yours:</p>
+  <p>Your key's fingerprint</p>
   <Fingerprint fingerprint={enrolled.fingerprint} />
   <p><button class="primary" onclick={() => ondone(enrolled.user)}>Continue to log in</button></p>
 {:else}
@@ -48,10 +48,10 @@
     <input id="new-password" type="password" autocomplete="new-password" bind:value={password} required />
     <label for="again">Again</label>
     <input id="again" type="password" autocomplete="new-password" bind:value={again} required />
-    <p class="note">Only you ever know it: nobody can reset it, and without it your files stay sealed.</p>
+    <p class="note">Choose a password with at least 12 characters</p>
     {#if error}<p class="error">{error}</p>{/if}
     <p>
-      <button class="primary" type="submit" disabled={busy}>{busy ? "Enrolling…" : "Enrol"}</button>
+      <button class="primary" type="submit" disabled={busy}>{busy ? "Enrolling…" : "Enroll"}</button>
       <button type="button" onclick={oncancel}>Cancel</button>
     </p>
   </form>

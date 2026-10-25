@@ -57,18 +57,15 @@
   <input id="password" type="password" autocomplete="current-password" bind:value={password} required />
   <label class="stay">
     <input type="checkbox" bind:checked={stay} />
-    Stay unlocked on this device for 7 days
+    Stay logged in on this device for 7 days
   </label>
   {#if stay}
-    <p class="note">
-      Only on a device that only you use: anyone who can open this browser can open your
-      files until then, or until you log out.
-    </p>
+    <p class="note">Check this option on devices that only you use</p>
   {/if}
   {#if error}<p class="error">{error}</p>{/if}
   <p><button class="primary" type="submit" disabled={busy}>{busy ? "Logging in…" : "Log in"}</button></p>
 </form>
-<p class="note">New here, with an invitation? <a href="#enrol" onclick={(e) => { e.preventDefault(); onenrol(); }}>Enrol</a></p>
+<p class="note"><a href="#enroll" onclick={(e) => { e.preventDefault(); onenrol(); }}>Enroll with an invitation</a></p>
 
 <style>
   .stay { display: flex; gap: 8px; align-items: center; color: var(--text); }

@@ -44,17 +44,13 @@
     <form onsubmit={submit}>
       <label for="share-user">User</label>
       <input id="share-user" bind:value={user} required disabled={needWords} />
-      <label for="share-label">Shown to them as</label>
+      <label for="share-label">What this folder will show up to shared user as</label>
       <input id="share-label" bind:value={label} required />
       <label><input type="checkbox" bind:checked={readOnly} style="width:auto" /> Read-only</label>
       {#if needWords}
         <label for="share-words">{user}'s fingerprint</label>
         <textarea id="share-words" rows="3" bind:value={words} required></textarea>
-        <p class="note">
-          This is your first share with {user}. Ask them to read you the fingerprint
-          that “Your fingerprint” shows them (or <code>raft5fs whoami</code>), in person
-          or on a call, and type it here. The share goes through only if it matches.
-        </p>
+        <p class="note">This is your first share with {user}. Ask them for their key's fingerprint.</p>
       {/if}
       {#if error}<p class="error">{error}</p>{/if}
       <p>

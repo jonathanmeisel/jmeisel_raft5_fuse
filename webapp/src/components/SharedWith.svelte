@@ -60,8 +60,8 @@
   {:else if confirming}
     <p>Revoke <strong>{confirming.user}</strong>'s share of {path}?</p>
     <p class="note">
-      This app then re-seals what is there, so {confirming.user}'s old keys stop opening it:
-      about {size(confirming.estimate.bytes)} to download, re-seal and upload, while this tab is open.
+      This will attempt to re-encrypt all files previously visible to {confirming.user} while
+      the tab stays open, around {size(confirming.estimate.bytes)}
     </p>
     {#if confirming.estimate.bytes > WARN_BYTES}
       <p class="error">

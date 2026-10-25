@@ -60,7 +60,7 @@
       session.kill();
       notice =
         e.code === "EHOSTUNREACH"
-          ? `Couldn't reach the servers to unlock: ${e.message}`
+          ? `Couldn't reach servers: ${e.message}`
           : `Log in again: ${e.message}`;
     }
     screen = "login";
@@ -88,7 +88,7 @@
   <Files {fs} {me} {storageError} onlogout={() => logout()} />
 {:else}
   <main class="card">
-    <h1>raft5fs</h1>
+    <h1>Store your <em>gayest</em> files</h1>
     {#if notice}<p class="note">{notice}</p>{/if}
     {#if screen === "enrol"}
       <Enrol
@@ -107,7 +107,8 @@
 
 <style>
   .card {
-    max-width: 440px;
+    /* A 16px gutter on phones. */
+    width: min(440px, calc(100% - 32px));
     margin: 8vh auto;
     background: var(--panel);
     border: 1px solid var(--border);

@@ -157,7 +157,7 @@ impl Session {
         let keys = |e: FsError| {
             FsError::new(
                 errno::EACCES,
-                format!("cannot open the account's keys: {e}"),
+                format!("cannot decrypt this account's keys: {e}"),
             )
         };
         let mut vault = Vault::new(Arc::new(remote))

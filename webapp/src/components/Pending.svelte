@@ -50,7 +50,7 @@
       </p>
     </form>
   {:else if pending.length === 0}
-    <p>Nothing pending: everything shared with you is from someone you trust.</p>
+    <p>No shares from untrusted users</p>
   {:else}
     {#each pending as p}
       <div class="item">

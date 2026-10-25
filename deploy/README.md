@@ -517,7 +517,7 @@ What it trusts that the native client doesn't:
   node's name (HTTP-01). Nothing listens there except certbot, for a
   minute every ~60 days while it renews. The nodes hold no DNS
   credentials, so a compromised node can't repoint the app's name.
-- **"Stay unlocked on this device"** (opt-in at login) keeps the
+- **"Stay logged in on this device"** (opt-in at login) keeps the
   account's unlock keys in the browser for 7 days, encrypted under a key
   the browser won't export. Anyone who can use that browser profile can
   open the account until then; changing the password or logging out

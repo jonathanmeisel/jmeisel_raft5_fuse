@@ -6,10 +6,13 @@
 // - The app may serve several filesystems (`filesystems`, from its build
 //   config). Each call works on one, chosen at login, or by an invitation's
 //   filesystem id at enrolment. Everything stored is filed by that id.
-// - One tab at a time per account: login takes a Web Lock named for the
-//   filesystem and user, held until the Worker ends. The pins and the
-//   prune queue in IndexedDB then have one writer.
 // - IndexedDB keeps pins and the prune queue, under `<fsId>/<user>/<name>`.
+//   Each tab on an account keeps its own copy in the wasm client; every
+//   save also goes to the account's other tabs (a BroadcastChannel), so
+//   none of them saves over another's change.
+// - One tab at a time runs the background prune: the one holding the
+//   account's prune lock (a Web Lock). When it closes, the next tab takes
+//   over.
 // - With "stay unlocked", it also keeps the account's unlock keys (what a
 //   password gives a login), for one account per filesystem and for
 //   REMEMBER_MS. They are encrypted (AES-GCM) under a key that WebCrypto
@@ -66,8 +69,10 @@ async function loadBlobs(db, prefix) {
   return blobs;
 }
 
-function persister(db, prefix) {
+/// Saves blobs to IndexedDB, and tells the account's other tabs.
+function persister(db, prefix, channel) {
   return async (name, bytes) => {
+    channel.postMessage({ name, bytes });
     try {
       const transaction = db.transaction("blobs", "readwrite");
       transaction.objectStore("blobs").put(bytes.slice().buffer, prefix + name);
@@ -146,24 +151,35 @@ async function recall(db) {
   }
 }
 
-/// Holds the account's lock until the Worker ends. False if another tab
-/// holds it.
-function takeLock(name) {
-  return new Promise((resolve) => {
-    navigator.locks.request(name, { ifAvailable: true }, (lock) => {
-      resolve(!!lock);
-      // Held for as long as this promise is pending: until the Worker ends.
-      return lock ? new Promise(() => {}) : null;
-    });
-  });
+// ------------------------------------------------------------------ tabs
+
+/// Whether this tab runs the account's background prune.
+let prunesHere = false;
+
+/// The account's channel to its other tabs, opened before its blobs are
+/// read, so no save made meanwhile is missed: saves that arrive before
+/// the session exists wait in `early`.
+function openChannel(user) {
+  const channel = new BroadcastChannel(`raft5fs:${config.fsId}:${user}`);
+  const early = [];
+  channel.onmessage = ({ data: { name, bytes } }) => {
+    if (fs) fs.storeUpdated(name, bytes);
+    else early.push([name, bytes]);
+  };
+  return { channel, early };
 }
 
-async function lock(user) {
-  if (!(await takeLock(`raft5fs:${config.fsId}:${user}`))) {
-    throw Object.assign(new Error(`${user} is already open in another tab or window`), {
-      code: "EBUSY",
-    });
-  }
+/// Once the session exists: applies the saves that arrived first, and
+/// waits for the account's prune lock, to run the background prune while
+/// it holds it (until the Worker ends).
+function joined(user, { early }) {
+  for (const [name, bytes] of early.splice(0)) fs.storeUpdated(name, bytes);
+  navigator.locks.request(`raft5fs:${config.fsId}:${user}:prune`, () => {
+    if (!fs) return null;
+    prunesHere = true;
+    fs.resumePruning();
+    return new Promise(() => {});
+  });
 }
 
 // ----------------------------------------------------------------- reading
@@ -226,7 +242,7 @@ const methods = {
     config = filesystems.find((f) => f.fsId === fsId);
     if (!config) {
       throw Object.assign(
-        new Error("this invitation is for a filesystem this app isn't set up for"),
+        new Error("not a valid invitation"),
         { code: "EINVAL" },
       );
     }
@@ -238,11 +254,17 @@ const methods = {
   /// filesystem.
   async login(fsId, user, password, stay) {
     config = filesystem(fsId);
-    await lock(user);
+    const tabs = openChannel(user);
     const db = await openDb();
     const prefix = `${config.fsId}/${user}/`;
     const blobs = await loadBlobs(db, prefix);
-    fs = await wasm.login(config, user, password, blobs, persister(db, prefix));
+    try {
+      fs = await wasm.login(config, user, password, blobs, persister(db, prefix, tabs.channel));
+    } catch (e) {
+      tabs.channel.close();
+      throw e;
+    }
+    joined(user, tabs);
     if (stay) await remember(db, user, fs.unlockKeys());
     else await putRecord(db, "unlock", config.fsId, undefined);
     return { ...fs.whoami(), remembered: !!stay, fsId: config.fsId, filesystem: config.name };
@@ -268,17 +290,19 @@ const methods = {
     config = remembered.config;
     remembered = remembered.found;
     const { user, keys } = remembered;
-    await lock(user);
+    const tabs = openChannel(user);
     const prefix = `${config.fsId}/${user}/`;
     const blobs = await loadBlobs(db, prefix);
     try {
-      fs = await wasm.resume(config, user, keys, blobs, persister(db, prefix));
+      fs = await wasm.resume(config, user, keys, blobs, persister(db, prefix, tabs.channel));
     } catch (e) {
+      tabs.channel.close();
       if (e.code !== "EHOSTUNREACH") await putRecord(db, "unlock", config.fsId, undefined);
       throw e;
     } finally {
       keys.fill(0);
     }
+    joined(user, tabs);
     return { ...fs.whoami(), remembered: true, fsId: config.fsId, filesystem: config.name };
   },
 
@@ -402,9 +426,11 @@ const methods = {
   pruneStatus: () => session().pruneStatus(),
   pruneEstimate: (path) => session().pruneEstimate(path),
   pruneAgain: (path) => session().pruneAgain(path),
-  pausePruning: () => session().pausePruning(),
-  resumePruning: () => session().resumePruning(),
-  pruning: () => session().pruning,
+  /// Pause and resume act only in the tab that runs the prune.
+  pausePruning: () => prunesHere && session().pausePruning(),
+  resumePruning: () => prunesHere && session().resumePruning(),
+  /// "running" or "paused" here, or "elsewhere": another tab runs it.
+  pruning: () => (prunesHere ? (session().pruning ? "running" : "paused") : "elsewhere"),
 
   /// Logs out, and forgets the account if this device remembered it.
   async logout() {
