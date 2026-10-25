@@ -166,6 +166,47 @@ async function lock(user) {
   }
 }
 
+// ----------------------------------------------------------------- reading
+
+/// How much of a text file its preview draws from.
+const TEXT_PREVIEW_BYTES = 8 << 10;
+
+/// Up to `max` bytes from the start of file `path`.
+async function readHead(path, max) {
+  const s = session();
+  const { size } = await s.stat(path);
+  const want = Math.min(size, max);
+  const handle = await s.open(path, false, false);
+  const parts = [];
+  let got = 0;
+  try {
+    while (got < want) {
+      const piece = await s.read(handle, got, Math.min(PIECE, want - got));
+      if (piece.length === 0) break;
+      parts.push(piece);
+      got += piece.length;
+    }
+  } finally {
+    await s.close(handle);
+  }
+  const bytes = new Uint8Array(got);
+  let at = 0;
+  for (const part of parts) {
+    bytes.set(part, at);
+    at += part.length;
+  }
+  return bytes;
+}
+
+/// `bytes` as UTF-8 text, or null if it looks like something else: a NUL,
+/// or many bytes that aren't UTF-8. A character cut off at the end is fine.
+function asText(bytes) {
+  if (bytes.includes(0)) return null;
+  const text = new TextDecoder("utf-8").decode(bytes);
+  const bad = (text.match(/\uFFFD/g) || []).length;
+  return bad > 4 + text.length / 100 ? null : text;
+}
+
 // ----------------------------------------------------------------- methods
 
 function session() {
@@ -295,6 +336,59 @@ const methods = {
       await s.close(handle);
     }
     return new Blob(parts);
+  },
+
+  /// A preview of file `path`, as a small image Blob that fits in
+  /// `width` x `height`: the picture shrunk, or the start of the text
+  /// drawn. `kind` is "image" or "text" (see previews.js). Null if it
+  /// doesn't decode.
+  async preview(path, kind, width, height) {
+    const bytes = await readHead(path, kind === "text" ? TEXT_PREVIEW_BYTES : Infinity);
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, width, height);
+    if (kind === "image") {
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(new Blob([bytes]));
+      } catch {
+        return null;
+      }
+      const scale = Math.min(1, width / bitmap.width, height / bitmap.height);
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.width = w;
+      canvas.height = h;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+    } else {
+      const text = asText(bytes);
+      if (text === null) return null;
+      // Large enough to read on a card, which shows it at about half size.
+      ctx.fillStyle = "#1d2330";
+      ctx.font = "22px ui-monospace, monospace";
+      const lines = text.split("\n");
+      const lineHeight = 28;
+      for (let i = 0; i < lines.length && (i + 1) * lineHeight < height - 16; i++) {
+        ctx.fillText(lines[i].replace(/\t/g, "    ").slice(0, 100), 16, 16 + (i + 1) * lineHeight - 6);
+      }
+    }
+    // PNG keeps drawn text sharp; JPEG is smaller for pictures.
+    return canvas.convertToBlob(
+      kind === "text" ? { type: "image/png" } : { type: "image/jpeg", quality: 0.85 },
+    );
+  },
+
+  /// The start of text file `path`, up to `max` bytes: {text, truncated},
+  /// or null if it isn't text.
+  async readText(path, max) {
+    const bytes = await readHead(path, max + 1);
+    const truncated = bytes.length > max;
+    const text = asText(truncated ? bytes.subarray(0, max) : bytes);
+    return text === null ? null : { text, truncated };
   },
 
   isPinned: (user) => session().isPinned(user),

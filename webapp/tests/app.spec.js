@@ -13,6 +13,11 @@ const localFsId = () =>
   JSON.parse(readFileSync(new URL("../config/local/config.json", import.meta.url)))
     .filesystems.find((f) => f.name === "local").fsId;
 const SLOW = { timeout: 60_000 };
+/// A 1x1 PNG.
+const PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
 
 /// Enrols `user` through the page, and gives their fingerprint's words.
 async function enrol(page, user) {
@@ -69,7 +74,7 @@ async function open(page, name) {
 }
 
 async function download(page, name) {
-  const [file] = await Promise.all([page.waitForEvent("download", SLOW), item(page, name).dblclick()]);
+  const [file] = await Promise.all([page.waitForEvent("download", SLOW), menu(page, name, "Download")]);
   return readFileSync(await file.path());
 }
 
@@ -111,6 +116,22 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   await test.step("and downloads the same bytes", async () => {
     expect((await download(alice, "small.txt")).equals(small)).toBe(true);
     expect((await download(alice, "large.bin")).equals(large)).toBe(true);
+  });
+
+  await test.step("images and text get previews, and open in the viewer", async () => {
+    await alice.locator("input[type=file]").setInputFiles([
+      { name: "dot.png", mimeType: "image/png", buffer: PNG },
+    ]);
+    await expect(item(alice, "dot.png")).toBeVisible(SLOW);
+    // Thumbnails, drawn in the Worker, for dot.png and small.txt; not for
+    // large.bin.
+    await expect(alice.locator('.fm img[src^="blob:"]')).toHaveCount(2, SLOW);
+    await item(alice, "small.txt").dblclick();
+    await expect(alice.locator("pre")).toHaveText(small.toString().trim(), SLOW);
+    await alice.getByRole("button", { name: "Close" }).click();
+    await item(alice, "dot.png").dblclick();
+    await expect(alice.getByRole("dialog").locator('img[src^="blob:"]')).toBeVisible(SLOW);
+    await alice.getByRole("button", { name: "Close" }).click();
   });
 
   await test.step("alice renames and deletes", async () => {

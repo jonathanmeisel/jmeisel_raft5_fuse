@@ -10,8 +10,17 @@
   import SharedWith from "./SharedWith.svelte";
   import Pending from "./Pending.svelte";
   import PruneBar from "./PruneBar.svelte";
+  import Viewer from "./Viewer.svelte";
+  import { onDestroy } from "svelte";
+  import { kindOf, previews } from "../lib/previews.js";
 
   let { fs, me, storageError, onlogout } = $props();
+
+  // svelte-ignore state_referenced_locally
+  const preview = previews(fs);
+  onDestroy(() => preview.clear());
+  /// The largest image the viewer opens; bigger ones download.
+  const MAX_VIEW_BYTES = 50 << 20;
 
   let api = null;
   let initial = $state(null);
@@ -179,8 +188,14 @@
       act(() => download(id), []);
       return false;
     });
+    // Images and text open in the viewer; anything else downloads.
     api.intercept("open-file", ({ id }) => {
-      act(() => download(id), []);
+      const file = api.getFile(id);
+      if (kindOf(nameOf(id)) && !(file?.size > MAX_VIEW_BYTES)) {
+        dialog = { kind: "view", path: id };
+      } else {
+        act(() => download(id), []);
+      }
       return false;
     });
   }
@@ -256,7 +271,13 @@
   <div class="fm">
     {#if initial}
       <Willow fonts={false}>
-        <Filemanager data={initial} {init} {menuOptions} icons="simple" />
+        <Filemanager
+          data={initial}
+          {init}
+          {menuOptions}
+          icons="simple"
+          previews={(file) => preview.url(file)}
+        />
       </Willow>
     {/if}
   </div>
@@ -267,6 +288,13 @@
     <p>Read these words to people who share with you, so they know the key is yours.</p>
     <Fingerprint fingerprint={me.fingerprint} />
   </Dialog>
+{:else if dialog?.kind === "view"}
+  <Viewer
+    {fs}
+    path={dialog.path}
+    ondownload={() => act(() => download(dialog.path), [])}
+    onclose={() => (dialog = null)}
+  />
 {:else if dialog?.kind === "share"}
   <ShareDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "shared-with"}

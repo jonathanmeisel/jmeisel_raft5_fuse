@@ -1,11 +1,11 @@
 <script>
-  let { title, onclose, children } = $props();
+  let { title, wide = false, onclose, children } = $props();
 </script>
 
 <svelte:window onkeydown={(e) => e.key === "Escape" && onclose()} />
 
 <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && onclose()}>
-  <div class="dialog" role="dialog" aria-modal="true" aria-label={title}>
+  <div class="dialog" class:wide role="dialog" aria-modal="true" aria-label={title}>
     <h2>{title}</h2>
     {@render children()}
   </div>
@@ -21,5 +21,6 @@
     background: var(--panel); border-radius: 10px; padding: 20px 24px;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
   }
+  .dialog.wide { width: min(1000px, 94vw); margin-top: 4vh; max-height: 92vh; }
   h2 { margin: 0 0 10px; font-size: 1.2em; }
 </style>
