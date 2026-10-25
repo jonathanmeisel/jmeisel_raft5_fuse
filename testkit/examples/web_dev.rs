@@ -102,8 +102,8 @@ fn main() {
         }
         std::fs::create_dir_all(&out).expect("--out");
         let config = format!(
-            "{{\n  \"servers\": [\"{web_address}\"],\n  \"objects\": \"{}\",\n  \
-             \"fsId\": \"{}\",\n  \"plaintext\": true\n}}\n",
+            "{{\"filesystems\": [{{\n  \"name\": \"local\",\n  \"servers\": [\"{web_address}\"],\n  \
+             \"objects\": \"{}\",\n  \"fsId\": \"{}\",\n  \"plaintext\": true\n}}]}}\n",
             objects.endpoint(),
             raft5fs_client::fs_id(&ca)
         );

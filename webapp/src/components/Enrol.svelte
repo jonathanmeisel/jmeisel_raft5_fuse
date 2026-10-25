@@ -22,6 +22,10 @@
       await fs.checkNewPassword(password);
       enrolled = await fs.enrol(invitation.trim(), password);
       password = again = "";
+      // The login screen then offers this filesystem first.
+      try {
+        localStorage.setItem("raft5fs:filesystem", enrolled.fsId);
+      } catch {}
     } catch (e) {
       error = e.message;
     } finally {

@@ -1,8 +1,9 @@
-// Starts a new, empty filesystem (`web_dev`), builds the app for it, and
+// Starts a new, empty filesystem (`web_dev`), builds the app for it and
+// for a second, unreachable one (so the app has a choice to make), and
 // serves the build on :4173. Returns the teardown, which stops both.
 // Needs the example built: cargo build -p raft5fs-testkit --example web_dev
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const root = new URL("../..", import.meta.url).pathname;
 const app = new URL("..", import.meta.url).pathname;
@@ -31,6 +32,15 @@ export default async function () {
     cwd: root,
   });
   await waitFor(backend, /^ready$/m, "the filesystem");
+  const file = `${app}config/local/config.json`;
+  const config = JSON.parse(readFileSync(file, "utf8"));
+  config.filesystems.unshift({
+    name: "elsewhere",
+    servers: ["http://127.0.0.1:9"],
+    fsId: "ffffffffffffffff",
+    plaintext: true,
+  });
+  writeFileSync(file, JSON.stringify(config, null, 2));
   execFileSync("npx", ["vite", "build", "--mode", "dev", "--logLevel", "error"], { cwd: app, stdio: "inherit" });
   const preview = spawn("npx", ["vite", "preview", "--mode", "dev"], { cwd: app });
   await waitFor(preview, /4173/, "the preview server");

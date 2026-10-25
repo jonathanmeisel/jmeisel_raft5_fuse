@@ -3,6 +3,9 @@
 // it through `rpc.js`: {id, method, args} in, {id, value} or {id, error}
 // out, and {id, progress} on the way for uploads and downloads.
 //
+// - The app may serve several filesystems (`filesystems`, from its build
+//   config). Each call works on one, chosen at login, or by an invitation's
+//   filesystem id at enrolment. Everything stored is filed by that id.
 // - One tab at a time per account: login takes a Web Lock named for the
 //   filesystem and user, held until the Worker ends. The pins and the
 //   prune queue in IndexedDB then have one writer.
@@ -14,7 +17,9 @@
 //   can read it out of the browser. Logging out deletes them.
 import init, * as wasm from "../wasm/raft5fs_web.js";
 
-const config = __RAFT5FS_CONFIG__;
+const filesystems = __RAFT5FS_FILESYSTEMS__;
+/// The filesystem of the session (or the enrolment) in this Worker.
+let config = null;
 const PIECE = 4 << 20;
 const REMEMBER_MS = 7 * 24 * 60 * 60 * 1000;
 let ready = null;
@@ -108,7 +113,19 @@ async function remember(db, user, keys) {
   await putRecord(db, "unlock", config.fsId, { user, key, iv, sealed, expires });
 }
 
-/// The remembered account and its keys, or null. Drops an expired record.
+/// The filesystem with id `fsId`.
+function filesystem(fsId) {
+  const found = filesystems.find((f) => f.fsId === fsId);
+  if (!found) {
+    throw Object.assign(new Error("this app isn't set up for that filesystem"), {
+      code: "EINVAL",
+    });
+  }
+  return found;
+}
+
+/// The remembered account of `config`'s filesystem and its keys, or null.
+/// Drops an expired record.
 async function recall(db) {
   const record = await getRecord(db, "unlock", config.fsId);
   if (!record) return null;
@@ -157,13 +174,29 @@ function session() {
 }
 
 const methods = {
+  /// Enrols with `invitation`, on the filesystem it is for.
   async enrol(invitation, password) {
-    return wasm.enrol(config, invitation, password);
+    let fsId;
+    try {
+      fsId = wasm.invitationFsId(invitation);
+    } catch (e) {
+      throw Object.assign(new Error(e.message), { code: e.code });
+    }
+    config = filesystems.find((f) => f.fsId === fsId);
+    if (!config) {
+      throw Object.assign(
+        new Error("this invitation is for a filesystem this app isn't set up for"),
+        { code: "EINVAL" },
+      );
+    }
+    return { ...(await wasm.enrol(config, invitation, password)), fsId };
   },
 
-  /// Logs in. With `stay`, remembers the account on this device; without
-  /// it, forgets any account remembered here.
-  async login(user, password, stay) {
+  /// Logs in to filesystem `fsId`. With `stay`, remembers the account on
+  /// this device; without it, forgets any account remembered here for that
+  /// filesystem.
+  async login(fsId, user, password, stay) {
+    config = filesystem(fsId);
     await lock(user);
     const db = await openDb();
     const prefix = `${config.fsId}/${user}/`;
@@ -171,16 +204,28 @@ const methods = {
     fs = await wasm.login(config, user, password, blobs, persister(db, prefix));
     if (stay) await remember(db, user, fs.unlockKeys());
     else await putRecord(db, "unlock", config.fsId, undefined);
-    return { ...fs.whoami(), remembered: !!stay };
+    return { ...fs.whoami(), remembered: !!stay, fsId: config.fsId, filesystem: config.name };
   },
 
-  /// Logs the remembered account in, if there is one; else null. Forgets
-  /// it if the servers refuse it (its password changed), but not if they
-  /// can't be reached.
+  /// Logs the remembered account in, if there is one (the newest, if
+  /// several filesystems have one); else null. Forgets it if the servers
+  /// refuse it (its password changed), but not if they can't be reached.
   async resume() {
     const db = await openDb();
-    const remembered = await recall(db);
+    let remembered = null;
+    for (const candidate of filesystems) {
+      config = candidate;
+      const found = await recall(db);
+      if (found && (!remembered || found.expires > remembered.found.expires)) {
+        remembered?.found.keys.fill(0);
+        remembered = { found, config: candidate };
+      } else {
+        found?.keys.fill(0);
+      }
+    }
     if (!remembered) return null;
+    config = remembered.config;
+    remembered = remembered.found;
     const { user, keys } = remembered;
     await lock(user);
     const prefix = `${config.fsId}/${user}/`;
@@ -193,7 +238,7 @@ const methods = {
     } finally {
       keys.fill(0);
     }
-    return { ...fs.whoami(), remembered: true };
+    return { ...fs.whoami(), remembered: true, fsId: config.fsId, filesystem: config.name };
   },
 
   checkNewPassword: (password) => wasm.checkNewPassword(password),
@@ -271,7 +316,7 @@ const methods = {
   async logout() {
     if (fs) await fs.logout();
     fs = null;
-    await putRecord(await openDb(), "unlock", config.fsId, undefined);
+    if (config) await putRecord(await openDb(), "unlock", config.fsId, undefined);
   },
 };
 

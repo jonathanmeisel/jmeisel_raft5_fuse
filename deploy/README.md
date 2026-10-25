@@ -57,6 +57,7 @@ raft5 store's repository (`RAFT5_REPO` in `cluster.conf`).
 | `admin-shell.sh` | Opens the store's admin shell (`raft`) on a node, as the store administrator. | no |
 | `status.sh` | One look at the cluster's health: services, failed units, pending reboots, certificate expiry, disk, memory, swap, backups, and drift from the cluster repo. | for the drift check |
 | `reboot.sh` | Reboots the nodes that need it, one at a time, each checked. | no |
+| `webapp-config.sh` | Prints the web app's config, for every cluster with the web app on, as one line for the `WEB_CONFIG` variable on GitHub ("Web app"). | no |
 | `get-raft5fs.sh` | Installs the `raft5fs` client from the newest GitHub release, checked against its checksums. | no |
 | `check.sh` | Runs shellcheck on every script here; CI runs it on every change to `deploy/`. | no |
 | `templates/` | What gets installed on the nodes: the systemd units, `raft5fs-admin`, `raft5-shell`, the certificate check, the nightly backup, and the node-side installer. | — |
@@ -564,12 +565,16 @@ What it trusts that the native client doesn't:
    aws s3api put-bucket-cors --endpoint-url "$S3_ENDPOINT" --bucket "$S3_BUCKET" \
        --cors-configuration file://cors.json
    ```
-7. **The app's config,** in the raft5fs repo: `webapp/config/prod.json`
-   (`servers`: `https://fsN.fs.<domain>:27061`; `objects`: the origin of
-   the bucket's signed URLs, e.g. `https://<bucket>.nyc3.digitaloceanspaces.com`;
-   `fsId`: the filesystem's id, from
-   `openssl x509 -in $RAFT5FS_CLUSTER/secrets/fs-ca.pem -outform der | sha256sum | cut -c1-16`),
-   and `webapp/public/CNAME` (`app.<domain>`). Commit both.
+7. **The app's config:**
+   ```sh
+   ./webapp-config.sh
+   ```
+   prints one line of JSON: for each cluster in the cluster repo with
+   `WEB_ORIGIN` set, its servers' web addresses, the origin of its
+   bucket's signed URLs, and its filesystem id. On GitHub, in the raft5fs
+   repo's Settings → Secrets and variables → Actions → Variables, make
+   (or update) the variable `WEB_CONFIG` with that line. Nothing in it is
+   secret: every visitor can read it in the published app.
 8. **GitHub Pages:**
    - Verify the domain for your account (your profile's Settings → Pages →
      Add a domain; a TXT record at the registrar), so no one else's
@@ -579,7 +584,8 @@ What it trusts that the native client doesn't:
    - Settings → Environments → `github-pages` → Deployment branches and
      tags: only tags matching `v*`.
    - Settings → Secrets and variables → Actions → Variables: `PAGES` =
-     `on`. Until then, tags don't publish the app.
+     `on`. Until then, tags don't publish the app; without `WEB_CONFIG`,
+     publishing fails rather than ship the example config.
 9. **Release** as for the binaries ("Building and deploying new server
     binaries"): the same tag publishes the app. Open `https://app.<domain>`.
 10. **Optional:** a Certificate Transparency alert for `<domain>` (on
@@ -597,6 +603,20 @@ What it trusts that the native client doesn't:
   the servers before tagging an app that needs them.
 - To turn the web port off: empty `WEB_ORIGIN`, `./install.sh --all`, and
   set `PAGES` to `off`.
+
+### More than one cluster
+
+One app serves every cluster: its login screen offers a choice (named
+after each cluster's directory in the cluster repo), and an invitation
+goes to the cluster it is for. Each cluster's browser data (pinned keys,
+prune queue, a device that stays unlocked) is kept apart. To add a
+cluster to the app:
+
+1. Set it up, with `WEB_ORIGIN` the same app origin as the others, and do
+   steps 2 to 6 above for it.
+2. `./webapp-config.sh` again, and replace `WEB_CONFIG` with its output.
+3. Tag a release: the app's Content Security Policy now allows the new
+   cluster's servers and bucket.
 
 ## Day-to-day operations
 

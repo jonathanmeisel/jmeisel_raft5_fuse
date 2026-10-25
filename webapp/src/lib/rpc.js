@@ -43,7 +43,7 @@ export function connect({ onStorageError } = {}) {
 
   return {
     enrol: (invitation, password) => call("enrol", [invitation, password]),
-    login: (user, password, stay) => call("login", [user, password, !!stay]),
+    login: (fsId, user, password, stay) => call("login", [fsId, user, password, !!stay]),
     resume: () => call("resume", []),
     checkNewPassword: (password) => call("checkNewPassword", [password]),
     whoami: () => call("whoami", []),

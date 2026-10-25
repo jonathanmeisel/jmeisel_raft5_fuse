@@ -1,5 +1,19 @@
 <script>
   let { worker, user = "", onlogin, onenrol } = $props();
+
+  // The filesystems this app serves; the last one used is remembered (not
+  // a secret) for next time.
+  const filesystems = __RAFT5FS_FILESYSTEMS__;
+  const LAST = "raft5fs:filesystem";
+  let fsId = $state(lastUsed());
+
+  function lastUsed() {
+    try {
+      const last = localStorage.getItem(LAST);
+      if (filesystems.some((f) => f.fsId === last)) return last;
+    } catch {}
+    return filesystems[0].fsId;
+  }
   // svelte-ignore state_referenced_locally
   let username = $state(user);
   let password = $state("");
@@ -13,7 +27,10 @@
     error = "";
     const fs = worker();
     try {
-      const me = await fs.login(username.trim(), password, stay);
+      const me = await fs.login(fsId, username.trim(), password, stay);
+      try {
+        localStorage.setItem(LAST, fsId);
+      } catch {}
       password = "";
       onlogin(fs, me);
     } catch (e) {
@@ -26,6 +43,14 @@
 </script>
 
 <form onsubmit={submit}>
+  {#if filesystems.length > 1}
+    <label for="filesystem">Filesystem</label>
+    <select id="filesystem" bind:value={fsId}>
+      {#each filesystems as f}
+        <option value={f.fsId}>{f.name}</option>
+      {/each}
+    </select>
+  {/if}
   <label for="user">User name</label>
   <input id="user" autocomplete="username" bind:value={username} required />
   <label for="password">Password</label>

@@ -57,7 +57,7 @@ const PINS: &str = "known_keys";
 const DIR_MODE: u16 = 0o755;
 const FILE_MODE: u16 = 0o644;
 
-/// What the app is built for: one filesystem's servers.
+/// One filesystem the app is built for: its servers.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Config {
@@ -166,6 +166,14 @@ fn start() {
 #[wasm_bindgen(js_name = fsId)]
 pub fn fs_id(ca: &[u8]) -> String {
     raft5fs_client::fs_id(ca)
+}
+
+/// The id of the filesystem that `invitation` is for, so the app can
+/// enrol with that filesystem's servers.
+#[wasm_bindgen(js_name = invitationFsId)]
+pub fn invitation_fs_id(invitation: &str) -> Result<String, JsValue> {
+    let invite = Invite::decode(invitation).map_err(|why| failure("EINVAL", &why))?;
+    Ok(raft5fs_client::fs_id(&invite.ca))
 }
 
 /// Whether `password` is good enough for a new account; rejects with why

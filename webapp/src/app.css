@@ -5,26 +5,104 @@
   --text: #1d2330;
   --muted: #5b6475;
   --border: #d8dce3;
-  --accent: #2f6fdf;
+  --accent: #DF2F90;
   --danger: #c0392b;
   --warn-bg: #fff6e0;
 }
-* { box-sizing: border-box; }
-html, body, #app { height: 100%; margin: 0; }
-body { font-family: var(--font); color: var(--text); background: var(--bg); }
-.wx-theme { --wx-font-family: var(--font); }
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background: var(--bg);
+  /* Checkboxes and the like. */
+  accent-color: var(--accent);
+}
+
+a {
+  color: var(--accent);
+}
+
+.wx-theme {
+  --wx-font-family: var(--font);
+}
+
 button {
-  font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
-  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  font: inherit;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
 }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.danger { color: var(--danger); }
-button:disabled { opacity: 0.6; cursor: default; }
-input, textarea {
-  font: inherit; padding: 7px 9px; border: 1px solid var(--border);
-  border-radius: 6px; width: 100%; background: var(--panel); color: var(--text);
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
-label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 0.9em; }
-.error { color: var(--danger); margin: 10px 0; white-space: pre-wrap; }
-.note { color: var(--muted); font-size: 0.9em; }
-.words { font-family: ui-monospace, monospace; font-size: 1.05em; line-height: 1.6; }
+
+button.danger {
+  color: var(--danger);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+}
+
+label {
+  display: block;
+  margin: 10px 0 4px;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.error {
+  color: var(--danger);
+  margin: 10px 0;
+  white-space: pre-wrap;
+}
+
+.note {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.words {
+  font-family: ui-monospace, monospace;
+  font-size: 1.05em;
+  line-height: 1.6;
+}
+
+/* SVAR's file manager in the app's accent. Two classes, so these win
+   over the theme's own settings whatever order the styles load in. */
+.wx-theme.wx-willow-theme {
+  --wx-color-primary: var(--accent);
+  --wx-color-primary-selected: #f8d5e8;
+  --wx-color-secondary-hover: rgba(223, 47, 144, 0.12);
+  --wx-color-info: var(--accent);
+}

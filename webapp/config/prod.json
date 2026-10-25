@@ -1,9 +1,0 @@
-{
-  "servers": [
-    "https://fs1.fs.example.com:27061",
-    "https://fs2.fs.example.com:27061",
-    "https://fs3.fs.example.com:27061"
-  ],
-  "objects": "https://jm-fs.nyc3.digitaloceanspaces.com",
-  "fsId": "0000000000000000"
-}

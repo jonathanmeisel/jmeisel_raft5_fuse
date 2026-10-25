@@ -4,3 +4,4 @@ src/wasm/
 config/local/
 test-results/
 playwright-report/
+config/prod.json

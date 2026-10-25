@@ -9,6 +9,9 @@ import { randomBytes } from "node:crypto";
 const invites = () =>
   JSON.parse(readFileSync(new URL("../config/local/invites.json", import.meta.url)));
 const PASSWORD = "correct horse battery staple";
+const localFsId = () =>
+  JSON.parse(readFileSync(new URL("../config/local/config.json", import.meta.url)))
+    .filesystems.find((f) => f.name === "local").fsId;
 const SLOW = { timeout: 60_000 };
 
 /// Enrols `user` through the page, and gives their fingerprint's words.
@@ -26,6 +29,9 @@ async function enrol(page, user) {
 }
 
 async function login(page, user, stay = false) {
+  // Of the two filesystems, enrolling chose "local" (by the invitation),
+  // and the app offers it first from then on.
+  await expect(page.getByLabel("Filesystem")).toHaveValue(localFsId());
   await page.getByLabel("User name").fill(user);
   await page.getByLabel("Password").fill(PASSWORD);
   if (stay) await page.getByLabel(/Stay unlocked/).check();

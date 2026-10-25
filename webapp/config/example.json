@@ -1,0 +1,14 @@
+{
+  "filesystems": [
+    {
+      "name": "example",
+      "servers": [
+        "https://node1.fs.example.com:27061",
+        "https://node2.fs.example.com:27061",
+        "https://node3.fs.example.com:27061"
+      ],
+      "objects": "https://example-bucket.nyc3.digitaloceanspaces.com",
+      "fsId": "0123456789abcdef"
+    }
+  ]
+}

@@ -225,7 +225,7 @@
 <div class="layout">
   <header>
     <strong>raft5fs</strong>
-    <span class="who">{me.user}</span>
+    <span class="who">{me.user}{__RAFT5FS_FILESYSTEMS__.length > 1 ? ` on ${me.filesystem}` : ""}</span>
     <span class="spacer"></span>
     <button onclick={() => (dialog = { kind: "pending" })}>
       Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
