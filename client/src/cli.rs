@@ -24,7 +24,6 @@ use raft5fs_objstore::http::HttpConfig;
 use raft5fs_proto::invite::pem_to_der;
 use raft5fs_proto::types::check_username;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, ClientTlsConfig};
 
 use crate::prune_queue::PruneQueue;
@@ -139,18 +138,11 @@ pub fn write_new_private(file: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 /// The first 16 hex digits of the SHA-256 of `bytes`.
-fn short_hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// The name of a filesystem here: a hash of the CA certificate that its
-/// servers chain to (`pem`, as the user has it).
+/// servers chain to (`pem`, as the user has it). See `crate::fs_id`.
 pub fn ca_id(pem: &[u8]) -> Result<String, String> {
     let pem = std::str::from_utf8(pem).map_err(|_| "not a PEM certificate".to_string())?;
-    Ok(short_hash(&pem_to_der(pem)?))
+    Ok(crate::fs_id(&pem_to_der(pem)?))
 }
 
 /// The default place for pins of other users' keys, for the filesystem
@@ -424,7 +416,10 @@ impl Context {
     pub fn prune_queue(&self) -> PruneQueue {
         let fs = match &self.ca_id {
             Some(id) => id.clone(),
-            None => format!("plain-{}", short_hash(self.servers.join(" ").as_bytes())),
+            None => format!(
+                "plain-{}",
+                crate::short_hash(self.servers.join(" ").as_bytes())
+            ),
         };
         prune_queue_for(&self.user, &fs)
     }

@@ -135,6 +135,12 @@ pub fn fs_tls() -> ClientTlsConfig {
     ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&cert().cert))
 }
 
+/// The certificate that `fs_tls` trusts, in DER: the test filesystem's
+/// CA, as an invitation carries it.
+pub fn fs_ca_der() -> Vec<u8> {
+    raft5fs_proto::invite::pem_to_der(&cert().cert).expect("the test certificate is PEM")
+}
+
 /// TLS for a filesystem server that `fs_tls` trusts.
 pub fn server_tls() -> ServerTlsConfig {
     ServerTlsConfig::new().identity(identity())
@@ -522,7 +528,7 @@ pub fn serve_if_requested() {
 
 /// The object settings for a test server: the fake store at `endpoint`, on
 /// the test grid, with changes from `edit`.
-fn object_settings(
+pub fn object_settings(
     endpoint: String,
     chunk_size: u64,
     prompt_delete: bool,

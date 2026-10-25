@@ -1,0 +1,54 @@
+<script>
+  import Fingerprint from "./Fingerprint.svelte";
+
+  let { worker, ondone, oncancel } = $props();
+  let invitation = $state("");
+  let password = $state("");
+  let again = $state("");
+  let busy = $state(false);
+  let error = $state("");
+  let enrolled = $state(null);
+
+  async function submit(event) {
+    event.preventDefault();
+    error = "";
+    if (password !== again) {
+      error = "The passwords don't match.";
+      return;
+    }
+    busy = true;
+    const fs = worker();
+    try {
+      await fs.checkNewPassword(password);
+      enrolled = await fs.enrol(invitation.trim(), password);
+      password = again = "";
+    } catch (e) {
+      error = e.message;
+    } finally {
+      fs.kill();
+      busy = false;
+    }
+  }
+</script>
+
+{#if enrolled}
+  <p>Enrolled <strong>{enrolled.user}</strong>.</p>
+  <p>Your key's fingerprint. Read it to people who share with you, so they know the key is yours:</p>
+  <Fingerprint fingerprint={enrolled.fingerprint} />
+  <p><button class="primary" onclick={() => ondone(enrolled.user)}>Continue to log in</button></p>
+{:else}
+  <form onsubmit={submit}>
+    <label for="invitation">Invitation</label>
+    <textarea id="invitation" rows="4" bind:value={invitation} required placeholder="raft5fs-invite:1:…"></textarea>
+    <label for="new-password">New password</label>
+    <input id="new-password" type="password" autocomplete="new-password" bind:value={password} required />
+    <label for="again">Again</label>
+    <input id="again" type="password" autocomplete="new-password" bind:value={again} required />
+    <p class="note">Only you ever know it: nobody can reset it, and without it your files stay sealed.</p>
+    {#if error}<p class="error">{error}</p>{/if}
+    <p>
+      <button class="primary" type="submit" disabled={busy}>{busy ? "Enrolling…" : "Enrol"}</button>
+      <button type="button" onclick={oncancel}>Cancel</button>
+    </p>
+  </form>
+{/if}

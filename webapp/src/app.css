@@ -1,0 +1,30 @@
+:root {
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --bg: #f6f7f9;
+  --panel: #fff;
+  --text: #1d2330;
+  --muted: #5b6475;
+  --border: #d8dce3;
+  --accent: #2f6fdf;
+  --danger: #c0392b;
+  --warn-bg: #fff6e0;
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body { font-family: var(--font); color: var(--text); background: var(--bg); }
+.wx-theme { --wx-font-family: var(--font); }
+button {
+  font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--danger); }
+button:disabled { opacity: 0.6; cursor: default; }
+input, textarea {
+  font: inherit; padding: 7px 9px; border: 1px solid var(--border);
+  border-radius: 6px; width: 100%; background: var(--panel); color: var(--text);
+}
+label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 0.9em; }
+.error { color: var(--danger); margin: 10px 0; white-space: pre-wrap; }
+.note { color: var(--muted); font-size: 0.9em; }
+.words { font-family: ui-monospace, monospace; font-size: 1.05em; line-height: 1.6; }

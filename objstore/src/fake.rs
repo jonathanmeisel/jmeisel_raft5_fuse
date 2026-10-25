@@ -66,7 +66,17 @@ impl FakeStore {
     /// Starts a store with one empty bucket on a local port, served from
     /// the current Tokio runtime.
     pub async fn start(bucket: &str) -> std::io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        Self::start_for(bucket, "127.0.0.1:0", None).await
+    }
+
+    /// Starts a store on `listen`. With `web_origin`, a page from there may
+    /// use it (CORS), as the web app uses a real one.
+    pub async fn start_for(
+        bucket: &str,
+        listen: &str,
+        web_origin: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(listen).await?;
         let addr = listener.local_addr()?;
         let state = Arc::new(Mutex::new(State {
             bucket: bucket.to_string(),
@@ -76,10 +86,26 @@ impl FakeStore {
             stats: Stats::default(),
         }));
         let shared = Arc::clone(&state);
-        let app = Router::new().fallback(move |method, uri, headers, body| {
-            let state = Arc::clone(&shared);
-            async move { handle(&state, addr, method, uri, headers, body) }
-        });
+        // Blocks are bigger than axum's default limit on a body (2 MB).
+        let mut app = Router::new()
+            .fallback(move |method, uri, headers, body| {
+                let state = Arc::clone(&shared);
+                async move { handle(&state, addr, method, uri, headers, body) }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        if let Some(origin) = web_origin {
+            use axum::http::{HeaderValue, Method, header};
+            use tower_http::cors::{AllowOrigin, CorsLayer};
+            let origin = HeaderValue::from_str(origin)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            app = app.layer(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::exact(origin))
+                    .allow_methods([Method::GET, Method::PUT])
+                    .allow_headers([header::RANGE, header::IF_NONE_MATCH, header::CONTENT_TYPE])
+                    .expose_headers([header::CONTENT_RANGE, header::ETAG]),
+            );
+        }
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
