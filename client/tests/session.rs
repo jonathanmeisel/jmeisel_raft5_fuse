@@ -347,3 +347,45 @@ fn remembered_keys_log_in_until_the_password_changes() {
             .is_err()
     );
 }
+
+/// A writer that something keeps looking at (a file manager, a shell
+/// prompt) still uploads each block once. Asking for the file's attributes
+/// counts what is buffered; storing it instead would cut the writer's run
+/// into pieces, and a block stored in pieces is uploaded again for each.
+#[test]
+fn looking_at_a_file_being_written_uploads_each_block_once() {
+    use raft5fs_testkit::{TEST_BLOCK_CHUNKS, TEST_OBJECT_FROM_CHUNKS};
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, true, true);
+    let session = open(&backend, |_| {});
+    let block = (TEST_BLOCK_CHUNKS * TEST_CHUNK_SIZE) as usize;
+    let inline = (TEST_OBJECT_FROM_CHUNKS * TEST_CHUNK_SIZE) as usize;
+    let data: Vec<u8> = (0..inline + 4 * block).map(|i| (i % 251) as u8).collect();
+    let rt = &backend.runtime;
+    let volume = rt
+        .block_on(session.mkdir(VIRTUAL_ROOT, OsStr::new(VOLUME), 0o755))
+        .unwrap()
+        .ino;
+    let ino = rt
+        .block_on(session.create(volume, OsStr::new("watched.bin"), 0o644))
+        .unwrap()
+        .ino;
+    let puts = backend.store().stats().puts;
+    let mut offset = 0;
+    for piece in data.chunks(16 << 10) {
+        let n = rt
+            .block_on(session.write(ino, offset as u64, piece))
+            .unwrap();
+        assert_eq!(n, piece.len());
+        offset += n;
+        let attr = rt.block_on(session.getattr(ino)).unwrap();
+        assert_eq!(attr.size, offset as u64, "the size counts buffered bytes");
+    }
+    rt.block_on(session.fsync(ino)).unwrap();
+    assert_eq!(
+        backend.store().stats().puts - puts,
+        4,
+        "each block uploaded once"
+    );
+    assert_eq!(rt.block_on(session.read(ino, 0, data.len())).unwrap(), data);
+}

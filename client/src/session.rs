@@ -34,10 +34,17 @@ use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
 
-/// How long buffered bytes can wait, not stored, when nothing else flushes
-/// them. Without this, a writer that stops before a full batch, and does
-/// not close or sync, would leave them in memory with no time limit.
+/// How long buffered bytes wait, not stored, after the writer's last write,
+/// when nothing else flushes them. Without this, a writer that stops
+/// before a full batch, and does not close or sync, would leave them in
+/// memory with no time limit. It counts from the last write, not the
+/// first: a writer that keeps going fills its batch or block, and a block
+/// stored in pieces is uploaded again for each piece.
 const AUTO_FLUSH_DELAY: Duration = Duration::from_millis(500);
+
+/// The longest that buffered bytes wait, however steadily a slow writer
+/// keeps adding to them.
+const MAX_BUFFER_AGE: Duration = Duration::from_secs(5);
 
 /// The filesystem size that `statfs` reports, all of it free: there are no
 /// quotas, and nothing to measure the store against.
@@ -252,11 +259,11 @@ impl Session {
         committed
     }
 
-    /// Makes sure that `ino`'s buffer is committed within
-    /// `AUTO_FLUSH_DELAY`, even if nothing else asks for it. So a writer
-    /// that stops before a full batch, and does not close or sync, does not
-    /// leave its bytes in memory with no time limit. Called when a buffer
-    /// goes from empty to not empty.
+    /// Makes sure that `ino`'s buffer is committed `AUTO_FLUSH_DELAY` after
+    /// its last write, or once it is `MAX_BUFFER_AGE` old, even if nothing
+    /// else asks for it. So a writer that stops before a full batch, and
+    /// does not close or sync, does not leave its bytes in memory with no
+    /// time limit. Called when a buffer goes from empty to not empty.
     ///
     /// - It runs one time, and nothing cancels it. If something else
     ///   flushes the buffer first, the timer finds it empty and does
@@ -269,8 +276,19 @@ impl Session {
     fn schedule_auto_flush(&self, slot: Slot) {
         let vault = Arc::clone(&self.vault);
         rt::spawn(async move {
-            rt::sleep(AUTO_FLUSH_DELAY).await;
-            let mut buf = slot.lock().await;
+            let mut buf = loop {
+                let wait = {
+                    let buf = slot.lock().await;
+                    match buf.due_in(AUTO_FLUSH_DELAY, MAX_BUFFER_AGE) {
+                        None => return,
+                        Some(wait) => wait,
+                    }
+                };
+                if wait.is_zero() {
+                    break slot.lock().await;
+                }
+                rt::sleep(wait).await;
+            };
             let Some((start, data)) = buf.take() else {
                 return;
             };
@@ -285,9 +303,10 @@ impl Session {
     }
 
     /// Commits `ino`'s buffered writes, if any. Call it before anything
-    /// that must see them (reads, attribute queries, truncation), and on
-    /// every `close()`, so that a failure reaches the application that
-    /// wrote the bytes.
+    /// that must see them (reads, truncation), and on every `close()`, so
+    /// that a failure reaches the application that wrote the bytes.
+    /// Attribute queries don't: they add the buffer's length (see
+    /// `with_buffered`).
     ///
     /// It reports a stored error (from an earlier failed commit) but leaves
     /// it in place for `fsync` or `release` to take, as a `read` reports a
@@ -360,7 +379,8 @@ impl Session {
     /// Accepts `data` at `offset` into `ino`'s buffer.
     ///
     /// - Commits the run when it fills a batch or stops being contiguous,
-    ///   or else after `AUTO_FLUSH_DELAY`.
+    ///   or else `AUTO_FLUSH_DELAY` after the last write (at most
+    ///   `MAX_BUFFER_AGE` after the first).
     /// - Commits a write that already fills a batch directly, because there
     ///   is nothing to join it with.
     ///
@@ -475,13 +495,21 @@ impl Session {
         } else {
             self.vault.lookup(parent, name).await?
         };
-        // Buffered writes can make the stored size stale. Store them and
-        // look again, so the caller gets the size it will see.
-        if self.existing_write_slot(attr.ino).is_some() {
-            self.flush(attr.ino).await?;
-            attr = self.remote().getattr(attr.ino).await?;
-        }
+        self.with_buffered(&mut attr).await;
         Ok(attr)
+    }
+
+    /// Counts `attr`'s buffered writes in its size, without storing them.
+    /// Storing them here would cut a writer's run short whenever anything
+    /// looks at the file (a file manager, a shell prompt), and a block
+    /// stored in pieces is uploaded again for each piece. Reads and
+    /// truncation still store them first.
+    async fn with_buffered(&self, attr: &mut Attr) {
+        if let Some(slot) = self.existing_write_slot(attr.ino)
+            && let Some(end) = slot.lock().await.end()
+        {
+            attr.size = attr.size.max(end);
+        }
     }
 
     pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
@@ -491,8 +519,9 @@ impl Session {
         if is_snapshot_ino(ino) {
             return self.snapshots.getattr(ino).await;
         }
-        self.flush(ino).await?;
-        self.remote().getattr(ino).await
+        let mut attr = self.remote().getattr(ino).await?;
+        self.with_buffered(&mut attr).await;
+        Ok(attr)
     }
 
     pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
