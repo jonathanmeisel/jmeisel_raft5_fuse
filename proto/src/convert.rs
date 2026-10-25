@@ -3,8 +3,7 @@
 //! without a required field decodes as `EIO`. The server always sets the
 //! field, so this happens only between versions that do not work together.
 
-use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use crate::os_bytes;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
@@ -15,13 +14,13 @@ use crate::types::{
 };
 
 fn malformed(what: &str) -> FsError {
-    FsError::new(libc::EIO, format!("malformed response: no {what}"))
+    FsError::new(crate::errno::EIO, format!("malformed response: no {what}"))
 }
 
 /// The error that the server returns for a request field with no valid
 /// meaning.
 fn invalid(what: &str) -> FsError {
-    FsError::new(libc::EINVAL, format!("malformed request: {what}"))
+    FsError::new(crate::errno::EINVAL, format!("malformed request: {what}"))
 }
 
 impl From<SystemTime> for pb::Timestamp {
@@ -123,7 +122,7 @@ impl TryFrom<pb::ObjectGrid> for ObjectGrid {
     fn try_from(g: pb::ObjectGrid) -> Result<Self, FsError> {
         if g.per_block == 0 {
             return Err(FsError::new(
-                libc::EIO,
+                crate::errno::EIO,
                 "malformed response: an empty block",
             ));
         }
@@ -238,7 +237,7 @@ impl From<DirItem> for pb::DirItem {
         Self {
             ino: d.ino,
             kind: pb::Kind::from(d.kind).into(),
-            name: d.name.into_vec(),
+            name: os_bytes::into_bytes(d.name),
             sealed_name: d.sealed_name,
         }
     }
@@ -249,7 +248,7 @@ impl From<pb::DirItem> for DirItem {
         Self {
             ino: d.ino,
             kind: kind(d.kind),
-            name: OsString::from_vec(d.name),
+            name: os_bytes::into_name(d.name),
             sealed_name: d.sealed_name,
         }
     }
@@ -257,7 +256,7 @@ impl From<pb::DirItem> for DirItem {
 
 /// A name in its wire form.
 pub fn name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    name.as_bytes().to_vec()
+    os_bytes::bytes(name).to_vec()
 }
 
 // -- Responses: the server builds them from results, and the client takes
@@ -929,7 +928,7 @@ impl From<ResealedName> for pb::ResealedName {
 impl From<pb::ResealedName> for ResealedName {
     fn from(r: pb::ResealedName) -> Self {
         Self {
-            tag: OsString::from_vec(r.name),
+            tag: os_bytes::into_name(r.name),
             ino: r.ino,
             sealed_name: r.sealed_name,
         }
@@ -1039,7 +1038,7 @@ mod tests {
                 blocks: vec![],
             })),
         };
-        assert_eq!(wire.into_result().unwrap_err().errno, libc::EIO);
+        assert_eq!(wire.into_result().unwrap_err().errno, crate::errno::EIO);
     }
 
     #[test]
@@ -1078,7 +1077,10 @@ mod tests {
         if let Some(pb::chunk_write::Body::Block(b)) = &mut bad.body {
             b.random.pop();
         }
-        assert_eq!(ChunkWrite::try_from(bad).unwrap_err().errno, libc::EINVAL);
+        assert_eq!(
+            ChunkWrite::try_from(bad).unwrap_err().errno,
+            crate::errno::EINVAL
+        );
     }
 
     #[test]
@@ -1090,7 +1092,7 @@ mod tests {
         }];
         let wire = pb::PrepareUploadsResponse::from(Ok(uploads.clone()));
         assert_eq!(wire.into_result(), Ok(uploads));
-        let e = FsError::new(libc::ENOTSUP, "no object storage");
+        let e = FsError::new(crate::errno::ENOTSUP, "no object storage");
         assert_eq!(
             pb::PrepareUploadsResponse::from(Err(e.clone())).into_result(),
             Err(e)
@@ -1115,7 +1117,7 @@ mod tests {
 
     #[test]
     fn errors_survive_the_trip() {
-        let e = FsError::new(libc::EACCES, "nope");
+        let e = FsError::new(crate::errno::EACCES, "nope");
         assert_eq!(
             pb::AttrResponse::from(Err(e.clone())).into_result(),
             Err(e.clone())
@@ -1139,7 +1141,7 @@ mod tests {
 
     #[test]
     fn a_non_utf8_name_survives() {
-        let name = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        let name = os_bytes::into_name(vec![b'a', 0xff, b'b']);
         let item = DirItem {
             ino: 1,
             kind: Kind::File,
@@ -1164,12 +1166,12 @@ mod tests {
                 pb::ChunksWritten { attr: None, seq: 1 },
             )),
         };
-        assert_eq!(r.into_result().unwrap_err().errno, libc::EIO);
+        assert_eq!(r.into_result().unwrap_err().errno, crate::errno::EIO);
     }
 
     #[test]
     fn a_response_missing_its_result_is_eio() {
         let r = pb::AttrResponse { result: None }.into_result();
-        assert_eq!(r.unwrap_err().errno, libc::EIO);
+        assert_eq!(r.unwrap_err().errno, crate::errno::EIO);
     }
 }

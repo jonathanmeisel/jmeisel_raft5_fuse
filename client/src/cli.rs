@@ -538,7 +538,11 @@ mod tests {
         let id = ca_id(PEM.as_bytes()).unwrap();
         assert_eq!(ctx.known_keys, Some(default_known_keys(&base, &id)));
         assert!(ctx.tls.is_some());
-        assert!(ctx.prune_queue().dir().ends_with(format!("alice@{id}")));
+        assert!(
+            ctx.prune_queue()
+                .location()
+                .ends_with(&format!("alice@{id}/queue"))
+        );
         // Flags win over the profile.
         let over = Overrides {
             servers: vec!["https://fs2".into()],

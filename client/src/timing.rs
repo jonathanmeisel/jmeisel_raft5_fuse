@@ -13,16 +13,20 @@
 
 use std::env;
 use std::fmt::Display;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `std::time::Instant` panics in a browser; this is the same type natively.
+use web_time::Instant;
 
 use http_body::{Body, Frame, SizeHint};
 use raft5fs_proto::timing::{HEADER, ServerTiming, ms};
 use tonic::codegen::http::{Request, Response};
 use tonic::codegen::{Bytes, Service};
+
+use crate::rt::{BoxFuture, MaybeSend};
 
 static ENABLED: LazyLock<bool> =
     LazyLock::new(|| env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
@@ -46,12 +50,12 @@ impl<S> Timed<S> {
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for Timed<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
-    S::Future: Send + 'static,
+    S::Future: MaybeSend + 'static,
     S::Error: Display,
 {
     type Response = Response<TimedBody<ResBody>>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, S::Error>> + Send>>;
+    type Future = BoxFuture<'static, Result<Self::Response, S::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
         self.inner.poll_ready(cx)

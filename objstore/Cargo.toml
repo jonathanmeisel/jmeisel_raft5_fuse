@@ -12,19 +12,27 @@ fake = ["dep:axum", "dep:base64", "dep:md-5", "dep:tokio"]
 getrandom = "0.2"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rusty-s3 = "0.10"
 url = "2"
-webpki-roots = "1"
 
 axum = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 md-5 = { version = "0.10", optional = true }
 tokio = { workspace = true, features = ["net", "sync"], optional = true }
 
+# Natively, the client does its own TLS, and servers sign S3 URLs. In a
+# browser, the browser does TLS and there is no server side.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rusty-s3 = "0.10"
+webpki-roots = "1"
+
+# A browser's randomness comes from JavaScript (`crypto.getRandomValues`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 # Android verifies certificates through Java, which a plain program (as
 # under Termux) can't reach. There, the client uses `webpki-roots` instead.
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dependencies]
 rustls-platform-verifier = "0.7"
 
 [dev-dependencies]

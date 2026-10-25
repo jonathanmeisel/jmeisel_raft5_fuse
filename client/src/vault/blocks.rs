@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use raft5fs_crypto::data::seal_chunk;
+use raft5fs_proto::errno;
 use raft5fs_proto::types::{
     Attr, BlockRef, BlockUpload, ChunkBody, ChunkWrite, Chunks, FsError, Layout, ObjectGrid,
     WriteBody,
@@ -261,7 +262,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("block {start} of inode {ino} kept changing under this change"),
         ))
     }
@@ -303,7 +304,7 @@ impl Vault {
         let mut read = self.remote.read_chunks(ino, start, per, &known).await?;
         if read.chunks.len() != per as usize || read.chunks[0].index != start {
             return Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!("inode {ino}: block {start} came back cut short"),
             ));
         }
@@ -371,10 +372,12 @@ impl Vault {
             .prepare_uploads(ino, &[BlockUpload { index: start, nseg }])
             .await?
             .pop()
-            .ok_or_else(|| FsError::new(libc::EIO, "the server named no upload"))?;
+            .ok_or_else(|| FsError::new(errno::EIO, "the server named no upload"))?;
         raft5fs_objstore::http::put(self.remote.objects(), &up.url, body)
             .await
-            .map_err(|e| FsError::new(libc::EIO, format!("inode {ino}: uploading a block: {e}")))?;
+            .map_err(|e| {
+                FsError::new(errno::EIO, format!("inode {ino}: uploading a block: {e}"))
+            })?;
         Ok(BlockRef {
             version,
             minted_ms: up.minted_ms,

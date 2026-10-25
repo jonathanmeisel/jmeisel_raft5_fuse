@@ -21,12 +21,14 @@ use std::fmt;
 
 pub mod http;
 pub mod name;
+#[cfg(not(target_arch = "wasm32"))]
 mod s3;
 
 #[cfg(feature = "fake")]
 pub mod fake;
 
 pub use name::ObjectName;
+#[cfg(not(target_arch = "wasm32"))]
 pub use s3::{Listed, S3Config, S3Store};
 
 #[derive(Debug)]

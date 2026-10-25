@@ -122,7 +122,7 @@ pub enum SetTime {
 impl SetTime {
     pub fn resolve(self) -> SystemTime {
         match self {
-            Self::Now => SystemTime::now(),
+            Self::Now => crate::clock::now(),
             Self::At(t) => t,
         }
     }
@@ -350,7 +350,7 @@ impl FsError {
 
     /// An error that needs no message beyond its errno.
     pub fn errno(errno: i32) -> Self {
-        Self::new(errno, std::io::Error::from_raw_os_error(errno).to_string())
+        Self::new(errno, crate::errno::describe(errno))
     }
 }
 
@@ -377,7 +377,7 @@ pub fn check_username(user: &str) -> Result<(), FsError> {
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EINVAL,
+            crate::errno::EINVAL,
             format!(
                 "bad username {user:?}: it must start with a lower-case letter or _, \
                  then up to {} more lower-case letters, digits, _ . or -",
@@ -390,7 +390,7 @@ pub fn check_username(user: &str) -> Result<(), FsError> {
 #[cfg(feature = "raft5")]
 impl From<raft5_client::Error> for FsError {
     fn from(e: raft5_client::Error) -> Self {
-        Self::new(libc::EIO, e.to_string())
+        Self::new(crate::errno::EIO, e.to_string())
     }
 }
 

@@ -8,25 +8,24 @@
 //! survives restarts, and an entry leaves only after its prune left nothing
 //! behind.
 //!
-//! It is three files in one directory, readable only by their owner:
+//! It is two blobs in a `Store` (natively, files in one directory, readable
+//! only by their owner):
 //!
 //! - `queue`: one line for each entry, `ino seconds-since-epoch note`. The
 //!   note says what the directory was, for people.
 //! - `status`: `ino what`, the latest status of each entry.
-//! - `lock`: every change to the other two files holds it, because a mount
-//!   and the CLI can change them at the same time.
 //!
-//! The files show inode numbers, which the server knows anyway.
+//! Every change holds the store's lock `lock`, because a mount and the CLI
+//! can change the queue at the same time.
+//!
+//! The blobs show inode numbers, which the server knows anyway.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
-use crate::vault::replace_private;
+use crate::store::{Store, locked};
 
 /// One directory waiting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,63 +37,50 @@ pub struct Queued {
     pub note: String,
 }
 
+/// A handle on the queue. Clones share the same store.
+#[derive(Clone)]
 pub struct PruneQueue {
-    dir: PathBuf,
-}
-
-/// An exclusive lock on the queue's lock file, released when dropped.
-struct Locked(File);
-
-impl Drop for Locked {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor is the open file's own.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
+    store: Arc<dyn Store>,
 }
 
 impl PruneQueue {
-    /// The queue in `dir`, which does not have to exist yet.
-    pub fn at(dir: PathBuf) -> Self {
-        Self { dir }
+    /// The queue in `store`, which can be empty.
+    pub fn new(store: Arc<dyn Store>) -> Self {
+        Self { store }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The queue in directory `dir`, which does not have to exist yet.
+    #[cfg(unix)]
+    pub fn at(dir: std::path::PathBuf) -> Self {
+        Self::new(Arc::new(crate::store::FileStore::new(dir)))
     }
 
-    fn lock(&self) -> io::Result<Locked> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(self.dir.join("lock"))?;
-        // SAFETY: as above.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Locked(file))
+    /// Where the queue is, for messages.
+    pub fn location(&self) -> String {
+        self.store.location("queue")
+    }
+
+    fn locked<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        locked(self.store.as_ref(), "lock", f)
     }
 
     fn read_lines(&self, name: &str) -> io::Result<BTreeMap<u64, String>> {
-        let text = match std::fs::read_to_string(self.dir.join(name)) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(e),
+        let Some(data) = self.store.load(name)? else {
+            return Ok(BTreeMap::new());
         };
+        let bad = |what: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {what}", self.store.location(name)),
+            )
+        };
+        let text = String::from_utf8(data).map_err(|_| bad("not text".into()))?;
         let mut lines = BTreeMap::new();
         for line in text.lines() {
             let (ino, rest) = line.split_once(' ').unwrap_or((line, ""));
-            let ino = ino.parse().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}: {line:?} isn't an entry", self.dir.join(name).display()),
-                )
-            })?;
+            let ino = ino
+                .parse()
+                .map_err(|_| bad(format!("{line:?} isn't an entry")))?;
             lines.insert(ino, rest.to_string());
         }
         Ok(lines)
@@ -105,29 +91,29 @@ impl PruneQueue {
             .iter()
             .map(|(ino, rest)| format!("{ino} {rest}\n"))
             .collect();
-        replace_private(&self.dir.join(name), text.as_bytes())
+        self.store.save(name, text.as_bytes())
     }
 
     /// Adds `ino` to the queue with a note about what it is, unless it is
     /// already queued.
     pub fn add(&self, ino: u64, note: &str) -> io::Result<()> {
-        let _held = self.lock()?;
-        let mut queue = self.read_lines("queue")?;
-        if queue.contains_key(&ino) {
-            return Ok(());
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        queue.insert(ino, format!("{now} {}", note.replace('\n', " ")));
-        self.write_lines("queue", &queue)
+        self.locked(|| {
+            let mut queue = self.read_lines("queue")?;
+            if queue.contains_key(&ino) {
+                return Ok(());
+            }
+            let now = raft5fs_proto::clock::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            queue.insert(ino, format!("{now} {}", note.replace('\n', " ")));
+            self.write_lines("queue", &queue)
+        })
     }
 
     /// The waiting entries, lowest inode number first.
     pub fn entries(&self) -> io::Result<Vec<Queued>> {
-        let _held = self.lock()?;
-        Ok(self
-            .read_lines("queue")?
+        let queue = self.locked(|| self.read_lines("queue"))?;
+        Ok(queue
             .into_iter()
             .map(|(ino, rest)| {
                 let (since, note) = rest.split_once(' ').unwrap_or((&rest, ""));
@@ -142,44 +128,45 @@ impl PruneQueue {
 
     /// Removes `ino` from the queue as done, with its status.
     pub fn remove(&self, ino: u64) -> io::Result<()> {
-        let _held = self.lock()?;
-        let mut queue = self.read_lines("queue")?;
-        let mut status = self.read_lines("status")?;
-        queue.remove(&ino);
-        status.remove(&ino);
-        self.write_lines("queue", &queue)?;
-        self.write_lines("status", &status)
+        self.locked(|| {
+            let mut queue = self.read_lines("queue")?;
+            let mut status = self.read_lines("status")?;
+            queue.remove(&ino);
+            status.remove(&ino);
+            self.write_lines("queue", &queue)?;
+            self.write_lines("status", &status)
+        })
     }
 
     /// Records the latest status of `ino`'s prune (one line).
     pub fn set_status(&self, ino: u64, what: &str) -> io::Result<()> {
-        let _held = self.lock()?;
-        let mut status = self.read_lines("status")?;
-        status.insert(ino, what.replace('\n', " "));
-        self.write_lines("status", &status)
+        self.locked(|| {
+            let mut status = self.read_lines("status")?;
+            status.insert(ino, what.replace('\n', " "));
+            self.write_lines("status", &status)
+        })
     }
 
     /// The latest status of each entry that has one.
     pub fn statuses(&self) -> io::Result<BTreeMap<u64, String>> {
-        let _held = self.lock()?;
-        self.read_lines("status")
+        self.locked(|| self.read_lines("status"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{FileStore, MemoryStore};
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
-    fn queue(name: &str) -> PruneQueue {
+    fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("raft5fs-queue-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        PruneQueue::at(dir)
+        dir
     }
 
-    #[test]
-    fn entries_collapse_and_go_once_done() {
-        let q = queue("collapse");
+    fn check_entries_collapse_and_go_once_done(q: PruneQueue) {
         assert!(q.entries().unwrap().is_empty());
         q.add(9, "photos/2024").unwrap();
         q.add(3, "x").unwrap();
@@ -198,28 +185,34 @@ mod tests {
         let inos: Vec<u64> = q.entries().unwrap().iter().map(|e| e.ino).collect();
         assert_eq!(inos, [3]);
         assert!(q.statuses().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(q.dir());
+    }
+
+    #[test]
+    fn entries_collapse_and_go_once_done() {
+        let dir = temp_dir("collapse");
+        check_entries_collapse_and_go_once_done(PruneQueue::at(dir.clone()));
+        let _ = std::fs::remove_dir_all(dir);
+        check_entries_collapse_and_go_once_done(PruneQueue::new(Arc::new(MemoryStore::new())));
     }
 
     #[test]
     fn only_the_owner_can_read_it() {
-        let q = queue("private");
+        let dir = temp_dir("private");
+        let q = PruneQueue::at(dir.clone());
         q.add(1, "").unwrap();
         q.set_status(1, "x").unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(q.dir()), 0o700);
+        assert_eq!(mode(&dir), 0o700);
         for name in ["queue", "status", "lock"] {
-            assert_eq!(mode(&q.dir().join(name)), 0o600, "{name}");
+            assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
         }
-        let _ = std::fs::remove_dir_all(q.dir());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn adds_from_two_places_at_once_all_land() {
-        let q = std::sync::Arc::new(queue("racing"));
+    fn check_adds_from_two_places_at_once_all_land(open: impl Fn() -> PruneQueue) {
         let threads: Vec<_> = (0..8)
             .map(|t| {
-                let q = std::sync::Arc::clone(&q);
+                let q = open();
                 std::thread::spawn(move || {
                     for i in 0..25 {
                         q.add(t * 100 + i, "n").unwrap();
@@ -230,16 +223,36 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(q.entries().unwrap().len(), 200);
-        let _ = std::fs::remove_dir_all(q.dir());
+        assert_eq!(open().entries().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn adds_from_two_places_at_once_all_land() {
+        // Each thread has its own handle on the files, as two processes do.
+        let dir = temp_dir("racing");
+        check_adds_from_two_places_at_once_all_land(|| PruneQueue::at(dir.clone()));
+        let _ = std::fs::remove_dir_all(dir);
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        check_adds_from_two_places_at_once_all_land(|| PruneQueue::new(Arc::clone(&store)));
     }
 
     #[test]
     fn a_garbled_queue_is_an_error_not_an_empty_one() {
-        let q = queue("garbled");
+        let dir = temp_dir("garbled");
+        let q = PruneQueue::at(dir.clone());
         q.add(1, "").unwrap();
-        std::fs::write(q.dir().join("queue"), "not a number\n").unwrap();
+        std::fs::write(dir.join("queue"), "not a number\n").unwrap();
         assert!(q.entries().is_err());
-        let _ = std::fs::remove_dir_all(q.dir());
+        let _ = std::fs::remove_dir_all(dir);
+        let store = Arc::new(MemoryStore::new());
+        store.save("queue", b"1 2 x\n\xff\n").unwrap();
+        assert!(PruneQueue::new(store).entries().is_err());
+    }
+
+    #[test]
+    fn the_location_names_the_directory() {
+        let dir = temp_dir("location");
+        let q = PruneQueue::new(Arc::new(FileStore::new(dir.clone())));
+        assert_eq!(q.location(), dir.join("queue").display().to_string());
     }
 }

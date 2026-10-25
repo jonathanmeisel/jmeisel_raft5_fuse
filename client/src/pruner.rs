@@ -11,12 +11,13 @@
 //! prunes in the background needs only its own vault.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
+// `std::time::Instant` panics in a browser; this is the same type natively.
+use web_time::Instant;
 
 use crate::prune_queue::PruneQueue;
+use crate::rt::{self, AbortHandle};
 use crate::vault::{PruneStats, Vault};
 
 /// How fast a background pruner works.
@@ -90,22 +91,19 @@ pub async fn prune_entry(
     stats
 }
 
-/// Starts to work through `queue` in the background, on `rt`, with `vault`.
+/// Starts to work through `queue` in the background, with `vault`.
 /// Best give it its own vault, not the one that serves the mount's
 /// requests, because a prune often drops the keys it holds. Runs until
 /// aborted. Anything left stays in the queue.
-pub fn spawn(rt: &Handle, vault: Vault, queue: PruneQueue, config: PrunerConfig) -> JoinHandle<()> {
-    rt.spawn(async move {
+pub fn spawn(vault: Vault, queue: PruneQueue, config: PrunerConfig) -> AbortHandle {
+    rt::spawn(async move {
         let mut retry: HashMap<u64, (Instant, Duration)> = HashMap::new();
         loop {
             let entries = match queue.entries() {
                 Ok(entries) => entries,
                 Err(e) => {
-                    eprintln!(
-                        "cannot read the prune queue in {}: {e}",
-                        queue.dir().display()
-                    );
-                    tokio::time::sleep(config.max_backoff.min(config.poll * 12)).await;
+                    eprintln!("cannot read the prune queue in {}: {e}", queue.location());
+                    rt::sleep(config.max_backoff.min(config.poll * 12)).await;
                     continue;
                 }
             };
@@ -115,7 +113,7 @@ pub fn spawn(rt: &Handle, vault: Vault, queue: PruneQueue, config: PrunerConfig)
                 .iter()
                 .find(|e| retry.get(&e.ino).is_none_or(|(at, _)| *at <= now));
             let Some(entry) = due else {
-                tokio::time::sleep(config.poll).await;
+                rt::sleep(config.poll).await;
                 continue;
             };
             let stats = prune_entry(&vault, &queue, entry.ino, config.pace).await;

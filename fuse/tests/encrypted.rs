@@ -1696,15 +1696,18 @@ fn a_name_that_could_break_a_line_is_no_account() {
 
 // ------------------------------------------------- shares and the pruner
 
-/// Its own prune queue, in a new temporary directory.
-fn temp_queue(name: &str) -> raft5fs_client::prune_queue::PruneQueue {
+/// Its own prune queue, in a new temporary directory, and the directory.
+fn temp_queue(name: &str) -> (raft5fs_client::prune_queue::PruneQueue, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "raft5fs-test-queue-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    raft5fs_client::prune_queue::PruneQueue::at(dir)
+    (
+        raft5fs_client::prune_queue::PruneQueue::at(dir.clone()),
+        dir,
+    )
 }
 
 #[test]
@@ -1761,9 +1764,8 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
     let h = support::setup_root();
     let (v, _) = revoked_tree(&h);
     let f = v.join("shared/sub/f");
-    let queue = temp_queue("background");
+    let (queue, dir) = temp_queue("background");
     queue.add(ino(&v), "v (revoked alice)").unwrap();
-    let dir = queue.dir().to_path_buf();
     let _mount = h.pruning_mount(queue);
     // Writes through the first mount continue in the meantime.
     let writer = {
@@ -1774,7 +1776,7 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
             }
         })
     };
-    let queue = raft5fs_client::prune_queue::PruneQueue::at(dir);
+    let queue = raft5fs_client::prune_queue::PruneQueue::at(dir.clone());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !queue.entries().unwrap().is_empty() {
         assert!(
@@ -1787,7 +1789,7 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
     writer.join().unwrap();
     assert_eq!(fs::read(&f).unwrap(), b"write 39");
     assert_fully_pruned(&h, &v);
-    let _ = fs::remove_dir_all(queue.dir());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1806,7 +1808,7 @@ fn a_prune_that_skips_anything_stays_queued() {
 
     // Alice cannot prune what she can only read. It stays in the queue,
     // with the reason, for a user who can.
-    let queue = temp_queue("skips");
+    let (queue, dir) = temp_queue("skips");
     queue.add(ino(&v), "v").unwrap();
     let hers = vault(&h, "alice");
     let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
@@ -1830,5 +1832,5 @@ fn a_prune_that_skips_anything_stays_queued() {
     assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
     assert!(queue.entries().unwrap().is_empty());
     assert_fully_pruned(&h, &v);
-    let _ = fs::remove_dir_all(queue.dir());
+    let _ = fs::remove_dir_all(&dir);
 }

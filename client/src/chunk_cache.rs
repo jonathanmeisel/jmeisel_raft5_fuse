@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `std::time::Instant` panics in a browser; this is the same type natively.
+use web_time::Instant;
 
 /// The filesystem that a chunk belongs to (the live one, or one of its
 /// snapshots, which use the same inode numbers; see `Vault`), its inode,

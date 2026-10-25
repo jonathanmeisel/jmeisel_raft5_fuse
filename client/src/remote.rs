@@ -58,6 +58,7 @@ use raft5fs_objstore::http::{self, HttpConfig};
 use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
+use raft5fs_proto::errno;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
@@ -73,14 +74,25 @@ use raft5fs_proto::types::{
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+#[cfg(not(target_arch = "wasm32"))]
+pub use tonic::transport::ClientTlsConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use tonic::transport::{Channel, Endpoint};
 
 use crate::timing::Timed;
+
+#[cfg(target_arch = "wasm32")]
+mod web;
+#[cfg(target_arch = "wasm32")]
+pub use web::ClientTlsConfig;
+#[cfg(target_arch = "wasm32")]
+use web::WebChannel as Channel;
 
 /// The largest message that the client sends: one write batch, which is at
 /// most one maximum-size chunk (8 MiB), plus framing.
 const MAX_MESSAGE_BYTES: usize = 9 << 20;
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Long on purpose: a write commits a batch of up to 8 MiB through raft,
 /// and can retry under contention. A request that takes longer counts as a
@@ -88,7 +100,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Sends pings on idle connections, so the client notices a server that
 /// stopped without a message before the next request times out on it.
+#[cfg(not(target_arch = "wasm32"))]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(not(target_arch = "wasm32"))]
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The user that a mount logs in as.
@@ -181,6 +195,31 @@ pub struct Remote {
     snapshot: String,
 }
 
+/// A connection to `address`, made when the first request needs it.
+#[cfg(not(target_arch = "wasm32"))]
+fn channel(address: &str, tls: Option<&ClientTlsConfig>) -> Result<Channel, String> {
+    let mut endpoint =
+        Endpoint::from_shared(address.to_string()).map_err(|e| format!("{address}: {e}"))?;
+    if let Some(tls) = tls {
+        endpoint = endpoint
+            .tls_config(tls.clone())
+            .map_err(|e| format!("{address}: {e}"))?;
+    }
+    Ok(endpoint
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .connect_lazy())
+}
+
+/// gRPC-Web to `address`. The browser does TLS (see `ClientTlsConfig`).
+#[cfg(target_arch = "wasm32")]
+fn channel(address: &str, _tls: Option<&ClientTlsConfig>) -> Result<Channel, String> {
+    Ok(Channel::new(address, REQUEST_TIMEOUT))
+}
+
 /// Stretches `password` away from the async threads, because Argon2 is slow
 /// on purpose.
 async fn derive(
@@ -191,12 +230,9 @@ async fn derive(
 ) -> Result<PasswordKeys, FsError> {
     let password = Zeroizing::new(password.to_string());
     let username = username.to_string();
-    tokio::task::spawn_blocking(move || {
-        password::derive(password.as_bytes(), &username, &salt, params)
-    })
-    .await
-    .expect("key derivation panicked")
-    .map_err(|e| FsError::new(libc::EIO, e.to_string()))
+    crate::rt::blocking(move || password::derive(password.as_bytes(), &username, &salt, params))
+        .await
+        .map_err(|e| FsError::new(errno::EIO, e.to_string()))
 }
 
 /// What the server keeps for an account with password `password` and key
@@ -284,21 +320,7 @@ impl Remote {
         let authorize = Authorize(Arc::clone(&session));
         let mut servers = Vec::new();
         for address in addresses {
-            let mut endpoint =
-                Endpoint::from_shared(address.clone()).map_err(|e| format!("{address}: {e}"))?;
-            if let Some(tls) = &tls {
-                endpoint = endpoint
-                    .tls_config(tls.clone())
-                    .map_err(|e| format!("{address}: {e}"))?;
-            }
-            let channel = endpoint
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
-                .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-                .keep_alive_while_idle(true)
-                .connect_lazy();
-            let channel = Timed::new(channel, address);
+            let channel = Timed::new(channel(address, tls.as_ref())?, address);
             let client = FsClient::with_interceptor(channel, authorize.clone())
                 .max_encoding_message_size(MAX_MESSAGE_BYTES);
             servers.push((address.clone(), client));
@@ -352,7 +374,7 @@ impl Remote {
         let (username, password) = (username.as_str(), password.as_str());
         let remote = Self::dial(addresses, credentials, tls)
             .await
-            .map_err(|e| FsError::new(libc::EIO, e))?;
+            .map_err(|e| FsError::new(errno::EIO, e))?;
         let identity = Identity::generate();
         let (keys, _) = account_keys(username, password, params, &identity).await?;
         let req = EnrolRequest {
@@ -383,11 +405,11 @@ impl Remote {
     ) -> Result<(), FsError> {
         let identity = self
             .identity()
-            .ok_or_else(|| FsError::new(libc::EACCES, "not logged in: no key pair to re-wrap"))?;
+            .ok_or_else(|| FsError::new(errno::EACCES, "not logged in: no key pair to re-wrap"))?;
         let old_auth = match &*self.secret.read().unwrap() {
             Secret::Auth(auth) => auth.to_vec(),
             Secret::Password(_) => {
-                return Err(FsError::new(libc::EACCES, "not logged in"));
+                return Err(FsError::new(errno::EACCES, "not logged in"));
             }
         };
         let (keys, new_auth) =
@@ -487,10 +509,10 @@ impl Remote {
                 .await?
                 .into_result()?;
             let params = KdfParams::decode(&settings.params)
-                .map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
+                .map_err(|e| FsError::new(errno::EIO, e.to_string()))?;
             params
                 .check(self.min_kdf)
-                .map_err(|e| FsError::new(libc::EACCES, format!("login refused: {e}")))?;
+                .map_err(|e| FsError::new(errno::EACCES, format!("login refused: {e}")))?;
             let keys = derive(&password, &self.username, settings.salt, params).await?;
             req.auth = keys.auth.to_vec();
             derived = Some(keys);
@@ -508,7 +530,7 @@ impl Remote {
             // mistyped.
             let identity =
                 Identity::unwrap(&keys.kek, &self.username, &session.wrapped_private_key)
-                    .map_err(|e| FsError::new(libc::EIO, format!("login: {e}")))?;
+                    .map_err(|e| FsError::new(errno::EIO, format!("login: {e}")))?;
             *self.identity.write().unwrap() = Some(Arc::new(identity));
             *self.secret.write().unwrap() = Secret::Auth(Zeroizing::new(keys.auth));
         }
@@ -543,7 +565,7 @@ impl Remote {
             }
         }
         Err(FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("no server answered {what}: {}", failures.join("; ")),
         ))
     }
@@ -587,7 +609,7 @@ impl Remote {
         Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
         if retry != Retry::ReadOnly && !self.snapshot.is_empty() {
-            return Err(FsError::new(libc::EROFS, "a snapshot is read-only"));
+            return Err(FsError::new(errno::EROFS, "a snapshot is read-only"));
         }
         let n = self.servers.len();
         let start = self.current.load(Ordering::Relaxed);
@@ -618,7 +640,7 @@ impl Remote {
                 }
                 Err(status) if status.code() == Code::Unauthenticated => {
                     return Err(FsError::new(
-                        libc::EACCES,
+                        errno::EACCES,
                         format!("{address} refused a fresh session: {}", status.message()),
                     ));
                 }
@@ -634,7 +656,7 @@ impl Remote {
             }
         }
         Err(FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("no server answered: {}", failures.join("; ")),
         ))
     }

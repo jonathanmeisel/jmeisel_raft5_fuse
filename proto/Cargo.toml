@@ -11,11 +11,22 @@ raft5 = ["dep:raft5-client"]
 
 [dependencies]
 base64 = "0.22"
-libc = { workspace = true }
 prost = { workspace = true }
 raft5-client = { workspace = true, optional = true }
-tonic = { workspace = true }
 tonic-prost = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tonic = { workspace = true }
+
+# A browser can't open sockets, so tonic comes without its transport; the
+# client speaks gRPC-Web through `fetch` instead. A browser has no clock of
+# its own either: `clock::now` asks JavaScript.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

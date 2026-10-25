@@ -5,17 +5,33 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 http-body = "1"
-libc = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
-tokio = { workspace = true, features = ["sync"] }
 toml = "1"
-tonic = { workspace = true }
+web-time = "1"
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync"] }
+tonic = { workspace = true }
+
+# In a browser: one thread, no Tokio runtime, and gRPC-Web through `fetch`
+# (see `rt` and `remote`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-web-wasm-client = "0.9.2"
+wasm-bindgen-futures = "0.4"
 
 # The session's tests run against a real store and servers.
 [dev-dependencies]

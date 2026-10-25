@@ -30,11 +30,9 @@
 //!   returned.
 //! - It refuses key records older than ones it already saw.
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,6 +46,8 @@ use raft5fs_crypto::identity::{
     seal_grant, seal_label,
 };
 use raft5fs_crypto::node::NodeKeys;
+use raft5fs_proto::errno;
+use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
     Attr, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
     Layout, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError,
@@ -62,6 +62,7 @@ mod prune;
 pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
+use crate::store::{MemoryStore, Store};
 
 /// The inode number that the kernel uses for a mount's root. This is the
 /// virtual root, not the server's real root.
@@ -143,7 +144,7 @@ impl Node {
         match &self.untrusted {
             None => Ok(()),
             Some(u) => Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 format!(
                     "inode {ino} is shared with this account by {}, whose key isn't pinned \
                      here: the server could have made the share up, so nothing is written \
@@ -160,7 +161,7 @@ impl Node {
 
     /// The tag that `name` is filed under in this directory.
     pub fn tag(&self, name: &OsStr) -> OsString {
-        OsString::from_vec(name_tag(&self.name_key, name.as_bytes()).to_vec())
+        os_bytes::into_name(name_tag(&self.name_key, os_bytes::bytes(name)).to_vec())
     }
 
     /// Seals `name`, filed under `tag` in directory `ino` and pointing to
@@ -171,8 +172,8 @@ impl Node {
             self.record.version,
             ino,
             child,
-            tag.as_bytes(),
-            name.as_bytes(),
+            os_bytes::bytes(tag),
+            os_bytes::bytes(name),
         )
     }
 
@@ -198,62 +199,85 @@ fn expired(e: &FsError) -> bool {
 }
 
 fn changed(e: &FsError) -> bool {
-    e.errno == libc::EAGAIN
+    e.errno == errno::EAGAIN
 }
 
 /// Public keys that this account sealed to, by user. The server could give
 /// its own key in place of a user's key, so the vault trusts the first key
 /// it sees for a user and refuses a different key later. It keeps the keys
-/// in memory, and also in a file if it has one (one `user hex-key` line for
-/// each user, readable only by its owner).
+/// in memory and in a blob of a `Store` (one `user hex-key` line for each
+/// user; natively, a file readable only by its owner).
 ///
 /// The names come from the server, so the vault checks each one
-/// (`check_username`) before it writes it to the file. A name with a line
+/// (`check_username`) before it writes it to the blob. A name with a line
 /// break could otherwise add a line that pins a key for a different user.
 pub struct KnownKeys {
     keys: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
-    file: Option<PathBuf>,
+    store: Arc<dyn Store>,
+    name: String,
 }
 
 impl KnownKeys {
+    /// Pins kept only in memory, forgotten when the last handle drops.
     pub fn in_memory() -> Self {
         Self {
             keys: Mutex::new(HashMap::new()),
-            file: None,
+            store: Arc::new(MemoryStore::new()),
+            name: "known_keys".into(),
         }
     }
 
-    /// Loads the keys pinned in `file`, which does not have to exist yet.
-    /// New pins go into the same file. A bad line, or a second key for the
-    /// same user, makes the whole file fail: this code did not write that
-    /// file, and it cannot know which key is correct.
-    pub fn load(file: PathBuf) -> std::io::Result<Self> {
-        let keys = read_pins(&file)?;
+    /// Loads the keys pinned in blob `name` of `store`, which does not have
+    /// to exist yet. New pins go into the same blob. A bad line, or a
+    /// second key for the same user, makes the whole blob fail: this code
+    /// did not write that blob, and it cannot know which key is correct.
+    pub fn open(store: Arc<dyn Store>, name: &str) -> std::io::Result<Self> {
+        let keys = read_pins(store.as_ref(), name)?;
         Ok(Self {
             keys: Mutex::new(keys),
-            file: Some(file),
+            store,
+            name: name.to_string(),
         })
     }
 
-    /// Another handle on the same pins and the same file. A pin that one
-    /// handle adds later reaches the other handle through the file.
+    /// Loads the keys pinned in `file`, which does not have to exist yet,
+    /// as `open` does.
+    #[cfg(unix)]
+    pub fn load(file: std::path::PathBuf) -> std::io::Result<Self> {
+        let bad = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} isn't a file name this can use", file.display()),
+            )
+        };
+        let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?;
+        let dir = file.parent().ok_or_else(bad)?.to_path_buf();
+        Self::open(Arc::new(crate::store::FileStore::new(dir)), name)
+    }
+
+    /// Another handle on the same pins and the same store. A pin that one
+    /// handle adds later reaches the other handle through the store.
     pub fn duplicate(&self) -> Self {
         Self {
             keys: Mutex::new(self.keys.lock().unwrap().clone()),
-            file: self.file.clone(),
+            store: Arc::clone(&self.store),
+            name: self.name.clone(),
         }
     }
 
+    fn lock_name(&self) -> String {
+        format!("{}.lock", self.name)
+    }
+
     /// The key pinned for `user`, if there is one. If no key is known in
-    /// memory, this reads the file again, because `raft5fs-share trust` can
-    /// add a pin while a mount runs. If the file is now bad, this adds
-    /// nothing.
+    /// memory, this reads the store again, because `raft5fs trust` can add
+    /// a pin while a mount runs. If the blob is now bad, this adds nothing.
     pub fn pinned(&self, user: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
         let mut keys = self.keys.lock().unwrap();
         if let Some(key) = keys.get(user) {
             return Some(*key);
         }
-        let key = *read_pins(self.file.as_ref()?).ok()?.get(user)?;
+        let key = *read_pins(self.store.as_ref(), &self.name).ok()?.get(user)?;
         keys.insert(user.to_string(), key);
         Some(key)
     }
@@ -261,22 +285,22 @@ impl KnownKeys {
     /// Checks `key` against the key pinned for `user`.
     ///
     /// - Returns `key` if it matches the pin.
-    /// - If no key is pinned, pins `key` (also in the file, if there is
-    ///   one) and returns it.
+    /// - If no key is pinned, pins `key` (also in the store) and returns
+    ///   it.
     /// - Returns `EPERM` if a different key is pinned, and `EIO` if `key`
     ///   has the wrong length.
     pub fn check(&self, user: &str, key: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         let key: [u8; PUBLIC_KEY_LEN] = key
             .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
-        // Another process could have pinned this user in the file.
+            .map_err(|_| FsError::new(errno::EIO, format!("{user}'s public key is malformed")))?;
+        // Another process could have pinned this user in the store.
         self.pinned(user);
         let mut keys = self.keys.lock().unwrap();
         match keys.get(user) {
             Some(pinned) if *pinned == key => Ok(key),
             Some(pinned) => Err(FsError::new(
-                libc::EPERM,
+                errno::EPERM,
                 format!(
                     "the server gave a different key for {user} than before ({} now, {} pinned); \
                      if they enrolled again, check the new fingerprint with them and forget the old",
@@ -285,18 +309,32 @@ impl KnownKeys {
                 ),
             )),
             None => {
-                if let Some(file) = &self.file {
-                    append_pin(file, user, &key).map_err(|e| {
-                        FsError::new(
-                            libc::EIO,
-                            format!("cannot pin {user}'s key in {}: {e}", file.display()),
-                        )
-                    })?;
-                }
+                self.append_pin(user, &key).map_err(|e| {
+                    FsError::new(
+                        errno::EIO,
+                        format!(
+                            "cannot pin {user}'s key in {}: {e}",
+                            self.store.location(&self.name)
+                        ),
+                    )
+                })?;
                 keys.insert(user.to_string(), key);
                 Ok(key)
             }
         }
+    }
+
+    /// Adds a `user key` line to the blob, under the store's lock so that
+    /// another process's pin made at the same time is kept.
+    fn append_pin(&self, user: &str, key: &[u8]) -> std::io::Result<()> {
+        crate::store::locked(self.store.as_ref(), &self.lock_name(), || {
+            let mut data = self.store.load(&self.name)?.unwrap_or_default();
+            if !data.is_empty() && !data.ends_with(b"\n") {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(format!("{user} {}\n", to_hex(key)).as_bytes());
+            self.store.save(&self.name, &data)
+        })
     }
 
     /// Every pinned key, by user name, sorted by name.
@@ -317,35 +355,47 @@ impl KnownKeys {
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
         check_username(user).map_err(|e| std::io::Error::other(e.message))?;
         let mut keys = self.keys.lock().unwrap();
-        keys.remove(user);
-        if let Some(file) = &self.file {
+        crate::store::locked(self.store.as_ref(), &self.lock_name(), || {
+            // Keep pins that another process added since this one loaded.
+            if let Ok(stored) = read_pins(self.store.as_ref(), &self.name) {
+                for (other, key) in stored {
+                    keys.entry(other).or_insert(key);
+                }
+            }
+            keys.remove(user);
             let mut users: Vec<_> = keys.iter().collect();
             users.sort();
             let text: String = users
                 .into_iter()
                 .map(|(user, key)| format!("{user} {}\n", to_hex(key)))
                 .collect();
-            replace_private(file, text.as_bytes())?;
-        }
-        Ok(())
+            self.store.save(&self.name, text.as_bytes())
+        })
     }
 }
 
-/// Reads the pins in `file`. A missing file has no pins. A bad line, or a
-/// second key for the same user, makes the whole file fail.
-fn read_pins(file: &std::path::Path) -> std::io::Result<HashMap<String, [u8; PUBLIC_KEY_LEN]>> {
+/// Reads the pins in blob `name`. A missing blob has no pins. A bad line,
+/// or a second key for the same user, makes the whole blob fail.
+fn read_pins(
+    store: &dyn Store,
+    name: &str,
+) -> std::io::Result<HashMap<String, [u8; PUBLIC_KEY_LEN]>> {
     let bad = |n: usize, why: &str| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{} line {}: {why}", file.display(), n + 1),
+            format!("{} line {}: {why}", store.location(name), n + 1),
         )
     };
     let mut keys = HashMap::new();
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(keys),
-        Err(e) => return Err(e),
+    let Some(data) = store.load(name)? else {
+        return Ok(keys);
     };
+    let text = String::from_utf8(data).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: not text", store.location(name)),
+        )
+    })?;
     for (n, line) in text.lines().enumerate() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         let (user, hex) = match fields.as_slice() {
@@ -360,39 +410,6 @@ fn read_pins(file: &std::path::Path) -> std::io::Result<HashMap<String, [u8; PUB
         }
     }
     Ok(keys)
-}
-
-/// Adds a `user key` line to `file`. Only the owner can read the file.
-fn append_pin(file: &std::path::Path, user: &str, key: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(file)?;
-    writeln!(f, "{user} {}", to_hex(key))
-}
-
-/// Replaces `file` with `contents` in one step: it writes a file next to
-/// it, then renames that file over it. Only the owner can read the result.
-pub(crate) fn replace_private(file: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut tmp = file.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(contents)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, file)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -446,14 +463,14 @@ fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
         ChunkBody::Hole => Ok(None),
         ChunkBody::Inline(blob) => Ok(Some(blob)),
         ChunkBody::Segment { .. } => Err(FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("inode {ino}: a chunk in object storage, not fetched"),
         )),
     }
 }
 
 fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
-    FsError::new(libc::EIO, format!("inode {ino}: {e}"))
+    FsError::new(errno::EIO, format!("inode {ino}: {e}"))
 }
 
 /// The grants this account has, by the names they show in the root.
@@ -503,7 +520,7 @@ impl Vault {
     pub fn new(remote: Arc<Remote>) -> Result<Self, FsError> {
         let identity = remote
             .identity()
-            .ok_or_else(|| FsError::new(libc::EACCES, "not logged in"))?;
+            .ok_or_else(|| FsError::new(errno::EACCES, "not logged in"))?;
         Ok(Self {
             remote,
             identity,
@@ -616,7 +633,7 @@ impl Vault {
             .unwrap()
             .get(&ino)
             .cloned()
-            .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino}'s key went missing")))
+            .ok_or_else(|| FsError::new(errno::EIO, format!("inode {ino}'s key went missing")))
     }
 
     /// Gives every stale node on the path from this account's grant to
@@ -660,7 +677,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("the keys above inode {ino} kept changing"),
         ))
     }
@@ -689,7 +706,7 @@ impl Vault {
     ) -> Result<HashMap<String, GranteeEntry>, FsError> {
         let mismatch = |why: String| {
             FsError::new(
-                libc::EPERM,
+                errno::EPERM,
                 format!(
                     "inode {ino}: the server's list of who it is granted to doesn't match the \
                      one sealed under its key ({why}); refusing to seal its key to anyone on it"
@@ -796,7 +813,7 @@ impl Vault {
                 .is_some_and(|n| n.grantees.iter().any(|g| g.user == user))
         {
             return Err(FsError::new(
-                libc::ENOENT,
+                errno::ENOENT,
                 format!("{user} has no grant of inode {top}"),
             ));
         }
@@ -814,7 +831,7 @@ impl Vault {
             } else if ino == top {
                 let parent = parent.ok_or_else(|| {
                     FsError::new(
-                        libc::EACCES,
+                        errno::EACCES,
                         format!(
                             "a new key for inode {top} must be wrapped under its parent's, \
                              which this account can't reach"
@@ -911,7 +928,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("inode {ino}'s keys kept changing under this revocation"),
         ))
     }
@@ -954,7 +971,7 @@ impl Vault {
         ino: u64,
         grant: &Grant,
     ) -> Result<(u32, Key, Option<Arc<Untrusted>>), FsError> {
-        let refused = |e: String| FsError::new(libc::EACCES, format!("inode {ino}: {e}"));
+        let refused = |e: String| FsError::new(errno::EACCES, format!("inode {ino}: {e}"));
         let sealed = &grant.sealed_key;
         let sender = grant_sender(sealed).map_err(|e| refused(e.to_string()))?;
         check_username(sender).map_err(|e| refused(e.message))?;
@@ -992,7 +1009,7 @@ impl Vault {
             .public_key(user)
             .await?
             .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))?;
+            .map_err(|_| FsError::new(errno::EIO, format!("{user}'s public key is malformed")))?;
         self.senders.lock().unwrap().insert(user.to_string(), key);
         Ok(key)
     }
@@ -1009,7 +1026,7 @@ impl Vault {
         let mut nodes = path.nodes.into_iter();
         let (root_ino, root_bytes) = nodes
             .next()
-            .ok_or_else(|| FsError::new(libc::EIO, "an empty key path"))?;
+            .ok_or_else(|| FsError::new(errno::EIO, "an empty key path"))?;
         let record = NodeKeys::decode(&root_bytes).map_err(|e| corrupt(root_ino, e))?;
         self.check_not_older(root_ino, &record)?;
         let (version, key, untrusted) = self.open_grant(root_ino, &path.grant).await?;
@@ -1017,7 +1034,7 @@ impl Vault {
         // seals every grant of the node again.
         if version != record.version {
             return Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 format!("the grant of inode {root_ino} holds an out-of-date key"),
             ));
         }
@@ -1056,7 +1073,7 @@ impl Vault {
     fn check_not_older(&self, ino: u64, record: &NodeKeys) -> Result<(), FsError> {
         match self.seen.lock().unwrap().get(&ino) {
             Some(&seen) if record.version < seen => Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!(
                     "inode {ino}: the server handed back key version {}, older than \
                      version {seen} seen before",
@@ -1087,7 +1104,7 @@ impl Vault {
             let label = self
                 .identity
                 .open_label(grant.ino, &grant.sealed_label)
-                .map(OsString::from_vec)
+                .map(os_bytes::into_name)
                 .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
             let mut name = label.clone();
             let mut n = 2;
@@ -1126,7 +1143,7 @@ impl Vault {
             .into_iter()
             .find(|(n, _)| n == name)
             .map(|(_, ino)| ino)
-            .ok_or_else(|| FsError::errno(libc::ENOENT))
+            .ok_or_else(|| FsError::errno(errno::ENOENT))
     }
 
     /// Whether `ino` is granted to this account. These inodes are the
@@ -1182,7 +1199,7 @@ impl Vault {
             &dir.name_key,
             parent,
             attr.ino,
-            tag.as_bytes(),
+            os_bytes::bytes(&tag),
             &sealed,
         )
         .map_err(|e| {
@@ -1259,14 +1276,14 @@ impl Vault {
                         &dir.name_key,
                         ino,
                         item.ino,
-                        item.name.as_bytes(),
+                        os_bytes::bytes(&item.name),
                         &item.sealed_name,
                     )
                     .map_err(|e| corrupt(ino, e))
                 });
             match opened {
                 Ok(name) => {
-                    item.name = OsString::from_vec(name);
+                    item.name = os_bytes::into_name(name);
                     item.sealed_name = Vec::new();
                     named.push(item);
                 }
@@ -1415,7 +1432,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("the keys of the node moving out of inode {parent} kept changing"),
         ))
     }
@@ -1423,14 +1440,14 @@ impl Vault {
     /// Makes a new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
         if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
-            return Err(FsError::errno(libc::EEXIST));
+            return Err(FsError::errno(errno::EEXIST));
         }
         let ino = self.remote.allocate_inode().await?;
         let (record, key) = NodeKeys::create(ino, None);
         let me = self.identity.public_key();
         let username = self.remote.username();
         let sealed_key = seal_grant(&self.identity, username, &me, ino, record.version, &key);
-        let sealed_label = seal_label(&me, ino, label.as_bytes());
+        let sealed_label = seal_label(&me, ino, os_bytes::bytes(label));
         let sealed_grantees = seal_grantees(
             &key,
             record.version,
@@ -1536,7 +1553,7 @@ impl Vault {
                     version,
                     &node.key,
                 ),
-                sealed_label: seal_label(&public_key, ino, label.as_bytes()),
+                sealed_label: seal_label(&public_key, ino, os_bytes::bytes(label)),
             };
             let sealed_grantees = seal_grantees(&node.key, version, ino, &entries);
             match self.remote.grant(user, grant, sealed_grantees, seq).await {
@@ -1551,7 +1568,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("inode {ino}'s grantees kept changing under this grant"),
         ))
     }
@@ -1567,10 +1584,10 @@ impl Vault {
         check_username(user)?;
         let served = self.served_key(user).await?;
         let matches = fingerprint_matches(&served, expected)
-            .map_err(|e| FsError::new(libc::EINVAL, format!("{expected:?}: {e}")))?;
+            .map_err(|e| FsError::new(errno::EINVAL, format!("{expected:?}: {e}")))?;
         if !matches {
             return Err(FsError::new(
-                libc::EPERM,
+                errno::EPERM,
                 format!(
                     "the server's key for {user} has fingerprint\n  {}\nnot the one given: \
                      not pinning it",
@@ -1593,7 +1610,7 @@ impl Vault {
             .public_key(user)
             .await?
             .try_into()
-            .map_err(|_| FsError::new(libc::EIO, format!("{user}'s public key is malformed")))
+            .map_err(|_| FsError::new(errno::EIO, format!("{user}'s public key is malformed")))
     }
 
     /// Every grant made to this account, with its sender and whether this
@@ -1606,7 +1623,7 @@ impl Vault {
             let label = self
                 .identity
                 .open_label(grant.ino, &grant.sealed_label)
-                .map(OsString::from_vec)
+                .map(os_bytes::into_name)
                 .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
             let sender = grant_sender(&grant.sealed_key).unwrap_or("?").to_string();
             let trust = match self.open_grant(grant.ino, &grant).await {
@@ -1631,7 +1648,7 @@ impl Vault {
         let mut parts = path.split('/').filter(|p| !p.is_empty() && *p != ".");
         let first = parts
             .next()
-            .ok_or_else(|| FsError::new(libc::EINVAL, "an empty path"))?;
+            .ok_or_else(|| FsError::new(errno::EINVAL, "an empty path"))?;
         let mut ino = self.root_lookup(OsStr::new(first)).await?;
         for part in parts {
             ino = self.lookup(ino, OsStr::new(part)).await?.ino;
@@ -1790,7 +1807,7 @@ impl Vault {
             let read = self.remote.read_chunks(ino, next, count, known).await?;
             size = read.attr.size;
             let Some(after) = read.chunks.last().map(|c| c.index + 1) else {
-                return Err(FsError::new(libc::EIO, "the server returned no chunks"));
+                return Err(FsError::new(errno::EIO, "the server returned no chunks"));
             };
             next = after;
             reads.push(read);
@@ -1803,9 +1820,9 @@ impl Vault {
     async fn fetch_one(&self, ino: u64, index: u64, known: u64) -> Result<SealedChunk, FsError> {
         let read = self.remote.read_chunks(ino, index, 1, &[known]).await?;
         let mut got = self.fetch_segments(ino, vec![read]).await?;
-        got.pop()
-            .filter(|c| c.index == index)
-            .ok_or_else(|| FsError::new(libc::EIO, format!("chunk {index} of inode {ino} missing")))
+        got.pop().filter(|c| c.index == index).ok_or_else(|| {
+            FsError::new(errno::EIO, format!("chunk {index} of inode {ino} missing"))
+        })
     }
 
     /// Fetches each chunk in `reads` that is in object storage, and puts
@@ -1850,7 +1867,9 @@ impl Vault {
             }
         }
 
-        let mut fetching = tokio::task::JoinSet::new();
+        // Several downloads in flight at once. They only fetch: opening the
+        // chunks happens below, so one task polling them all loses nothing.
+        let mut fetching = FuturesUnordered::new();
         let mut runs = runs.into_iter();
         loop {
             while fetching.len() < MAX_FETCHES {
@@ -1860,17 +1879,16 @@ impl Vault {
                 let client = self.remote.objects().clone();
                 let range = u64::from(start) * segment_len
                     ..(u64::from(start) + ats.len() as u64) * segment_len;
-                fetching.spawn(async move {
+                fetching.push(async move {
                     let bytes = raft5fs_objstore::http::get_range(&client, &url, range).await;
                     (bytes, ats)
                 });
             }
-            let Some(done) = fetching.join_next().await else {
+            let Some((bytes, ats)) = fetching.next().await else {
                 break;
             };
-            let (bytes, ats) = done.map_err(|e| FsError::new(libc::EIO, e.to_string()))?;
             let bytes = bytes.map_err(|e| {
-                FsError::new(libc::EIO, format!("inode {ino}: fetching a block: {e}"))
+                FsError::new(errno::EIO, format!("inode {ino}: fetching a block: {e}"))
             })?;
             for (sealed, at) in bytes.chunks(segment_len as usize).zip(ats) {
                 chunks[at].body = ChunkBody::Inline(sealed.to_vec());
@@ -1998,7 +2016,7 @@ impl Vault {
                             Rewritten::Stored {
                                 attr: Some(attr), ..
                             } => Ok(attr),
-                            _ => Err(FsError::new(libc::EIO, "a write stored nothing")),
+                            _ => Err(FsError::new(errno::EIO, "a write stored nothing")),
                         }
                     }
                     _ => self.write_batch(&node, ino, group, piece, end).await,
@@ -2104,7 +2122,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("inode {ino}'s chunks kept changing under this write"),
         ))
     }
@@ -2188,7 +2206,7 @@ impl Vault {
             }
         }
         Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("inode {ino}'s last chunk kept changing under this truncate"),
         ))
     }
@@ -2198,27 +2216,73 @@ impl Vault {
 mod tests {
     use super::*;
 
+    fn check_pins_survive_a_reload(open: impl Fn() -> KnownKeys) {
+        let known = open();
+        known.check("alice", &[1; 32]).unwrap();
+        known.check("bob", &[2; 32]).unwrap();
+
+        let again = open();
+        again.check("alice", &[1; 32]).unwrap();
+        assert_eq!(
+            again.check("alice", &[9; 32]).unwrap_err().errno,
+            errno::EPERM
+        );
+        assert_eq!(
+            again.check("alice", &[1; 31]).unwrap_err().errno,
+            errno::EIO
+        );
+
+        // A pin made through another handle reaches this one.
+        let other = open();
+        known.check("carol", &[4; 32]).unwrap();
+        assert_eq!(other.pinned("carol"), Some([4; 32]));
+
+        // Forgetting keeps pins that another handle added since.
+        again.forget("alice").unwrap();
+        let after = open();
+        assert_eq!(after.pinned("carol"), Some([4; 32]));
+        after.check("alice", &[9; 32]).unwrap();
+        assert_eq!(
+            after.check("bob", &[3; 32]).unwrap_err().errno,
+            errno::EPERM
+        );
+    }
+
     #[test]
     fn pinned_keys_survive_a_reload_and_a_different_key_is_refused() {
         let file = std::env::temp_dir().join(format!("raft5fs-known-keys-{}", std::process::id()));
         let _ = std::fs::remove_file(&file);
-        let known = KnownKeys::load(file.clone()).unwrap();
-        known.check("alice", &[1; 32]).unwrap();
-        known.check("bob", &[2; 32]).unwrap();
-
-        let again = KnownKeys::load(file.clone()).unwrap();
-        again.check("alice", &[1; 32]).unwrap();
-        assert_eq!(
-            again.check("alice", &[9; 32]).unwrap_err().errno,
-            libc::EPERM
-        );
-        assert_eq!(again.check("alice", &[1; 31]).unwrap_err().errno, libc::EIO);
-
-        again.forget("alice").unwrap();
-        let after = KnownKeys::load(file.clone()).unwrap();
-        after.check("alice", &[9; 32]).unwrap();
-        assert_eq!(after.check("bob", &[3; 32]).unwrap_err().errno, libc::EPERM);
+        check_pins_survive_a_reload(|| KnownKeys::load(file.clone()).unwrap());
         let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(file.with_file_name(format!(
+            "{}.lock",
+            file.file_name().unwrap().to_str().unwrap()
+        )));
+
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        check_pins_survive_a_reload(|| KnownKeys::open(Arc::clone(&store), "pins").unwrap());
+    }
+
+    #[test]
+    fn pins_from_two_places_at_once_all_land() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let threads: Vec<_> = (0..8u8)
+            .map(|t| {
+                let known = KnownKeys::open(Arc::clone(&store), "pins").unwrap();
+                std::thread::spawn(move || {
+                    for i in 0..10u8 {
+                        known
+                            .check(&format!("u{t}x{i}"), &[t * 10 + i; 32])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let known = KnownKeys::open(store, "pins").unwrap();
+        assert_eq!(known.entries().len(), 80);
     }
 
     #[test]
@@ -2230,7 +2294,7 @@ mod tests {
         let forged = format!("x\nbob {}\ny", to_hex(&[7; 32]));
         assert_eq!(
             known.check(&forged, &[1; 32]).unwrap_err().errno,
-            libc::EINVAL
+            errno::EINVAL
         );
         assert!(known.forget(&forged).is_err());
         known.check("bob", &[2; 32]).unwrap();

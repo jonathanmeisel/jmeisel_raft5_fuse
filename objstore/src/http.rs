@@ -3,14 +3,17 @@
 //! it.
 
 use std::ops::Range;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::{IF_NONE_MATCH, RANGE};
-use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
+#[cfg(not(target_arch = "wasm32"))]
+use rustls::{
+    client::danger::ServerCertVerifier,
+    pki_types::{CertificateDer, pem::PemObject},
+};
 
 use crate::{Error, status_error};
 
@@ -45,6 +48,7 @@ impl Default for HttpConfig {
 /// system's roots and any extra ones, and refuses plaintext unless allowed.
 /// On Android, "the system's roots" are Mozilla's, built in (see
 /// `webpki_verifier`).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut extra = Vec::new();
@@ -78,10 +82,27 @@ pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
         .map_err(|e| Error::Config(format!("HTTP client: {e}")))
 }
 
+/// An HTTP client for the object store in a browser, where requests go
+/// through `fetch` and the browser does TLS against its own roots. So
+/// `extra_roots_pem` can't apply. The page's mixed-content rules refuse
+/// `http://` from an `https://` page, whatever `allow_plaintext` says.
+#[cfg(target_arch = "wasm32")]
+pub fn client(config: &HttpConfig) -> Result<reqwest::Client, Error> {
+    if config.extra_roots_pem.is_some() {
+        return Err(Error::Config(
+            "extra CA: a browser trusts only its own roots".into(),
+        ));
+    }
+    reqwest::Client::builder()
+        .build()
+        .map_err(|e| Error::Config(format!("HTTP client: {e}")))
+}
+
 /// A verifier that trusts Mozilla's roots (`webpki-roots`, built into the
 /// binary) and `extra`. Android checks certificates through Java, which a
 /// plain program, as under Termux, can't reach; this needs nothing from the
 /// system. Elsewhere, `client` uses the system's own verifier.
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn webpki_verifier(
     extra: Vec<CertificateDer<'static>>,

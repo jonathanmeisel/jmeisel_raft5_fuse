@@ -25,11 +25,12 @@
 //! walk is not lost: the node is visited again.
 
 use std::collections::{HashSet, VecDeque};
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsString;
 use std::time::Duration;
 
 use raft5fs_crypto::data::{open_name, seal_chunk, sealed_version};
+use raft5fs_proto::errno;
+use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
     ChunkBody, ChunkWrite, DirItem, FsError, Kind, Layout, RESEAL_NAMES_BATCH, ResealedName,
     WriteBody,
@@ -96,7 +97,7 @@ impl Vault {
                 label: self
                     .identity
                     .open_label(grant.ino, &grant.sealed_label)
-                    .map(OsString::from_vec)
+                    .map(os_bytes::into_name)
                     .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino))),
                 ino: grant.ino,
                 writable: grant.writable,
@@ -136,12 +137,12 @@ impl Vault {
                     queue.extend(children);
                 }
                 // Removed before the walk got to it.
-                Err(e) if e.errno == libc::ENOENT => {}
+                Err(e) if e.errno == errno::ENOENT => {}
                 Err(e) => stats.skipped.push((ino, e)),
             }
             progress(&stats);
             if !pace.is_zero() && !queue.is_empty() {
-                tokio::time::sleep(pace).await;
+                crate::rt::sleep(pace).await;
             }
         }
         stats
@@ -159,12 +160,12 @@ impl Vault {
         let mut last = None;
         for _ in 0..CHANGE_RETRIES {
             match self.prune_node_once(visit, dry_run).await {
-                Err(e) if changed(&e) || expired(&e) || e.errno == libc::EBUSY => last = Some(e),
+                Err(e) if changed(&e) || expired(&e) || e.errno == errno::EBUSY => last = Some(e),
                 other => return other,
             }
         }
         Err(last
-            .unwrap_or_else(|| FsError::new(libc::EAGAIN, format!("inode {ino} kept changing"))))
+            .unwrap_or_else(|| FsError::new(errno::EAGAIN, format!("inode {ino} kept changing"))))
     }
 
     async fn prune_node_once(
@@ -350,13 +351,13 @@ fn reseal_name(node: &Node, dir: u64, item: &DirItem) -> Result<ResealedName, Fs
         &node.name_key,
         dir,
         item.ino,
-        item.name.as_bytes(),
+        os_bytes::bytes(&item.name),
         &item.sealed_name,
     )
     .map_err(|e| corrupt(dir, e))?;
     Ok(ResealedName {
         tag: item.name.clone(),
         ino: item.ino,
-        sealed_name: node.seal(dir, item.ino, &item.name, OsStr::from_bytes(&name)),
+        sealed_name: node.seal(dir, item.ino, &item.name, os_bytes::as_name(&name)),
     })
 }

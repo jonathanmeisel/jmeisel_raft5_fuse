@@ -13,10 +13,14 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+// `std::time::Instant` panics in a browser; this is the same type natively.
+use web_time::Instant;
+
+use raft5fs_proto::errno;
+use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{Attr, FsError};
 
 use crate::session::Session;
@@ -73,8 +77,8 @@ fn components(path: &[u8]) -> Result<Vec<&OsStr>, FsError> {
     for part in path.split(|&b| b == b'/') {
         match part {
             b"" | b"." => {}
-            b".." => return Err(FsError::new(libc::EINVAL, "a path with `..` in it")),
-            name => names.push(OsStr::from_bytes(name)),
+            b".." => return Err(FsError::new(errno::EINVAL, "a path with `..` in it")),
+            name => names.push(os_bytes::as_name(name)),
         }
     }
     Ok(names)
@@ -88,7 +92,7 @@ impl Session {
         match self.walk(&names, true).await {
             // A remembered name could be the one that is now gone. Look up
             // the whole path again.
-            Err(e) if e.errno == libc::ENOENT => {
+            Err(e) if e.errno == errno::ENOENT => {
                 self.dentries.clear();
                 self.walk(&names, false).await
             }
@@ -102,17 +106,17 @@ impl Session {
     pub async fn resolve_parent(&self, path: &[u8]) -> Result<(u64, OsString), FsError> {
         let names = components(path)?;
         let Some((name, above)) = names.split_last() else {
-            return Err(FsError::new(libc::EPERM, "the root has no parent"));
+            return Err(FsError::new(errno::EPERM, "the root has no parent"));
         };
         let parent = match self.walk(above, true).await {
-            Err(e) if e.errno == libc::ENOENT => {
+            Err(e) if e.errno == errno::ENOENT => {
                 self.dentries.clear();
                 self.walk(above, false).await
             }
             other => other,
         }?;
         if parent.kind != raft5fs_proto::types::Kind::Directory {
-            return Err(FsError::errno(libc::ENOTDIR));
+            return Err(FsError::errno(errno::ENOTDIR));
         }
         Ok((parent.ino, name.to_os_string()))
     }
@@ -159,7 +163,7 @@ mod tests {
 
     #[test]
     fn components_refuse_dot_dot() {
-        assert_eq!(components(b"/a/../b").unwrap_err().errno, libc::EINVAL);
+        assert_eq!(components(b"/a/../b").unwrap_err().errno, errno::EINVAL);
     }
 
     #[test]

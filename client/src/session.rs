@@ -21,15 +21,15 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
-use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
-use tonic::transport::ClientTlsConfig;
 
 use crate::paths::Dentries;
 use crate::prune_queue::PruneQueue;
 use crate::pruner::{self, PrunerConfig};
+use crate::remote::ClientTlsConfig;
 use crate::remote::{Credentials, Remote};
+use crate::rt::{self, AbortHandle};
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
 use crate::write_buffer::WriteBuf;
@@ -125,7 +125,7 @@ fn is_apple_double(name: &OsStr) -> bool {
 pub struct Session {
     vault: Arc<Vault>,
     /// The task that works through the prune queue, if there is one.
-    pruner: Mutex<Option<JoinHandle<()>>>,
+    pruner: Mutex<Option<AbortHandle>>,
     /// The virtual root's timestamps: when the session was opened.
     opened_at: SystemTime,
     /// Buffers of writes that were accepted but not stored, one for each
@@ -150,12 +150,16 @@ impl Session {
             .await
             .map_err(|why| {
                 FsError::new(
-                    libc::EHOSTUNREACH,
+                    errno::EHOSTUNREACH,
                     format!("cannot connect to the filesystem: {why}"),
                 )
             })?;
-        let keys =
-            |e: FsError| FsError::new(libc::EACCES, format!("cannot open the account's keys: {e}"));
+        let keys = |e: FsError| {
+            FsError::new(
+                errno::EACCES,
+                format!("cannot open the account's keys: {e}"),
+            )
+        };
         let mut vault = Vault::new(Arc::new(remote))
             .map_err(keys)?
             .with_cache_size(config.cache_bytes)
@@ -168,16 +172,11 @@ impl Session {
                 let pruning = Vault::new(Arc::clone(vault.remote()))
                     .map_err(keys)?
                     .with_known_keys(vault.known_keys().duplicate());
-                Some(pruner::spawn(
-                    &Handle::current(),
-                    pruning,
-                    queue,
-                    prune_config,
-                ))
+                Some(pruner::spawn(pruning, queue, prune_config))
             }
             None => None,
         };
-        let opened_at = SystemTime::now();
+        let opened_at = raft5fs_proto::clock::now();
         Ok(Arc::new(Self {
             vault: Arc::new(vault),
             pruner: Mutex::new(pruner),
@@ -269,8 +268,8 @@ impl Session {
     ///   correctness never depends on this timer.
     fn schedule_auto_flush(&self, slot: Slot) {
         let vault = Arc::clone(&self.vault);
-        tokio::spawn(async move {
-            tokio::time::sleep(AUTO_FLUSH_DELAY).await;
+        rt::spawn(async move {
+            rt::sleep(AUTO_FLUSH_DELAY).await;
             let mut buf = slot.lock().await;
             let Some((start, data)) = buf.take() else {
                 return;
@@ -501,7 +500,7 @@ impl Session {
             return Err(read_only());
         }
         if ino == VIRTUAL_ROOT {
-            return Err(FsError::errno(libc::EPERM));
+            return Err(FsError::errno(errno::EPERM));
         }
         // Buffered bytes are older than this change, so they must be stored
         // before it. A truncate must cut them, and not be undone when they
@@ -541,7 +540,7 @@ impl Session {
             return Err(read_only());
         }
         if parent == VIRTUAL_ROOT {
-            return Err(FsError::errno(libc::EPERM));
+            return Err(FsError::errno(errno::EPERM));
         }
         let ino = self.vault.unlink(parent, name).await;
         self.dentries.forget(parent, name);
@@ -567,12 +566,12 @@ impl Session {
         // a snapshot, nothing moves.
         match (is_snapshot_ino(parent), is_snapshot_ino(new_parent)) {
             (true, true) => return Err(read_only()),
-            (true, false) | (false, true) => return Err(FsError::errno(libc::EXDEV)),
+            (true, false) | (false, true) => return Err(FsError::errno(errno::EXDEV)),
             (false, false) => {}
         }
         // The virtual root's entries are grants, not names that can move.
         if parent == VIRTUAL_ROOT || new_parent == VIRTUAL_ROOT {
-            return Err(FsError::errno(libc::EPERM));
+            return Err(FsError::errno(errno::EPERM));
         }
         let renamed = self
             .vault
@@ -597,11 +596,11 @@ impl Session {
             return Err(read_only());
         }
         if parent == VIRTUAL_ROOT {
-            return Err(FsError::errno(libc::EPERM));
+            return Err(FsError::errno(errno::EPERM));
         }
         if self.hide_apple_double && is_apple_double(name) {
             return Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 "macOS metadata files are not stored here",
             ));
         }
@@ -626,7 +625,7 @@ impl Session {
     /// again on their own, so nothing is kept open.
     pub async fn open_file(&self, ino: u64, mask: u32) -> Result<(), FsError> {
         if ino == VIRTUAL_ROOT {
-            return Err(FsError::errno(libc::EISDIR));
+            return Err(FsError::errno(errno::EISDIR));
         }
         self.access(ino, mask).await
     }
@@ -639,7 +638,7 @@ impl Session {
             self.vault.read(ino, offset, len).await
         };
         if let Err(e) = &read
-            && e.errno != libc::ENOENT
+            && e.errno != errno::ENOENT
         {
             eprintln!("read from inode {ino} at offset {offset} failed: {e}");
         }
@@ -716,7 +715,7 @@ impl Session {
     pub async fn copy_file(&self, src: u64, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
         let from = self.getattr(src).await?;
         if from.kind != Kind::File {
-            return Err(FsError::errno(libc::EISDIR));
+            return Err(FsError::errno(errno::EISDIR));
         }
         let to = self.create(parent, name, from.perm).await?.ino;
         let mut offset = 0;

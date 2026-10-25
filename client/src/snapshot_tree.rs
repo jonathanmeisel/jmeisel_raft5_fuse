@@ -17,9 +17,15 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SnapshotInfo};
 
 use crate::vault::{SNAPSHOT_DIR, Vault};
+
+/// access(2)'s bit for writing: 2 on every system (POSIX leaves the value
+/// open, but Linux and the BSDs agree), and named here for builds without
+/// `libc`.
+const W_OK: u32 = 2;
 
 /// The first inode number on the snapshots' side, for `/.snapshot` itself.
 /// Every number below it belongs to the live filesystem.
@@ -37,11 +43,11 @@ pub fn is_snapshot_dir(name: &OsStr) -> bool {
 
 /// The error for every change asked of a snapshot.
 pub fn read_only() -> FsError {
-    FsError::new(libc::EROFS, "a snapshot is read-only")
+    FsError::new(errno::EROFS, "a snapshot is read-only")
 }
 
 fn stale() -> FsError {
-    FsError::new(libc::ENOENT, "that snapshot is gone")
+    FsError::new(errno::ENOENT, "that snapshot is gone")
 }
 
 /// One snapshot that this mount has opened.
@@ -123,11 +129,11 @@ impl SnapshotTree {
 
     /// Snapshot `name`, as the servers list it now.
     async fn open(&self, live: &Vault, name: &OsStr) -> Result<Arc<Snap>, FsError> {
-        let name = name.to_str().ok_or_else(|| FsError::errno(libc::ENOENT))?;
+        let name = name.to_str().ok_or_else(|| FsError::errno(errno::ENOENT))?;
         let listed = live.remote().list_snapshots().await?;
         let Some(info) = listed.into_iter().find(|s| s.name == name) else {
             self.inodes.lock().unwrap().by_name.remove(name);
-            return Err(FsError::errno(libc::ENOENT));
+            return Err(FsError::errno(errno::ENOENT));
         };
         Ok(self.snap(live, info))
     }
@@ -216,7 +222,7 @@ impl SnapshotTree {
 
     /// access(2): allows anything except writing.
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
-        if mask & libc::W_OK as u32 != 0 {
+        if mask & W_OK != 0 {
             return Err(read_only());
         }
         match self.target(ino)? {
@@ -227,7 +233,7 @@ impl SnapshotTree {
 
     pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         match self.target(ino)? {
-            Target::List | Target::Root(_) => Err(FsError::errno(libc::EISDIR)),
+            Target::List | Target::Root(_) => Err(FsError::errno(errno::EISDIR)),
             Target::Node(snap, node) => snap.vault.read(node, offset, len).await,
         }
     }

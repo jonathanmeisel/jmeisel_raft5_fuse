@@ -57,6 +57,8 @@ impl WriteBuf {
 
 #[cfg(test)]
 mod tests {
+    use raft5fs_proto::errno;
+
     use super::*;
 
     #[test]
@@ -85,7 +87,7 @@ mod tests {
     fn discard_clears_data_and_error() {
         let mut b = WriteBuf::default();
         b.append(0, b"abc");
-        b.err = Some(FsError::errno(libc::EIO));
+        b.err = Some(FsError::errno(errno::EIO));
         b.discard();
         assert!(b.is_empty());
         assert_eq!(b.err, None);
