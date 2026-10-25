@@ -1,6 +1,9 @@
 <script>
   // The app's screens: log in, enrol, then the files. Logging out, or 30
-  // minutes without input, ends the Worker, which drops every key.
+  // minutes without input, ends the Worker, which drops every key. A
+  // device that stays unlocked (an opt-in at login) logs back in by itself
+  // when the app opens, has no idle logout, and forgets the account when
+  // the user logs out.
   import { onDestroy } from "svelte";
   import { connect } from "./lib/rpc.js";
   import Login from "./components/Login.svelte";
@@ -9,7 +12,7 @@
 
   const IDLE_MS = 30 * 60 * 1000;
 
-  let screen = $state("login");
+  let screen = $state("starting");
   let fs = $state(null);
   let me = $state(null);
   let notice = $state("");
@@ -25,7 +28,8 @@
     me = who;
     notice = "";
     screen = "files";
-    // Ask the browser not to evict the pins and the prune queue.
+    // Ask the browser not to evict the pins, the prune queue, and any
+    // remembered account.
     try {
       await navigator.storage?.persist?.();
     } catch {}
@@ -45,9 +49,27 @@
     }
   }
 
+  /// Logs the remembered account back in, if this device has one.
+  async function start() {
+    const session = worker();
+    try {
+      const who = await session.resume();
+      if (who) return loggedIn(session, who);
+      session.kill();
+    } catch (e) {
+      session.kill();
+      notice =
+        e.code === "EHOSTUNREACH"
+          ? `Couldn't reach the servers to unlock: ${e.message}`
+          : `Log in again: ${e.message}`;
+    }
+    screen = "login";
+  }
+  start();
+
   let idleTimer = null;
   function resetIdle() {
-    if (!fs) return;
+    if (!fs || me?.remembered) return;
     clearTimeout(idleTimer);
     idleTimer = setTimeout(
       () => logout("Logged out after 30 minutes without use."),
@@ -60,7 +82,9 @@
   onDestroy(() => clearTimeout(idleTimer));
 </script>
 
-{#if screen === "files" && fs}
+{#if screen === "starting"}
+  <main class="card"><p class="note">Opening…</p></main>
+{:else if screen === "files" && fs}
   <Files {fs} {me} {storageError} onlogout={() => logout()} />
 {:else}
   <main class="card">

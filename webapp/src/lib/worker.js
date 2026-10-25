@@ -6,12 +6,17 @@
 // - One tab at a time per account: login takes a Web Lock named for the
 //   filesystem and user, held until the Worker ends. The pins and the
 //   prune queue in IndexedDB then have one writer.
-// - IndexedDB keeps only pins and the prune queue, under
-//   `<fsId>/<user>/<name>`. Nothing secret is stored.
+// - IndexedDB keeps pins and the prune queue, under `<fsId>/<user>/<name>`.
+// - With "stay unlocked", it also keeps the account's unlock keys (what a
+//   password gives a login), for one account per filesystem and for
+//   REMEMBER_MS. They are encrypted (AES-GCM) under a key that WebCrypto
+//   made non-extractable: scripts on this origin can use it, but nothing
+//   can read it out of the browser. Logging out deletes them.
 import init, * as wasm from "../wasm/raft5fs_web.js";
 
 const config = __RAFT5FS_CONFIG__;
 const PIECE = 4 << 20;
+const REMEMBER_MS = 7 * 24 * 60 * 60 * 1000;
 let ready = null;
 let fs = null;
 
@@ -19,8 +24,12 @@ let fs = null;
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("raft5fs", 1);
-    request.onupgradeneeded = () => request.result.createObjectStore("blobs");
+    const request = indexedDB.open("raft5fs", 2);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs");
+      if (!db.objectStoreNames.contains("unlock")) db.createObjectStore("unlock");
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
@@ -65,6 +74,61 @@ function persister(db, prefix) {
   };
 }
 
+async function getRecord(db, store, key) {
+  const transaction = db.transaction(store, "readonly");
+  const request = transaction.objectStore(store).get(key);
+  await done(transaction);
+  return request.result;
+}
+
+async function putRecord(db, store, key, value) {
+  const transaction = db.transaction(store, "readwrite");
+  if (value === undefined) transaction.objectStore(store).delete(key);
+  else transaction.objectStore(store).put(value, key);
+  await done(transaction);
+}
+
+/// What the encryption binds the keys to, so a record can't be moved to
+/// another account or given a later expiry.
+const aad = (user, expires) => new TextEncoder().encode(`raft5fs-unlock:1:${config.fsId}:${user}:${expires}`);
+
+async function remember(db, user, keys) {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const expires = Date.now() + REMEMBER_MS;
+  const sealed = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: aad(user, expires) },
+    key,
+    keys,
+  );
+  keys.fill(0);
+  await putRecord(db, "unlock", config.fsId, { user, key, iv, sealed, expires });
+}
+
+/// The remembered account and its keys, or null. Drops an expired record.
+async function recall(db) {
+  const record = await getRecord(db, "unlock", config.fsId);
+  if (!record) return null;
+  if (!(record.expires > Date.now())) {
+    await putRecord(db, "unlock", config.fsId, undefined);
+    return null;
+  }
+  try {
+    const keys = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: record.iv, additionalData: aad(record.user, record.expires) },
+      record.key,
+      record.sealed,
+    );
+    return { user: record.user, keys: new Uint8Array(keys), expires: record.expires };
+  } catch {
+    await putRecord(db, "unlock", config.fsId, undefined);
+    return null;
+  }
+}
+
 /// Holds the account's lock until the Worker ends. False if another tab
 /// holds it.
 function takeLock(name) {
@@ -75,6 +139,14 @@ function takeLock(name) {
       return lock ? new Promise(() => {}) : null;
     });
   });
+}
+
+async function lock(user) {
+  if (!(await takeLock(`raft5fs:${config.fsId}:${user}`))) {
+    throw Object.assign(new Error(`${user} is already open in another tab or window`), {
+      code: "EBUSY",
+    });
+  }
 }
 
 // ----------------------------------------------------------------- methods
@@ -89,18 +161,39 @@ const methods = {
     return wasm.enrol(config, invitation, password);
   },
 
-  async login(user, password) {
-    if (!(await takeLock(`raft5fs:${config.fsId}:${user}`))) {
-      throw Object.assign(
-        new Error(`${user} is already open in another tab or window`),
-        { code: "EBUSY" },
-      );
-    }
+  /// Logs in. With `stay`, remembers the account on this device; without
+  /// it, forgets any account remembered here.
+  async login(user, password, stay) {
+    await lock(user);
     const db = await openDb();
     const prefix = `${config.fsId}/${user}/`;
     const blobs = await loadBlobs(db, prefix);
     fs = await wasm.login(config, user, password, blobs, persister(db, prefix));
-    return fs.whoami();
+    if (stay) await remember(db, user, fs.unlockKeys());
+    else await putRecord(db, "unlock", config.fsId, undefined);
+    return { ...fs.whoami(), remembered: !!stay };
+  },
+
+  /// Logs the remembered account in, if there is one; else null. Forgets
+  /// it if the servers refuse it (its password changed), but not if they
+  /// can't be reached.
+  async resume() {
+    const db = await openDb();
+    const remembered = await recall(db);
+    if (!remembered) return null;
+    const { user, keys } = remembered;
+    await lock(user);
+    const prefix = `${config.fsId}/${user}/`;
+    const blobs = await loadBlobs(db, prefix);
+    try {
+      fs = await wasm.resume(config, user, keys, blobs, persister(db, prefix));
+    } catch (e) {
+      if (e.code !== "EHOSTUNREACH") await putRecord(db, "unlock", config.fsId, undefined);
+      throw e;
+    } finally {
+      keys.fill(0);
+    }
+    return { ...fs.whoami(), remembered: true };
   },
 
   checkNewPassword: (password) => wasm.checkNewPassword(password),
@@ -174,9 +267,11 @@ const methods = {
   resumePruning: () => session().resumePruning(),
   pruning: () => session().pruning,
 
+  /// Logs out, and forgets the account if this device remembered it.
   async logout() {
     if (fs) await fs.logout();
     fs = null;
+    await putRecord(await openDb(), "unlock", config.fsId, undefined);
   },
 };
 

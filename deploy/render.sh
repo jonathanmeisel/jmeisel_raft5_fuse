@@ -34,6 +34,22 @@ if [[ -n ${BACKUP_BUCKET:-} ]]; then
     [[ $BACKUP_BUCKET != "${S3_BUCKET:-}" ]] || die "BACKUP_BUCKET must not be S3_BUCKET"
     backup_options >/dev/null
 fi
+# The web port (README "Web app"). Off unless WEB_ORIGIN is set.
+WEB_PORT=${WEB_PORT:-27061}
+if web_enabled; then
+    [[ $WEB_ORIGIN =~ ^https://[a-z0-9.-]+(:[0-9]+)?$ ]] ||
+        die "WEB_ORIGIN ($WEB_ORIGIN) must be the web app's origin, like https://app.example.com (lowercase, no path)"
+    [[ $WEB_PORT =~ ^[0-9]+$ && $WEB_PORT != 27060 ]] || die "WEB_PORT ($WEB_PORT) must be a port other than 27060"
+    [[ -n ${LETSENCRYPT_EMAIL:-} ]] || die "WEB_ORIGIN is set: set LETSENCRYPT_EMAIL too, for Let's Encrypt's notices"
+    for node in $(node_names); do
+        [[ $(node_field "$node" 4) != - ]] ||
+            die "WEB_ORIGIN is set: give $node a DNS name in NODES; its web certificate is for that name"
+    done
+    [[ -f $SECRETS/do-dns.env ]] ||
+        die "WEB_ORIGIN is set: add a DigitalOcean API token for the nodes' DNS zone with ./secrets.sh edit do-dns.env (README \"Web app\")"
+    grep -q '^DIGITALOCEAN_TOKEN=.' "$SECRETS/do-dns.env" || die "secrets/do-dns.env has no DIGITALOCEAN_TOKEN="
+fi
+
 # Node hardening (README "Creating and deploying a new cluster"). Off unless
 # set.
 ADMIN_USER=${ADMIN_USER:-}
@@ -71,6 +87,7 @@ fill() {
         -e "s|@INVITE_SERVERS@|$(invite_servers)|g" \
         -e "s|@OBJECT_OPTIONS@|$(object_options)|g" \
         -e "s|@BACKUP_OPTIONS@|$(backup_options)|g" \
+        -e "s|@WEB_OPTIONS@|$(web_options)|g" \
         -e "s|@BACKUP_KEEP@|$BACKUP_KEEP|g" \
         -e "s|@BACKUP_TIME@|$(backup_time "$2")|g" \
         "$DEPLOY/templates/$1"
@@ -91,7 +108,7 @@ render() {
         die "no certificate for $node: run ./certs.sh after adding it to cluster.conf"
     umask 077
     rm -rf "$dir"
-    mkdir -p "$dir"/{bin,raft5,raft5fs,systemd,sbin,harden}
+    mkdir -p "$dir"/{bin,raft5,raft5fs,systemd,sbin,harden,web}
 
     cp "$OUT/bin/"{raft5-server,raft,raft5fs-server} "$dir/bin/"
 
@@ -118,6 +135,14 @@ render() {
         if [[ -f $SECRETS/backup-ca.pem ]]; then
             cp "$SECRETS/backup-ca.pem" "$dir/raft5fs/"
         fi
+    fi
+
+    # The web port's certificate: certbot's token for the DNS check (only
+    # root reads it on the node), and the hook that installs renewals.
+    if web_enabled; then
+        sed -n 's/^DIGITALOCEAN_TOKEN=/dns_digitalocean_token = /p' "$SECRETS/do-dns.env" \
+            >"$dir/web/digitalocean.ini"
+        cp "$DEPLOY/templates/raft5fs-web-cert" "$dir/web/"
     fi
 
     # Only the first node bootstraps the cluster, and only it needs the
@@ -183,6 +208,10 @@ render() {
         echo "SSH_HARDEN=$SSH_HARDEN"
         echo "NIGHTLY_BACKUPS=$NIGHTLY_BACKUPS"
         echo "SWAP_SIZE=$SWAP_SIZE"
+        echo "WEB=$(web_enabled && echo yes || echo no)"
+        echo "WEB_PORT=$WEB_PORT"
+        echo "WEB_NAME=$(node_field "$node" 4)"
+        echo "LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}"
     } >"$dir/node.conf"
     echo "rendered $dir"
 }

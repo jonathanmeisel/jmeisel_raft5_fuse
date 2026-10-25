@@ -1,11 +1,15 @@
 #!/bin/sh
 # raft5fs-cert-check [DAYS]: fails, and names them, if any certificate that
-# the servers use expires within DAYS days (default 30).
+# the servers use expires within DAYS days (default 30). The web port's
+# (web.pem) counts only within 14: certbot renews it 30 days before it
+# expires.
 days=${1:-30}
 status=0
 for pem in /etc/raft5/*.pem /etc/raft5fs/*.pem; do
     [ -f "$pem" ] || continue
-    if ! openssl x509 -in "$pem" -noout -checkend $((days * 86400)) >/dev/null; then
+    within=$days
+    case $pem in */web.pem) [ "$within" -lt 14 ] || within=14 ;; esac
+    if ! openssl x509 -in "$pem" -noout -checkend $((within * 86400)) >/dev/null; then
         echo "$pem expires $(openssl x509 -in "$pem" -noout -enddate | cut -d= -f2)" >&2
         status=1
     fi

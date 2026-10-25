@@ -27,12 +27,13 @@ use futures_util::future::{AbortHandle, LocalBoxFuture, join_all};
 use js_sys::{Function, Promise, Uint8Array};
 use raft5fs_client::prune_queue::PruneQueue;
 use raft5fs_client::pruner::{self, PrunerConfig};
-use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote};
+use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault};
 use raft5fs_crypto::identity::{PUBLIC_KEY_LEN, fingerprint, fingerprint_words};
-use raft5fs_crypto::password::{KdfParams, check_new_password};
+use raft5fs_crypto::password::{AUTH_LEN, KdfParams, check_new_password};
+use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::os_bytes;
@@ -40,6 +41,7 @@ use raft5fs_proto::types::{Attr, FsError, Kind, SetAttr};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+use zeroize::Zeroizing;
 
 use crate::store::BrowserStore;
 
@@ -227,6 +229,42 @@ pub async fn login(
     persist: Function,
 ) -> Result<Fs, JsValue> {
     let config = Config::parse(config)?;
+    let credentials = config.credentials(username, password);
+    open(config, credentials, stored, persist).await
+}
+
+/// Logs `username` in with `keys`, from an earlier session's `unlockKeys`,
+/// for a device that stays unlocked. Fails as a login with a wrong
+/// password would once the password has changed.
+#[wasm_bindgen]
+pub async fn resume(
+    config: JsValue,
+    username: String,
+    keys: Vec<u8>,
+    stored: js_sys::Map,
+    persist: Function,
+) -> Result<Fs, JsValue> {
+    let config = Config::parse(config)?;
+    let keys = Zeroizing::new(keys);
+    let (auth, kek) = keys
+        .split_first_chunk::<AUTH_LEN>()
+        .and_then(|(auth, rest)| Some((*auth, <[u8; KEY_LEN]>::try_from(rest).ok()?)))
+        .ok_or_else(|| failure("EINVAL", "the remembered keys are malformed"))?;
+    let mut credentials = config.credentials(username, String::new());
+    credentials.keys = Some(UnlockKeys {
+        auth: Zeroizing::new(auth),
+        kek: Key::from_bytes(kek),
+    });
+    open(config, credentials, stored, persist).await
+}
+
+/// A session for `credentials`, with this browser's pins and prune queue.
+async fn open(
+    config: Config,
+    credentials: Credentials,
+    stored: js_sys::Map,
+    persist: Function,
+) -> Result<Fs, JsValue> {
     let mut blobs = HashMap::new();
     stored.for_each(&mut |value, key| {
         if let (Some(name), Some(bytes)) = (key.as_string(), value.dyn_ref::<Uint8Array>()) {
@@ -238,10 +276,7 @@ pub async fn login(
         .map_err(|e| failure("EIO", &format!("the pinned keys in this browser: {e}")))?;
     let queue = PruneQueue::new(store);
 
-    let mut session_config = SessionConfig::new(
-        config.servers.clone(),
-        config.credentials(username, password),
-    );
+    let mut session_config = SessionConfig::new(config.servers.clone(), credentials);
     session_config.tls = config.tls();
     session_config.known_keys = Some(known);
     let session = Session::open(session_config).await.map_err(fs_failure)?;
@@ -418,6 +453,22 @@ impl Fs {
             user: remote.username().to_string(),
             fingerprint: Fingerprint::of(&identity.public_key()),
         })
+    }
+
+    /// What logs this account in without its password, for `resume`: 64
+    /// bytes, as secret as the password while it is unchanged. The app
+    /// stores them only encrypted under a key that can't leave the browser.
+    #[wasm_bindgen(js_name = unlockKeys)]
+    pub fn unlock_keys(&self) -> Result<Vec<u8>, JsValue> {
+        let keys = self
+            .0
+            .vault()
+            .remote()
+            .unlock_keys()
+            .ok_or_else(|| failure("EACCES", "not logged in"))?;
+        let mut bytes = keys.auth.to_vec();
+        bytes.extend_from_slice(keys.kek.as_bytes());
+        Ok(bytes)
     }
 
     /// The entries of directory `path`, without `.` and `..`. The root also

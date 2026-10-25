@@ -1,5 +1,6 @@
-# Tests the workspace, builds the `raft5fs` client for each platform, and
-# on a v* tag publishes the binaries as a release.
+# Tests the workspace, builds the `raft5fs` client for each platform and the
+# web app, and on a v* tag publishes the binaries as a release and the web
+# app on GitHub Pages.
 #
 # - test:    formatting, clippy (also of the client for browsers), the
 #            whole test suite (FUSE mounts included); on a tag, that the
@@ -7,8 +8,18 @@
 # - build:   only once the tests pass. Each binary is its own workflow
 #            artifact. Linux has FUSE (`mount`) and WebDAV; macOS and
 #            Android have WebDAV only (no FUSE to build against).
+# - web:     the web app: its browser tests (headless Chromium, against a
+#            filesystem on the runner), then the site for
+#            webapp/config/prod.json, as a Pages artifact.
 # - release: on a v* tag only: attaches each binary, and SHA256SUMS, to
 #            the release named after the tag.
+# - pages:   on a v* tag only, once the repository variable PAGES is
+#            "on": publishes the web app (deploy/README.md "Web app").
+#
+# The web app's code is whatever this workflow publishes, so it is part of
+# the app's supply chain: each job gets only the permissions it needs,
+# third-party actions are pinned to commits (Dependabot proposes updates),
+# and only the protected github-pages environment can publish.
 #
 # The servers aren't built here: deploy/build.sh builds them from source.
 name: release
@@ -26,6 +37,7 @@ on:
       - "proto/proto/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "webapp/**"
       - ".github/workflows/release.yml"
   pull_request:
   workflow_dispatch:
@@ -35,7 +47,7 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,14 +56,14 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install FUSE
         # The runner's package list can be older than the mirror: refresh it.
         run: sudo apt-get update -q && sudo apt-get install -y fuse3 libfuse3-dev pkg-config
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: The tag matches the Cargo version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -66,7 +78,7 @@ jobs:
       - name: The client builds for browsers
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo clippy -p raft5fs-client --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy -p raft5fs-client -p raft5fs-web --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test
 
   build:
@@ -91,8 +103,8 @@ jobs:
     env:
       BINARY: raft5fs-${{ matrix.name }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install FUSE headers
@@ -103,7 +115,7 @@ jobs:
         run: |
           rustup target add aarch64-linux-android
           cargo install cargo-ndk --locked
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Test the errno translation
@@ -121,17 +133,57 @@ jobs:
           fi
           cp "target/${{ matrix.target }}/release/raft5fs" "$BINARY"
           file "$BINARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ env.BINARY }}
           path: ${{ env.BINARY }}
+
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: web
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - name: The wasm target and the wasm-bindgen CLI that web/Cargo.toml pins
+        run: |
+          rustup target add wasm32-unknown-unknown
+          version=$(sed -n 's/^wasm-bindgen = "=\(.*\)"/\1/p' ../web/Cargo.toml)
+          if [ "$(wasm-bindgen --version 2>/dev/null)" != "wasm-bindgen $version" ]; then
+            cargo install --locked wasm-bindgen-cli --version "$version"
+          fi
+      - run: npm ci
+      - run: npm run wasm
+      - name: Browser tests
+        run: |
+          cargo build -p raft5fs-testkit --example web_dev
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - name: Build the site
+        run: npx vite build
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: webapp/dist
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -146,3 +198,18 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --title "raft5fs $GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" raft5fs-* SHA256SUMS --clobber
+
+  pages:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PAGES == 'on'
+    needs: [test, web]
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    # Its deployment rules (repository settings) allow only v* tags.
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

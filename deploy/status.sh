@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One look at the cluster's health, since nothing alerts yet. For each node:
 # its services, failed units, a pending reboot, certificate expiry, disk,
-# memory and swap, and the nightly backup timer. For the cluster: the
+# memory and swap, and the nightly backup timer. With the web app on, its
+# web port, as a browser on the app's page sees it. For the cluster: the
 # newest backup and the number of snapshots. With the secrets unlocked, it
 # also checks for drift (install.sh --dry-run). Exits 1 if anything needs
 # attention, and lists what.
@@ -26,13 +27,18 @@ echo "services=$(systemctl is-active raft5-server raft5fs-server | paste -sd/)"
 echo "failed=$(systemctl --failed --no-legend --plain | awk "{print \$1}" | paste -sd" ")"
 [ -f /var/run/reboot-required ] && echo reboot=yes || echo reboot=no
 min=
+web=
 for pem in /etc/raft5/*.pem /etc/raft5fs/*.pem; do
     [ -f "$pem" ] || continue
     end=$(openssl x509 -in "$pem" -noout -enddate | cut -d= -f2)
     days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
-    if [ -z "$min" ] || [ "$days" -lt "$min" ]; then min=$days; fi
+    case $pem in
+    */web.pem) web=$days ;;
+    *) if [ -z "$min" ] || [ "$days" -lt "$min" ]; then min=$days; fi ;;
+    esac
 done
 echo "certdays=$min"
+echo "webdays=$web"
 echo "disk=$(df --output=pcent / | tail -1 | tr -d " %")"
 echo "memfree=$(awk "/MemAvailable/ {print int(\$2 / 1024)}" /proc/meminfo)"
 echo "swap=$(awk "/SwapTotal/ {print int(\$2 / 1024)}" /proc/meminfo)"
@@ -83,6 +89,27 @@ for node in $(node_names); do
     if [[ -n ${f[certdays]} ]] && ((f[certdays] < 30)); then
         problem "$node: a certificate expires in ${f[certdays]} days (README \"Rotating certificates\")"
     fi
+    web=""
+    if web_enabled; then
+        # certbot renews it 30 days before it expires.
+        if [[ -z ${f[webdays]} ]]; then
+            problem "$node: no web certificate (journalctl -u certbot)"
+        elif ((f[webdays] < 14)); then
+            problem "$node: the web certificate expires in ${f[webdays]} days, so certbot isn't renewing it (journalctl -u certbot)"
+        fi
+        # A CORS preflight, as a browser on the app's page sends before a
+        # request: it needs TLS with a public certificate, the server, and
+        # the right origin.
+        url="https://$(public_address "$node"):${WEB_PORT:-27061}/raft5fs.Fs/Hello"
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X OPTIONS \
+            -H "Origin: $WEB_ORIGIN" -H 'Access-Control-Request-Method: POST' "$url") || true
+        if [[ $code == 200 ]]; then
+            web="  web ok ${f[webdays]}d"
+        else
+            web="  web FAILED"
+            problem "$node: the web port doesn't answer the app's origin (HTTP ${code:-none} from $url)"
+        fi
+    fi
     ((f[disk] < 80)) || problem "$node: disk ${f[disk]}% full"
     ((f[memfree] >= 150)) || notes+=("low memory")
     ((f[swap] > 0)) || notes+=("no swap")
@@ -91,9 +118,9 @@ for node in $(node_names); do
         [[ ${f[nightlyresult]} == success ]] ||
             problem "$node: last nightly backup run: ${f[nightlyresult]} (journalctl -u raft5fs-nightly-backup)"
     fi
-    printf '%-8s %-6s services %-13s disk %3s%%  mem %4sM free  swap %4sM  certs %sd  reboot %-3s  nightly %s%s\n' \
+    printf '%-8s %-6s services %-13s disk %3s%%  mem %4sM free  swap %4sM  certs %sd  reboot %-3s  nightly %s%s%s\n' \
         "$node" "$([[ ${#problems[@]} -eq "$before" ]] && echo ok || echo CHECK)" "${f[services]}" "${f[disk]}" \
-        "${f[memfree]}" "${f[swap]}" "${f[certdays]:-?}" "${f[reboot]}" "${f[nightly]}" \
+        "${f[memfree]}" "${f[swap]}" "${f[certdays]:-?}" "${f[reboot]}" "${f[nightly]}" "$web" \
         "${notes[*]:+  (${notes[*]})}"
 
     if [[ $want == cluster ]]; then

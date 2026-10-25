@@ -187,6 +187,21 @@ backup_options() {
     printf -- '--backup-public-key /etc/raft5fs/backup.pub '
 }
 
+# Whether the servers have a web port for the web app (cluster.conf's
+# WEB_ORIGIN).
+web_enabled() {
+    [[ -n ${WEB_ORIGIN:-} ]]
+}
+
+# raft5fs-server's web port options, from cluster.conf. None unless
+# WEB_ORIGIN is set. The certificate is Let's Encrypt's, which certbot
+# keeps renewed on the node (templates/raft5fs-web-cert).
+web_options() {
+    web_enabled || return 0
+    printf -- '--web-listen 0.0.0.0:%s --web-origin %s ' "${WEB_PORT:-27061}" "$WEB_ORIGIN"
+    printf -- '--web-tls-cert /etc/raft5fs/web.pem --web-tls-key /etc/raft5fs/web.key '
+}
+
 # The address that users connect to for node $1.
 public_address() {
     local name

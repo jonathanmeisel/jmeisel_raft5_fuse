@@ -1,8 +1,9 @@
 # The raft5fs filesystem server on @NODE@. deploy/render.sh renders this
-# file. The server is stateless: it serves users on the public port and
-# keeps everything in the store, through whichever store node answers. So it
-# needs the store to run, but not this node's store node. It cannot log in
-# until the store is bootstrapped, so systemd restarts it until then.
+# file. The server is stateless: it serves users on the public port (and
+# browsers on the web port, with the web app on) and keeps everything in
+# the store, through whichever store node answers. So it needs the store
+# to run, but not this node's store node. It cannot log in until the store
+# is bootstrapped, so systemd restarts it until then.
 [Unit]
 Description=raft5fs filesystem server
 After=raft5-server.service wg-quick@wg0.service network-online.target
@@ -20,7 +21,7 @@ EnvironmentFile=/etc/raft5fs/store.env
 ExecStart=/usr/local/bin/raft5fs-server --listen 0.0.0.0:27060 \
     --token-key-file /etc/raft5fs/token.key \
     --tls-cert /etc/raft5fs/fs.pem --tls-key /etc/raft5fs/fs.key \
-    --chunk-size @CHUNK_SIZE@ @OBJECT_OPTIONS@\
+    --chunk-size @CHUNK_SIZE@ @OBJECT_OPTIONS@@WEB_OPTIONS@\
     --store-user raft5fs --store-ca /etc/raft5fs/internal-ca.pem \
     --store-cert /etc/raft5fs/node.pem --store-key /etc/raft5fs/node.key \
     @SEEDS@

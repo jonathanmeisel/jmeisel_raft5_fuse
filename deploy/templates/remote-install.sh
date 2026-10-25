@@ -42,7 +42,10 @@ act() {
 
 # -- packages and users -------------------------------------------------
 missing=""
-for pkg in wireguard-tools ufw openssl unattended-upgrades; do
+packages="wireguard-tools ufw openssl unattended-upgrades"
+# Let's Encrypt, for the web port's certificate.
+[ "$WEB" = yes ] && packages="$packages certbot python3-certbot-dns-digitalocean"
+for pkg in $packages; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
 done
 if [ -n "$missing" ]; then
@@ -149,6 +152,41 @@ else
     # The bootstrap login stops working once the cluster exists.
     unput /etc/raft5/bootstrap.env raft5-server
     unput /etc/raft5/admin.pw raft5-server
+fi
+
+# -- the web port's certificate ---------------------------------------------
+# Let's Encrypt's, for this node's DNS name, under the fixed name
+# raft5fs-web. certbot proves the name through DigitalOcean DNS (a TXT
+# record), with a token only root can read, and renews it by itself
+# (certbot.timer); the deploy hook then installs the renewal.
+live=/etc/letsencrypt/live/raft5fs-web
+if [ "$WEB" = yes ]; then
+    for d in /etc/letsencrypt /etc/letsencrypt/renewal-hooks /etc/letsencrypt/renewal-hooks/deploy; do
+        [ -d "$d" ] || act install -d -m 0755 -o root -g root "$d"
+    done
+    put web/digitalocean.ini /etc/letsencrypt/digitalocean.ini 0600 root:root certbot
+    put web/raft5fs-web-cert /etc/letsencrypt/renewal-hooks/deploy/raft5fs-web-cert 0755 root:root certbot
+    # A certificate for this name, unless there is one already.
+    if ! openssl x509 -in "$live/cert.pem" -noout -ext subjectAltName 2>/dev/null |
+        tr -s ', ' '\n' | grep -qxF "DNS:$WEB_NAME"; then
+        if $dry; then
+            say "would get a Let's Encrypt certificate for $WEB_NAME"
+            would=true
+        else
+            say "getting a Let's Encrypt certificate for $WEB_NAME"
+            certbot certonly --non-interactive --agree-tos --no-eff-email \
+                --email "$LETSENCRYPT_EMAIL" --cert-name raft5fs-web -d "$WEB_NAME" \
+                --dns-digitalocean --dns-digitalocean-credentials /etc/letsencrypt/digitalocean.ini \
+                --dns-digitalocean-propagation-seconds 60
+        fi
+    fi
+    if [ -f "$live/fullchain.pem" ]; then
+        put "$live/fullchain.pem" /etc/raft5fs/web.pem 0640 root:raft5fs raft5fs-server
+        put "$live/privkey.pem" /etc/raft5fs/web.key 0640 root:raft5fs raft5fs-server
+    fi
+else
+    unput /etc/raft5fs/web.pem raft5fs-server
+    unput /etc/raft5fs/web.key raft5fs-server
 fi
 
 put wg0.conf /etc/wireguard/wg0.conf 0600 root:root wg0
@@ -307,12 +345,17 @@ else
 fi
 
 # -- firewall --------------------------------------------------------------
-# Only SSH, WireGuard, and the filesystem servers' port are open to the
+# Only SSH, WireGuard, and the filesystem servers' ports are open to the
 # world. The store's ports are open only on wg0. (The store binds to the
 # WireGuard address anyway, so this is a second protection.)
 ufw allow "$SSH_PORT/tcp" >/dev/null
 ufw allow "$WG_PORT/udp" >/dev/null
 ufw allow 27060/tcp >/dev/null
+if [ "$WEB" = yes ]; then
+    ufw allow "$WEB_PORT/tcp" >/dev/null
+else
+    ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true
+fi
 ufw allow in on wg0 to any port 27051:27052 proto tcp >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
@@ -322,6 +365,9 @@ ufw --force enable >/dev/null
 systemctl daemon-reload
 systemctl enable -q raft5-server raft5fs-server raft5fs-cert-check.timer
 systemctl start raft5fs-cert-check.timer
+if [ "$WEB" = yes ]; then
+    systemctl enable -q --now certbot.timer
+fi
 if backups_wanted; then
     systemctl enable -q --now raft5fs-nightly-backup.timer
 elif systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then

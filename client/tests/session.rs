@@ -306,3 +306,44 @@ fn apple_double_files_are_refused_when_asked() {
     s.block(s.session.create(s.volume, OsStr::new(".f"), 0o644))
         .unwrap();
 }
+
+#[test]
+fn remembered_keys_log_in_until_the_password_changes() {
+    use raft5fs_client::remote::Remote;
+    use raft5fs_crypto::password::KdfParams;
+
+    let setup = Setup::new();
+    let remote = setup.session.vault().remote();
+    let keys = remote.unlock_keys().expect("keys after a login");
+    let identity = remote.identity().unwrap();
+
+    // A new login with the keys alone opens the same key pair.
+    let mut remembered = credentials(TESTER);
+    remembered.password = String::new();
+    remembered.keys = Some(keys);
+    let again = setup
+        .block(Remote::connect(
+            &setup.backend.addresses(),
+            remembered.clone(),
+            Some(fs_tls()),
+        ))
+        .expect("a login with the remembered keys");
+    assert_eq!(
+        again.identity().unwrap().public_key(),
+        identity.public_key()
+    );
+
+    // A new password makes them useless.
+    setup
+        .block(remote.change_password("a new password, long enough", KdfParams::TESTING))
+        .unwrap();
+    assert!(
+        setup
+            .block(Remote::connect(
+                &setup.backend.addresses(),
+                remembered,
+                Some(fs_tls()),
+            ))
+            .is_err()
+    );
+}

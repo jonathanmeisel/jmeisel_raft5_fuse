@@ -1,7 +1,7 @@
 // Builds the app for one filesystem. The config comes from
-// config/<mode>.json, or config/local/config.json for `--mode dev` and the
-// dev server (what `cargo run -p raft5fs-testkit --example web_dev`
-// writes):
+// config/<mode>.json: config/prod.json for a plain `vite build`, and
+// config/local/config.json for `--mode dev` and the dev server (what
+// `cargo run -p raft5fs-testkit --example web_dev` writes):
 //
 //   servers    the servers' web ports (https://host:port)
 //   objects    the object store's origin, where blocks are fetched from
@@ -16,6 +16,7 @@ import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 function loadConfig(mode) {
+  mode = { production: "prod", development: "dev" }[mode] ?? mode;
   const file =
     mode === "dev" ? "config/local/config.json" : `config/${mode}.json`;
   const config = JSON.parse(readFileSync(file, "utf8"));
@@ -48,7 +49,7 @@ function csp(config) {
 }
 
 export default defineConfig(({ mode, command }) => {
-  const config = loadConfig(mode === "development" ? "dev" : mode);
+  const config = loadConfig(mode);
   return {
     plugins: [
       svelte(),

@@ -22,3 +22,4 @@ serde-wasm-bindgen = "0.6"
 # Pinned: the wasm-bindgen CLI that builds the app must be this version.
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"
+zeroize = "1"

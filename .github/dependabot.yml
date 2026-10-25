@@ -1,0 +1,13 @@
+# Proposes updates, as pull requests to review: the workflows' actions
+# (pinned to commits) and the web app's npm packages, which are part of
+# what the app runs.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /webapp
+    schedule:
+      interval: weekly

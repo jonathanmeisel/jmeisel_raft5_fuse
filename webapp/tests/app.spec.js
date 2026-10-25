@@ -25,9 +25,10 @@ async function enrol(page, user) {
   return words;
 }
 
-async function login(page, user) {
+async function login(page, user, stay = false) {
   await page.getByLabel("User name").fill(user);
   await page.getByLabel("Password").fill(PASSWORD);
+  if (stay) await page.getByLabel(/Stay unlocked/).check();
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
 }
@@ -163,6 +164,24 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await bob.reload();
     await login(bob, "bob");
     await expect(item(bob, "docs")).toHaveCount(0, SLOW);
+  });
+
+  await test.step("a reload logs out, unless alice stays unlocked", async () => {
+    await alice.reload();
+    await expect(alice.getByRole("button", { name: "Log in" })).toBeVisible(SLOW);
+    await login(alice, "alice", true);
+    await alice.reload();
+    await expect(alice.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+    await expect(item(alice, "docs")).toBeVisible(SLOW);
+    // A second tab can't open the same account.
+    const second = await alice.context().newPage();
+    await second.goto("/");
+    await expect(second.getByText(/already open in another tab/)).toBeVisible(SLOW);
+    await second.close();
+    // Logging out forgets the device.
+    await alice.getByRole("button", { name: "Log out" }).click();
+    await alice.reload();
+    await expect(alice.getByRole("button", { name: "Log in" })).toBeVisible(SLOW);
   });
 
   expect(problems.flat()).toEqual([]);

@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use raft5fs_crypto::Key;
 use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN};
 use raft5fs_crypto::password::{self, AUTH_LEN, KdfParams, PasswordKeys, new_salt, verifier};
 use raft5fs_objstore::http::{self, HttpConfig};
@@ -121,6 +122,20 @@ pub struct Credentials {
     /// `http://` is allowed. By default it is not, because the URLs are
     /// bearer credentials.
     pub objects: HttpConfig,
+    /// Log in with these, from an earlier login's `Remote::unlock_keys`,
+    /// instead of `password`, which is then unused.
+    pub keys: Option<UnlockKeys>,
+}
+
+/// What a password gives a login: `auth`, which the server checks, and
+/// `kek`, which opens the account's private key. A device that stays
+/// unlocked keeps these instead of the password. They work only for this
+/// account and only until its password changes, and the password can't be
+/// found from them.
+#[derive(Clone)]
+pub struct UnlockKeys {
+    pub auth: Zeroizing<[u8; AUTH_LEN]>,
+    pub kek: Key,
 }
 
 impl Credentials {
@@ -133,6 +148,7 @@ impl Credentials {
             min_kdf: KdfParams::DEFAULT,
             allow_plaintext: false,
             objects: HttpConfig::default(),
+            keys: None,
         }
     }
 }
@@ -160,10 +176,10 @@ impl Interceptor for Authorize {
 type Client = FsClient<InterceptedService<Timed<Channel>, Authorize>>;
 
 /// What a login sends: the password, until the first login turns it into
-/// `auth`.
+/// the keys it gives.
 enum Secret {
     Password(Zeroizing<String>),
-    Auth(Zeroizing<[u8; AUTH_LEN]>),
+    Keys(UnlockKeys),
 }
 
 pub struct Remote {
@@ -244,7 +260,7 @@ async fn account_keys(
     password: &str,
     params: KdfParams,
     identity: &Identity,
-) -> Result<(AccountKeys, Zeroizing<[u8; AUTH_LEN]>), FsError> {
+) -> Result<(AccountKeys, UnlockKeys), FsError> {
     let salt = new_salt();
     let keys = derive(password, username, salt.to_vec(), params).await?;
     let account = AccountKeys {
@@ -254,7 +270,11 @@ async fn account_keys(
         public_key: identity.public_key().to_vec(),
         wrapped_private_key: identity.wrap(&keys.kek, username),
     };
-    Ok((account, Zeroizing::new(keys.auth)))
+    let unlock = UnlockKeys {
+        auth: Zeroizing::new(keys.auth),
+        kek: keys.kek.clone(),
+    };
+    Ok((account, unlock))
 }
 
 /// When a request can be sent again to another server; see the module doc.
@@ -330,7 +350,10 @@ impl Remote {
         let mut remote = Self {
             servers,
             username: credentials.username,
-            secret: RwLock::new(Secret::Password(Zeroizing::new(credentials.password))),
+            secret: RwLock::new(match credentials.keys {
+                Some(keys) => Secret::Keys(keys),
+                None => Secret::Password(Zeroizing::new(credentials.password)),
+            }),
             min_kdf: credentials.min_kdf,
             identity: RwLock::new(None),
             chunk_reads: AtomicU64::new(0),
@@ -411,12 +434,12 @@ impl Remote {
             .identity()
             .ok_or_else(|| FsError::new(errno::EACCES, "not logged in: no key pair to re-wrap"))?;
         let old_auth = match &*self.secret.read().unwrap() {
-            Secret::Auth(auth) => auth.to_vec(),
+            Secret::Keys(keys) => keys.auth.to_vec(),
             Secret::Password(_) => {
                 return Err(FsError::new(errno::EACCES, "not logged in"));
             }
         };
-        let (keys, new_auth) =
+        let (keys, new_keys) =
             account_keys(&self.username, new_password, params, &identity).await?;
         let req = ChangePasswordRequest {
             username: self.username.clone(),
@@ -429,7 +452,7 @@ impl Remote {
         })
         .await?
         .into_result()?;
-        *self.secret.write().unwrap() = Secret::Auth(new_auth);
+        *self.secret.write().unwrap() = Secret::Keys(new_keys);
         Ok(())
     }
 
@@ -440,7 +463,7 @@ impl Remote {
     pub fn at(&self, name: &str) -> Remote {
         let secret = match &*self.secret.read().unwrap() {
             Secret::Password(p) => Secret::Password(p.clone()),
-            Secret::Auth(a) => Secret::Auth(a.clone()),
+            Secret::Keys(k) => Secret::Keys(k.clone()),
         };
         Remote {
             servers: self.servers.clone(),
@@ -493,12 +516,13 @@ impl Remote {
             username: self.username.clone(),
             auth: Vec::new(),
         };
-        // The first login: the keys from the password, kept until the
-        // server accepts them.
+        // The first login with a password: the keys from it, kept until
+        // the server accepts them.
         let mut derived = None;
         let password = match &*self.secret.read().unwrap() {
-            Secret::Auth(auth) => {
-                req.auth = auth.to_vec();
+            Secret::Keys(keys) => {
+                req.auth = keys.auth.to_vec();
+                derived = Some(keys.clone());
                 None
             }
             Secret::Password(password) => Some(password.clone()),
@@ -520,7 +544,10 @@ impl Remote {
                 .map_err(|e| FsError::new(errno::EACCES, format!("login refused: {e}")))?;
             let keys = derive(&password, &self.username, settings.salt, params).await?;
             req.auth = keys.auth.to_vec();
-            derived = Some(keys);
+            derived = Some(UnlockKeys {
+                auth: Zeroizing::new(keys.auth),
+                kek: keys.kek.clone(),
+            });
         }
         let session = self
             .first_answer("a login", |mut c| {
@@ -529,7 +556,9 @@ impl Remote {
             })
             .await?
             .into_result()?;
-        if let Some(keys) = derived {
+        if let Some(keys) = derived
+            && self.identity().is_none()
+        {
             // The server accepted `auth`, so the password was correct. If
             // the private key does not open now, it was changed, not
             // mistyped.
@@ -537,7 +566,7 @@ impl Remote {
                 Identity::unwrap(&keys.kek, &self.username, &session.wrapped_private_key)
                     .map_err(|e| FsError::new(errno::EIO, format!("login: {e}")))?;
             *self.identity.write().unwrap() = Some(Arc::new(identity));
-            *self.secret.write().unwrap() = Secret::Auth(Zeroizing::new(keys.auth));
+            *self.secret.write().unwrap() = Secret::Keys(keys);
         }
         *self.session.write().unwrap() = session.token;
         Ok(())
@@ -577,6 +606,15 @@ impl Remote {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    /// The keys that log this account in without its password, once a
+    /// login has them (see `UnlockKeys`).
+    pub fn unlock_keys(&self) -> Option<UnlockKeys> {
+        match &*self.secret.read().unwrap() {
+            Secret::Keys(keys) => Some(keys.clone()),
+            Secret::Password(_) => None,
+        }
     }
 
     /// The protocol version of the server that said hello (see

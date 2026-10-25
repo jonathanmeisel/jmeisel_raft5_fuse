@@ -78,6 +78,17 @@ SSH_HARDEN=no
 # killed. Empty: leave swap as it is.
 SWAP_SIZE=
 
+# The web app (README "Web app"). Optional: leave WEB_ORIGIN empty for no
+# web port. With it set, each filesystem server also serves browsers
+# gRPC-Web on WEB_PORT, for pages from WEB_ORIGIN only, under a Let's
+# Encrypt certificate for the node's DNS name: every node in NODES needs
+# one, in a zone on DigitalOcean DNS, and the cluster's secrets need a
+# DigitalOcean API token that can change it (./secrets.sh edit do-dns.env).
+WEB_ORIGIN=
+WEB_PORT=27061
+# Where Let's Encrypt sends notices about the certificates.
+LETSENCRYPT_EMAIL=
+
 # How long the certificates that certs.sh issues are valid, in days. The CAs
 # are valid for ten years.
 CERT_DAYS=397

@@ -1,0 +1,17 @@
+#!/bin/sh
+# certbot's deploy hook for the web port's certificate (README "Web app").
+# After certbot renews it, this copies it to where raft5fs-server reads it,
+# and restarts the server, which reads it only when it starts. Users'
+# clients move to another node meanwhile. Each node renews at its own
+# time, so they don't all restart together.
+set -eu
+live=/etc/letsencrypt/live/raft5fs-web
+# Only for this certificate.
+[ "${RENEWED_LINEAGE:-}" = "$live" ] || exit 0
+for f in "fullchain.pem web.pem" "privkey.pem web.key"; do
+    # shellcheck disable=SC2086
+    set -- $f
+    install -m 0640 -o root -g raft5fs "$live/$1" "/etc/raft5fs/$2.new"
+    mv -f "/etc/raft5fs/$2.new" "/etc/raft5fs/$2"
+done
+systemctl restart raft5fs-server
