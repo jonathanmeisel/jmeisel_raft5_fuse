@@ -45,9 +45,6 @@ if web_enabled; then
         [[ $(node_field "$node" 4) != - ]] ||
             die "WEB_ORIGIN is set: give $node a DNS name in NODES; its web certificate is for that name"
     done
-    [[ -f $SECRETS/do-dns.env ]] ||
-        die "WEB_ORIGIN is set: add a DigitalOcean API token for the nodes' DNS zone with ./secrets.sh edit do-dns.env (README \"Web app\")"
-    grep -q '^DIGITALOCEAN_TOKEN=.' "$SECRETS/do-dns.env" || die "secrets/do-dns.env has no DIGITALOCEAN_TOKEN="
 fi
 
 # Node hardening (README "Creating and deploying a new cluster"). Off unless
@@ -137,11 +134,9 @@ render() {
         fi
     fi
 
-    # The web port's certificate: certbot's token for the DNS check (only
-    # root reads it on the node), and the hook that installs renewals.
+    # The hook that installs the web port's certificate when certbot
+    # renews it.
     if web_enabled; then
-        sed -n 's/^DIGITALOCEAN_TOKEN=/dns_digitalocean_token = /p' "$SECRETS/do-dns.env" \
-            >"$dir/web/digitalocean.ini"
         cp "$DEPLOY/templates/raft5fs-web-cert" "$dir/web/"
     fi
 

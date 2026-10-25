@@ -16,8 +16,8 @@ among them.
 ```
 
 Only three ports are open to the internet: SSH, WireGuard (51820/udp) and
-the filesystem servers (27060/tcp), plus the web port (27061/tcp) with
-the web app on. The store listens only on the WireGuard addresses, and
+the filesystem servers (27060/tcp), plus the web port (27061/tcp) and
+80/tcp, for Let's Encrypt's checks, with the web app on. The store listens only on the WireGuard addresses, and
 the firewall allows its ports only on `wg0`. Large files' data can live
 in an S3-compatible bucket, and backups go to a second bucket. The web
 app ("Web app" below) is a static site on GitHub Pages, apart from the
@@ -118,7 +118,6 @@ how to get back in when an identity is lost.
 | `backup.env.sops` | The backup bucket's key (`RAFT5FS_BACKUP_ACCESS_KEY`, `..._SECRET_KEY`) | deploy | every node, for `raft5fs-admin` only |
 | `backup.pub` | The operator public key backups are sealed to | — | every node |
 | `backup-ca.pem` | The backup bucket's CA, if private (optional) | — | every node |
-| `do-dns.env.sops` | A DigitalOcean API token (`DIGITALOCEAN_TOKEN`) that can change the nodes' DNS zone, for their web certificates, if the web app is on | deploy | every node, for certbot only (root) |
 | `operator/backup.key.sops` | The operator private key: the only way to open a backup's store contents | CA | nowhere: used on your machine to restore |
 
 `.sops.yaml` decides each file's identities by path. `certs.sh` writes
@@ -161,6 +160,7 @@ DigitalOcean: Networking → Firewalls, applied to the VMs:
 | Inbound | TCP | 22 (SSH) | all |
 | Inbound | TCP | 27060 (filesystem) | all |
 | Inbound | TCP | 27061 (web app, if on) | all |
+| Inbound | TCP | 80 (Let's Encrypt's checks, if the web app is on) | all |
 | Inbound | UDP | 51820 (WireGuard) | the nodes' public IPs only |
 | Outbound | ICMP, TCP, UDP | all | all |
 
@@ -512,12 +512,10 @@ What it trusts that the native client doesn't:
   yourself.
 - **The web port's identity is the public web PKI,** not `fs-ca`. A CAA
   record limits who may issue certificates for the domain.
-- **The nodes hold a DNS token,** to renew their certificates. Their
-  names live in their own zone, `fs.<domain>`, on DigitalOcean; the
-  parent zone, which holds `app`, stays at the registrar, so a
-  compromised node can't point the app elsewhere. Keep the parent zone
-  off DigitalOcean: a token with the `domain` scope can change every
-  zone in the account.
+- **Port 80 is open on the nodes,** for Let's Encrypt to check each
+  node's name (HTTP-01). Nothing listens there except certbot, for a
+  minute every ~60 days while it renews. The nodes hold no DNS
+  credentials, so a compromised node can't repoint the app's name.
 - **"Stay unlocked on this device"** (opt-in at login) keeps the
   account's unlock keys in the browser for 7 days, encrypted under a key
   the browser won't export. Anyone who can use that browser profile can
@@ -529,38 +527,28 @@ What it trusts that the native client doesn't:
 ### Setting it up
 
 1. **Buy the domain,** ideally in a TLD that browsers only ever reach over
-   HTTPS (`.dev`, `.app`, `.page`), at a registrar whose DNS has NS and
-   CAA records.
-2. **DNS, in two zones:**
-   - At the registrar (the parent zone): a CNAME `app` → `<your GitHub
-     user>.github.io`; a CAA record `0 issue "letsencrypt.org"`; and NS
-     records delegating `fs` to `ns1.digitalocean.com`,
-     `ns2.digitalocean.com` and `ns3.digitalocean.com`.
-   - On DigitalOcean (Networking → Domains): add `fs.<domain>`, with A
-     records `fs1`, `fs2`, `fs3` → the nodes' public IPs.
-3. **A DigitalOcean API token** (API → Tokens → custom scopes: `domain`,
-   all of read, create, update and delete; certbot adds and removes a TXT
-   record), then:
-   ```sh
-   ./secrets.sh edit do-dns.env      # DIGITALOCEAN_TOKEN=dop_v1_...
-   ```
-4. **`cluster.conf`:** each node's DNS name in `NODES` (`fs1.fs.<domain>`,
-   ...), `WEB_ORIGIN=https://app.<domain>`, `WEB_PORT=27061` and
-   `LETSENCRYPT_EMAIL`. The native certificate must cover the new names,
-   and new invitations then use them:
+   HTTPS (`.dev`, `.app`, `.page`), at a registrar whose DNS has CAA
+   records.
+2. **DNS, at the registrar:** a CNAME `app` → `<your GitHub
+   user>.github.io`; an A record for each node's name (e.g.
+   `node1.fs` → its public IP); and a CAA record on the domain itself,
+   `0 issue "letsencrypt.org"`.
+3. **`cluster.conf`:** each node's DNS name in `NODES`
+   (`node1.fs.<domain>`, ...), `WEB_ORIGIN=https://app.<domain>`,
+   `WEB_PORT=27061` and `LETSENCRYPT_EMAIL`. The native certificate must
+   cover the new names, and new invitations then use them:
    ```sh
    eval "$(./unlock --ca /media/usb/ca.age)"
    ./certs.sh
    ```
-5. **The cloud firewall:** inbound TCP 27061 from anywhere.
-6. **Install.** Each node gets its certificate on the way (DNS takes a
-   minute per node):
+4. **The cloud firewall:** inbound TCP 27061 and 80 from anywhere.
+5. **Install.** Each node gets its certificate on the way:
    ```sh
    ./install.sh --dry-run --all
    ./install.sh --all
    ./status.sh                 # each node shows "web ok"
    ```
-7. **CORS on the large-files bucket,** so pages from the app can fetch
+6. **CORS on the large-files bucket,** so pages from the app can fetch
    and upload blocks through the URLs the servers sign. With the bucket's
    key from `s3.env` in the AWS CLI's environment:
    ```sh
@@ -576,13 +564,13 @@ What it trusts that the native client doesn't:
    aws s3api put-bucket-cors --endpoint-url "$S3_ENDPOINT" --bucket "$S3_BUCKET" \
        --cors-configuration file://cors.json
    ```
-8. **The app's config,** in the raft5fs repo: `webapp/config/prod.json`
+7. **The app's config,** in the raft5fs repo: `webapp/config/prod.json`
    (`servers`: `https://fsN.fs.<domain>:27061`; `objects`: the origin of
    the bucket's signed URLs, e.g. `https://<bucket>.nyc3.digitaloceanspaces.com`;
    `fsId`: the filesystem's id, from
    `openssl x509 -in $RAFT5FS_CLUSTER/secrets/fs-ca.pem -outform der | sha256sum | cut -c1-16`),
    and `webapp/public/CNAME` (`app.<domain>`). Commit both.
-9. **GitHub Pages:**
+8. **GitHub Pages:**
    - Verify the domain for your account (your profile's Settings → Pages →
      Add a domain; a TXT record at the registrar), so no one else's
      repository can claim `app.<domain>`.
@@ -592,16 +580,16 @@ What it trusts that the native client doesn't:
      tags: only tags matching `v*`.
    - Settings → Secrets and variables → Actions → Variables: `PAGES` =
      `on`. Until then, tags don't publish the app.
-10. **Release** as for the binaries ("Building and deploying new server
+9. **Release** as for the binaries ("Building and deploying new server
     binaries"): the same tag publishes the app. Open `https://app.<domain>`.
-11. **Optional:** a Certificate Transparency alert for `<domain>` (on
+10. **Optional:** a Certificate Transparency alert for `<domain>` (on
     crt.sh, say), to see any certificate you didn't ask for.
 
 ### Running it
 
-- certbot renews each node's web certificate 30 days before it expires
-  and restarts that node's `raft5fs-server` (users' clients move to
-  another node meanwhile). `./status.sh` checks each web port as a
+- certbot renews each node's web certificate 30 days before it expires,
+  over port 80, and then restarts that node's `raft5fs-server` (users'
+  clients move to another node meanwhile). `./status.sh` checks each web port as a
   browser on the app's page would, and flags a web certificate within 14
   days of expiry: then certbot isn't renewing (`journalctl -u certbot`).
 - A new app version ships with a tag. Servers must be at least as new as

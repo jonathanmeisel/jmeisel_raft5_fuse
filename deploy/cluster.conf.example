@@ -82,8 +82,8 @@ SWAP_SIZE=
 # web port. With it set, each filesystem server also serves browsers
 # gRPC-Web on WEB_PORT, for pages from WEB_ORIGIN only, under a Let's
 # Encrypt certificate for the node's DNS name: every node in NODES needs
-# one, in a zone on DigitalOcean DNS, and the cluster's secrets need a
-# DigitalOcean API token that can change it (./secrets.sh edit do-dns.env).
+# one. Let's Encrypt checks the name over port 80, which the firewall
+# then opens.
 WEB_ORIGIN=
 WEB_PORT=27061
 # Where Let's Encrypt sends notices about the certificates.

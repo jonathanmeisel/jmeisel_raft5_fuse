@@ -44,7 +44,7 @@ act() {
 missing=""
 packages="wireguard-tools ufw openssl unattended-upgrades"
 # Let's Encrypt, for the web port's certificate.
-[ "$WEB" = yes ] && packages="$packages certbot python3-certbot-dns-digitalocean"
+[ "$WEB" = yes ] && packages="$packages certbot"
 for pkg in $packages; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
 done
@@ -156,15 +156,14 @@ fi
 
 # -- the web port's certificate ---------------------------------------------
 # Let's Encrypt's, for this node's DNS name, under the fixed name
-# raft5fs-web. certbot proves the name through DigitalOcean DNS (a TXT
-# record), with a token only root can read, and renews it by itself
+# raft5fs-web. certbot proves the name over HTTP: it listens on port 80
+# only while it gets or renews the certificate. It renews by itself
 # (certbot.timer); the deploy hook then installs the renewal.
 live=/etc/letsencrypt/live/raft5fs-web
 if [ "$WEB" = yes ]; then
     for d in /etc/letsencrypt /etc/letsencrypt/renewal-hooks /etc/letsencrypt/renewal-hooks/deploy; do
         [ -d "$d" ] || act install -d -m 0755 -o root -g root "$d"
     done
-    put web/digitalocean.ini /etc/letsencrypt/digitalocean.ini 0600 root:root certbot
     put web/raft5fs-web-cert /etc/letsencrypt/renewal-hooks/deploy/raft5fs-web-cert 0755 root:root certbot
     # A certificate for this name, unless there is one already.
     if ! openssl x509 -in "$live/cert.pem" -noout -ext subjectAltName 2>/dev/null |
@@ -174,10 +173,12 @@ if [ "$WEB" = yes ]; then
             would=true
         else
             say "getting a Let's Encrypt certificate for $WEB_NAME"
+            # Port 80 must be open for the check, before the firewall
+            # section below opens it for renewals.
+            ufw allow 80/tcp >/dev/null
             certbot certonly --non-interactive --agree-tos --no-eff-email \
                 --email "$LETSENCRYPT_EMAIL" --cert-name raft5fs-web -d "$WEB_NAME" \
-                --dns-digitalocean --dns-digitalocean-credentials /etc/letsencrypt/digitalocean.ini \
-                --dns-digitalocean-propagation-seconds 60
+                --standalone --preferred-challenges http
         fi
     fi
     if [ -f "$live/fullchain.pem" ]; then
@@ -345,16 +346,20 @@ else
 fi
 
 # -- firewall --------------------------------------------------------------
-# Only SSH, WireGuard, and the filesystem servers' ports are open to the
+# Only SSH, WireGuard, and the filesystem servers' port are open to the
 # world. The store's ports are open only on wg0. (The store binds to the
 # WireGuard address anyway, so this is a second protection.)
 ufw allow "$SSH_PORT/tcp" >/dev/null
 ufw allow "$WG_PORT/udp" >/dev/null
 ufw allow 27060/tcp >/dev/null
+# With the web app on, also its port, and port 80 for Let's Encrypt's
+# checks. Nothing listens there except certbot while it renews.
 if [ "$WEB" = yes ]; then
     ufw allow "$WEB_PORT/tcp" >/dev/null
+    ufw allow 80/tcp >/dev/null
 else
     ufw delete allow "$WEB_PORT/tcp" >/dev/null 2>&1 || true
+    ufw delete allow 80/tcp >/dev/null 2>&1 || true
 fi
 ufw allow in on wg0 to any port 27051:27052 proto tcp >/dev/null
 ufw default deny incoming >/dev/null
