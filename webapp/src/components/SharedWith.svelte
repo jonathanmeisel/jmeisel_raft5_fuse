@@ -2,6 +2,9 @@
   // Who a folder is shared with, and revoking. A revoke queues the folder
   // for pruning: until that finishes, what was written there before is
   // still sealed under keys the revoked user had.
+  //
+  // Shares of a folder above this one reach it too. They show with the
+  // folder they come from, and are revoked there, not here.
   import Dialog from "./Dialog.svelte";
 
   let { fs, path, me, onclose } = $props();
@@ -23,16 +26,18 @@
   }
   load();
 
-  async function ask(user) {
+  // Asks at once. The size to re-encrypt takes a walk of the whole folder,
+  // so it shows when it is ready; revoking needn't wait for it.
+  function ask(user) {
     error = "";
-    busy = true;
-    try {
-      confirming = { user, estimate: await fs.pruneEstimate(path) };
-    } catch (e) {
-      error = e.message;
-    } finally {
-      busy = false;
-    }
+    const asking = { user, estimate: null };
+    confirming = asking;
+    fs.pruneEstimate(path).then(
+      (estimate) => {
+        if (confirming?.user === asking.user) confirming = { ...confirming, estimate };
+      },
+      () => {},
+    );
   }
 
   async function revoke() {
@@ -50,6 +55,11 @@
     }
   }
 
+  const own = $derived(grantees?.filter((g) => !g.via) ?? []);
+  const inherited = $derived(grantees?.filter((g) => g.via) ?? []);
+  /// A folder as people know it: its path without the leading slash.
+  const folder = (via) => via.replace(/^\//, "");
+
   const size = (bytes) =>
     bytes >= 1 << 30 ? `${(bytes / (1 << 30)).toFixed(1)} GB` : `${Math.ceil(bytes / (1 << 20))} MB`;
 </script>
@@ -61,9 +71,9 @@
     <p>Revoke <strong>{confirming.user}</strong>'s share of {path}?</p>
     <p class="note">
       This will attempt to re-encrypt all files previously visible to {confirming.user} while
-      the tab stays open, around {size(confirming.estimate.bytes)}
+      the tab stays open, around {confirming.estimate ? size(confirming.estimate.bytes) : "…"}
     </p>
-    {#if confirming.estimate.bytes > WARN_BYTES}
+    {#if confirming.estimate && confirming.estimate.bytes > WARN_BYTES}
       <p class="error">
         That's a lot for a browser. Keep this tab open until it finishes, or let a desktop
         client do it (<code>raft5fs prune</code>).
@@ -80,7 +90,7 @@
     {:else}
       <table>
         <tbody>
-          {#each grantees as g}
+          {#each own as g}
             <tr>
               <td><strong>{g.user}</strong>{g.user === me ? " (you)" : ""}</td>
               <td>{g.writable ? "read-write" : "read-only"}</td>
@@ -89,6 +99,13 @@
                   <button class="danger" onclick={() => ask(g.user)} disabled={busy}>Revoke…</button>
                 {/if}
               </td>
+            </tr>
+          {/each}
+          {#each inherited as g}
+            <tr class="inherited">
+              <td><strong>{g.user}</strong></td>
+              <td>{g.writable ? "read-write" : "read-only"}</td>
+              <td class="note">via {folder(g.via)}</td>
             </tr>
           {/each}
         </tbody>

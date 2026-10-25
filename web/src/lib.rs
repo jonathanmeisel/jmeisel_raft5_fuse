@@ -711,31 +711,68 @@ impl Fs {
         })
     }
 
-    /// Who directory `path` is shared with.
+    /// Who directory `path` is shared with: its own grants, which
+    /// `revoke` can undo, and those of the folders above it, which also
+    /// reach it. An inherited entry names the folder it comes from in
+    /// `via`; only there can it be revoked.
     #[wasm_bindgen(js_name = sharedWith)]
     pub fn shared_with(&self, path: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
             #[derive(Serialize)]
-            struct Grantee {
+            struct Shared {
                 user: String,
                 writable: bool,
                 fingerprint: Option<Fingerprint>,
+                /// The folder above that it is shared through, if not
+                /// this one.
+                via: Option<String>,
             }
+            let entries = |grantees: Vec<raft5fs_proto::types::Grantee>, via: Option<&str>| {
+                grantees
+                    .into_iter()
+                    .map(|g| Shared {
+                        fingerprint: <[u8; PUBLIC_KEY_LEN]>::try_from(g.public_key.as_slice())
+                            .ok()
+                            .map(|k| Fingerprint::of(&k)),
+                        user: g.user,
+                        writable: g.writable,
+                        via: via.map(str::to_string),
+                    })
+                    .collect::<Vec<_>>()
+            };
             let ino = inner.resolve(&path).await?.ino;
-            Ok(inner
-                .vault()
-                .grantees(ino)
-                .await?
-                .into_iter()
-                .map(|g| Grantee {
-                    fingerprint: <[u8; PUBLIC_KEY_LEN]>::try_from(g.public_key.as_slice())
-                        .ok()
-                        .map(|k| Fingerprint::of(&k)),
-                    user: g.user,
-                    writable: g.writable,
-                })
-                .collect::<Vec<_>>())
+            let mut shared = entries(inner.vault().grantees(ino).await?, None);
+
+            // The folders above, from the volume down: one look at what is
+            // granted under the volume says which of them to ask about.
+            let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
+            if names.len() < 2 || names[0] == ".snapshot" {
+                return Ok(shared);
+            }
+            let mut above = Vec::new();
+            for depth in 1..names.len() {
+                let folder = format!("/{}", names[..depth].join("/"));
+                above.push((inner.resolve(&folder).await?.ino, folder));
+            }
+            // Listing grants needs write access to the volume; without it,
+            // say only what this folder's own grants say.
+            let Ok(granted) = inner.vault().remote().grants_under(above[0].0).await else {
+                return Ok(shared);
+            };
+            let me = inner.vault().remote().username().to_string();
+            for (folder_ino, folder) in above.iter().rev() {
+                if !granted.iter().any(|g| g.ino == *folder_ino) {
+                    continue;
+                }
+                let grantees = inner.vault().grantees(*folder_ino).await?;
+                shared.extend(
+                    entries(grantees, Some(folder))
+                        .into_iter()
+                        .filter(|e| e.user != me),
+                );
+            }
+            Ok(shared)
         })
     }
 

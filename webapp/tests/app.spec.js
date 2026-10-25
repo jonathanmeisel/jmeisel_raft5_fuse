@@ -171,6 +171,17 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.getByRole("button", { name: "Done" }).click();
   });
 
+  await test.step("a subfolder shows the share it inherits, without revoke", async () => {
+    await open(alice, "docs");
+    await addFolder(alice, "sub");
+    await menu(alice, "sub", "Shared with…");
+    const row = alice.getByRole("row").filter({ hasText: "bob" });
+    await expect(row).toContainText("via docs", SLOW);
+    await expect(row.getByRole("button")).toHaveCount(0);
+    await alice.getByRole("button", { name: "Close" }).click();
+    await alice.getByText("My files").first().click();
+  });
+
   await test.step("bob trusts alice and reads the share", async () => {
     await bob.reload();
     await login(bob, "bob");
