@@ -2594,17 +2594,23 @@ dependencies = [
 name = "raft5fs-server"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
  "jsonwebtoken",
  "libc",
  "raft5-client",
+ "raft5fs-client",
  "raft5fs-core",
  "raft5fs-crypto",
  "raft5fs-objstore",
  "raft5fs-proto",
+ "raft5fs-testkit",
+ "reqwest",
  "serde",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-web",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3629,6 +3635,24 @@ dependencies = [
  "syn 2.0.119",
  "tempfile",
  "tonic-build",
+]
+
+[[package]]
+name = "tonic-web"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e6a1b6319ca4b61a4c0f0c94d439c8f3ed344cca56fe0df40e1fe4be11380b"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "http",
+ "http-body",
+ "pin-project",
+ "tokio-stream",
+ "tonic",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]

@@ -205,6 +205,9 @@ message HelloResponse {
   // How hybrid-layout files split their data. It never changes for the
   // filesystem. Absent if no data is in object storage.
   ObjectGrid grid = 3;
+  // The server's protocol version (`raft5fs_proto::PROTOCOL`). 0 from
+  // servers made before it was sent.
+  uint32 protocol = 4;
 }
 
 // From chunk `from_index` up, a hybrid file stores its chunks `per_block`

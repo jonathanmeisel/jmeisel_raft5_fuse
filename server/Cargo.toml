@@ -17,8 +17,18 @@ raft5-client = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+tonic-web = "0.14"
+tower-http = { version = "0.6", features = ["cors"] }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 serde = { version = "1", features = ["derive"] }
 libc = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# The web port's test calls it as a browser would: gRPC-Web, and CORS.
+[dev-dependencies]
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+raft5fs-client = { workspace = true }
+raft5fs-testkit = { workspace = true }
+reqwest = { version = "0.13", default-features = false }
+tokio = { workspace = true, features = ["macros", "net"] }

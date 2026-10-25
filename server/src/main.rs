@@ -16,14 +16,16 @@ use raft5fs_objstore::http::HttpConfig;
 use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_proto::invite::{Invite, pem_to_der};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store};
+use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store, WebPort, parse_origin};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tonic::transport::ServerTlsConfig;
 
 const USAGE: &str = "\
 usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
-                      [--tls-cert <PEM> --tls-key <PEM>] [options]
+                      [--tls-cert <PEM> --tls-key <PEM>]
+                      [--web-listen <ADDR> --web-origin <URL>
+                       [--web-tls-cert <PEM> --web-tls-key <PEM>]] [options]
                       <store options> <kv-seed-address>...
        raft5fs-server user add <NAME> [<invite options>] <store options>
                       <kv-seed-address>...
@@ -67,6 +69,22 @@ Serving:
                        creating a new filesystem: an existing one keeps
                        the size it was created with, since chunk
                        boundaries are baked into its keys.
+
+The web port: browsers can't use the --listen port (plain gRPC, under
+the filesystem's own CA). With --web-listen, the server also serves them
+gRPC-Web, the same service, on a second port, for the web app at
+--web-origin only.
+  --web-listen <ADDR>  address to serve browsers on, e.g. 0.0.0.0:27061.
+  --web-origin <URL>   the web app's origin, e.g. https://app.example.com
+                       (no path). Browsers may read answers only for pages
+                       from there.
+  --web-tls-cert <PEM>, --web-tls-key <PEM>
+                       the web port's certificate and key. Browsers trust
+                       only public CAs, so this is not the filesystem's
+                       CA: e.g. a Let's Encrypt certificate. It is read at
+                       start, so restart the server after a renewal.
+                       Without them the port is plain HTTP, for local
+                       development only.
 
 Object storage (large files): with --object-bucket, files made through
 this server keep their data from --object-from on in an S3-compatible
@@ -272,6 +290,10 @@ struct Args {
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
+    web_listen: Option<String>,
+    web_origin: Option<String>,
+    web_tls_cert: Option<String>,
+    web_tls_key: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -296,6 +318,10 @@ fn parse_args() -> Args {
             "--store-user" => a.store_user = Some(value("--store-user")),
             "--tls-cert" => a.tls_cert = Some(value("--tls-cert")),
             "--tls-key" => a.tls_key = Some(value("--tls-key")),
+            "--web-listen" => a.web_listen = Some(value("--web-listen")),
+            "--web-origin" => a.web_origin = Some(value("--web-origin")),
+            "--web-tls-cert" => a.web_tls_cert = Some(value("--web-tls-cert")),
+            "--web-tls-key" => a.web_tls_key = Some(value("--web-tls-key")),
             "--store-ca" => a.store_ca = Some(value("--store-ca")),
             "--store-cert" => a.store_cert = Some(value("--store-cert")),
             "--store-key" => a.store_key = Some(value("--store-key")),
@@ -848,6 +874,7 @@ async fn serve_command(a: Args) {
         .await
         .unwrap_or_else(|e| usage(&format!("cannot listen on {listen}: {e}")));
     eprintln!("serving on {}", listener.local_addr().unwrap());
+    let web = web_port(&a).await;
     let core = Arc::new(core);
     let gc_interval = a.gc_interval.unwrap_or(DEFAULT_GC_INTERVAL);
     if core.object_grid().is_some() && !gc_interval.is_zero() {
@@ -855,9 +882,55 @@ async fn serve_command(a: Args) {
     }
     let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL))
         .with_timing_header(env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
-    if let Err(e) = raft5fs_server::serve(fs, listener, tls, pending()).await {
+    let fs = Arc::new(fs);
+    let native = raft5fs_server::serve(Arc::clone(&fs), listener, tls, pending());
+    let served = match web {
+        Some(web) => {
+            let web = raft5fs_server::serve_web(fs, web, pending());
+            tokio::try_join!(native, web).map(|_| ())
+        }
+        None => native.await,
+    };
+    if let Err(e) = served {
         fail(format!("server stopped: {e}"));
     }
+}
+
+/// The web port, if `--web-listen` asks for one.
+async fn web_port(a: &Args) -> Option<WebPort> {
+    let Some(listen) = &a.web_listen else {
+        if a.web_origin.is_some() || a.web_tls_cert.is_some() || a.web_tls_key.is_some() {
+            usage("--web-origin, --web-tls-cert and --web-tls-key need --web-listen");
+        }
+        return None;
+    };
+    let origin = a
+        .web_origin
+        .as_deref()
+        .unwrap_or_else(|| usage("--web-listen needs --web-origin"));
+    let origin = parse_origin(origin).unwrap_or_else(|why| usage(&format!("--web-origin: {why}")));
+    let tls = identity(
+        &a.web_tls_cert,
+        &a.web_tls_key,
+        "--web-tls-cert/--web-tls-key",
+    )
+    .map(|identity| ServerTlsConfig::new().identity(identity));
+    if tls.is_none() {
+        eprintln!("warning: the web port is plain HTTP; use it only for local development");
+    }
+    let listener = TcpListener::bind(listen)
+        .await
+        .unwrap_or_else(|e| usage(&format!("cannot listen on {listen}: {e}")));
+    eprintln!(
+        "serving browsers on {} for {}",
+        listener.local_addr().unwrap(),
+        origin.to_str().unwrap_or("?")
+    );
+    Some(WebPort {
+        listener,
+        tls,
+        origin,
+    })
 }
 
 fn main() {

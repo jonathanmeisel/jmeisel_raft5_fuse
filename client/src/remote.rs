@@ -181,6 +181,8 @@ pub struct Remote {
     current: AtomicUsize,
     chunk_size: u64,
     batch_bytes: u64,
+    /// The protocol version that the server said hello with.
+    protocol: u32,
     /// How hybrid files group chunks into blocks, if the filesystem keeps
     /// data in object storage.
     grid: Option<ObjectGrid>,
@@ -336,6 +338,7 @@ impl Remote {
             current: AtomicUsize::new(0),
             chunk_size: 0,
             batch_bytes: 0,
+            protocol: 0,
             grid: None,
             objects,
             objects_ok: true,
@@ -349,6 +352,7 @@ impl Remote {
             .map_err(|e| e.message)?;
         remote.chunk_size = hello.chunk_size;
         remote.batch_bytes = hello.batch_bytes;
+        remote.protocol = hello.protocol;
         remote.grid = hello
             .grid
             .map(ObjectGrid::try_from)
@@ -449,6 +453,7 @@ impl Remote {
             current: AtomicUsize::new(self.current.load(Ordering::Relaxed)),
             chunk_size: self.chunk_size,
             batch_bytes: self.batch_bytes,
+            protocol: self.protocol,
             grid: self.grid,
             objects: self.objects.clone(),
             objects_ok: self.objects_ok,
@@ -572,6 +577,12 @@ impl Remote {
 
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    /// The protocol version of the server that said hello (see
+    /// `raft5fs_proto::PROTOCOL`); 0 for a server too old to say.
+    pub fn protocol(&self) -> u32 {
+        self.protocol
     }
 
     pub fn batch_bytes(&self) -> u64 {

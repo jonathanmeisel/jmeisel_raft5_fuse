@@ -11,6 +11,9 @@
 //!
 //! Write buffering and the chunk cache are in the client. Sessions are
 //! signed tokens that the client holds (see `auth`).
+//!
+//! It serves native clients plain gRPC (`serve`), and can also serve
+//! browsers gRPC-Web on a second port (`serve_web`), with the same service.
 
 pub mod auth;
 pub mod timing;
@@ -42,8 +45,10 @@ use raft5fs_proto::pb::{
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::codegen::http::{HeaderName, HeaderValue, Method, header};
 use tonic::transport::ServerTlsConfig;
 use tonic::{Request, Response, Status};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::Signer;
 use crate::timing::Timed;
@@ -158,18 +163,19 @@ fn store_unavailable(e: FsError) -> Status {
 }
 
 /// The service, ready to add to a tonic `Server`.
-pub fn service(fs: FsService) -> FsServer<FsService> {
-    FsServer::new(fs).max_decoding_message_size(MAX_MESSAGE_BYTES)
+pub fn service(fs: impl Into<Arc<FsService>>) -> FsServer<FsService> {
+    FsServer::from_arc(fs.into()).max_decoding_message_size(MAX_MESSAGE_BYTES)
 }
 
 /// Serves on `listener` until `shutdown` completes, over TLS if `tls` is
 /// given, and times every request (see `timing`).
 pub async fn serve(
-    fs: FsService,
+    fs: impl Into<Arc<FsService>>,
     listener: TcpListener,
     tls: Option<ServerTlsConfig>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
+    let fs = fs.into();
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
@@ -179,6 +185,106 @@ pub async fn serve(
         .add_service(Timed::new(service(fs), header))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
+}
+
+/// The port for browsers: gRPC-Web, answered only for one web app.
+pub struct WebPort {
+    pub listener: TcpListener,
+    /// Without it, the port is plain HTTP: only for tests and local
+    /// development, because sessions would cross the network in the clear.
+    pub tls: Option<ServerTlsConfig>,
+    /// The web app's origin, from `parse_origin`.
+    pub origin: HeaderValue,
+}
+
+/// How long a browser can keep a CORS preflight's answer.
+const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Serves browsers on `web.listener` until `shutdown` completes, with the
+/// same service as `serve`.
+///
+/// - gRPC-Web (`tonic_web`) over HTTP/1.1 or HTTP/2. Over TLS, tonic offers
+///   only HTTP/2, which every browser speaks; one connection then carries
+///   every request at once.
+/// - CORS lets only `web.origin` read the answers. A browser asks first
+///   (a preflight), because every request is a POST with a gRPC-Web body,
+///   and sends nothing more if the origin isn't allowed. A session is a
+///   bearer token in a header, not a cookie, so another site's page can't
+///   send one on a user's behalf.
+/// - Plain gRPC requests also work here, because `tonic_web` passes them
+///   through unchanged.
+pub async fn serve_web(
+    fs: impl Into<Arc<FsService>>,
+    web: WebPort,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
+    let fs = fs.into();
+    let mut builder = tonic::transport::Server::builder().accept_http1(true);
+    if let Some(tls) = web.tls {
+        builder = builder.tls_config(tls)?;
+    }
+    let header = fs.timing_header;
+    builder
+        .layer(cors(web.origin))
+        .layer(tonic_web::GrpcWebLayer::new())
+        .add_service(Timed::new(service(fs), header))
+        .serve_with_incoming_shutdown(TcpListenerStream::new(web.listener), shutdown)
+        .await
+}
+
+/// CORS for the web app at `origin`: the headers that gRPC-Web and the
+/// client send, and the ones the client reads back. Another origin gets no
+/// `Access-Control-Allow-Origin` at all. The layer also says `Vary:
+/// origin`, so no cache gives one origin's answer to another.
+fn cors(origin: HeaderValue) -> CorsLayer {
+    let name = HeaderName::from_static;
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |asked, _| *asked == origin))
+        .allow_methods([Method::POST])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            name("x-grpc-web"),
+            name("x-user-agent"),
+            name("grpc-timeout"),
+        ])
+        .expose_headers([
+            name("grpc-status"),
+            name("grpc-message"),
+            name("grpc-status-details-bin"),
+            name(raft5fs_proto::timing::HEADER),
+        ])
+        .max_age(PREFLIGHT_MAX_AGE)
+}
+
+/// Checks that `origin` is a web origin as browsers send it in `Origin`:
+/// `https://host` or `https://host:port` (or `http://` for local
+/// development), lowercase, with no path. CORS compares it byte for byte,
+/// so anything else would never match.
+pub fn parse_origin(origin: &str) -> Result<HeaderValue, String> {
+    let bad = |why: &str| Err(format!("{origin:?} isn't a web origin: {why}"));
+    let Some(host) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    else {
+        return bad("it must start with https://");
+    };
+    if host.is_empty() {
+        return bad("it has no host");
+    }
+    if host.contains('/') {
+        return bad("it must have no path, not even a trailing /");
+    }
+    if host.contains(|c: char| c.is_ascii_uppercase()) {
+        return bad("browsers send it in lowercase");
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return bad("the host has characters a host name can't have");
+    }
+    HeaderValue::from_str(origin).or_else(|_| bad("not a header value"))
 }
 
 fn name(bytes: &[u8]) -> &OsStr {
@@ -214,6 +320,7 @@ impl Fs for FsService {
             chunk_size,
             batch_bytes: batch_bytes(chunk_size),
             grid: self.core.object_grid().map(Into::into),
+            protocol: raft5fs_proto::PROTOCOL,
         }))
     }
 

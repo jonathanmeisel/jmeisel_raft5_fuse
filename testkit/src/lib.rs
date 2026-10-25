@@ -135,6 +135,11 @@ pub fn fs_tls() -> ClientTlsConfig {
     ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&cert().cert))
 }
 
+/// TLS for a filesystem server that `fs_tls` trusts.
+pub fn server_tls() -> ServerTlsConfig {
+    ServerTlsConfig::new().identity(identity())
+}
+
 /// Every test account's password: its name, backwards. A test that wants a
 /// wrong password can use the name.
 pub fn password(user: &str) -> String {
@@ -506,13 +511,8 @@ pub fn serve_if_requested() {
         // Check accounts on every request, so a test that removes one sees
         // the result at once.
         let fs = FsService::new(Arc::new(core), signer, Duration::ZERO).with_timing_header(true);
-        if let Err(e) = raft5fs_server::serve(
-            fs,
-            listener,
-            Some(ServerTlsConfig::new().identity(identity())),
-            std::future::pending(),
-        )
-        .await
+        if let Err(e) =
+            raft5fs_server::serve(fs, listener, Some(server_tls()), std::future::pending()).await
         {
             eprintln!("test server stopped: {e}");
         }
