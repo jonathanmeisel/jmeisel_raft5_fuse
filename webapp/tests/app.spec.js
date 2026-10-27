@@ -94,6 +94,15 @@ async function enrol(page, user, { viaLink = false } = {}) {
   return words;
 }
 
+/// The account button in the header.
+const accountButton = (page) => page.getByRole("button", { name: /^Account/ });
+
+/// Chooses `item` from the account menu.
+async function accountMenu(page, item) {
+  await accountButton(page).click();
+  await page.getByRole("menuitem", { name: item }).click();
+}
+
 async function login(page, user, stay = false) {
   // Of the two filesystems, enrolling chose "local" (by the invitation),
   // and the app offers it first from then on.
@@ -102,7 +111,7 @@ async function login(page, user, stay = false) {
   await page.getByLabel("Password").fill(PASSWORD);
   if (stay) await page.getByLabel(/Stay logged in/).check();
   await page.getByRole("button", { name: "Log in" }).click();
-  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+  await expect(accountButton(page)).toBeVisible(SLOW);
 }
 
 /// Opens the app afresh at `hash`: a whole new page load, not a jump
@@ -298,7 +307,9 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   await test.step("bob trusts alice and reads the share", async () => {
     await bob.reload();
     await login(bob, "bob");
-    await bob.getByRole("button", { name: /Shared with me/ }).click();
+    // A share from someone not trusted yet shows as a banner.
+    await expect(bob.getByText("A share is waiting for you to check who sent it.")).toBeVisible(SLOW);
+    await bob.getByRole("button", { name: "Review" }).click();
     await expect(bob.getByText(/docs.*from alice/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Trust…" }).click();
     await bob.getByLabel("fingerprint").fill(aliceWords);
@@ -333,16 +344,16 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await expect(alice.getByRole("button", { name: "Log in" })).toBeVisible(SLOW);
     await login(alice, "alice", true);
     await alice.reload();
-    await expect(alice.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+    await expect(accountButton(alice)).toBeVisible(SLOW);
     await expect(item(alice, "docs")).toBeVisible(SLOW);
     // A second tab opens the same account too.
     const second = await alice.context().newPage();
     await second.goto("/");
-    await expect(second.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+    await expect(accountButton(second)).toBeVisible(SLOW);
     await expect(item(second, "docs")).toBeVisible(SLOW);
     await second.close();
     // Logging out forgets the device.
-    await alice.getByRole("button", { name: "Log out" }).click();
+    await accountMenu(alice, "Log out");
     await alice.reload();
     await expect(alice.getByRole("button", { name: "Log in" })).toBeVisible(SLOW);
   });
@@ -374,7 +385,7 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
   await test.step("erin invites dave from the app", async () => {
     await enrol(erin, "erin");
     await login(erin, "erin");
-    await erin.getByRole("button", { name: "Invite someone" }).click();
+    await accountMenu(erin, "Invite someone");
     // A name that is taken is refused.
     await erin.getByLabel("Their account name").fill("alice");
     await erin.getByRole("button", { name: "Invite", exact: true }).click();
@@ -397,7 +408,10 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
     await expect(dave.getByText("Enrolled dave")).toBeVisible(SLOW);
     await dave.getByRole("button", { name: "Continue to log in" }).click();
     await login(dave, "dave");
-    await expect(dave.getByRole("button", { name: "Invite someone" })).toHaveCount(0);
+    await accountButton(dave).click();
+    await expect(dave.getByRole("menuitem", { name: "Shared with me" })).toBeVisible();
+    await expect(dave.getByRole("menuitem", { name: "Invite someone" })).toHaveCount(0);
+    await dave.keyboard.press("Escape");
     await dave.getByText("Add New").click();
     await dave.getByText("Add new folder").click();
     await dave.locator(".wx-modal input").fill("mine");
@@ -406,7 +420,7 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
   });
 
   await test.step("the invitation is used up", async () => {
-    await erin.getByRole("button", { name: "Invite someone" }).click();
+    await accountMenu(erin, "Invite someone");
     await expect(erin.getByLabel("Their account name")).toBeVisible();
     await expect(erin.getByRole("cell", { name: "dave" })).toHaveCount(0);
   });
@@ -442,7 +456,7 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await frank.getByRole("button", { name: "Done" }).click();
     await gina.reload();
     await login(gina, "gina");
-    await gina.getByRole("button", { name: /Shared with me/ }).click();
+    await accountMenu(gina, "Shared with me");
     await gina.getByRole("button", { name: "Trust…" }).click();
     await gina.getByLabel("fingerprint").fill(frankWords);
     await gina.getByRole("button", { name: "Trust", exact: true }).click();
@@ -455,8 +469,10 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     link = await frank.getByLabel("Public link").inputValue();
     expect(link).toMatch(/^http:\/\/localhost:4173\/#link=[\w-]+$/);
     await frank.getByRole("button", { name: "Done" }).click();
-    await frank.getByRole("button", { name: "Public links" }).click();
+    await accountMenu(frank, "Public links");
     await expect(frank.getByRole("cell", { name: "/public" })).toBeVisible(SLOW);
+    await frank.getByRole("button", { name: "Show link" }).click();
+    expect(await frank.locator("#my-link").inputValue()).toBe(link);
     await frank.getByRole("button", { name: "Close" }).click();
   });
 
@@ -465,15 +481,17 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await expect(item(visitor, "note.txt")).toBeVisible(SLOW);
     expect(new URL(visitor.url()).hash).not.toContain("link=");
     await expect(visitor.getByRole("button", { name: "Close" })).toBeVisible();
-    await expect(visitor.getByRole("button", { name: "Log out" })).toHaveCount(0);
+    await expect(accountButton(visitor)).toHaveCount(0);
     await expect(visitor.getByText("Add New")).toHaveCount(0);
     expect((await download(visitor, "note.txt")).equals(note)).toBe(true);
     expect(await visitor.evaluate(async () => (await indexedDB.databases()).length)).toBe(0);
   });
 
-  await test.step("gina, who can change the folder, revokes it", async () => {
+  await test.step("gina, who can change the folder, copies it, then revokes it", async () => {
     await menu(gina, "public", "Shared with…");
     const row = gina.getByRole("row").filter({ hasText: "Public link" });
+    await row.getByRole("button", { name: "Show link" }).click();
+    expect(await gina.locator("#shared-link").inputValue()).toBe(link);
     await row.getByRole("button", { name: "Revoke…" }).click();
     await gina.getByRole("button", { name: "Revoke", exact: true }).click();
     await expect(gina.getByText(/Revoked the public link/)).toBeVisible(SLOW);
@@ -484,7 +502,7 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     const again = await (await browser.newContext()).newPage();
     await again.goto(link);
     await expect(again.getByText("This link no longer works.")).toBeVisible(SLOW);
-    await frank.getByRole("button", { name: "Public links" }).click();
+    await accountMenu(frank, "Public links");
     await expect(frank.getByText(/haven't made any public links/)).toBeVisible(SLOW);
   });
 

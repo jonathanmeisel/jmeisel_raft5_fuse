@@ -1,9 +1,10 @@
 <script>
   // Makes a public link to a folder: anyone with the link can read the
   // folder until it expires or someone who can write the folder revokes
-  // it. The link holds its own password, so it is shown once and kept
-  // nowhere: a lost link means making a new one.
+  // it. Whoever can change the folder can copy the link again from its
+  // "Shared with…" list.
   import Dialog from "./Dialog.svelte";
+  import LinkField from "./LinkField.svelte";
 
   let { fs, path, onclose } = $props();
 
@@ -20,7 +21,6 @@
   let busy = $state(false);
   let error = $state("");
   let link = $state("");
-  let copied = $state(false);
 
   async function submit(event) {
     event.preventDefault();
@@ -29,34 +29,24 @@
     try {
       const expires = days ? Math.floor(Date.now() / 1000) + days * 86400 : null;
       const made = await fs.createLink(path, label.trim(), expires);
-      link = `${location.origin}${location.pathname}#link=${made.link}`;
+      link = made.link;
     } catch (e) {
       error = e.code === "EROFS" ? "You can only share folders you can change." : e.message;
     } finally {
       busy = false;
     }
   }
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(link);
-      copied = true;
-    } catch {
-      error = "The browser wouldn't copy. Select the link and copy it yourself.";
-    }
-  }
 </script>
 
 <Dialog title={`Share ${path} publicly`} {onclose}>
   {#if link}
-    <label for="public-link">Public link</label>
-    <div class="row">
-      <input id="public-link" readonly value={link} onfocus={(e) => e.target.select()} />
-      <button onclick={copy}>{copied ? "Copied" : "Copy"}</button>
-    </div>
+    <LinkField {link} />
     <p class="error">
-      Anyone with this link can read {path} until you revoke it{days ? " or it expires" : ""}. This is
-      the only time it is shown: if it is lost, make a new one.
+      Anyone with this link can read {path} until it is revoked{days ? " or it expires" : ""}.
+    </p>
+    <p class="note">
+      You, and anyone else who can change this folder and make links, can copy it again from the
+      folder's "Shared with…".
     </p>
     <p><button class="primary" onclick={onclose}>Done</button></p>
   {:else}
@@ -76,8 +66,3 @@
     </form>
   {/if}
 </Dialog>
-
-<style>
-  .row { display: flex; gap: 8px; align-items: center; }
-  .row input { flex: 1; min-width: 0; }
-</style>

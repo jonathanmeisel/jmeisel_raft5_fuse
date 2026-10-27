@@ -159,10 +159,10 @@ pub fn grants(connect: &ConnectArgs, args: PathArg) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
     let vault = log_in(&runtime, &ctx)?;
-    let grantees = runtime
+    let (grantees, secrets) = runtime
         .block_on(async {
             let ino = vault.resolve(&args.path).await?;
-            vault.grantees(ino).await
+            vault.grantees_with_links(ino).await
         })
         .map_err(|e| format!("cannot list the shares of {}: {e}", args.path))?;
     for g in grantees {
@@ -175,7 +175,13 @@ pub fn grants(connect: &ConnectArgs, args: PathArg) -> Outcome {
             "read-only"
         };
         if g.user.starts_with(raft5fs_proto::types::LINK_PREFIX) {
-            println!("{}\tpublic link\t(revoke it like a user)", g.user);
+            let link = match (secrets.get(&g.user), &ctx.ca_id) {
+                (Some(secret), Some(fs_id)) => {
+                    super::link::fragment(fs_id, &g.user, secret.clone())
+                }
+                _ => "(revoke it like a user)".to_string(),
+            };
+            println!("{}\tpublic link\t{link}", g.user);
         } else {
             println!("{}\t{mode}\t{key}", g.user);
         }

@@ -9,6 +9,10 @@
 //! list, with the keys on it. The server can still remove a grant (it can
 //! always refuse access), but it cannot add one.
 //!
+//! A public link's entry also holds the link's secret, so that whoever can
+//! change the node can copy the link again. The servers give the list only
+//! to them, and can't read it.
+//!
 //! Like chunks and names, the list starts with the key version it was
 //! sealed under, not encrypted. A revoked user could have written a list
 //! under an old version, so only a list under the node's current version
@@ -23,7 +27,15 @@ pub struct GranteeEntry {
     pub user: String,
     pub public_key: [u8; PUBLIC_KEY_LEN],
     pub writable: bool,
+    /// For a public link: its secret, the password in the link.
+    pub link_secret: Option<String>,
 }
+
+/// An entry's flags byte: whether the grantee can write, and whether a
+/// link secret follows. A list from before link secrets has only the
+/// first.
+const WRITABLE: u8 = 1;
+const HAS_LINK_SECRET: u8 = 2;
 
 fn grantees_aad(ino: u64, version: u32) -> Vec<u8> {
     aad("grantees", &[&ino.to_be_bytes(), &version.to_be_bytes()])
@@ -40,7 +52,17 @@ pub fn seal_grantees(key: &Key, version: u32, ino: u64, entries: &[GranteeEntry]
     for entry in sorted {
         put_bytes(&mut plain, entry.user.as_bytes());
         plain.extend_from_slice(&entry.public_key);
-        plain.push(u8::from(entry.writable));
+        let mut flags = 0;
+        if entry.writable {
+            flags |= WRITABLE;
+        }
+        if entry.link_secret.is_some() {
+            flags |= HAS_LINK_SECRET;
+        }
+        plain.push(flags);
+        if let Some(secret) = &entry.link_secret {
+            put_bytes(&mut plain, secret.as_bytes());
+        }
     }
     let mut out = version.to_be_bytes().to_vec();
     out.extend_from_slice(&seal(key, &grantees_aad(ino, version), &plain));
@@ -63,10 +85,15 @@ pub fn open_grantees(key: &Key, ino: u64, blob: &[u8]) -> Result<Vec<GranteeEntr
             .map_err(|_| Error(what))?
             .to_string();
         let public_key = r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap();
-        let writable = match r.take(1, what)?[0] {
-            0 => false,
-            1 => true,
-            _ => return Err(Error(what)),
+        let flags = r.take(1, what)?[0];
+        if flags & !(WRITABLE | HAS_LINK_SECRET) != 0 {
+            return Err(Error(what));
+        }
+        let link_secret = if flags & HAS_LINK_SECRET != 0 {
+            let secret = std::str::from_utf8(r.bytes(what)?).map_err(|_| Error(what))?;
+            Some(secret.to_string())
+        } else {
+            None
         };
         if entries.iter().any(|e| e.user == user) {
             return Err(Error(what));
@@ -74,7 +101,8 @@ pub fn open_grantees(key: &Key, ino: u64, blob: &[u8]) -> Result<Vec<GranteeEntr
         entries.push(GranteeEntry {
             user,
             public_key,
-            writable,
+            writable: flags & WRITABLE != 0,
+            link_secret,
         });
     }
     r.finish(what)?;
@@ -91,7 +119,38 @@ mod tests {
             user: user.to_string(),
             public_key: [byte; PUBLIC_KEY_LEN],
             writable,
+            link_secret: None,
         }
+    }
+
+    #[test]
+    fn a_link_keeps_its_secret_and_old_lists_still_open() {
+        let key = Key::random();
+        let link = GranteeEntry {
+            link_secret: Some("ab".repeat(32)),
+            ..entry("link-abc", 3, false)
+        };
+        let list = vec![entry("alice", 1, true), link];
+        let blob = seal_grantees(&key, 2, 9, &list);
+        assert_eq!(open_grantees(&key, 9, &blob).unwrap(), list);
+
+        // A list sealed before link secrets: one flags byte, 0 or 1.
+        let mut plain = 1u32.to_be_bytes().to_vec();
+        put_bytes(&mut plain, b"bob");
+        plain.extend_from_slice(&[2; PUBLIC_KEY_LEN]);
+        plain.push(1);
+        let mut old = 2u32.to_be_bytes().to_vec();
+        old.extend_from_slice(&seal(&key, &grantees_aad(9, 2), &plain));
+        assert_eq!(
+            open_grantees(&key, 9, &old).unwrap(),
+            [entry("bob", 2, true)]
+        );
+
+        // Flags it doesn't know are refused.
+        *plain.last_mut().unwrap() = 4;
+        let mut odd = 2u32.to_be_bytes().to_vec();
+        odd.extend_from_slice(&seal(&key, &grantees_aad(9, 2), &plain));
+        assert!(open_grantees(&key, 9, &odd).is_err());
     }
 
     #[test]

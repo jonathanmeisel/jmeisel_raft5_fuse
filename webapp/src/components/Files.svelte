@@ -12,6 +12,7 @@
   import PruneBar from "./PruneBar.svelte";
   import Viewer from "./Viewer.svelte";
   import InviteDialog from "./InviteDialog.svelte";
+  import AccountMenu from "./AccountMenu.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
   import { onDestroy } from "svelte";
@@ -325,32 +326,51 @@
   }
 
   const percent = (t) => (t.total ? Math.floor((100 * t.done) / t.total) : 0);
+
+  /// The account menu: what the account does besides files.
+  const menuItems = $derived([
+    { id: "pending", text: "Shared with me", icon: "wxi-file-multiple-outline", badge: pendingCount || 0 },
+    ...(account.caps.includes("invite") ? [{ id: "invite", text: "Invite someone", icon: "wxi-plus" }] : []),
+    ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
+    { id: "fingerprint", text: "My fingerprint", icon: "wxi-information-outline" },
+    { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
+  ]);
+
+  function chose(id) {
+    if (id === "logout") onlogout();
+    else dialog = { kind: id };
+  }
+
+  const several = __RAFT5FS_FILESYSTEMS__.length > 1;
 </script>
 
 <svelte:window onbeforeunload={beforeUnload} />
 
+<WillowDark fonts={false}>
 <div class="layout">
   <header>
     {#if visitor}
-      <span class="who">Shared with you by public link: read-only</span>
-      <span class="spacer"></span>
-      <button onclick={onlogout}>Close</button>
+      <span class="title">
+        <i class="wxi-folder logo" aria-hidden="true"></i>
+        <span class="fs">Shared with you: read-only</span>
+      </span>
+      <button class="close" onclick={onlogout}>Close</button>
     {:else}
-      <span class="who">{me.user}{__RAFT5FS_FILESYSTEMS__.length > 1 ? ` on ${me.filesystem}` : ""}</span>
-      <span class="spacer"></span>
-      <button onclick={() => (dialog = { kind: "pending" })}>
-        Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
-      </button>
-      {#if account.caps.includes("invite")}
-        <button onclick={() => (dialog = { kind: "invite" })}>Invite someone</button>
-      {/if}
-      {#if account.caps.includes("links")}
-        <button onclick={() => (dialog = { kind: "links" })}>Public links</button>
-      {/if}
-      <button onclick={() => (dialog = { kind: "fingerprint" })}>My fingerprint</button>
-      <button onclick={onlogout}>Log out</button>
+      <span class="title">
+        <i class="wxi-folder logo" aria-hidden="true"></i>
+        {#if several}<span class="fs">{me.filesystem}</span>{/if}
+      </span>
+      <AccountMenu user={me.user} items={menuItems} onselect={chose} />
     {/if}
   </header>
+
+  {#if pendingCount && !visitor}
+    <div class="banner">
+      {pendingCount === 1 ? "A share is" : `${pendingCount} shares are`} waiting for you to check who
+      sent {pendingCount === 1 ? "it" : "them"}.
+      <button onclick={() => (dialog = { kind: "pending" })}>Review</button>
+    </div>
+  {/if}
 
   {#if storageError}
     <div class="banner" title={storageError}>Unable to persist state to browser storage</div>
@@ -375,7 +395,6 @@
 
   <div class="fm">
     {#if initial}
-      <WillowDark fonts={false}>
         <Filemanager
           data={initial}
           {init}
@@ -384,10 +403,10 @@
           icons="simple"
           previews={(file) => preview.url(file)}
         />
-      </WillowDark>
     {/if}
   </div>
 </div>
+</WillowDark>
 
 {#if dialog?.kind === "fingerprint"}
   <Dialog title="My fingerprint" onclose={() => (dialog = null)}>
@@ -425,23 +444,28 @@
 
 <style>
   .layout { display: flex; flex-direction: column; height: 100%; }
+  /* In SVAR's colours and sizes, as one bar with its toolbar below. */
   header {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px 14px;
-    background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+    height: 52px; padding: 0 12px 0 16px; flex: none;
+    background: var(--wx-background); border-bottom: var(--wx-border-medium);
+    font-size: var(--wx-font-size);
   }
-  .who {
-    color: var(--muted);
-    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  .title {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
+    overflow: hidden; white-space: nowrap;
   }
-  header button { white-space: nowrap; }
-  /* Phones: the name on its own line, the buttons sharing the row below. */
-  @media (max-width: 600px) {
-    header { padding: 8px 10px; }
-    .who { flex: 1 0 100%; }
-    .spacer { display: none; }
-    header button { flex: 1 1 auto; padding: 6px 8px; font-size: 0.9em; }
+  /* SVAR's folder icon, in its colour, as in the folder tree. The glyph
+     sits high in its box, so it moves down to look centred. */
+  .logo {
+    font-size: 28px; line-height: 1; color: var(--wx-color-primary); flex: none;
+    transform: translateY(2px);
   }
-  .spacer { flex: 1; }
+  .fs { color: var(--wx-color-font-alt); overflow: hidden; text-overflow: ellipsis; }
+  .close {
+    height: 36px; border: none; border-radius: var(--wx-radius-major, 6px);
+    background: var(--wx-background-alt); color: var(--wx-color-font);
+  }
   .banner {
     padding: 8px 14px; background: var(--warn-bg); border-bottom: 1px solid var(--border);
     display: flex; gap: 12px; align-items: center; justify-content: space-between;

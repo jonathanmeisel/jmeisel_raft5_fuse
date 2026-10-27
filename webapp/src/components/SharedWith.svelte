@@ -9,6 +9,7 @@
   // Public links show as such, not by their account name. Anyone who can
   // change the folder can revoke one, as for a person.
   import Dialog from "./Dialog.svelte";
+  import LinkField from "./LinkField.svelte";
 
   let { fs, path, me, links = false, onclose } = $props();
   /// This account's own links, by name, for their expiry.
@@ -21,6 +22,8 @@
   let confirming = $state(null);
   let busy = $state(false);
   let revoked = $state("");
+  /// The public link being shown, by its account name.
+  let shown = $state(null);
 
   async function load() {
     try {
@@ -118,11 +121,21 @@
                 <td>{g.writable ? "read-write" : "read-only"}</td>
               {/if}
               <td>
+                {#if links && g.link}
+                  <button onclick={() => (shown = shown === g.user ? null : g.user)}>
+                    {shown === g.user ? "Hide link" : "Show link"}
+                  </button>
+                {/if}
                 {#if g.user !== me}
                   <button class="danger" onclick={() => ask(g.user)} disabled={busy}>Revoke…</button>
                 {/if}
               </td>
             </tr>
+            {#if shown === g.user}
+              <tr>
+                <td colspan="3"><LinkField link={g.link} id="shared-link" /></td>
+              </tr>
+            {/if}
           {/each}
           {#each inherited as g}
             <tr class="inherited">

@@ -945,6 +945,16 @@ impl Vault {
     /// list does not agree with the grantee list sealed under its key, or
     /// with the keys pinned here.
     pub async fn grantees(&self, ino: u64) -> Result<Vec<Grantee>, FsError> {
+        Ok(self.grantees_with_links(ino).await?.0)
+    }
+
+    /// `grantees`, and the secret of each public link among them, by link
+    /// name, from the sealed grantee list. Needs write access to `ino`, as
+    /// the list does.
+    pub async fn grantees_with_links(
+        &self,
+        ino: u64,
+    ) -> Result<(Vec<Grantee>, HashMap<String, String>), FsError> {
         let mut node = self.node(ino).await?;
         let Some(granted) = self
             .remote
@@ -953,14 +963,18 @@ impl Vault {
             .into_iter()
             .find(|n| n.ino == ino)
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         };
         if newer_key(&node, &granted) {
             self.forget_all();
             node = self.node(ino).await?;
         }
-        self.checked_grantees(&node, ino, &granted)?;
-        Ok(granted.grantees)
+        let secrets = self
+            .checked_grantees(&node, ino, &granted)?
+            .into_values()
+            .filter_map(|e| Some((e.user, e.link_secret?)))
+            .collect();
+        Ok((granted.grantees, secrets))
     }
 
     /// Returns `ino`'s key. If it is not known yet, unwraps it from this
@@ -1468,6 +1482,7 @@ impl Vault {
                 user: username.to_string(),
                 public_key: me,
                 writable: true,
+                link_secret: None,
             }],
         );
         let new = NewNode {
@@ -1522,6 +1537,19 @@ impl Vault {
         writable: bool,
         label: &OsStr,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        self.grant_with(ino, user, writable, label, None).await
+    }
+
+    /// `grant`, with `link_secret` kept in `user`'s sealed grantee entry
+    /// when `user` is a public link.
+    async fn grant_with(
+        &self,
+        ino: u64,
+        user: &str,
+        writable: bool,
+        label: &OsStr,
+        link_secret: Option<&str>,
+    ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         // Check this before pinning `user`'s key. A pin also makes shares
         // from `user` trusted, and sharing from an untrusted share must not
@@ -1555,6 +1583,7 @@ impl Vault {
                 user: user.to_string(),
                 public_key,
                 writable,
+                link_secret: link_secret.map(str::to_string),
             });
             let version = node.record.version;
             let grant = Grant {
@@ -1599,8 +1628,10 @@ impl Vault {
     /// - `label` is the name the directory shows under for the link's
     ///   visitors.
     ///
-    /// Returns the link's account name and secret. The secret is kept
-    /// nowhere else: it goes in the link (`public_link`).
+    /// Returns the link's account name and secret. The secret goes in the
+    /// link (`public_link`), and in the directory's sealed grantee list, so
+    /// whoever can change the directory can copy the link again
+    /// (`grantees_with_links`).
     pub async fn create_link(
         &self,
         ino: u64,
@@ -1618,7 +1649,8 @@ impl Vault {
             .await?;
         // This account made the key, so it needs no fingerprint check.
         self.known.check(&user, &key)?;
-        self.grant(ino, &user, false, label).await?;
+        self.grant_with(ino, &user, false, label, Some(&secret))
+            .await?;
         Ok((user, secret))
     }
 

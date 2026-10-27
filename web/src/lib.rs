@@ -776,14 +776,29 @@ impl Fs {
                 /// The folder above that it is shared through, if not
                 /// this one.
                 via: Option<String>,
+                /// For a public link: the `#link=` fragment's value.
+                link: Option<String>,
             }
-            let entries = |grantees: Vec<raft5fs_proto::types::Grantee>, via: Option<&str>| {
+            let fs_id = inner.fs_id.clone();
+            let entries = |(grantees, secrets): (
+                Vec<raft5fs_proto::types::Grantee>,
+                HashMap<String, String>,
+            ),
+                           via: Option<&str>| {
                 grantees
                     .into_iter()
                     .map(|g| Shared {
                         fingerprint: <[u8; PUBLIC_KEY_LEN]>::try_from(g.public_key.as_slice())
                             .ok()
                             .map(|k| Fingerprint::of(&k)),
+                        link: secrets.get(&g.user).map(|secret| {
+                            PublicLink {
+                                fs_id: fs_id.clone(),
+                                user: g.user.clone(),
+                                secret: secret.clone(),
+                            }
+                            .encode()
+                        }),
                         user: g.user,
                         writable: g.writable,
                         via: via.map(str::to_string),
@@ -791,7 +806,7 @@ impl Fs {
                     .collect::<Vec<_>>()
             };
             let ino = inner.resolve(&path).await?.ino;
-            let mut shared = entries(inner.vault().grantees(ino).await?, None);
+            let mut shared = entries(inner.vault().grantees_with_links(ino).await?, None);
 
             // The folders above, from the volume down: one look at what is
             // granted under the volume says which of them to ask about.
@@ -814,7 +829,7 @@ impl Fs {
                 if !granted.iter().any(|g| g.ino == *folder_ino) {
                     continue;
                 }
-                let grantees = inner.vault().grantees(*folder_ino).await?;
+                let grantees = inner.vault().grantees_with_links(*folder_ino).await?;
                 shared.extend(
                     entries(grantees, Some(folder))
                         .into_iter()
@@ -958,8 +973,10 @@ impl Fs {
     }
 
     /// The public links that this account made, as `[{user, path, created,
-    /// expires, expired}]` (times in seconds since 1970; `expires` null for
-    /// never; `path` null if it can't be read).
+    /// expires, expired, link}]` (times in seconds since 1970; `expires`
+    /// null for never; `path` null if it can't be read; `link`, the
+    /// `#link=` fragment's value, null if this account can no longer
+    /// change the folder or the link predates keeping it).
     #[wasm_bindgen(js_name = listLinks)]
     pub fn list_links(&self) -> Promise {
         let inner = Rc::clone(&self.0);
@@ -971,19 +988,32 @@ impl Fs {
                 created: u64,
                 expires: Option<u64>,
                 expired: bool,
+                link: Option<String>,
             }
             let now = (js_sys::Date::now() / 1000.0) as u64;
-            let links = inner.vault().links().await?;
-            Ok(links
-                .into_iter()
-                .map(|(link, path)| Made {
+            let mut made = Vec::new();
+            for (link, path) in inner.vault().links().await? {
+                let secret = match inner.vault().grantees_with_links(link.info.folder).await {
+                    Ok((_, mut secrets)) => secrets.remove(&link.user),
+                    Err(_) => None,
+                };
+                made.push(Made {
                     expired: link.info.expired(now),
+                    link: secret.map(|secret| {
+                        PublicLink {
+                            fs_id: inner.fs_id.clone(),
+                            user: link.user.clone(),
+                            secret,
+                        }
+                        .encode()
+                    }),
                     user: link.user,
                     path,
                     created: link.info.created,
                     expires: link.info.expires,
-                })
-                .collect::<Vec<_>>())
+                });
+            }
+            Ok(made)
         })
     }
 

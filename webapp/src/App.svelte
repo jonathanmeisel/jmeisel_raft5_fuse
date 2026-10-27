@@ -117,7 +117,6 @@
   <Files {fs} {me} {storageError} onlogout={() => logout()} />
 {:else}
   <main class="card">
-    <h1>Store your <em>gayest</em> files</h1>
     {#if notice}<p class="note">{notice}</p>{/if}
     {#if screen === "closed"}
       <p>To see the folder again, open the link you were given once more.</p>
@@ -147,5 +146,4 @@
     border-radius: 10px;
     padding: 24px 28px;
   }
-  h1 { margin: 0 0 12px; font-size: 1.5em; }
 </style>

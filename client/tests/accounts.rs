@@ -269,6 +269,7 @@ fn public_links_read_one_folder_until_any_writer_revokes() {
     let rt = &backend.runtime;
     backend.enrol("bob");
     backend.enrol("carol");
+    backend.enrol("dave");
     let tester = vault(&backend, TESTER);
     let docs = rt
         .block_on(tester.create_volume(OsStr::new("docs"), 0o755))
@@ -361,6 +362,20 @@ fn public_links_read_one_folder_until_any_writer_revokes() {
         errno(rt.block_on(tester.grant(docs, &link, true, OsStr::new("x")))),
         libc::EPERM
     );
+
+    // Whoever can change the folder can copy the link again; a reader
+    // can't. The secret outlives a revoke of someone else, which gives the
+    // folder a new key.
+    let secret_for = |who: &Vault| {
+        rt.block_on(who.grantees_with_links(docs))
+            .map(|(_, mut secrets)| secrets.remove(&link))
+    };
+    assert_eq!(secret_for(&bob).unwrap().as_deref(), Some(secret.as_str()));
+    assert!(secret_for(&carol).is_err());
+    rt.block_on(tester.grant(docs, "dave", false, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(tester.revoke(docs, "dave")).unwrap();
+    assert_eq!(secret_for(&bob).unwrap().as_deref(), Some(secret.as_str()));
 
     // A reader can't revoke it; any writer can, and that ends the link.
     assert!(rt.block_on(carol.revoke(docs, &link)).is_err());

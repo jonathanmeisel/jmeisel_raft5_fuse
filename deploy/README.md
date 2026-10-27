@@ -689,6 +689,13 @@ never send to a server. So:
   with…** list shows it as "Public link"), as for a person: the folder is
   re-encrypted and the servers delete the link's account. Deleting the
   folder ends its links too.
+- Anyone who can change the folder and make links can also copy its links
+  again (**Show link**). The link's secret is kept in the folder's list of
+  who it is shared with, which is sealed under the folder's key, and which
+  the servers give only to those who can change the folder. So a writer
+  you later remove from the folder may still have its links: revoke them
+  too if that matters. Clients from before this change can't share or
+  revoke on a folder that has a link: update them.
 - An expired link can't log in, and an open visit stops within seconds.
   It keeps its share until someone revokes it, though, and the folder
   isn't re-encrypted until then: someone who kept the link and later got

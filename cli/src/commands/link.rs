@@ -17,7 +17,8 @@ pub enum LinkCommand {
     /// the directory, until it expires or anyone who can write the
     /// directory revokes it (`raft5fs revoke <PATH> <LINK-NAME>`).
     Create(CreateArgs),
-    /// List the links you made.
+    /// List the links you made, with each link while you can still
+    /// change its directory.
     List,
 }
 
@@ -109,15 +110,7 @@ fn create(connect: &ConnectArgs, args: CreateArgs) -> Outcome {
                 .await
         })
         .map_err(|e| format!("cannot make a link to {}: {e}", args.path))?;
-    let fragment = format!(
-        "#link={}",
-        PublicLink {
-            fs_id,
-            user: user.clone(),
-            secret
-        }
-        .encode()
-    );
+    let fragment = fragment(&fs_id, &user, secret);
     println!("public link {user} to {}, read-only:", args.path);
     match &args.app {
         Some(app) => println!("{}/{fragment}", app.trim_end_matches('/')),
@@ -127,8 +120,8 @@ fn create(connect: &ConnectArgs, args: CreateArgs) -> Outcome {
         }
     }
     println!(
-        "anyone with it can read {} until {}; it can't be shown again, so make a new one \
-         if it is lost. To revoke it: raft5fs revoke {} {user}",
+        "anyone with it can read {} until {}; `raft5fs link list` shows it again. To revoke \
+         it: raft5fs revoke {} {user}",
         args.path,
         match expires {
             Some(at) => until(at).replace("expires in", "it expires in"),
@@ -159,8 +152,27 @@ fn list(connect: &ConnectArgs) -> Outcome {
             link.user,
             path.as_deref().unwrap_or("(unknown folder)")
         );
+        // The secret is in the folder's sealed grantee list, which only
+        // those who can change the folder get.
+        let secret = runtime
+            .block_on(vault.grantees_with_links(link.info.folder))
+            .ok()
+            .and_then(|(_, mut secrets)| secrets.remove(&link.user));
+        if let (Some(secret), Some(fs_id)) = (secret, &ctx.ca_id) {
+            println!("  {}", fragment(fs_id, &link.user, secret));
+        }
     }
     Ok(0)
+}
+
+/// What goes after the web app's address for a link.
+pub fn fragment(fs_id: &str, user: &str, secret: String) -> String {
+    let link = PublicLink {
+        fs_id: fs_id.to_string(),
+        user: user.to_string(),
+        secret,
+    };
+    format!("#link={}", link.encode())
 }
 
 #[cfg(test)]

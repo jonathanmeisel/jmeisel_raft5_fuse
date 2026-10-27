@@ -305,8 +305,9 @@ account:
 A link is an account whose password is a random secret in the URL's
 fragment (never sent to a server). It can only read the directory it was
 made for. Anyone who can write the directory can revoke it, as for a
-person (`raft5fs grants` shows links), and that deletes the link's
-account. An expired link can't log in, but keeps its share until it is
+person, and that deletes the link's account. They can also see the link
+again (`raft5fs grants` and `link list` show it): its secret is kept in
+the directory's sealed list of who it is shared with. An expired link can't log in, but keeps its share until it is
 revoked, so revoke it to re-encrypt the directory.
 
 

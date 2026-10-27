@@ -1,9 +1,10 @@
 <script>
   // The public links this account made: their folder, when they expire,
-  // and revoking. Revoking re-seals the folder, as for a person, and queues
-  // it for pruning. A link can't be shown again: its password is kept only
-  // in the link.
+  // the link itself (while this account can still change the folder), and
+  // revoking. Revoking re-seals the folder, as for a person, and queues it
+  // for pruning.
   import Dialog from "./Dialog.svelte";
+  import LinkField from "./LinkField.svelte";
 
   let { fs, onclose } = $props();
 
@@ -11,6 +12,7 @@
   let error = $state("");
   let confirming = $state(null);
   let busy = $state(false);
+  let shown = $state(null);
 
   async function load() {
     try {
@@ -63,12 +65,23 @@
             <tr>
               <td><strong>{l.path ?? "(a folder)"}</strong></td>
               <td class="note">made {date(l.created)}, {expiry(l)}</td>
-              <td><button class="danger" onclick={() => (confirming = l)}>Revoke…</button></td>
+              <td>
+                {#if l.link}
+                  <button onclick={() => (shown = shown === l.user ? null : l.user)}>
+                    {shown === l.user ? "Hide link" : "Show link"}
+                  </button>
+                {/if}
+                <button class="danger" onclick={() => (confirming = l)}>Revoke…</button>
+              </td>
             </tr>
+            {#if shown === l.user}
+              <tr>
+                <td colspan="3"><LinkField link={l.link} id="my-link" /></td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
-      <p class="note">A link is shown only when it is made. If one is lost, revoke it and make a new one.</p>
     {/if}
     <p><button onclick={onclose}>Close</button></p>
   {/if}
