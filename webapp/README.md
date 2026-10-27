@@ -13,6 +13,10 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   other tabs up to date with its saves, and runs the background prune
   when it holds the account's prune lock (one tab at a time).
 - `src/lib/rpc.js`: the page's calls into the Worker.
+- `src/lib/route.js`: where the app is, in the URL's fragment (never sent to
+  a server): `#/<path>` opens a folder or a file, browsing adds history
+  entries, and `#invite=<invitation>` opens the enroll screen filled in.
+  Logging out clears it.
 - `src/lib/previews.js`: thumbnails for images and text files (up to
   20 MB), which the Worker decrypts and draws. Showing a folder fetches
   its images to make them. It also says what the viewer can open, and as

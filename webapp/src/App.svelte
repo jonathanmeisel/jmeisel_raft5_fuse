@@ -9,6 +9,7 @@
   import Login from "./components/Login.svelte";
   import Enrol from "./components/Enrol.svelte";
   import Files from "./components/Files.svelte";
+  import { clearRoute, readRoute } from "./lib/route.js";
 
   const IDLE_MS = 30 * 60 * 1000;
 
@@ -18,6 +19,8 @@
   let notice = $state("");
   let storageError = $state("");
   let lastUser = $state("");
+  /// An invitation from the URL (`#invite=`), for the enroll screen.
+  let invitation = $state("");
 
   function worker() {
     return connect({ onStorageError: (m) => (storageError = m) });
@@ -43,14 +46,25 @@
     screen = "login";
     notice = why;
     clearTimeout(idleTimer);
+    // A shared computer's address bar shouldn't keep showing folder names.
+    clearRoute();
     if (ending) {
       if (why) ending.kill();
       else await ending.end().catch(() => ending.kill());
     }
   }
 
-  /// Logs the remembered account back in, if this device has one.
+  /// Logs the remembered account back in, if this device has one. An
+  /// invitation link goes straight to the enroll screen instead; its code
+  /// leaves the address bar at once.
   async function start() {
+    const route = readRoute();
+    if (route?.invite) {
+      invitation = route.invite;
+      clearRoute();
+      screen = "enrol";
+      return;
+    }
     const session = worker();
     try {
       const who = await session.resume();
@@ -93,6 +107,7 @@
     {#if screen === "enrol"}
       <Enrol
         {worker}
+        {invitation}
         ondone={(user) => {
           lastUser = user;
           screen = "login";

@@ -1,8 +1,9 @@
 <script>
   import Fingerprint from "./Fingerprint.svelte";
 
-  let { worker, ondone, oncancel } = $props();
-  let invitation = $state("");
+  let { worker, invitation: given = "", ondone, oncancel } = $props();
+  // svelte-ignore state_referenced_locally
+  let invitation = $state(given);
   let password = $state("");
   let again = $state("");
   let busy = $state(false);

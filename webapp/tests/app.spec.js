@@ -73,10 +73,18 @@ const PNG = Buffer.from(
 );
 
 /// Enrols `user` through the page, and gives their fingerprint's words.
-async function enrol(page, user) {
-  await page.goto("/");
-  await page.getByRole("link", { name: "Enroll with an invitation" }).click();
-  await page.getByLabel("Invitation").fill(invites()[user]);
+async function enrol(page, user, { viaLink = false } = {}) {
+  if (viaLink) {
+    // An invitation link opens the enroll screen with it filled in, and
+    // takes the code out of the address bar.
+    await page.goto(`/#invite=${encodeURIComponent(invites()[user])}`);
+    await expect(page.getByLabel("Invitation")).toHaveValue(invites()[user]);
+    expect(new URL(page.url()).hash).toBe("");
+  } else {
+    await page.goto("/");
+    await page.getByRole("link", { name: "Enroll with an invitation" }).click();
+    await page.getByLabel("Invitation").fill(invites()[user]);
+  }
   await page.getByLabel("New password").fill(PASSWORD);
   await page.getByLabel("Again").fill(PASSWORD);
   await page.getByRole("button", { name: "Enroll" }).click();
@@ -95,6 +103,13 @@ async function login(page, user, stay = false) {
   if (stay) await page.getByLabel(/Stay logged in/).check();
   await page.getByRole("button", { name: "Log in" }).click();
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible(SLOW);
+}
+
+/// Opens the app afresh at `hash`: a whole new page load, not a jump
+/// within the page that is already there.
+async function visit(page, hash) {
+  await page.goto("about:blank");
+  await page.goto(`/${hash}`);
 }
 
 /// Collects CSP violations and uncaught errors in `page`.
@@ -180,6 +195,30 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   await test.step("and downloads the same bytes", async () => {
     expect((await download(alice, "small.txt")).equals(small)).toBe(true);
     expect((await download(alice, "large.bin")).equals(large)).toBe(true);
+  });
+
+  await test.step("paths in the URL open folders and files", async () => {
+    // Browsing records the folder, and a fresh visit to it lands there.
+    expect(new URL(alice.url()).hash).toBe("#/docs");
+    await visit(alice, "#/docs");
+    await login(alice, "alice");
+    await expect(item(alice, "small.txt")).toBeVisible(SLOW);
+    // Back returns to where the app was before.
+    await alice.getByText("My files").first().click();
+    await expect(item(alice, "docs")).toBeVisible(SLOW);
+    await alice.goBack();
+    await expect(item(alice, "small.txt")).toBeVisible(SLOW);
+    // A file's path opens it.
+    await visit(alice, "#/docs/small.txt");
+    await login(alice, "alice");
+    await expect(alice.getByRole("dialog").locator("pre")).toHaveText(small.toString().trim(), SLOW);
+    await alice.getByRole("button", { name: "Close" }).click();
+    // A path that isn't there says so, from the root.
+    await visit(alice, "#/nowhere");
+    await login(alice, "alice");
+    await expect(alice.getByText(/There's nothing at \/nowhere/)).toBeVisible(SLOW);
+    await expect(item(alice, "docs")).toBeVisible(SLOW);
+    await open(alice, "docs");
   });
 
   await test.step("video and PDFs stream through the service worker", async () => {
@@ -315,7 +354,7 @@ test("without a service worker, files open and download whole", async ({ browser
   const context = await browser.newContext({ serviceWorkers: "block" });
   const carol = await context.newPage();
   const problems = watch(carol);
-  await enrol(carol, "carol");
+  await enrol(carol, "carol", { viaLink: true });
   await login(carol, "carol");
   await addFolder(carol, "media");
   await open(carol, "media");

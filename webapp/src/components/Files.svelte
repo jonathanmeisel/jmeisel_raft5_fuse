@@ -14,6 +14,7 @@
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
+  import { pathHash, readRoute } from "../lib/route.js";
 
   let { fs, me, storageError, onlogout } = $props();
 
@@ -165,8 +166,52 @@
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
+  // ---------------------------------------------------------- the URL
+  // The open folder is in the URL's fragment (see route.js): browsing adds
+  // a history entry, Back and Forward go back to it, and the app opens at
+  // the path it was given.
+
+  /// Whether a navigation comes from the URL, so it adds no history entry.
+  let following = false;
+
+  /// Opens `path`: a folder, or a file in its folder (then opened as a
+  /// double-click would). Loads each folder on the way, which SVAR only
+  /// knows once its parent is listed.
+  async function goTo(path, { fromUrl = false } = {}) {
+    let kind = "folder";
+    try {
+      kind = (await fs.stat(path)).kind;
+    } catch {
+      if (path !== "/") error = `There's nothing at ${path} that you can see.`;
+      path = "/";
+    }
+    const folder = kind === "folder" ? path : parentOf(path);
+    const names = folder.split("/").filter(Boolean);
+    for (let i = 1; i < names.length; i++) await reload("/" + names.slice(0, i).join("/"));
+    following = fromUrl;
+    try {
+      await api.exec("set-path", { id: folder });
+    } finally {
+      following = false;
+    }
+    if (kind !== "folder") await api.exec("open-file", { id: path });
+  }
+
+  /// Adds a history entry for the folder SVAR moved to.
+  function moved({ id }) {
+    if (following || !id || location.hash === pathHash(id)) return;
+    history.pushState(null, "", pathHash(id));
+  }
+
+  const onPopState = () => goTo(readRoute()?.path ?? "/", { fromUrl: true });
+  addEventListener("popstate", onPopState);
+  onDestroy(() => removeEventListener("popstate", onPopState));
+
   function init(fm) {
     api = fm;
+    api.on("set-path", moved);
+    const start = readRoute()?.path;
+    if (start && start !== "/") queueMicrotask(() => goTo(start, { fromUrl: true }));
     api.intercept("request-data", ({ id }) => {
       reload(id);
       return false;
