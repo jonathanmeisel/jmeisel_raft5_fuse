@@ -365,6 +365,55 @@ test("without a service worker, files open and download whole", async ({ browser
   expect(problems).toEqual([]);
 });
 
+test("a user invites someone, who enrolls from the link", async ({ browser }) => {
+  const erin = await (await browser.newContext()).newPage();
+  const dave = await (await browser.newContext()).newPage();
+  const problems = [erin, dave].map(watch);
+  let link;
+
+  await test.step("erin invites dave from the app", async () => {
+    await enrol(erin, "erin");
+    await login(erin, "erin");
+    await erin.getByRole("button", { name: "Invite someone" }).click();
+    // A name that is taken is refused.
+    await erin.getByLabel("Their account name").fill("alice");
+    await erin.getByRole("button", { name: "Invite", exact: true }).click();
+    await expect(erin.getByText("The name alice is taken")).toBeVisible(SLOW);
+    await erin.getByLabel("Their account name").fill("dave");
+    await erin.getByRole("button", { name: "Invite", exact: true }).click();
+    link = await erin.getByLabel("Link to enroll in this app").inputValue();
+    expect(link).toMatch(/^http:\/\/localhost:4173\/#invite=raft5fs-invite/);
+    await erin.getByRole("button", { name: "Invite someone else" }).click();
+    await expect(erin.getByRole("cell", { name: "dave" })).toBeVisible();
+    await erin.getByRole("button", { name: "Cancel", exact: true }).click();
+  });
+
+  await test.step("dave enrolls from the link, and can't make volumes", async () => {
+    await dave.goto(link);
+    expect(new URL(dave.url()).hash).toBe("");
+    await dave.getByLabel("New password").fill(PASSWORD);
+    await dave.getByLabel("Again").fill(PASSWORD);
+    await dave.getByRole("button", { name: "Enroll" }).click();
+    await expect(dave.getByText("Enrolled dave")).toBeVisible(SLOW);
+    await dave.getByRole("button", { name: "Continue to log in" }).click();
+    await login(dave, "dave");
+    await expect(dave.getByRole("button", { name: "Invite someone" })).toHaveCount(0);
+    await dave.getByText("Add New").click();
+    await dave.getByText("Add new folder").click();
+    await dave.locator(".wx-modal input").fill("mine");
+    await dave.locator(".wx-modal").getByRole("button", { name: "OK" }).click();
+    await expect(dave.getByText("You can't create top-level folders here")).toBeVisible();
+  });
+
+  await test.step("the invitation is used up", async () => {
+    await erin.getByRole("button", { name: "Invite someone" }).click();
+    await expect(erin.getByLabel("Their account name")).toBeVisible();
+    await expect(erin.getByRole("cell", { name: "dave" })).toHaveCount(0);
+  });
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

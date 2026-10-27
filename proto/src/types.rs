@@ -331,6 +331,135 @@ pub struct AccountKeys {
     pub wrapped_private_key: Vec<u8>,
 }
 
+/// What an account may do beyond what its grants allow, as a set of bits.
+/// Grants decide everything about existing files; these decide what an
+/// account may start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Caps(u32);
+
+impl Caps {
+    pub const NONE: Caps = Caps(0);
+    /// Make new volumes (top-level folders).
+    pub const VOLUMES: Caps = Caps(1);
+    /// Invite new users.
+    pub const INVITE: Caps = Caps(2);
+    /// Make public links.
+    pub const LINKS: Caps = Caps(4);
+    /// Every capability, with its name.
+    pub const NAMED: [(Caps, &'static str); 3] = [
+        (Caps::VOLUMES, "volumes"),
+        (Caps::INVITE, "invite"),
+        (Caps::LINKS, "links"),
+    ];
+
+    /// The capabilities in `bits`. Bits that no capability uses are
+    /// dropped, so a newer peer's capabilities never read as more.
+    pub fn from_bits(bits: u32) -> Self {
+        let all = Self::NAMED.iter().fold(0, |all, (c, _)| all | c.0);
+        Caps(bits & all)
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether every capability in `other` is in `self`.
+    pub fn contains(self, other: Caps) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// `self` with `other` added (`on`) or removed.
+    pub fn with(self, other: Caps, on: bool) -> Self {
+        if on {
+            Caps(self.0 | other.0)
+        } else {
+            Caps(self.0 & !other.0)
+        }
+    }
+
+    /// The capability called `name`.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::NAMED
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(c, _)| *c)
+    }
+
+    /// The names of the capabilities in `self`, in a fixed order.
+    pub fn names(self) -> Vec<&'static str> {
+        Self::NAMED
+            .iter()
+            .filter(|(c, _)| self.contains(*c))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+}
+
+impl std::ops::BitOr for Caps {
+    type Output = Caps;
+    fn bitor(self, other: Caps) -> Caps {
+        Caps(self.0 | other.0)
+    }
+}
+
+/// Who or what an account is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccountKind {
+    #[default]
+    Person,
+    /// A public link: an account whose password is in a URL.
+    Link,
+}
+
+/// What the servers keep about an account besides its keys: what it may
+/// do, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub caps: Caps,
+    pub kind: AccountKind,
+    /// The user who invited this account. Empty for one that an
+    /// administrator added.
+    pub invited_by: String,
+    /// When the account was added, in seconds since the Unix epoch. 0 if
+    /// not known.
+    pub created: u64,
+    /// For a link: the user who made it.
+    pub owner: String,
+    /// For a link: when it stops working, in seconds since the Unix epoch.
+    pub expires: Option<u64>,
+}
+
+impl Default for AccountInfo {
+    /// An account with no record: one that an administrator added before
+    /// capabilities existed. It may make volumes, as every account could
+    /// then.
+    fn default() -> Self {
+        Self {
+            caps: Caps::VOLUMES,
+            kind: AccountKind::Person,
+            invited_by: String::new(),
+            created: 0,
+            owner: String::new(),
+            expires: None,
+        }
+    }
+}
+
+/// An invitation that a user issued and nobody has used yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInvite {
+    pub user: String,
+    pub caps: Caps,
+    pub created: u64,
+}
+
+/// The most invitations that one user can have waiting at a time.
+pub const MAX_PENDING_INVITES: usize = 10;
+
+/// What every public link's account name starts with. Nobody can invite a
+/// user with such a name.
+pub const LINK_PREFIX: &str = "link-";
+
 /// An errno and a message. The caller gives the errno to the kernel. The
 /// message has the real cause (usually the store's own error text), so it
 /// can be logged.

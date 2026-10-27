@@ -645,15 +645,38 @@ drift from the cluster repo. `--no-drift` skips the drift check.
 
 ```sh
 ./fsadmin.sh user add alice      # prints an invitation
-./fsadmin.sh user list
+./fsadmin.sh user list           # with capabilities, under whoever invited each user
 ./fsadmin.sh user del alice      # also removes every grant made to her
 ```
 
 An invitation holds the one-time enrolment code, the servers' addresses
 and `fs-ca.pem`: it is as secret as the code, so hand it to alice alone.
 She installs the client (`get-raft5fs.sh`) and runs
-`raft5fs enrol '<invitation>'` (SETUP.txt section 5). A new code for an
-existing user lets them enrol again after forgetting their password.
+`raft5fs enrol '<invitation>'` (SETUP.txt section 5), or opens the web
+app's enroll screen with it. A new code for an existing user lets them
+enrol again after forgetting their password.
+
+**Capabilities** decide what a user may start, beyond what is shared with
+them:
+
+| Capability | Lets the user | Default |
+|---|---|---|
+| `volumes` | make top-level folders of their own | on for `user add`, and for every user added before capabilities existed |
+| `invite` | invite new users themselves (web app: **Invite someone**; CLI: `raft5fs invite`) | off |
+| `links` | make public links to folders (not yet built) | off |
+
+```sh
+./fsadmin.sh user add carol --no-volumes          # sees only what is shared with her
+./fsadmin.sh user set alice --invite on --links on
+./fsadmin.sh user set carol --volumes on
+```
+
+A user without `volumes` who is given only read-only shares can't change
+anything. A user who invites someone can give them only capabilities they
+have themselves, only under a name nobody has, and can have at most 10
+invitations waiting (`raft5fs invites` lists and cancels them). The
+servers put the same addresses and `fs-ca.pem` in those invitations as
+`user add` does.
 
 ### Snapshots
 

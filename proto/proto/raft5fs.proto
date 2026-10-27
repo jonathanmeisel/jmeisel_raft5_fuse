@@ -149,6 +149,21 @@ service Fs {
   // still sealed under a version that the prune removes, and EAGAIN if the
   // record changed in the meantime. Needs read-write access to the node.
   rpc PruneKeys(PruneKeysRequest) returns (EmptyResponse);
+
+  // Accounts (protocol 2 on). Each account has capabilities: what it may
+  // start, beyond what its grants allow (raft5fs-proto's `Caps`).
+  //
+  // The caller's own account: its capabilities, and where it came from.
+  rpc GetAccount(NoArgs) returns (AccountResponse);
+  // Makes a one-time code for a new user, and their account record. Needs
+  // the `invite` capability, and gives the new user only capabilities that
+  // the caller has. The name must be new: no account, code or record. A
+  // user can have at most 10 invitations waiting.
+  rpc IssueInvite(IssueInviteRequest) returns (IssueInviteResponse);
+  // The caller's invitations that nobody has used yet.
+  rpc ListInvites(NoArgs) returns (InviteListResponse);
+  // Withdraws one of the caller's unused invitations.
+  rpc CancelInvite(CancelInviteRequest) returns (EmptyResponse);
 }
 
 message NoArgs {}
@@ -704,6 +719,72 @@ message ResealedName {
 message ResealNamesRequest {
   uint64 dir = 1;
   repeated ResealedName names = 2;
+}
+
+enum AccountKind {
+  ACCOUNT_KIND_PERSON = 0;
+  ACCOUNT_KIND_LINK = 1;
+}
+
+message AccountInfo {
+  // `Caps` bits.
+  uint32 capabilities = 1;
+  AccountKind kind = 2;
+  // Empty for an account that an administrator added.
+  string invited_by = 3;
+  // Seconds since the Unix epoch; 0 if not known.
+  uint64 created = 4;
+  // For a link: who made it, and when it stops working (0: never).
+  string owner = 5;
+  uint64 expires = 6;
+}
+
+message AccountResponse {
+  oneof result {
+    AccountInfo account = 1;
+    Error error = 2;
+  }
+}
+
+message IssueInviteRequest {
+  string username = 1;
+  // `Caps` bits for the new user.
+  uint32 capabilities = 2;
+}
+
+message IssuedInvite {
+  string code = 1;
+  // The whole invitation (raft5fs-proto's `invite`), if the server knows
+  // the addresses and CA that users reach it by. Empty if not.
+  string invitation = 2;
+}
+
+message IssueInviteResponse {
+  oneof result {
+    IssuedInvite invite = 1;
+    Error error = 2;
+  }
+}
+
+message PendingInvite {
+  string username = 1;
+  uint32 capabilities = 2;
+  uint64 created = 3;
+}
+
+message InviteList {
+  repeated PendingInvite invites = 1;
+}
+
+message InviteListResponse {
+  oneof result {
+    InviteList list = 1;
+    Error error = 2;
+  }
+}
+
+message CancelInviteRequest {
+  string username = 1;
 }
 
 message PruneKeysRequest {

@@ -2500,6 +2500,7 @@ dependencies = [
  "gloo-timers",
  "http-body",
  "libc",
+ "raft5fs-core",
  "raft5fs-crypto",
  "raft5fs-objstore",
  "raft5fs-proto",

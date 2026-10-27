@@ -22,6 +22,7 @@ ExecStart=/usr/local/bin/raft5fs-server --listen 0.0.0.0:27060 \
     --token-key-file /etc/raft5fs/token.key \
     --tls-cert /etc/raft5fs/fs.pem --tls-key /etc/raft5fs/fs.key \
     --chunk-size @CHUNK_SIZE@ @OBJECT_OPTIONS@@WEB_OPTIONS@\
+    @INVITE_SERVERS@--invite-ca /etc/raft5fs/fs-ca.pem \
     --store-user raft5fs --store-ca /etc/raft5fs/internal-ca.pem \
     --store-cert /etc/raft5fs/node.pem --store-key /etc/raft5fs/node.key \
     @SEEDS@

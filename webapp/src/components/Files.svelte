@@ -11,6 +11,7 @@
   import Pending from "./Pending.svelte";
   import PruneBar from "./PruneBar.svelte";
   import Viewer from "./Viewer.svelte";
+  import InviteDialog from "./InviteDialog.svelte";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
@@ -40,6 +41,8 @@
   let dialog = $state(null);
   let pendingCount = $state(0);
   let pruneQueued = $state(0);
+  /// What this account may do (see the wasm `account`).
+  let account = $state({ caps: ["volumes"], kind: "person" });
 
   const parentOf = (path) => path.slice(0, path.lastIndexOf("/")) || "/";
   const nameOf = (path) => path.slice(path.lastIndexOf("/") + 1);
@@ -63,6 +66,9 @@
       initial = [];
     }
     refreshPending();
+    try {
+      account = await fs.account();
+    } catch {}
   }
   load();
 
@@ -217,6 +223,10 @@
       return false;
     });
     api.intercept("create-file", ({ file, parent }) => {
+      if (parent === "/" && !account.caps.includes("volumes")) {
+        error = "You can't create top-level folders here. Open a folder shared with you to add things to it.";
+        return false;
+      }
       const work = file.file
         ? () => upload(parent, file.file)
         : file.type === "folder"
@@ -317,6 +327,9 @@
     <button onclick={() => (dialog = { kind: "pending" })}>
       Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
     </button>
+    {#if account.caps.includes("invite")}
+      <button onclick={() => (dialog = { kind: "invite" })}>Invite someone</button>
+    {/if}
     <button onclick={() => (dialog = { kind: "fingerprint" })}>My fingerprint</button>
     <button onclick={onlogout}>Log out</button>
   </header>
@@ -372,6 +385,8 @@
   <ShareDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "shared-with"}
   <SharedWith {fs} path={dialog.path} me={me.user} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "invite"}
+  <InviteDialog {fs} caps={account.caps} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "pending"}
   <Pending
     {fs}

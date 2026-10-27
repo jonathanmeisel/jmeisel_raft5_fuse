@@ -16,7 +16,7 @@ mod wire;
 /// clients to agree, so that a client can refuse a server older than it
 /// needs with a clear message. Servers and the web app are released apart,
 /// so they can drift.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// Generated wire types and the tonic client and server.
 #[allow(clippy::all)]

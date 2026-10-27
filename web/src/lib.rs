@@ -37,7 +37,7 @@ use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::os_bytes;
-use raft5fs_proto::types::{Attr, FsError, Kind, SetAttr};
+use raft5fs_proto::types::{AccountInfo, AccountKind, Attr, Caps, FsError, Kind, SetAttr};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -125,6 +125,8 @@ fn errno_name(code: i32) -> &'static str {
         c if c == ENOTCONN => "ENOTCONN",
         c if c == ETIMEDOUT => "ETIMEDOUT",
         c if c == EKEYEXPIRED => "EKEYEXPIRED",
+        c if c == ENOTSUP => "ENOTSUP",
+        c if c == EDQUOT => "EDQUOT",
         _ => "EIO",
     }
 }
@@ -795,6 +797,89 @@ impl Fs {
                     )
                 })
         })
+    }
+
+    /// What this account may do, as `{caps, kind, invitedBy}`: `caps`
+    /// names its capabilities, and `kind` is `person` or `link`. Servers
+    /// too old to say give what every account could do then.
+    pub fn account(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let info = match inner.vault().remote().account().await {
+                Err(e) if e.errno == errno::ENOTSUP => AccountInfo::default(),
+                other => other?,
+            };
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Account {
+                caps: Vec<&'static str>,
+                kind: &'static str,
+                invited_by: String,
+            }
+            Ok(Account {
+                caps: info.caps.names(),
+                kind: match info.kind {
+                    AccountKind::Person => "person",
+                    AccountKind::Link => "link",
+                },
+                invited_by: info.invited_by,
+            })
+        })
+    }
+
+    /// Invites a new user `user`, who may do what `caps` names. Returns
+    /// `{invitation, code}`: the whole invitation, or null if the servers
+    /// don't say how users reach them, and the bare code.
+    #[wasm_bindgen(js_name = issueInvite)]
+    pub fn issue_invite(&self, user: String, caps: Vec<String>) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let mut wanted = Caps::NONE;
+            for name in &caps {
+                let cap = Caps::named(name).ok_or_else(|| {
+                    FsError::new(errno::EINVAL, format!("no capability {name:?}"))
+                })?;
+                wanted = wanted | cap;
+            }
+            let (code, invitation) = inner.vault().remote().issue_invite(&user, wanted).await?;
+            #[derive(Serialize)]
+            struct Issued {
+                invitation: Option<String>,
+                code: String,
+            }
+            Ok(Issued { invitation, code })
+        })
+    }
+
+    /// This account's invitations that nobody has used yet, as `[{user,
+    /// caps, created}]` (`created` in seconds since 1970).
+    #[wasm_bindgen(js_name = listInvites)]
+    pub fn list_invites(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            struct Pending {
+                user: String,
+                caps: Vec<&'static str>,
+                created: u64,
+            }
+            let pending = inner.vault().remote().list_invites().await?;
+            Ok(pending
+                .into_iter()
+                .map(|p| Pending {
+                    user: p.user,
+                    caps: p.caps.names(),
+                    created: p.created,
+                })
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Withdraws this account's unused invitation of `user`.
+    #[wasm_bindgen(js_name = cancelInvite)]
+    pub fn cancel_invite(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().remote().cancel_invite(&user).await })
     }
 
     /// Shares from people whose keys aren't pinned here: read-only until

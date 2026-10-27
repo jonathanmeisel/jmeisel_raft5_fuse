@@ -1623,7 +1623,7 @@ impl FsCore {
     /// reserved inode, granted read-write to `caller` with `sealed_key`
     /// (its key, version 1) and `sealed_label`. Its name is its inode
     /// number. The name people use is only in the grants, where the server
-    /// cannot read it.
+    /// cannot read it. Needs the `volumes` capability (`EACCES`).
     pub async fn create_volume(
         &self,
         caller: &Caller,
@@ -1634,6 +1634,18 @@ impl FsCore {
         sealed_grantees: &[u8],
     ) -> Result<Attr, FsError> {
         let user = caller.user.as_str();
+        // Read outside the transaction: it changes rarely, and only by an
+        // administrator.
+        if !crate::accounts::info(&self.client, user)
+            .await?
+            .caps
+            .contains(raft5fs_proto::types::Caps::VOLUMES)
+        {
+            return Err(FsError::new(
+                libc::EACCES,
+                "you can't create volumes on this filesystem",
+            ));
+        }
         check_grantees_version(new.ino, sealed_grantees, 1)?;
         let dirent = &dirent_key(ROOT_INO, OsStr::new(&new.ino.to_string()));
         let grant = &Grant {

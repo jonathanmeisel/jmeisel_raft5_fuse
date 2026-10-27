@@ -273,6 +273,27 @@ new keys, as a revocation does (7.2): to shut someone out of what is
 written from then on, even should they get hold of the raw store,
 revoke their grants first.
 
+Capabilities decide what a user may start, beyond what is shared with
+them: `volumes` (make top-level folders), `invite` (invite new users)
+and `links` (make public links). `user add` gives `volumes` alone unless
+told otherwise (--no-volumes, --invite, --links); users added before
+capabilities existed have `volumes`. `user set` changes them:
+
+  raft5fs-server user add carol --no-volumes ... $STORE https://127.0.0.1:27051
+  raft5fs-server user set alice --invite on $STORE https://127.0.0.1:27051
+
+With `invite`, alice invites others herself, giving them at most what
+she may do, only under names nobody has, and at most 10 at a time:
+
+  raft5fs invite dave [--volumes] [--invite] [--links]
+  raft5fs invites                    # hers that nobody has used yet
+  raft5fs invites --cancel dave
+
+For her invitations to hold the servers' addresses and CA, as `user
+add`'s do, serve with the same --invite-server and --invite-ca options.
+Without them she gets only a code. `raft5fs whoami` shows what she may
+do.
+
 
 -------------------------------------------------------------------------
 6. MOUNT

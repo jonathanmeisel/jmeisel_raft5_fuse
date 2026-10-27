@@ -23,6 +23,8 @@ pub struct WriteBuf {
     /// When the run got its first byte, and its latest.
     since: Option<Instant>,
     last: Option<Instant>,
+    /// How many runs `take` has handed out to be stored.
+    pub taken: u64,
 }
 
 impl WriteBuf {
@@ -76,6 +78,7 @@ impl WriteBuf {
         }
         self.since = None;
         self.last = None;
+        self.taken += 1;
         Some((self.start, std::mem::take(&mut self.data)))
     }
 

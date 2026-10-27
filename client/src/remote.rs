@@ -62,15 +62,16 @@ use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
-    AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
-    EnrolRequest, GrantRequest, HelloRequest, InodeRequest, ListGrantsRequest, LoginRequest,
-    NameRequest, NoArgs, PreloginRequest, PrepareUploadsRequest, PruneKeysRequest,
-    PublicKeyRequest, ReadChunksRequest, RenameRequest, ResealChunksRequest, ResealNamesRequest,
-    RotateRequest, SetAttrRequest, WriteChunksRequest,
+    AccessRequest, AccountKeys, CancelInviteRequest, ChangePasswordRequest, CreateRequest,
+    CreateVolumeRequest, EnrolRequest, GrantRequest, HelloRequest, InodeRequest,
+    IssueInviteRequest, ListGrantsRequest, LoginRequest, NameRequest, NoArgs, PreloginRequest,
+    PrepareUploadsRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
+    ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::types::{
-    Attr, BlockUpload, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, KeyPath, NewNode,
-    ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr, SnapshotInfo,
+    AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
+    KeyPath, NewNode, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation,
+    SealedMove, SetAttr, SnapshotInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -1145,6 +1146,78 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.reseal_names(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// `ENOTSUP` unless the servers speak protocol `version` or later.
+    fn needs_protocol(&self, version: u32, what: &str) -> Result<(), FsError> {
+        if self.protocol >= version {
+            Ok(())
+        } else {
+            Err(FsError::new(
+                errno::ENOTSUP,
+                format!("the servers are too old for {what}"),
+            ))
+        }
+    }
+
+    /// This account's record: its capabilities, and where it came from.
+    pub async fn account(&self) -> Result<AccountInfo, FsError> {
+        self.needs_protocol(2, "capabilities")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.get_account(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Invites a new user `user`, who gets `caps`. Returns the one-time
+    /// code, and the whole invitation if the servers know how users reach
+    /// them.
+    pub async fn issue_invite(
+        &self,
+        user: &str,
+        caps: Caps,
+    ) -> Result<(String, Option<String>), FsError> {
+        self.needs_protocol(2, "invitations")?;
+        let req = IssueInviteRequest {
+            username: user.to_string(),
+            capabilities: caps.bits(),
+        };
+        // Not sent again: a resend after it was stored would say the name
+        // is taken.
+        let issued = self
+            .call(Retry::Once, |mut c| {
+                let req = req.clone();
+                async move { c.issue_invite(req).await }
+            })
+            .await?
+            .into_result()?;
+        let invitation = (!issued.invitation.is_empty()).then_some(issued.invitation);
+        Ok((issued.code, invitation))
+    }
+
+    /// This account's invitations that nobody has used yet.
+    pub async fn list_invites(&self) -> Result<Vec<PendingInvite>, FsError> {
+        self.needs_protocol(2, "invitations")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_invites(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Withdraws this account's unused invitation of `user`.
+    pub async fn cancel_invite(&self, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(2, "invitations")?;
+        let req = CancelInviteRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.cancel_invite(req).await }
         })
         .await?
         .into_result()

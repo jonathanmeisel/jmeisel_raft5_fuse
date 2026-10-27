@@ -23,8 +23,9 @@ use std::time::Duration;
 use raft5fs_core::{FsCore, accounts};
 use raft5fs_objstore::fake::FakeStore;
 use raft5fs_proto::invite::Invite;
+use raft5fs_proto::types::Caps;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{FsService, WebPort, parse_origin, serve, serve_web};
+use raft5fs_server::{FsService, InviteSettings, WebPort, parse_origin, serve, serve_web};
 use raft5fs_testkit::{TEST_BUCKET, TOKEN_KEY, TestCluster, fs_ca_der, object_settings};
 use tokio::net::TcpListener;
 
@@ -67,7 +68,17 @@ fn main() {
             .await
             .expect("the filesystem opens");
         let signer = Signer::new(TOKEN_KEY.as_bytes(), DEFAULT_SESSION_TTL);
-        let fs = Arc::new(FsService::new(Arc::new(core), signer, Duration::ZERO));
+        let native_address = format!("http://127.0.0.1:{port}");
+        let ca = fs_ca_der();
+        let fs = Arc::new(
+            FsService::new(Arc::new(core), signer, Duration::ZERO).with_invites(Some(
+                InviteSettings {
+                    servers: vec![native_address.clone()],
+                    tls_server_name: None,
+                    ca: ca.clone(),
+                },
+            )),
+        );
 
         let native = TcpListener::bind(("127.0.0.1", port))
             .await
@@ -75,7 +86,6 @@ fn main() {
         let web = TcpListener::bind(("127.0.0.1", port + 1))
             .await
             .expect("the web port");
-        let native_address = format!("http://127.0.0.1:{port}");
         let web_address = format!("http://127.0.0.1:{}", port + 1);
         tokio::spawn(serve(Arc::clone(&fs), native, None, std::future::pending()));
         let web = WebPort {
@@ -85,10 +95,11 @@ fn main() {
         };
         tokio::spawn(serve_web(fs, web, std::future::pending()));
 
-        let ca = fs_ca_der();
         let mut invites = BTreeMap::new();
         for user in users {
-            let code = accounts::issue_code(&client, &user)
+            // Everything, so the app's invitations and public links can be
+            // tried.
+            let code = accounts::add(&client, &user, Caps::INVITE | Caps::LINKS, Caps::NONE)
                 .await
                 .expect("an enrolment code");
             let invite = Invite {

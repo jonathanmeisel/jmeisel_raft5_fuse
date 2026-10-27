@@ -101,8 +101,13 @@ pub enum Command {
     /// readable.
     Passwd,
     /// Show the account's key fingerprint, for others to check when they
-    /// share with it.
+    /// share with it, and what it may do.
     Whoami,
+    /// Invite a new user (if your account may). Prints an invitation, for
+    /// them alone.
+    Invite(account::InviteArgs),
+    /// List your invitations that nobody has used yet, or cancel one.
+    Invites(account::InvitesArgs),
     /// Share a directory, and everything below it, with a user.
     Grant(share::GrantArgs),
     /// Remove a user's share of a directory. Data written there after this
@@ -134,6 +139,8 @@ pub fn run(cli: Cli) -> i32 {
         Command::Enrol(args) => account::enrol(&cli.connect, args),
         Command::Passwd => account::passwd(&cli.connect),
         Command::Whoami => account::whoami(&cli.connect),
+        Command::Invite(args) => account::invite(&cli.connect, args),
+        Command::Invites(args) => account::invites(&cli.connect, args),
         Command::Grant(args) => share::grant(&cli.connect, args),
         Command::Revoke(args) => share::revoke(&cli.connect, args),
         Command::Grants(args) => share::grants(&cli.connect, args),
@@ -281,6 +288,7 @@ mod tests {
             vec!["raft5fs", "--user", "alice", "revoke", "p", "bob"],
             vec!["raft5fs", "--user", "alice", "forget-key", "bob"],
             vec!["raft5fs", "--user", "alice", "trust", "bob", "w"],
+            vec!["raft5fs", "--user", "alice", "invite", "bob", "--links"],
         ] {
             let cli = Cli::try_parse_from(line).unwrap();
             assert_eq!(cli.connect.user.as_deref(), Some("alice"));
@@ -288,6 +296,7 @@ mod tests {
                 Command::Revoke(a) => a.grantee,
                 Command::ForgetKey(a) => a.who,
                 Command::Trust(a) => a.who,
+                Command::Invite(a) => a.name,
                 _ => panic!("wrong command"),
             };
             assert_eq!(who, "bob");

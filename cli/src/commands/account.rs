@@ -1,9 +1,9 @@
-//! `raft5fs enrol`, `passwd`, and `whoami`.
+//! `raft5fs enrol`, `passwd`, `whoami`, `invite`, and `invites`.
 
 use clap::Args;
 use raft5fs_crypto::password::{KdfParams, check_new_password};
 use raft5fs_proto::invite::{Invite, der_to_pem};
-use raft5fs_proto::types::check_username;
+use raft5fs_proto::types::{Caps, check_username};
 
 use super::{ConnectArgs, Outcome, runtime, show_fingerprint};
 use raft5fs_client::cli::{
@@ -158,5 +158,97 @@ pub fn whoami(connect: &ConnectArgs) -> Outcome {
     // the server.
     println!("{}, whose key's fingerprint is", ctx.user);
     println!("{}", show_fingerprint(&identity.public_key()));
+    // Older servers have no capabilities to show.
+    if let Ok(account) = runtime.block_on(vault.remote().account()) {
+        println!("can: {}", caps_text(account.caps));
+    }
+    Ok(0)
+}
+
+fn caps_text(caps: Caps) -> String {
+    if caps == Caps::NONE {
+        "only use what is shared with you".to_string()
+    } else {
+        caps.names().join(", ")
+    }
+}
+
+#[derive(Args)]
+pub struct InviteArgs {
+    /// The new user's account name. It must not exist yet.
+    #[arg(value_name = "USER")]
+    pub name: String,
+    /// Let them make top-level folders (volumes) of their own.
+    #[arg(long)]
+    pub volumes: bool,
+    /// Let them invite others.
+    #[arg(long)]
+    pub invite: bool,
+    /// Let them make public links.
+    #[arg(long)]
+    pub links: bool,
+}
+
+pub fn invite(connect: &ConnectArgs, args: InviteArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let mut caps = Caps::NONE;
+    for (on, cap) in [
+        (args.volumes, Caps::VOLUMES),
+        (args.invite, Caps::INVITE),
+        (args.links, Caps::LINKS),
+    ] {
+        caps = caps.with(cap, on);
+    }
+    let runtime = runtime();
+    let vault = super::log_in(&runtime, &ctx)?;
+    let (code, invitation) = runtime
+        .block_on(vault.remote().issue_invite(&args.name, caps))
+        .map_err(|e| format!("cannot invite {}: {e}", args.name))?;
+    let name = &args.name;
+    match invitation {
+        Some(invitation) => {
+            println!("invitation for {name} (as secret as a password -- for {name} alone):");
+            println!("{invitation}");
+            println!(
+                "(they run `raft5fs enrol '<invitation>'`, or paste it into the web app's \
+                 enroll screen)"
+            );
+        }
+        None => {
+            println!("enrolment code for {name} (as secret as a password): {code}");
+            println!("(the servers don't say how to reach them; give {name} the addresses too)");
+        }
+    }
+    println!("they can: {}", caps_text(caps));
+    Ok(0)
+}
+
+#[derive(Args)]
+pub struct InvitesArgs {
+    /// Withdraw the invitation for this user.
+    #[arg(long, value_name = "USER")]
+    pub cancel: Option<String>,
+}
+
+pub fn invites(connect: &ConnectArgs, args: InvitesArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = super::log_in(&runtime, &ctx)?;
+    if let Some(name) = args.cancel {
+        runtime
+            .block_on(vault.remote().cancel_invite(&name))
+            .map_err(|e| format!("cannot cancel: {e}"))?;
+        println!("cancelled the invitation for {name}");
+        return Ok(0);
+    }
+    let pending = runtime
+        .block_on(vault.remote().list_invites())
+        .map_err(|e| format!("cannot list invitations: {e}"))?;
+    if pending.is_empty() {
+        println!("no invitations waiting");
+    }
+    for invite in pending {
+        println!("{}\t{}", invite.user, caps_text(invite.caps));
+    }
     Ok(0)
 }

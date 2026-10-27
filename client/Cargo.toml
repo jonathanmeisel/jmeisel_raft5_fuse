@@ -36,3 +36,4 @@ wasm-bindgen-futures = "0.4"
 # The session's tests run against a real store and servers.
 [dev-dependencies]
 raft5fs-testkit = { workspace = true }
+raft5fs-core = { workspace = true }

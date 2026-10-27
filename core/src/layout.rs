@@ -110,6 +110,8 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x05 ++ ino(BE8)                    -> marker: this inode's deletion is under way
 //   0x06 ++ "k/" ++ username            -> the account's keys (`accounts`)
 //   0x06 ++ "e/" ++ username            -> a pending enrolment code's hash (`accounts`)
+//   0x06 ++ "c/" ++ username            -> the account record: capabilities, kind,
+//                                          who invited it (`accounts`)
 //   0x07 ++ ino(BE8) ++ username        -> a grant of that directory to that user (`grants`)
 //   0x08 ++ ino(BE8)                    -> the inode's key record
 //   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
@@ -180,6 +182,10 @@ pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
 
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";
+
+/// The prefix of every account record (capabilities, kind, and who
+/// invited the account); see `accounts`.
+pub(crate) const ACCOUNT_INFO_PREFIX: &[u8] = b"\x06c/";
 
 /// The prefix of every deletion marker; see the layout notes above.
 pub(crate) const TOMBSTONE_PREFIX: &[u8] = &[0x05];

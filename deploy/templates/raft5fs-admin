@@ -2,7 +2,9 @@
 # raft5fs-admin: filesystem administration on this node, with the
 # credentials installed here. Run as root.
 #
-#   raft5fs-admin user add <NAME>          an invitation to enrol with
+#   raft5fs-admin user add <NAME> [--no-volumes] [--invite] [--links]
+#                                          an invitation to enrol with
+#   raft5fs-admin user set <NAME> [--volumes on|off] [--invite on|off] [--links on|off]
 #   raft5fs-admin user del <NAME>
 #   raft5fs-admin user list
 #   raft5fs-admin snapshot create [<NAME>]
@@ -45,7 +47,7 @@ backup)
         @OBJECT_OPTIONS@@BACKUP_OPTIONS@$SEEDS
     ;;
 *)
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
     ;;
 esac

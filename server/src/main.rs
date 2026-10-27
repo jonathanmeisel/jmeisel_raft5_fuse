@@ -15,8 +15,11 @@ use raft5fs_crypto::backup::{BACKUP_KEY_LEN, BackupKeyPair};
 use raft5fs_objstore::http::HttpConfig;
 use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_proto::invite::{Invite, pem_to_der};
+use raft5fs_proto::types::{AccountKind, Caps};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{DEFAULT_IDENTITY_TTL, FsService, Store, WebPort, parse_origin};
+use raft5fs_server::{
+    DEFAULT_IDENTITY_TTL, FsService, InviteSettings, Store, WebPort, parse_origin,
+};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tonic::transport::ServerTlsConfig;
@@ -27,7 +30,9 @@ usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       [--web-listen <ADDR> --web-origin <URL>
                        [--web-tls-cert <PEM> --web-tls-key <PEM>]] [options]
                       <store options> <kv-seed-address>...
-       raft5fs-server user add <NAME> [<invite options>] <store options>
+       raft5fs-server user add <NAME> [<capabilities>] [<invite options>]
+                      <store options> <kv-seed-address>...
+       raft5fs-server user set <NAME> <capabilities> <store options>
                       <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
@@ -134,7 +139,21 @@ addresses and their CA certificate, which is all `raft5fs enrol` needs.
 An invitation is as secret as the code: hand it to the user alone. A new code for an existing user lets them
 enrol again after forgetting it -- losing access to whatever was shared
 with them until it is shared again. `user del` removes a user and every
-grant made to them, cutting them off within --identity-ttl.
+grant made to them, cutting them off within --identity-ttl. `user list`
+shows each user's capabilities, under whoever invited them.
+
+Capabilities: what a user may start, beyond what is shared with them.
+  --volumes [on|off]   make new top-level folders (volumes). New users
+                       have it unless --no-volumes; users added before
+                       capabilities existed have it too.
+  --invite [on|off]    invite new users themselves, giving them at most
+                       their own capabilities. (Serving servers need the
+                       invite options for these invitations to be whole.)
+  --links [on|off]     make public links to folders.
+  --no-volumes, --no-invite, --no-links
+                       the same as `off`.
+`user add` applies them to a new user, or to an existing user's current
+ones; `user set` changes an existing user's.
 
 Snapshots: `snapshot create` pins the whole filesystem as it is now,
 under NAME (letters, digits, '.', '_', '-', ':' and '+'; the time if left
@@ -184,7 +203,7 @@ Backup options:
                        the operator private key. Needed by
                        `backup fetch-kv`.
 
-Invite options (user add):
+Invite options (user add, and serving: for invitations users issue):
   --invite-server <URL>
                        a filesystem server's address, as users reach it
                        (https://...). May be given more than once.
@@ -290,6 +309,8 @@ struct Args {
     invite_servers: Vec<String>,
     invite_ca: Option<String>,
     invite_server_name: Option<String>,
+    /// Capability flags, in order: each turns one on or off.
+    caps: Vec<(Caps, bool)>,
     web_listen: Option<String>,
     web_origin: Option<String>,
     web_tls_cert: Option<String>,
@@ -298,8 +319,24 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args::default();
-    let mut args = env::args().skip(1);
+    let mut args = env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
+        if let Some((cap, on)) = cap_flag(&arg) {
+            let on = match args.peek().map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    a.caps.push((cap, on));
+                    continue;
+                }
+            };
+            args.next();
+            if arg.starts_with("--no-") {
+                usage(&format!("{arg} takes no value"));
+            }
+            a.caps.push((cap, on));
+            continue;
+        }
         let mut value = |flag: &str| {
             args.next()
                 .unwrap_or_else(|| usage(&format!("{flag} needs a value")))
@@ -373,6 +410,16 @@ fn parse_args() -> Args {
         }
     }
     a
+}
+
+/// The capability that a flag such as `--invite` or `--no-links` names,
+/// and whether it turns it on.
+fn cap_flag(flag: &str) -> Option<(Caps, bool)> {
+    let name = flag.strip_prefix("--")?;
+    match name.strip_prefix("no-") {
+        Some(name) => Caps::named(name).map(|cap| (cap, false)),
+        None => Caps::named(name).map(|cap| (cap, true)),
+    }
 }
 
 fn read_file(path: &str) -> Vec<u8> {
@@ -557,22 +604,35 @@ async fn user_command(a: Args) {
     let mut positional = a.positional.iter().skip(1);
     let command = positional.next().map(String::as_str);
     let name = match command {
-        Some("add" | "del") => Some(
+        Some("add" | "set" | "del") => Some(
             positional
                 .next()
                 .cloned()
                 .unwrap_or_else(|| usage("which user?")),
         ),
         Some("list") => None,
-        _ => usage("user takes add, del or list"),
+        _ => usage("user takes add, set, del or list"),
     };
+    let (mut on, mut off) = (Caps::NONE, Caps::NONE);
+    for &(cap, turn_on) in &a.caps {
+        on = on.with(cap, turn_on);
+        off = off.with(cap, !turn_on);
+    }
+    match command {
+        Some("set") if a.caps.is_empty() => {
+            usage("user set needs --volumes, --invite or --links, each on or off")
+        }
+        Some("add" | "set") => {}
+        _ if !a.caps.is_empty() => usage("only user add and user set take capabilities"),
+        _ => {}
+    }
     let seeds = positional.cloned().collect();
     // Check this before a code is issued, so a mistake does not use up a
     // code.
     let invite_ca = invite_ca(&a);
     let client = store_client(&a, seeds).await;
     let result = match (command, name) {
-        (Some("add"), Some(name)) => accounts::issue_code(&client, &name).await.map(|code| {
+        (Some("add"), Some(name)) => accounts::add(&client, &name, on, off).await.map(|code| {
             println!("enrolment code for {name}: {code}");
             match invite_ca {
                 Some(ca) => {
@@ -597,14 +657,80 @@ async fn user_command(a: Args) {
                 eprintln!("there was no user {name}");
             }
         }),
-        _ => accounts::list(&client).await.map(|rows| {
-            for (name, enrolled) in rows {
-                let state = if enrolled { "enrolled" } else { "code issued" };
-                println!("{name}\t{state}");
-            }
-        }),
+        (Some("set"), Some(name)) => accounts::set_caps(&client, &name, on, off)
+            .await
+            .map(|caps| println!("{name} can now: {}", caps_text(caps))),
+        _ => accounts::list(&client).await.map(print_accounts),
     };
     result.unwrap_or_else(|e| fail(e));
+}
+
+fn caps_text(caps: Caps) -> String {
+    if caps == Caps::NONE {
+        "-".to_string()
+    } else {
+        caps.names().join(",")
+    }
+}
+
+/// Prints every account, each under the user who invited it (or, for a
+/// link, made it), indented a level per step.
+fn print_accounts(rows: Vec<accounts::Listed>) {
+    let names: std::collections::HashSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let parent = |row: &accounts::Listed| -> Option<String> {
+        let parent = match row.info.kind {
+            AccountKind::Link => &row.info.owner,
+            AccountKind::Person => &row.info.invited_by,
+        };
+        names.contains(parent.as_str()).then(|| parent.clone())
+    };
+    let mut children: std::collections::BTreeMap<Option<String>, Vec<&accounts::Listed>> =
+        Default::default();
+    for row in &rows {
+        children.entry(parent(row)).or_default().push(row);
+    }
+    // Each account has one parent and is printed under it once. Every
+    // record names its parent at creation, so there are no loops; the
+    // `seen` set only guards against a damaged store.
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<(&accounts::Listed, usize)> = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|row| (*row, 0))
+        .collect();
+    while let Some((row, depth)) = stack.pop() {
+        if !seen.insert(row.name.as_str()) {
+            continue;
+        }
+        let state = if row.enrolled {
+            "enrolled"
+        } else {
+            "code issued"
+        };
+        let what = match row.info.kind {
+            AccountKind::Link => match row.info.expires {
+                Some(at) => format!("public link, expires {at}"),
+                None => "public link".to_string(),
+            },
+            AccountKind::Person => caps_text(row.info.caps),
+        };
+        println!("{}{}\t{state}\t{what}", "  ".repeat(depth), row.name);
+        if let Some(kids) = children.get(&Some(row.name.clone())) {
+            stack.extend(kids.iter().rev().map(|kid| (*kid, depth + 1)));
+        }
+    }
+}
+
+/// The invite options, for a server to put in the invitations that users
+/// issue, if they were given.
+fn invite_settings(a: &Args) -> Option<InviteSettings> {
+    invite_ca(a).map(|ca| InviteSettings {
+        servers: a.invite_servers.clone(),
+        tls_server_name: a.invite_server_name.clone(),
+        ca,
+    })
 }
 
 /// The CA certificate from the invite options, in DER, if invitations were
@@ -881,7 +1007,8 @@ async fn serve_command(a: Args) {
         tokio::spawn(Arc::clone(&core).run_gc(gc_interval));
     }
     let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL))
-        .with_timing_header(env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"));
+        .with_timing_header(env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"))
+        .with_invites(invite_settings(&a));
     let fs = Arc::new(fs);
     let native = raft5fs_server::serve(Arc::clone(&fs), listener, tls, pending());
     let served = match web {

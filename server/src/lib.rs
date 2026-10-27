@@ -32,17 +32,20 @@ use raft5fs_core::{
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
+use raft5fs_proto::invite::Invite;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
-    AccessRequest, AttrResponse, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
-    EmptyResponse, EnrolRequest, GrantListResponse, GrantRequest, GrantsUnderResponse,
-    HelloRequest, HelloResponse, InoResponse, InodeRequest, KdfSettings, KeyPathResponse,
-    ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest, NoArgs,
-    PreloginRequest, PreloginResponse, PrepareUploadsRequest, PrepareUploadsResponse,
+    AccessRequest, AccountResponse, AttrResponse, CancelInviteRequest, ChangePasswordRequest,
+    CreateRequest, CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse,
+    GrantRequest, GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse, InodeRequest,
+    InviteListResponse, IssueInviteRequest, IssueInviteResponse, IssuedInvite, KdfSettings,
+    KeyPathResponse, ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest,
+    NoArgs, PreloginRequest, PreloginResponse, PrepareUploadsRequest, PrepareUploadsResponse,
     PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
     ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
+use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::http::{HeaderName, HeaderValue, Method, header};
@@ -82,6 +85,16 @@ impl Store {
     }
 }
 
+/// How users reach the filesystem, for the invitations that users issue:
+/// the same as `raft5fs-server user add`'s invite options.
+#[derive(Debug, Clone)]
+pub struct InviteSettings {
+    pub servers: Vec<String>,
+    pub tls_server_name: Option<String>,
+    /// The CA certificate, in DER.
+    pub ca: Vec<u8>,
+}
+
 pub struct FsService {
     core: Arc<FsCore>,
     signer: Signer,
@@ -90,6 +103,8 @@ pub struct FsService {
     identity_ttl: Duration,
     /// Whether responses say where their time went (see `timing`).
     timing_header: bool,
+    /// Without them, an invitation that a user issues is only a code.
+    invites: Option<InviteSettings>,
 }
 
 impl FsService {
@@ -103,7 +118,15 @@ impl FsService {
             enrolled: Mutex::new(HashMap::new()),
             identity_ttl,
             timing_header: false,
+            invites: None,
         }
+    }
+
+    /// Makes the invitations that users issue whole: with the servers'
+    /// addresses and CA, not only the code.
+    pub fn with_invites(mut self, invites: Option<InviteSettings>) -> Self {
+        self.invites = invites;
+        self
     }
 
     /// Adds `raft5fs_proto::timing::HEADER` to every response: how long the
@@ -612,6 +635,58 @@ impl Fs for FsService {
             )
             .await;
         Ok(Response::new(made.into()))
+    }
+
+    async fn get_account(&self, r: Request<NoArgs>) -> Result<Response<AccountResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let info = accounts::info(self.core.client(), &caller.user).await;
+        Ok(Response::new(info.into()))
+    }
+
+    async fn issue_invite(
+        &self,
+        r: Request<IssueInviteRequest>,
+    ) -> Result<Response<IssueInviteResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let caps = Caps::from_bits(r.capabilities);
+        let issued = accounts::issue_invite(self.core.client(), &caller.user, &r.username, caps)
+            .await
+            .map(|code| {
+                let invitation = self.invites.as_ref().map(|i| {
+                    Invite {
+                        user: r.username.clone(),
+                        code: code.clone(),
+                        servers: i.servers.clone(),
+                        tls_server_name: i.tls_server_name.clone(),
+                        ca: i.ca.clone(),
+                    }
+                    .encode()
+                });
+                IssuedInvite {
+                    code,
+                    invitation: invitation.unwrap_or_default(),
+                }
+            });
+        Ok(Response::new(issued.into()))
+    }
+
+    async fn list_invites(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<InviteListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let pending = accounts::pending_invites(self.core.client(), &caller.user).await;
+        Ok(Response::new(pending.into()))
+    }
+
+    async fn cancel_invite(
+        &self,
+        r: Request<CancelInviteRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let cancelled =
+            accounts::cancel_invite(self.core.client(), &caller.user, &r.username).await;
+        Ok(Response::new(cancelled.into()))
     }
 
     async fn delete_volume(

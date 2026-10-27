@@ -132,7 +132,9 @@ put raft5fs/store.env /etc/raft5fs/store.env 0600 root:root raft5fs-server
 if [ -f raft5fs/s3-ca.pem ]; then
     put raft5fs/s3-ca.pem /etc/raft5fs/s3-ca.pem 0644 root:root raft5fs-server
 fi
-put raft5fs/fs-ca.pem /etc/raft5fs/fs-ca.pem 0644 root:root raft5fs-admin
+# The filesystem's CA, which invitations carry (raft5fs-admin's, and the
+# server's for those that users issue).
+put raft5fs/fs-ca.pem /etc/raft5fs/fs-ca.pem 0644 root:root raft5fs-server
 # The backup space's settings (cluster.conf's BACKUP_* settings), for
 # raft5fs-admin alone.
 if [ -f raft5fs/backup.env ]; then

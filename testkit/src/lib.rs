@@ -42,7 +42,7 @@ use raft5fs_objstore::fake::{self, FakeStore};
 use raft5fs_objstore::http::HttpConfig;
 use raft5fs_objstore::{S3Config, S3Store};
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
-use raft5fs_server::{FsService, Store};
+use raft5fs_server::{FsService, InviteSettings, Store};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -516,7 +516,13 @@ pub fn serve_if_requested() {
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
         // Check accounts on every request, so a test that removes one sees
         // the result at once.
-        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO).with_timing_header(true);
+        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO)
+            .with_timing_header(true)
+            .with_invites(Some(InviteSettings {
+                servers: vec![format!("https://{listen}")],
+                tls_server_name: None,
+                ca: fs_ca_der(),
+            }));
         if let Err(e) =
             raft5fs_server::serve(fs, listener, Some(server_tls()), std::future::pending()).await
         {

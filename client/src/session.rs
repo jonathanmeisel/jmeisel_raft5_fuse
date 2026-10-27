@@ -306,7 +306,7 @@ impl Session {
     /// that must see them (reads, truncation), and on every `close()`, so
     /// that a failure reaches the application that wrote the bytes.
     /// Attribute queries don't: they add the buffer's length (see
-    /// `with_buffered`).
+    /// `getattr`).
     ///
     /// It reports a stored error (from an earlier failed commit) but leaves
     /// it in place for `fsync` or `release` to take, as a `read` reports a
@@ -489,29 +489,30 @@ impl Session {
         if is_snapshot_ino(parent) {
             return self.snapshots.lookup(&self.vault, parent, name).await;
         }
-        let mut attr = if parent == VIRTUAL_ROOT {
+        let attr = if parent == VIRTUAL_ROOT {
             let ino = self.vault.root_lookup(name).await?;
             self.remote().getattr(ino).await?
         } else {
             self.vault.lookup(parent, name).await?
         };
-        self.with_buffered(&mut attr).await;
+        // A file with writes buffered here: its size needs `getattr`'s care.
+        if self.existing_write_slot(attr.ino).is_some() {
+            return self.getattr(attr.ino).await;
+        }
         Ok(attr)
     }
 
-    /// Counts `attr`'s buffered writes in its size, without storing them.
-    /// Storing them here would cut a writer's run short whenever anything
-    /// looks at the file (a file manager, a shell prompt), and a block
-    /// stored in pieces is uploaded again for each piece. Reads and
-    /// truncation still store them first.
-    async fn with_buffered(&self, attr: &mut Attr) {
-        if let Some(slot) = self.existing_write_slot(attr.ino)
-            && let Some(end) = slot.lock().await.end()
-        {
-            attr.size = attr.size.max(end);
-        }
-    }
-
+    /// `ino`'s attributes, with its buffered writes counted in its size
+    /// but not stored. Storing them here would cut a writer's run short
+    /// whenever anything looks at the file (a file manager, a shell
+    /// prompt), and a block stored in pieces is uploaded again for each
+    /// piece. Reads and truncation still store them first.
+    ///
+    /// A commit between reading the server's size and looking at the
+    /// buffer would hide its bytes from both. So if one started in that
+    /// time, this reads the size again. That commit is over by then (a
+    /// commit holds the buffer's lock throughout), and no other can start
+    /// while this holds the lock.
     pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
         if ino == VIRTUAL_ROOT {
             return Ok(self.root_attr());
@@ -519,8 +520,18 @@ impl Session {
         if is_snapshot_ino(ino) {
             return self.snapshots.getattr(ino).await;
         }
+        let Some(slot) = self.existing_write_slot(ino) else {
+            return self.remote().getattr(ino).await;
+        };
+        let seen = slot.lock().await.taken;
         let mut attr = self.remote().getattr(ino).await?;
-        self.with_buffered(&mut attr).await;
+        let buf = slot.lock().await;
+        if buf.taken != seen {
+            attr = self.remote().getattr(ino).await?;
+        }
+        if let Some(end) = buf.end() {
+            attr.size = attr.size.max(end);
+        }
         Ok(attr)
     }
 
