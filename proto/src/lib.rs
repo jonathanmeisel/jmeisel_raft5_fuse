@@ -7,6 +7,7 @@ pub mod errno;
 pub mod invite;
 pub mod link;
 pub mod os_bytes;
+pub mod public_link;
 pub mod timing;
 pub mod types;
 mod wire;

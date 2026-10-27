@@ -153,13 +153,16 @@ impl Session {
     /// Fails if no server is reachable: then there is no filesystem to
     /// serve, and no chunk size to buffer writes against.
     pub async fn open(config: SessionConfig) -> Result<Arc<Self>, FsError> {
-        let remote = Remote::connect(&config.servers, config.credentials, config.tls)
+        // A refused login stays `EACCES`, so the app can tell it from
+        // servers it can't reach.
+        let remote = Remote::open(&config.servers, config.credentials, config.tls)
             .await
-            .map_err(|why| {
-                FsError::new(
+            .map_err(|e| match e.errno {
+                errno::EACCES => e,
+                _ => FsError::new(
                     errno::EHOSTUNREACH,
-                    format!("cannot connect to the filesystem: {why}"),
-                )
+                    format!("cannot connect to the filesystem: {}", e.message),
+                ),
             })?;
         let keys = |e: FsError| {
             FsError::new(

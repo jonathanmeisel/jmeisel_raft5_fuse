@@ -294,6 +294,21 @@ add`'s do, serve with the same --invite-server and --invite-ca options.
 Without them she gets only a code. `raft5fs whoami` shows what she may
 do.
 
+With `links`, she can make public links: read-only access to one
+directory for anyone with the URL, through the web app, without an
+account:
+
+  raft5fs link create photos/2024 --expires 7d --app https://files.example.com
+  raft5fs link list
+  raft5fs revoke photos/2024 link-abcdefghijkl
+
+A link is an account whose password is a random secret in the URL's
+fragment (never sent to a server). It can only read the directory it was
+made for. Anyone who can write the directory can revoke it, as for a
+person (`raft5fs grants` shows links), and that deletes the link's
+account. An expired link can't log in, but keeps its share until it is
+revoked, so revoke it to re-encrypt the directory.
+
 
 -------------------------------------------------------------------------
 6. MOUNT

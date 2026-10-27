@@ -311,6 +311,26 @@ const methods = {
     return { ...fs.whoami(), remembered: true, fsId: config.fsId, filesystem: config.name };
   },
 
+  /// Opens public link `link` on the filesystem it is for, as its
+  /// visitor. Nothing is stored in this browser (no pins, no prune queue,
+  /// no remembered login), and nothing is pruned. Gives the shared
+  /// folder's name.
+  async visit(link) {
+    const dead = () => Object.assign(new Error("This link no longer works."), { code: "ELINK" });
+    let fsId;
+    try {
+      fsId = wasm.linkFsId(link);
+    } catch {
+      throw dead();
+    }
+    config = filesystems.find((f) => f.fsId === fsId);
+    if (!config) throw dead();
+    fs = await wasm.visit(config, link, () => {});
+    const folder = (await fs.readdir("/")).find((e) => e.kind === "folder" && e.name !== ".snapshot");
+    if (!folder) throw dead();
+    return { visitor: true, folder: folder.name, fsId: config.fsId, filesystem: config.name };
+  },
+
   checkNewPassword: (password) => wasm.checkNewPassword(password),
   whoami: () => session().whoami(),
   readdir: (path) => session().readdir(path),
@@ -439,6 +459,9 @@ const methods = {
   issueInvite: (user, caps) => session().issueInvite(user, caps),
   listInvites: () => session().listInvites(),
   cancelInvite: (user) => session().cancelInvite(user),
+  createLink: (path, label, expires) => session().createLink(path, label, expires ?? undefined),
+  listLinks: () => session().listLinks(),
+  revokeLink: (user) => session().revokeLink(user),
   pruneStatus: () => session().pruneStatus(),
   pruneEstimate: (path) => session().pruneEstimate(path),
   pruneAgain: (path) => session().pruneAgain(path),

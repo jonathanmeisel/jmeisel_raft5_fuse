@@ -65,6 +65,14 @@ impl KdfParams {
         parallelism: 1,
     };
 
+    /// For a secret with full entropy, such as a public link's: guessing
+    /// it is hopeless at any cost, so stretching it adds nothing.
+    pub const SECRET: Self = Self {
+        memory_kib: 64,
+        iterations: 1,
+        parallelism: 1,
+    };
+
     /// The highest cost that a client accepts for a login: 4 GiB, 64
     /// passes, 16 lanes. This is much more than an honest account needs.
     pub const MAXIMUM: Self = Self {
@@ -212,6 +220,22 @@ pub fn new_enrolment_code() -> String {
     let mut bytes = [0; 16];
     OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A new public link's name and secret: `link-` and 60 random bits as 12
+/// base32 letters, and 256 random bits as 64 hex digits.
+pub fn new_link_credentials() -> (String, String) {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0; 12];
+    OsRng.fill_bytes(&mut bytes);
+    let name: String = bytes
+        .iter()
+        .map(|b| ALPHABET[usize::from(b & 31)] as char)
+        .collect();
+    let mut secret = [0; 32];
+    OsRng.fill_bytes(&mut secret);
+    let secret = secret.iter().map(|b| format!("{b:02x}")).collect();
+    (format!("link-{name}"), secret)
 }
 
 /// The hash of an enrolment code that the server keeps. A plain hash is

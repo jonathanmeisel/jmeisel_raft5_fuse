@@ -23,6 +23,11 @@
 //! Users with the `invite` capability can invite others (`issue_invite`),
 //! but only under new names: a code for an existing account would let its
 //! holder replace that account's keys.
+//!
+//! A public link is an account too (`create_link`), whose password only the
+//! link holds. Its name starts with `LINK_PREFIX`, which nothing else may
+//! use. It can only read the one folder its maker grants it, and it lasts
+//! only as long as that grant (`drop_unused_link`) and until it expires.
 
 use raft5_client::{Client, Consistency, Error as KvError, Transaction};
 use raft5fs_crypto::identity::PUBLIC_KEY_LEN;
@@ -35,8 +40,8 @@ use crate::layout::{ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX};
 use crate::timing::next_key;
 use crate::view::ReadKeys;
 use raft5fs_proto::types::{
-    AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, MAX_PENDING_INVITES,
-    PendingInvite,
+    AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
+    MAX_PENDING_INVITES, PendingInvite,
 };
 
 /// In a transaction attempt, unwraps a decision, or ends the attempt with
@@ -82,6 +87,8 @@ fn encode_info(info: &AccountInfo) -> Vec<u8> {
     out.extend_from_slice(&info.created.to_be_bytes());
     put(&mut out, info.owner.as_bytes());
     out.extend_from_slice(&info.expires.unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(&info.folder.to_be_bytes());
+    put(&mut out, &info.note);
     out
 }
 
@@ -113,6 +120,9 @@ fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
     let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
     let owner = String::from_utf8(take(n)?.to_vec()).map_err(|_| garbled())?;
     let expires = u64::from_be_bytes(take(8)?.try_into().unwrap());
+    let folder = u64::from_be_bytes(take(8)?.try_into().unwrap());
+    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
+    let note = take(n)?.to_vec();
     if !rest.is_empty() {
         return Err(garbled());
     }
@@ -123,6 +133,8 @@ fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
         created,
         owner,
         expires: (expires != 0).then_some(expires),
+        folder,
+        note,
     })
 }
 
@@ -241,9 +253,25 @@ pub async fn check_login(
     if crate::grants::check_username(user).is_err() {
         return Ok(None);
     }
-    Ok(get(client, user)
+    let Some(keys) = get(client, user)
         .await?
-        .filter(|keys| check_verifier(auth, &keys.verifier)))
+        .filter(|keys| check_verifier(auth, &keys.verifier))
+    else {
+        return Ok(None);
+    };
+    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs()) {
+        return Ok(None);
+    }
+    Ok(Some(keys))
+}
+
+/// Whether `user` can still use a session: they have keys, and are not a
+/// link that has expired.
+pub async fn active(client: &Client, user: &str) -> Result<bool, FsError> {
+    if get(client, user).await?.is_none() {
+        return Ok(false);
+    }
+    Ok(!(user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs())))
 }
 
 /// Makes a new one-time code that `user` can enrol with, and replaces any
@@ -255,6 +283,180 @@ pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> 
         .write(&code_key(user), Some(&enrolment_code_hash(&code)))
         .await?;
     Ok(code)
+}
+
+fn refuse_link_name(user: &str) -> Result<(), FsError> {
+    if user.starts_with(LINK_PREFIX) {
+        return Err(FsError::new(
+            libc::EINVAL,
+            format!("names that start with {LINK_PREFIX} are for public links"),
+        ));
+    }
+    Ok(())
+}
+
+/// How long a link may go without a grant after it is made: its maker
+/// grants it a folder at once, so one without is left over from a failure.
+const LINK_SETUP_GRACE: u64 = 3600;
+
+/// `owner` makes the account for a public link: `user` (which starts with
+/// `LINK_PREFIX`) with `keys`, which the owner made from the link's secret.
+///
+/// - `owner` needs the `links` capability (`EACCES`).
+/// - The name must be new (`EEXIST`).
+/// - The account may do nothing beyond its grant. Only `owner` can grant
+///   it anything, and only `folder`, read-only (`check_link_grant`).
+/// - From `expires` on, it can't log in.
+///
+/// It also removes `owner`'s earlier links that never got their grant.
+pub async fn create_link(
+    client: &Client,
+    owner: &str,
+    user: &str,
+    keys: &AccountKeys,
+    expires: Option<u64>,
+    folder: u64,
+    note: &[u8],
+) -> Result<(), FsError> {
+    crate::grants::check_username(user)?;
+    if !user.starts_with(LINK_PREFIX) {
+        return Err(FsError::new(
+            libc::EINVAL,
+            format!("a link's name starts with {LINK_PREFIX}"),
+        ));
+    }
+    validate(keys)?;
+    if note.len() > MAX_LINK_NOTE {
+        return Err(FsError::new(libc::EINVAL, "the link's note is too long"));
+    }
+    let now = now_secs();
+    if expires.is_some_and(|at| at <= now) {
+        return Err(FsError::new(libc::EINVAL, "the link would expire at once"));
+    }
+    for stale in links_of(client, owner).await? {
+        if stale.info.created + LINK_SETUP_GRACE < now
+            && list_granted(client, &stale.user).await?.is_empty()
+        {
+            remove(client, &stale.user).await?;
+        }
+    }
+    let encoded = encode(keys);
+    let info = AccountInfo {
+        caps: Caps::NONE,
+        kind: AccountKind::Link,
+        created: now,
+        owner: owner.to_string(),
+        expires,
+        folder,
+        note: note.to_vec(),
+        ..AccountInfo::default()
+    };
+    let record = encode_info(&info);
+    retrying(|| {
+        let (encoded, record) = (&encoded, &record);
+        async move {
+            let txn = client.transaction(TXN_TTL).await?;
+            let mine = decide!(info_in(&txn, owner).await?).unwrap_or_default();
+            if mine.kind != AccountKind::Person || !mine.caps.contains(Caps::LINKS) {
+                return Ok(Err(FsError::new(
+                    libc::EACCES,
+                    "you can't make public links on this filesystem",
+                )));
+            }
+            let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
+                || txn.read_one(&code_key(user)).await?.value.is_some()
+                || txn.read_one(&info_key(user)).await?.value.is_some();
+            if taken {
+                return Ok(Err(FsError::new(
+                    libc::EEXIST,
+                    format!("the name {user} is taken"),
+                )));
+            }
+            txn.write(&keys_key(user), Some(encoded)).await?;
+            txn.write(&info_key(user), Some(record)).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        }
+    })
+    .await?
+}
+
+/// The public links that `owner` made, in name order.
+pub async fn links_of(client: &Client, owner: &str) -> Result<Vec<LinkAccount>, FsError> {
+    let mut prefix = ACCOUNT_INFO_PREFIX.to_vec();
+    prefix.extend_from_slice(LINK_PREFIX.as_bytes());
+    let mut names = Vec::new();
+    let mut iter = client.key_iterator(&prefix, Consistency::Stale);
+    while let Some(key) = next_key(&mut iter).await? {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        names.push(String::from_utf8_lossy(&key[ACCOUNT_INFO_PREFIX.len()..]).into_owned());
+    }
+    let keys: Vec<Vec<u8>> = names.iter().map(|name| info_key(name)).collect();
+    let records = client.read_many(&keys).await?;
+    let mut links = Vec::new();
+    for (user, record) in names.into_iter().zip(records) {
+        let Some(bytes) = record.value else { continue };
+        let info = decode_info(&user, &bytes)?;
+        if info.kind == AccountKind::Link && info.owner == owner {
+            links.push(LinkAccount { user, info });
+        }
+    }
+    Ok(links)
+}
+
+/// Refuses a grant to a link, unless the link's maker grants it its own
+/// folder, read-only. The servers give links no other way in.
+pub(crate) async fn check_link_grant(
+    txn: &Transaction,
+    granter: &str,
+    grantee: &str,
+    ino: u64,
+    writable: bool,
+) -> Result<Result<(), FsError>, KvError> {
+    if !grantee.starts_with(LINK_PREFIX) {
+        return Ok(Ok(()));
+    }
+    let info = decide!(info_in(txn, grantee).await?).unwrap_or_default();
+    let ok =
+        info.kind == AccountKind::Link && info.owner == granter && info.folder == ino && !writable;
+    Ok(if ok {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::EPERM,
+            "a public link can only be shared by its maker, read-only, with its own folder",
+        ))
+    })
+}
+
+/// Removes link account `user` if `txn` leaves it no grant: a link lasts
+/// only as long as its grant. Called by everything that removes a grant, so
+/// a revoke by anyone, or deleting the folder, ends the link.
+pub(crate) async fn drop_unused_link(txn: &Transaction, user: &str) -> Result<(), KvError> {
+    if !user.starts_with(LINK_PREFIX) || !granted_in(txn, user).await?.is_empty() {
+        return Ok(());
+    }
+    txn.write(&keys_key(user), None).await?;
+    txn.write(&code_key(user), None).await?;
+    txn.write(&info_key(user), None).await
+}
+
+/// The inodes that `user` has grants of, read without a transaction.
+async fn list_granted(client: &Client, user: &str) -> Result<Vec<u64>, FsError> {
+    let prefix = crate::grants::index_prefix(user);
+    let mut granted = Vec::new();
+    let mut iter = client.key_iterator(&prefix, Consistency::Stale);
+    while let Some(key) = next_key(&mut iter).await? {
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        if let Ok(ino) = <[u8; 8]>::try_from(&key[prefix.len()..]) {
+            granted.push(u64::from_be_bytes(ino));
+        }
+    }
+    Ok(granted)
 }
 
 /// `user`'s record, or the default for an account with none.
@@ -282,6 +484,7 @@ async fn info_in(
 /// in `off` turned off.
 pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<String, FsError> {
     crate::grants::check_username(user)?;
+    refuse_link_name(user)?;
     let code = new_enrolment_code();
     let hash = enrolment_code_hash(&code);
     retrying(|| {
@@ -345,12 +548,7 @@ pub async fn issue_invite(
     caps: Caps,
 ) -> Result<String, FsError> {
     crate::grants::check_username(user)?;
-    if user.starts_with(LINK_PREFIX) {
-        return Err(FsError::new(
-            libc::EINVAL,
-            format!("names that start with {LINK_PREFIX} are for public links"),
-        ));
-    }
+    refuse_link_name(user)?;
     let code = new_enrolment_code();
     let hash = enrolment_code_hash(&code);
     retrying(|| {
@@ -583,18 +781,7 @@ pub async fn change_password(
 /// already issued to them stops working when the servers see that the keys
 /// are gone (their identity cache).
 pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
-    let prefix = crate::grants::index_prefix(user);
-    let mut granted = Vec::new();
-    let mut iter = client.key_iterator(&prefix, Consistency::Stale);
-    while let Some(key) = next_key(&mut iter).await? {
-        if !key.starts_with(&prefix) {
-            break;
-        }
-        if let Ok(ino) = <[u8; 8]>::try_from(&key[prefix.len()..]) {
-            granted.push(u64::from_be_bytes(ino));
-        }
-    }
-    let granted = &granted;
+    let granted = &list_granted(client, user).await?;
     retrying(|| async move {
         let txn = client.transaction(TXN_TTL).await?;
         let existed = txn.read_one(&keys_key(user)).await?.value.is_some()
@@ -694,6 +881,8 @@ mod tests {
             created: 1_700_000_000,
             owner: "bob".into(),
             expires: Some(1_800_000_000),
+            folder: 42,
+            note: vec![7; 20],
         };
         assert_eq!(decode_info("u", &encode_info(&info)).unwrap(), info);
         let plain = AccountInfo::default();

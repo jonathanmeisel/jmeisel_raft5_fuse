@@ -573,7 +573,8 @@ pub(crate) async fn grants_of(
 /// Removes `user`'s grant of `ino` and its index entry.
 pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Result<(), KvError> {
     txn.write(&grant_key(ino, user), None).await?;
-    txn.write(&index_key(user, ino), None).await
+    txn.write(&index_key(user, ino), None).await?;
+    crate::accounts::drop_unused_link(txn, user).await
 }
 
 /// What `user` needs to unwrap `ino`'s key: their grant above it, and the
@@ -641,8 +642,7 @@ pub(crate) async fn forget_inode(txn: &Transaction, ino: u64) -> Result<(), KvEr
         users.push(String::from_utf8_lossy(&key[prefix.len()..]).into_owned());
     }
     for user in users {
-        txn.write(&grant_key(ino, &user), None).await?;
-        txn.write(&index_key(&user, ino), None).await?;
+        remove_grant(txn, &user, ino).await?;
     }
     txn.write(&grantees_key(ino), None).await?;
     txn.write(&node_keys_key(ino), None).await

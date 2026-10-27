@@ -427,6 +427,19 @@ pub struct AccountInfo {
     pub owner: String,
     /// For a link: when it stops working, in seconds since the Unix epoch.
     pub expires: Option<u64>,
+    /// For a link: the folder it shares, as its maker said.
+    pub folder: u64,
+    /// For a link: a note for its maker alone (the folder's path), sealed
+    /// to their key, so the servers can't read it.
+    pub note: Vec<u8>,
+}
+
+impl AccountInfo {
+    /// Whether this is a link that has stopped working at `now` (seconds
+    /// since the Unix epoch).
+    pub fn expired(&self, now: u64) -> bool {
+        self.kind == AccountKind::Link && self.expires.is_some_and(|at| at <= now)
+    }
 }
 
 impl Default for AccountInfo {
@@ -441,6 +454,8 @@ impl Default for AccountInfo {
             created: 0,
             owner: String::new(),
             expires: None,
+            folder: 0,
+            note: Vec::new(),
         }
     }
 }
@@ -452,6 +467,16 @@ pub struct PendingInvite {
     pub caps: Caps,
     pub created: u64,
 }
+
+/// A public link, as its maker sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkAccount {
+    pub user: String,
+    pub info: AccountInfo,
+}
+
+/// The longest note that a link can hold.
+pub const MAX_LINK_NOTE: usize = 4096;
 
 /// The most invitations that one user can have waiting at a time.
 pub const MAX_PENDING_INVITES: usize = 10;

@@ -1597,6 +1597,10 @@ impl FsCore {
                     format!("{grantee} hasn't enrolled"),
                 )));
             }
+            decide!(
+                crate::accounts::check_link_grant(&txn, &caller.user, grantee, ino, grant.writable)
+                    .await?
+            );
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(

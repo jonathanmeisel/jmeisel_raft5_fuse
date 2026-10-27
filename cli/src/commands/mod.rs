@@ -3,6 +3,7 @@
 //! and the command line can override any of it.
 
 mod account;
+mod link;
 #[cfg(feature = "fuse")]
 mod mount;
 mod profile;
@@ -108,6 +109,10 @@ pub enum Command {
     Invite(account::InviteArgs),
     /// List your invitations that nobody has used yet, or cancel one.
     Invites(account::InvitesArgs),
+    /// Make or list public links: read-only access to a directory for
+    /// anyone with the link.
+    #[command(subcommand)]
+    Link(link::LinkCommand),
     /// Share a directory, and everything below it, with a user.
     Grant(share::GrantArgs),
     /// Remove a user's share of a directory. Data written there after this
@@ -141,6 +146,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Whoami => account::whoami(&cli.connect),
         Command::Invite(args) => account::invite(&cli.connect, args),
         Command::Invites(args) => account::invites(&cli.connect, args),
+        Command::Link(command) => link::run(&cli.connect, command),
         Command::Grant(args) => share::grant(&cli.connect, args),
         Command::Revoke(args) => share::revoke(&cli.connect, args),
         Command::Grants(args) => share::grants(&cli.connect, args),

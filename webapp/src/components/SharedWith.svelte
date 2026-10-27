@@ -5,9 +5,15 @@
   //
   // Shares of a folder above this one reach it too. They show with the
   // folder they come from, and are revoked there, not here.
+  //
+  // Public links show as such, not by their account name. Anyone who can
+  // change the folder can revoke one, as for a person.
   import Dialog from "./Dialog.svelte";
 
-  let { fs, path, me, onclose } = $props();
+  let { fs, path, me, links = false, onclose } = $props();
+  /// This account's own links, by name, for their expiry.
+  let mine = $state(new Map());
+  const isLink = (user) => user.startsWith("link-");
   const WARN_BYTES = 1 << 30;
 
   let grantees = $state(null);
@@ -19,6 +25,9 @@
   async function load() {
     try {
       grantees = await fs.sharedWith(path);
+      if (links && grantees.some((g) => isLink(g.user))) {
+        mine = new Map((await fs.listLinks()).map((l) => [l.user, l]));
+      }
     } catch (e) {
       error = e.message;
       grantees = [];
@@ -45,7 +54,7 @@
     error = "";
     try {
       await fs.revoke(path, confirming.user);
-      revoked = confirming.user;
+      revoked = isLink(confirming.user) ? "the public link" : `${confirming.user}'s share`;
       confirming = null;
       await load();
     } catch (e) {
@@ -68,10 +77,15 @@
   {#if grantees === null}
     <p class="note">Loading…</p>
   {:else if confirming}
-    <p>Revoke <strong>{confirming.user}</strong>'s share of {path}?</p>
+    {#if isLink(confirming.user)}
+      <p>Revoke the public link to {path}? It stops working at once.</p>
+    {:else}
+      <p>Revoke <strong>{confirming.user}</strong>'s share of {path}?</p>
+    {/if}
     <p class="note">
-      This will attempt to re-encrypt all files previously visible to {confirming.user} while
-      the tab stays open, around {confirming.estimate ? size(confirming.estimate.bytes) : "…"}
+      This will attempt to re-encrypt all files previously visible to
+      {isLink(confirming.user) ? "the link" : confirming.user} while the tab stays open, around
+      {confirming.estimate ? size(confirming.estimate.bytes) : "…"}
     </p>
     {#if confirming.estimate && confirming.estimate.bytes > WARN_BYTES}
       <p class="error">
@@ -84,7 +98,7 @@
       <button onclick={() => (confirming = null)}>Cancel</button>
     </p>
   {:else}
-    {#if revoked}<p class="note">Revoked {revoked}'s share; re-sealing runs in the background.</p>{/if}
+    {#if revoked}<p class="note">Revoked {revoked}; re-sealing runs in the background.</p>{/if}
     {#if grantees.length === 0}
       <p>Not shared with anyone.</p>
     {:else}
@@ -92,8 +106,17 @@
         <tbody>
           {#each own as g}
             <tr>
-              <td><strong>{g.user}</strong>{g.user === me ? " (you)" : ""}</td>
-              <td>{g.writable ? "read-write" : "read-only"}</td>
+              {#if isLink(g.user)}
+                <td><strong>Public link</strong>{mine.has(g.user) ? " (yours)" : ""}</td>
+                <td>
+                  read-only{mine.get(g.user)?.expired ? ", expired" : ""}{mine.get(g.user)?.expires && !mine.get(g.user)?.expired
+                    ? `, until ${new Date(mine.get(g.user).expires * 1000).toLocaleDateString()}`
+                    : ""}
+                </td>
+              {:else}
+                <td><strong>{g.user}</strong>{g.user === me ? " (you)" : ""}</td>
+                <td>{g.writable ? "read-write" : "read-only"}</td>
+              {/if}
               <td>
                 {#if g.user !== me}
                   <button class="danger" onclick={() => ask(g.user)} disabled={busy}>Revoke…</button>
@@ -103,7 +126,7 @@
           {/each}
           {#each inherited as g}
             <tr class="inherited">
-              <td><strong>{g.user}</strong></td>
+              <td><strong>{isLink(g.user) ? "Public link" : g.user}</strong></td>
               <td>{g.writable ? "read-write" : "read-only"}</td>
               <td class="note">via {folder(g.via)}</td>
             </tr>

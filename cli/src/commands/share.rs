@@ -174,7 +174,11 @@ pub fn grants(connect: &ConnectArgs, args: PathArg) -> Outcome {
         } else {
             "read-only"
         };
-        println!("{}\t{mode}\t{key}", g.user);
+        if g.user.starts_with(raft5fs_proto::types::LINK_PREFIX) {
+            println!("{}\tpublic link\t(revoke it like a user)", g.user);
+        } else {
+            println!("{}\t{mode}\t{key}", g.user);
+        }
     }
     Ok(0)
 }

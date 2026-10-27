@@ -46,12 +46,13 @@ use raft5fs_crypto::identity::{
     seal_grant, seal_label,
 };
 use raft5fs_crypto::node::NodeKeys;
+use raft5fs_crypto::password::new_link_credentials;
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
     Attr, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Layout, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody, WriteError,
-    check_username,
+    Layout, LinkAccount, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody,
+    WriteError, check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
@@ -196,6 +197,13 @@ const ROTATION_ROUNDS: usize = 16;
 
 fn expired(e: &FsError) -> bool {
     e.errno == raft5fs_proto::errno::EKEYEXPIRED
+}
+
+/// Whether another client gave `granted`'s node a new key since this one
+/// cached `node`: its sealed grantee list is under a later version.
+fn newer_key(node: &Node, granted: &GrantedNode) -> bool {
+    !granted.sealed_grantees.is_empty()
+        && sealed_version(&granted.sealed_grantees).is_ok_and(|v| v > node.record.version)
 }
 
 fn changed(e: &FsError) -> bool {
@@ -937,7 +945,7 @@ impl Vault {
     /// list does not agree with the grantee list sealed under its key, or
     /// with the keys pinned here.
     pub async fn grantees(&self, ino: u64) -> Result<Vec<Grantee>, FsError> {
-        let node = self.node(ino).await?;
+        let mut node = self.node(ino).await?;
         let Some(granted) = self
             .remote
             .grants_under(ino)
@@ -947,6 +955,10 @@ impl Vault {
         else {
             return Ok(Vec::new());
         };
+        if newer_key(&node, &granted) {
+            self.forget_all();
+            node = self.node(ino).await?;
+        }
         self.checked_grantees(&node, ino, &granted)?;
         Ok(granted.grantees)
     }
@@ -1526,6 +1538,10 @@ impl Vault {
                 .await?
                 .into_iter()
                 .find(|n| n.ino == ino);
+            if granted.as_ref().is_some_and(|g| newer_key(&node, g)) {
+                self.forget_all();
+                continue;
+            }
             let seq = granted.as_ref().map_or(0, |g| g.grantees_seq);
             let mut entries: Vec<GranteeEntry> = match &granted {
                 Some(granted) => self
@@ -1571,6 +1587,56 @@ impl Vault {
             errno::EAGAIN,
             format!("inode {ino}'s grantees kept changing under this grant"),
         ))
+    }
+
+    /// Makes a public link to directory `ino`: a new account that can only
+    /// read it, until it expires (`expires`, in seconds since the Unix
+    /// epoch) or anyone who can write the directory revokes it. Needs the
+    /// `links` capability and write access.
+    ///
+    /// - `path` is how this account knows the directory. It is sealed to
+    ///   this account's key, so only `links` here reads it back.
+    /// - `label` is the name the directory shows under for the link's
+    ///   visitors.
+    ///
+    /// Returns the link's account name and secret. The secret is kept
+    /// nowhere else: it goes in the link (`public_link`).
+    pub async fn create_link(
+        &self,
+        ino: u64,
+        path: &str,
+        label: &OsStr,
+        expires: Option<u64>,
+    ) -> Result<(String, String), FsError> {
+        // Checked first, so a refused grant leaves no account behind.
+        self.remote.access(ino, 2).await?;
+        let (user, secret) = new_link_credentials();
+        let note = seal_label(&self.identity.public_key(), ino, path.as_bytes());
+        let key = self
+            .remote
+            .create_link_account(&user, &secret, expires, ino, note)
+            .await?;
+        // This account made the key, so it needs no fingerprint check.
+        self.known.check(&user, &key)?;
+        self.grant(ino, &user, false, label).await?;
+        Ok((user, secret))
+    }
+
+    /// The public links that this account made, with the path each was made
+    /// for (`None` if it can't be read).
+    pub async fn links(&self) -> Result<Vec<(LinkAccount, Option<String>)>, FsError> {
+        let links = self.remote.list_links().await?;
+        Ok(links
+            .into_iter()
+            .map(|link| {
+                let path = self
+                    .identity
+                    .open_label(link.info.folder, &link.info.note)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                (link, path)
+            })
+            .collect())
     }
 
     /// Pins `user`'s public key if its fingerprint matches `expected`.

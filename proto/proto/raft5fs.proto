@@ -164,6 +164,16 @@ service Fs {
   rpc ListInvites(NoArgs) returns (InviteListResponse);
   // Withdraws one of the caller's unused invitations.
   rpc CancelInvite(CancelInviteRequest) returns (EmptyResponse);
+  // Makes the account for a public link, with keys that the caller made
+  // from a secret that only the link holds. Needs the `links` capability.
+  // The name must be new and start with "link-". The account may do
+  // nothing but read what is granted to it, and only the caller can grant
+  // it anything: one folder (`folder`), read-only. The servers remove it
+  // when its grant is removed (a revoke, by anyone who can write the
+  // folder). From `expires` on, it can't log in.
+  rpc CreateLinkAccount(CreateLinkAccountRequest) returns (EmptyResponse);
+  // The public links the caller made.
+  rpc ListLinks(NoArgs) returns (LinkListResponse);
 }
 
 message NoArgs {}
@@ -737,6 +747,35 @@ message AccountInfo {
   // For a link: who made it, and when it stops working (0: never).
   string owner = 5;
   uint64 expires = 6;
+  // For a link: the folder it shares, and a note for its maker, sealed to
+  // their key.
+  uint64 folder = 7;
+  bytes note = 8;
+}
+
+message CreateLinkAccountRequest {
+  string username = 1;
+  AccountKeys keys = 2;
+  // Seconds since the Unix epoch; 0 for never.
+  uint64 expires = 3;
+  uint64 folder = 4;
+  bytes note = 5;
+}
+
+message LinkInfo {
+  string username = 1;
+  AccountInfo account = 2;
+}
+
+message LinkList {
+  repeated LinkInfo links = 1;
+}
+
+message LinkListResponse {
+  oneof result {
+    LinkList list = 1;
+    Error error = 2;
+  }
 }
 
 message AccountResponse {

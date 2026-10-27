@@ -3,7 +3,8 @@
   // minutes without input, ends the Worker, which drops every key. A
   // device that stays unlocked (an opt-in at login) logs back in by itself
   // when the app opens, has no idle logout, and forgets the account when
-  // the user logs out.
+  // the user logs out. A public link opens its folder for a visitor, with
+  // nothing kept in the browser.
   import { onDestroy } from "svelte";
   import { connect } from "./lib/rpc.js";
   import Login from "./components/Login.svelte";
@@ -41,9 +42,10 @@
 
   async function logout(why = "") {
     const ending = fs;
+    const visitor = me?.visitor;
     fs = null;
     me = null;
-    screen = "login";
+    screen = visitor ? "closed" : "login";
     notice = why;
     clearTimeout(idleTimer);
     // A shared computer's address bar shouldn't keep showing folder names.
@@ -65,6 +67,19 @@
       screen = "enrol";
       return;
     }
+    if (route?.link) {
+      // The link is a password: it leaves the address bar at once.
+      clearRoute();
+      const session = worker();
+      try {
+        return loggedIn(session, await session.visit(route.link));
+      } catch (e) {
+        session.kill();
+        notice = e.code === "ELINK" ? e.message : `Couldn't open the link: ${e.message}`;
+        screen = "closed";
+        return;
+      }
+    }
     const session = worker();
     try {
       const who = await session.resume();
@@ -83,7 +98,7 @@
 
   let idleTimer = null;
   function resetIdle() {
-    if (!fs || me?.remembered) return;
+    if (!fs || me?.remembered || me?.visitor) return;
     clearTimeout(idleTimer);
     idleTimer = setTimeout(
       () => logout("Logged out after 30 minutes without use."),
@@ -104,7 +119,9 @@
   <main class="card">
     <h1>Store your <em>gayest</em> files</h1>
     {#if notice}<p class="note">{notice}</p>{/if}
-    {#if screen === "enrol"}
+    {#if screen === "closed"}
+      <p>To see the folder again, open the link you were given once more.</p>
+    {:else if screen === "enrol"}
       <Enrol
         {worker}
         {invitation}

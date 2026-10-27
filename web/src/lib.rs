@@ -37,6 +37,7 @@ use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::os_bytes;
+use raft5fs_proto::public_link::PublicLink;
 use raft5fs_proto::types::{AccountInfo, AccountKind, Attr, Caps, FsError, Kind, SetAttr};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -178,6 +179,49 @@ pub fn invitation_fs_id(invitation: &str) -> Result<String, JsValue> {
     Ok(raft5fs_client::fs_id(&invite.ca))
 }
 
+/// The id of the filesystem that public link `link` (a `#link=`
+/// fragment's value) is for.
+#[wasm_bindgen(js_name = linkFsId)]
+pub fn link_fs_id(link: &str) -> Result<String, JsValue> {
+    PublicLink::decode(link)
+        .map(|link| link.fs_id)
+        .map_err(|_| dead_link())
+}
+
+/// One message for every link that doesn't work, whatever the reason:
+/// garbled, revoked or expired. A visitor can only ask for a new one.
+fn dead_link() -> JsValue {
+    failure("ELINK", "This link no longer works.")
+}
+
+/// Opens public link `link`: logs in as the link's account. Nothing is kept
+/// in the browser: `persist` should do nothing, and the app starts no
+/// prune. The secret is random, so its key stretching is minimal.
+#[wasm_bindgen]
+pub async fn visit(config: JsValue, link: String, persist: Function) -> Result<Fs, JsValue> {
+    let config = Config::parse(config)?;
+    let link = PublicLink::decode(&link).map_err(|_| dead_link())?;
+    if link.fs_id != config.fs_id {
+        return Err(dead_link());
+    }
+    let mut credentials = config.credentials(link.user, link.secret);
+    credentials.min_kdf = KdfParams::SECRET;
+    open(config, credentials, js_sys::Map::new(), persist)
+        .await
+        .map_err(|e| {
+            let code = js_sys::Reflect::get(&e, &"code".into())
+                .ok()
+                .and_then(|c| c.as_string());
+            // A refused login is a revoked or expired link; anything else
+            // (servers down) says what it is.
+            if code.as_deref() == Some("EACCES") {
+                dead_link()
+            } else {
+                e
+            }
+        })
+}
+
 /// One message for every invitation that doesn't parse: the user can only
 /// ask for a new one anyway.
 fn invalid_invitation() -> JsValue {
@@ -317,6 +361,7 @@ async fn open(
     // is the one to run it.
     Ok(Fs(Rc::new(Inner {
         session,
+        fs_id: config.fs_id.clone(),
         store: browser,
         queue,
         pruner: RefCell::new(None),
@@ -331,6 +376,8 @@ pub struct Fs(Rc<Inner>);
 
 struct Inner {
     session: Arc<Session>,
+    /// The filesystem's id, for public links.
+    fs_id: String,
     /// This tab's copy of the account's pins and prune queue.
     store: Arc<BrowserStore>,
     queue: PruneQueue,
@@ -880,6 +927,92 @@ impl Fs {
     pub fn cancel_invite(&self, user: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move { inner.vault().remote().cancel_invite(&user).await })
+    }
+
+    /// Makes a public link to folder `path`, under which visitors see it
+    /// as `label`, that stops working at `expires` (seconds since 1970) if
+    /// given. Returns `{user, link}`: the link's account name and the
+    /// `#link=` fragment's value, which is shown once and kept nowhere.
+    #[wasm_bindgen(js_name = createLink)]
+    pub fn create_link(&self, path: String, label: String, expires: Option<f64>) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.resolve(&path).await?.ino;
+            let (user, secret) = inner
+                .vault()
+                .create_link(ino, &path, OsStr::new(&label), expires.map(|at| at as u64))
+                .await?;
+            #[derive(Serialize)]
+            struct Made {
+                user: String,
+                link: String,
+            }
+            let link = PublicLink {
+                fs_id: inner.fs_id.clone(),
+                user: user.clone(),
+                secret,
+            }
+            .encode();
+            Ok(Made { user, link })
+        })
+    }
+
+    /// The public links that this account made, as `[{user, path, created,
+    /// expires, expired}]` (times in seconds since 1970; `expires` null for
+    /// never; `path` null if it can't be read).
+    #[wasm_bindgen(js_name = listLinks)]
+    pub fn list_links(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            struct Made {
+                user: String,
+                path: Option<String>,
+                created: u64,
+                expires: Option<u64>,
+                expired: bool,
+            }
+            let now = (js_sys::Date::now() / 1000.0) as u64;
+            let links = inner.vault().links().await?;
+            Ok(links
+                .into_iter()
+                .map(|(link, path)| Made {
+                    expired: link.info.expired(now),
+                    user: link.user,
+                    path,
+                    created: link.info.created,
+                    expires: link.info.expires,
+                })
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Revokes public link `user`, which this account made, wherever its
+    /// folder now is, and queues the folder for pruning, as `revoke` does.
+    #[wasm_bindgen(js_name = revokeLink)]
+    pub fn revoke_link(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let (link, path) = inner
+                .vault()
+                .links()
+                .await?
+                .into_iter()
+                .find(|(link, _)| link.user == user)
+                .ok_or_else(|| FsError::new(errno::ENOENT, "there's no such link"))?;
+            let ino = link.info.folder;
+            inner.vault().revoke(ino, &user).await?;
+            let path = path.unwrap_or_else(|| format!("folder {ino}"));
+            inner
+                .queue
+                .add(ino, &format!("{path} (revoked a public link)"))
+                .map_err(|e| {
+                    FsError::new(
+                        errno::EIO,
+                        format!("revoked, but not queued for pruning: {e}"),
+                    )
+                })
+        })
     }
 
     /// Shares from people whose keys aren't pinned here: read-only until

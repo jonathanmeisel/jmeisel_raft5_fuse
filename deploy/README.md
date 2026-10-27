@@ -663,7 +663,7 @@ them:
 |---|---|---|
 | `volumes` | make top-level folders of their own | on for `user add`, and for every user added before capabilities existed |
 | `invite` | invite new users themselves (web app: **Invite someone**; CLI: `raft5fs invite`) | off |
-| `links` | make public links to folders (not yet built) | off |
+| `links` | make public links to folders (web app: a folder's **Share publicly…**; CLI: `raft5fs link create`) | off |
 
 ```sh
 ./fsadmin.sh user add carol --no-volumes          # sees only what is shared with her
@@ -677,6 +677,26 @@ have themselves, only under a name nobody has, and can have at most 10
 invitations waiting (`raft5fs invites` lists and cancels them). The
 servers put the same addresses and `fs-ca.pem` in those invitations as
 `user add` does.
+
+**Public links** let anyone with a URL read one folder, without an
+account. Each link is an account of its own (`link-` and 12 letters),
+whose password is a random secret in the URL's fragment, which browsers
+never send to a server. So:
+
+- The URL is the credential. Whoever it is forwarded to can read the
+  folder until the link expires or is revoked. Links are read-only.
+- Anyone who can change the folder can revoke its link (its **Shared
+  with…** list shows it as "Public link"), as for a person: the folder is
+  re-encrypted and the servers delete the link's account. Deleting the
+  folder ends its links too.
+- An expired link can't log in, and an open visit stops within seconds.
+  It keeps its share until someone revokes it, though, and the folder
+  isn't re-encrypted until then: someone who kept the link and later got
+  hold of the raw store could read what was there when it expired.
+- `user list` shows each link under the user who made it; `user del`
+  removes one like any account.
+- A visitor's browser keeps nothing: reloading the page needs the link
+  again.
 
 ### Snapshots
 

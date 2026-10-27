@@ -10,8 +10,8 @@ use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
     Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, Layout, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SetAttr, SetTime, SnapshotInfo, WriteBody,
+    Kind, Layout, LinkAccount, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation,
+    SealedChunk, SetAttr, SetTime, SnapshotInfo, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -418,6 +418,8 @@ impl From<AccountInfo> for pb::AccountInfo {
             created: a.created,
             owner: a.owner,
             expires: a.expires.unwrap_or(0),
+            folder: a.folder,
+            note: a.note,
         }
     }
 }
@@ -434,6 +436,8 @@ impl From<pb::AccountInfo> for AccountInfo {
             created: a.created,
             owner: a.owner,
             expires: (a.expires != 0).then_some(a.expires),
+            folder: a.folder,
+            note: a.note,
         }
     }
 }
@@ -457,6 +461,46 @@ impl pb::AccountResponse {
             Some(R::Account(a)) => Ok(a.into()),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("account")),
+        }
+    }
+}
+
+impl From<Result<Vec<LinkAccount>, FsError>> for pb::LinkListResponse {
+    fn from(r: Result<Vec<LinkAccount>, FsError>) -> Self {
+        use pb::link_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(links) => R::List(pb::LinkList {
+                    links: links
+                        .into_iter()
+                        .map(|l| pb::LinkInfo {
+                            username: l.user,
+                            account: Some(l.info.into()),
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::LinkListResponse {
+    pub fn into_result(self) -> Result<Vec<LinkAccount>, FsError> {
+        use pb::link_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => l
+                .links
+                .into_iter()
+                .map(|l| {
+                    Ok(LinkAccount {
+                        user: l.username,
+                        info: l.account.ok_or_else(|| malformed("link account"))?.into(),
+                    })
+                })
+                .collect(),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("link list")),
         }
     }
 }

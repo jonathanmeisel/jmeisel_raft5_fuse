@@ -2,12 +2,16 @@
 //! start, and how users invite users. They run against a real store and
 //! servers.
 
+use std::ffi::OsStr;
+use std::sync::Arc;
+
 use raft5fs_client::remote::Remote;
+use raft5fs_client::vault::Vault;
 use raft5fs_core::accounts;
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, MAX_PENDING_INVITES, NewNode};
-use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
+use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, credentials_with, fs_tls};
 
 #[test]
 fn server_process_mode() {
@@ -235,5 +239,170 @@ fn users_invite_new_users_only() {
             .unwrap()
             .invited_by,
         ""
+    );
+}
+
+fn vault(backend: &Backend, user: &str) -> Vault {
+    Vault::new(Arc::new(connect(backend, user))).unwrap()
+}
+
+/// Logs in as a link, as a visitor's browser does.
+fn visit(backend: &Backend, user: &str, secret: &str) -> Result<Vault, String> {
+    let remote = backend.runtime.block_on(Remote::connect(
+        &backend.addresses(),
+        credentials_with(user, secret),
+        Some(fs_tls()),
+    ))?;
+    Vault::new(Arc::new(remote)).map_err(|e| e.message)
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn public_links_read_one_folder_until_any_writer_revokes() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    backend.enrol("bob");
+    backend.enrol("carol");
+    let tester = vault(&backend, TESTER);
+    let docs = rt
+        .block_on(tester.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let other = rt
+        .block_on(tester.create_volume(OsStr::new("other"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.mkdir(docs, OsStr::new("inside"), 0o755))
+        .unwrap();
+    rt.block_on(tester.grant(docs, "bob", true, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(tester.grant(docs, "carol", false, OsStr::new("docs")))
+        .unwrap();
+
+    // Links need the capability.
+    assert_eq!(
+        errno(rt.block_on(tester.create_link(docs, "/docs", OsStr::new("docs"), None))),
+        libc::EACCES
+    );
+    rt.block_on(accounts::set_caps(
+        &backend.client,
+        TESTER,
+        Caps::LINKS,
+        Caps::NONE,
+    ))
+    .unwrap();
+    // And write access: carol only reads.
+    rt.block_on(accounts::set_caps(
+        &backend.client,
+        "carol",
+        Caps::LINKS,
+        Caps::NONE,
+    ))
+    .unwrap();
+    let carol = vault(&backend, "carol");
+    assert_eq!(
+        errno(rt.block_on(carol.create_link(docs, "/docs", OsStr::new("docs"), None))),
+        libc::EROFS
+    );
+
+    let (link, secret) = rt
+        .block_on(tester.create_link(docs, "/docs", OsStr::new("Our docs"), None))
+        .unwrap();
+    assert!(link.starts_with("link-"));
+    let made = rt.block_on(tester.links()).unwrap();
+    assert_eq!(made.len(), 1);
+    assert_eq!(
+        (made[0].0.user.as_str(), made[0].1.as_deref()),
+        (link.as_str(), Some("/docs"))
+    );
+
+    // A visitor reads the folder, under the name it was shared as, and
+    // nothing more.
+    let visitor = visit(&backend, &link, &secret).unwrap();
+    let roots = rt.block_on(visitor.root_entries()).unwrap();
+    assert_eq!(roots, [(OsStr::new("Our docs").to_owned(), docs)]);
+    let names: Vec<_> = rt
+        .block_on(visitor.readdir(docs))
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "inside"), "{names:?}");
+    assert_ne!(
+        rt.block_on(visitor.mkdir(docs, OsStr::new("mine"), 0o755))
+            .map(drop),
+        Ok(())
+    );
+    assert_eq!(
+        errno(rt.block_on(visitor.create_volume(OsStr::new("v"), 0o755))),
+        libc::EACCES
+    );
+    assert!(visit(&backend, &link, "wrong").is_err());
+
+    // Only its maker shares with a link, and only its folder.
+    let bob = vault(&backend, "bob");
+    // Bob trusts the tester, so his vault would share from what they share.
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+    let key = rt.block_on(bob.served_key(&link)).unwrap();
+    bob.known_keys().check(&link, &key).unwrap();
+    for (who, ino) in [(&bob, docs), (&tester, other)] {
+        assert_eq!(
+            errno(rt.block_on(who.grant(ino, &link, false, OsStr::new("x")))),
+            libc::EPERM
+        );
+    }
+    assert_eq!(
+        errno(rt.block_on(tester.grant(docs, &link, true, OsStr::new("x")))),
+        libc::EPERM
+    );
+
+    // A reader can't revoke it; any writer can, and that ends the link.
+    assert!(rt.block_on(carol.revoke(docs, &link)).is_err());
+    rt.block_on(bob.revoke(docs, &link)).unwrap();
+    assert!(
+        rt.block_on(accounts::get(&backend.client, &link))
+            .unwrap()
+            .is_none()
+    );
+    assert!(rt.block_on(tester.links()).unwrap().is_empty());
+    assert!(visit(&backend, &link, &secret).is_err());
+    // An open session ends too.
+    assert!(rt.block_on(visitor.root_entries()).is_err());
+
+    // An expired link can't log in.
+    let soon = now() + 2;
+    let (link, secret) = rt
+        .block_on(tester.create_link(docs, "/docs", OsStr::new("docs"), Some(soon)))
+        .unwrap();
+    visit(&backend, &link, &secret).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(visit(&backend, &link, &secret).is_err());
+    // Deleting its folder ends it as well.
+    let (link, _) = rt
+        .block_on(tester.create_link(other, "/other", OsStr::new("other"), None))
+        .unwrap();
+    rt.block_on(tester.delete_volume(OsStr::new("other")))
+        .unwrap();
+    assert!(
+        rt.block_on(accounts::get(&backend.client, &link))
+            .unwrap()
+            .is_none()
+    );
+
+    // Nobody else may take a link's name.
+    assert_eq!(
+        errno(rt.block_on(accounts::add(
+            &backend.client,
+            "link-x",
+            Caps::NONE,
+            Caps::NONE
+        ))),
+        libc::EINVAL
     );
 }

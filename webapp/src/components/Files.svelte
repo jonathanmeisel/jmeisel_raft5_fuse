@@ -12,12 +12,17 @@
   import PruneBar from "./PruneBar.svelte";
   import Viewer from "./Viewer.svelte";
   import InviteDialog from "./InviteDialog.svelte";
+  import LinkDialog from "./LinkDialog.svelte";
+  import LinksDialog from "./LinksDialog.svelte";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
   import { pathHash, readRoute } from "../lib/route.js";
 
   let { fs, me, storageError, onlogout } = $props();
+  /// A public link's visitor: read-only, one folder, nothing of an account.
+  // svelte-ignore state_referenced_locally
+  const visitor = !!me.visitor;
 
 
   // svelte-ignore state_referenced_locally
@@ -65,6 +70,7 @@
       error = e.message;
       initial = [];
     }
+    if (visitor) return;
     refreshPending();
     try {
       account = await fs.account();
@@ -216,7 +222,7 @@
   function init(fm) {
     api = fm;
     api.on("set-path", moved);
-    const start = readRoute()?.path;
+    const start = readRoute()?.path ?? (visitor ? "/" + me.folder : null);
     if (start && start !== "/") queueMicrotask(() => goTo(start, { fromUrl: true }));
     api.intercept("request-data", ({ id }) => {
       reload(id);
@@ -295,6 +301,9 @@
       { comp: "separator" },
       { id: "share", text: "Share…", icon: "wxi-account", handler: () => (dialog = { kind: "share", path: item.id }) },
       { id: "shared-with", text: "Shared with…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
+      ...(account.caps.includes("links")
+        ? [{ id: "share-link", text: "Share publicly…", icon: "wxi-link", handler: () => (dialog = { kind: "link", path: item.id }) }]
+        : []),
       { id: "prune-again", text: "Prune again", icon: "wxi-sync", handler: () => pruneAgain(item.id) },
     ];
   }
@@ -322,16 +331,25 @@
 
 <div class="layout">
   <header>
-    <span class="who">{me.user}{__RAFT5FS_FILESYSTEMS__.length > 1 ? ` on ${me.filesystem}` : ""}</span>
-    <span class="spacer"></span>
-    <button onclick={() => (dialog = { kind: "pending" })}>
-      Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
-    </button>
-    {#if account.caps.includes("invite")}
-      <button onclick={() => (dialog = { kind: "invite" })}>Invite someone</button>
+    {#if visitor}
+      <span class="who">Shared with you by public link: read-only</span>
+      <span class="spacer"></span>
+      <button onclick={onlogout}>Close</button>
+    {:else}
+      <span class="who">{me.user}{__RAFT5FS_FILESYSTEMS__.length > 1 ? ` on ${me.filesystem}` : ""}</span>
+      <span class="spacer"></span>
+      <button onclick={() => (dialog = { kind: "pending" })}>
+        Shared with me{pendingCount ? ` (${pendingCount} pending)` : ""}
+      </button>
+      {#if account.caps.includes("invite")}
+        <button onclick={() => (dialog = { kind: "invite" })}>Invite someone</button>
+      {/if}
+      {#if account.caps.includes("links")}
+        <button onclick={() => (dialog = { kind: "links" })}>Public links</button>
+      {/if}
+      <button onclick={() => (dialog = { kind: "fingerprint" })}>My fingerprint</button>
+      <button onclick={onlogout}>Log out</button>
     {/if}
-    <button onclick={() => (dialog = { kind: "fingerprint" })}>My fingerprint</button>
-    <button onclick={onlogout}>Log out</button>
   </header>
 
   {#if storageError}
@@ -344,7 +362,9 @@
     </div>
   {/if}
 
-  <PruneBar {fs} onqueued={(n) => (pruneQueued = n)} />
+  {#if !visitor}
+    <PruneBar {fs} onqueued={(n) => (pruneQueued = n)} />
+  {/if}
 
   {#each transfers as t}
     <div class="transfer">
@@ -360,6 +380,7 @@
           data={initial}
           {init}
           {menuOptions}
+          readonly={visitor}
           icons="simple"
           previews={(file) => preview.url(file)}
         />
@@ -384,7 +405,11 @@
 {:else if dialog?.kind === "share"}
   <ShareDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "shared-with"}
-  <SharedWith {fs} path={dialog.path} me={me.user} onclose={() => (dialog = null)} />
+  <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "link"}
+  <LinkDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "links"}
+  <LinksDialog {fs} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "invite"}
   <InviteDialog {fs} caps={account.caps} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "pending"}

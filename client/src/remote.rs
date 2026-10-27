@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
+use raft5fs_proto::pb::CreateLinkAccountRequest;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, CancelInviteRequest, ChangePasswordRequest, CreateRequest,
@@ -68,6 +69,7 @@ use raft5fs_proto::pb::{
     PrepareUploadsRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
     ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
+use raft5fs_proto::types::LinkAccount;
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
     KeyPath, NewNode, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation,
@@ -308,8 +310,22 @@ impl Remote {
         credentials: Credentials,
         tls: Option<ClientTlsConfig>,
     ) -> Result<Self, String> {
-        let remote = Self::dial(addresses, credentials, tls).await?;
-        remote.login().await.map_err(|e| e.message)?;
+        Self::open(addresses, credentials, tls)
+            .await
+            .map_err(|e| e.message)
+    }
+
+    /// `connect`, keeping what went wrong: `EHOSTUNREACH` if it couldn't
+    /// connect, or the login's own error (`EACCES` for a refused one).
+    pub async fn open(
+        addresses: &[String],
+        credentials: Credentials,
+        tls: Option<ClientTlsConfig>,
+    ) -> Result<Self, FsError> {
+        let remote = Self::dial(addresses, credentials, tls)
+            .await
+            .map_err(|why| FsError::new(errno::EHOSTUNREACH, why))?;
+        remote.login().await?;
         Ok(remote)
     }
 
@@ -1218,6 +1234,48 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.cancel_invite(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Makes the account for a public link to folder `folder`: `user`, with
+    /// a new key pair wrapped under `secret`, and `note` for this account
+    /// alone. Returns the link's public key, to pin and grant to.
+    pub async fn create_link_account(
+        &self,
+        user: &str,
+        secret: &str,
+        expires: Option<u64>,
+        folder: u64,
+        note: Vec<u8>,
+    ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        self.needs_protocol(2, "public links")?;
+        let identity = Identity::generate();
+        let (keys, _) = account_keys(user, secret, KdfParams::SECRET, &identity).await?;
+        let req = CreateLinkAccountRequest {
+            username: user.to_string(),
+            keys: Some(keys),
+            expires: expires.unwrap_or(0),
+            folder,
+            note,
+        };
+        // Not sent again: a resend after it was stored would say the name
+        // is taken.
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.create_link_account(req).await }
+        })
+        .await?
+        .into_result()?;
+        Ok(identity.public_key())
+    }
+
+    /// The public links that this account made.
+    pub async fn list_links(&self) -> Result<Vec<LinkAccount>, FsError> {
+        self.needs_protocol(2, "public links")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_links(NoArgs {}).await
         })
         .await?
         .into_result()

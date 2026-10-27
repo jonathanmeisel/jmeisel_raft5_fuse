@@ -414,6 +414,83 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
   expect(problems.flat()).toEqual([]);
 });
 
+test("a public link opens a folder for anyone, until a writer revokes it", async ({ browser }) => {
+  const frank = await (await browser.newContext()).newPage();
+  const gina = await (await browser.newContext()).newPage();
+  const visitor = await (await browser.newContext()).newPage();
+  const problems = [frank, gina, visitor].map(watch);
+  const note = Buffer.from("for everyone\n");
+  let link;
+
+  await test.step("frank shares a folder with gina, who trusts him", async () => {
+    const frankWords = await enrol(frank, "frank");
+    const ginaWords = await enrol(gina, "gina");
+    await login(frank, "frank");
+    await login(gina, "gina");
+    await addFolder(frank, "public");
+    await open(frank, "public");
+    await frank.locator("input[type=file]").setInputFiles([
+      { name: "note.txt", mimeType: "text/plain", buffer: note },
+    ]);
+    await expect(item(frank, "note.txt")).toBeVisible(SLOW);
+    await frank.getByText("My files").first().click();
+    await menu(frank, "public", "Share…");
+    await frank.getByLabel("User", { exact: true }).fill("gina");
+    await frank.getByRole("button", { name: "Share", exact: true }).click();
+    await frank.getByLabel("gina's fingerprint").fill(ginaWords);
+    await frank.getByRole("button", { name: "Share", exact: true }).click();
+    await frank.getByRole("button", { name: "Done" }).click();
+    await gina.reload();
+    await login(gina, "gina");
+    await gina.getByRole("button", { name: /Shared with me/ }).click();
+    await gina.getByRole("button", { name: "Trust…" }).click();
+    await gina.getByLabel("fingerprint").fill(frankWords);
+    await gina.getByRole("button", { name: "Trust", exact: true }).click();
+    await gina.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("frank makes a public link", async () => {
+    await menu(frank, "public", "Share publicly…");
+    await frank.getByRole("button", { name: "Make link" }).click();
+    link = await frank.getByLabel("Public link").inputValue();
+    expect(link).toMatch(/^http:\/\/localhost:4173\/#link=[\w-]+$/);
+    await frank.getByRole("button", { name: "Done" }).click();
+    await frank.getByRole("button", { name: "Public links" }).click();
+    await expect(frank.getByRole("cell", { name: "/public" })).toBeVisible(SLOW);
+    await frank.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("anyone opens it, read-only, with nothing kept", async () => {
+    await visitor.goto(link);
+    await expect(item(visitor, "note.txt")).toBeVisible(SLOW);
+    expect(new URL(visitor.url()).hash).not.toContain("link=");
+    await expect(visitor.getByRole("button", { name: "Close" })).toBeVisible();
+    await expect(visitor.getByRole("button", { name: "Log out" })).toHaveCount(0);
+    await expect(visitor.getByText("Add New")).toHaveCount(0);
+    expect((await download(visitor, "note.txt")).equals(note)).toBe(true);
+    expect(await visitor.evaluate(async () => (await indexedDB.databases()).length)).toBe(0);
+  });
+
+  await test.step("gina, who can change the folder, revokes it", async () => {
+    await menu(gina, "public", "Shared with…");
+    const row = gina.getByRole("row").filter({ hasText: "Public link" });
+    await row.getByRole("button", { name: "Revoke…" }).click();
+    await gina.getByRole("button", { name: "Revoke", exact: true }).click();
+    await expect(gina.getByText(/Revoked the public link/)).toBeVisible(SLOW);
+    await gina.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("and the link no longer works", async () => {
+    const again = await (await browser.newContext()).newPage();
+    await again.goto(link);
+    await expect(again.getByText("This link no longer works.")).toBeVisible(SLOW);
+    await frank.getByRole("button", { name: "Public links" }).click();
+    await expect(frank.getByText(/haven't made any public links/)).toBeVisible(SLOW);
+  });
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

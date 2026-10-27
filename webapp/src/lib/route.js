@@ -3,7 +3,7 @@
 // - `#/<path>`: a folder or file, as a path from the root, each name
 //   encoded with encodeURIComponent. `#/` is the root.
 // - `#invite=<invitation>`: open the enroll screen with this invitation.
-// - `#link=<…>`: a public link (part C of the plan; not handled yet).
+// - `#link=<…>`: a public link: open its folder as a visitor.
 
 /// What `hash` (default: the page's) asks for: `{ path }`, `{ invite }`,
 /// `{ link }`, or null.

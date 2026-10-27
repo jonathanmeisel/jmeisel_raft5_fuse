@@ -36,14 +36,15 @@ use raft5fs_proto::invite::Invite;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
     AccessRequest, AccountResponse, AttrResponse, CancelInviteRequest, ChangePasswordRequest,
-    CreateRequest, CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse,
-    GrantRequest, GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse, InodeRequest,
-    InviteListResponse, IssueInviteRequest, IssueInviteResponse, IssuedInvite, KdfSettings,
-    KeyPathResponse, ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest,
-    NoArgs, PreloginRequest, PreloginResponse, PrepareUploadsRequest, PrepareUploadsResponse,
-    PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
-    ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
-    Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
+    CreateLinkAccountRequest, CreateRequest, CreateVolumeRequest, EmptyResponse, EnrolRequest,
+    GrantListResponse, GrantRequest, GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse,
+    InodeRequest, InviteListResponse, IssueInviteRequest, IssueInviteResponse, IssuedInvite,
+    KdfSettings, KeyPathResponse, LinkListResponse, ListGrantsRequest, LoginRequest, LoginResponse,
+    LookupResponse, NameRequest, NoArgs, PreloginRequest, PreloginResponse, PrepareUploadsRequest,
+    PrepareUploadsResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse,
+    ReadChunksRequest, ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest,
+    ResealNamesRequest, RotateRequest, Session, SetAttrRequest, SnapshotListResponse,
+    WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -146,8 +147,9 @@ impl FsService {
         Ok((Caller::new(name), request.into_inner()))
     }
 
-    /// Checks that account `name` is still enrolled, within `identity_ttl`.
-    /// A removed account gives `UNAUTHENTICATED`. The client then logs in
+    /// Checks that account `name` is still enrolled (and, for a public
+    /// link, not expired), within `identity_ttl`. A removed account gives
+    /// `UNAUTHENTICATED`. The client then logs in
     /// again, which fails, so removing an account cuts off a mounted user
     /// without waiting for their session to expire.
     async fn check_enrolled(&self, name: &str) -> Result<(), Status> {
@@ -156,12 +158,12 @@ impl FsService {
         {
             return Ok(());
         }
-        match accounts::get(self.core.client(), name).await {
-            Ok(Some(_)) => {
+        match accounts::active(self.core.client(), name).await {
+            Ok(true) => {
                 self.remember(name);
                 Ok(())
             }
-            Ok(None) => {
+            Ok(false) => {
                 self.enrolled.lock().unwrap().remove(name);
                 Err(Status::unauthenticated(format!(
                     "{name} no longer has an account"
@@ -687,6 +689,35 @@ impl Fs for FsService {
         let cancelled =
             accounts::cancel_invite(self.core.client(), &caller.user, &r.username).await;
         Ok(Response::new(cancelled.into()))
+    }
+
+    async fn create_link_account(
+        &self,
+        r: Request<CreateLinkAccountRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let made = match r.keys {
+            None => Err(FsError::new(libc::EINVAL, "a link needs keys")),
+            Some(keys) => {
+                accounts::create_link(
+                    self.core.client(),
+                    &caller.user,
+                    &r.username,
+                    &keys.into(),
+                    (r.expires != 0).then_some(r.expires),
+                    r.folder,
+                    &r.note,
+                )
+                .await
+            }
+        };
+        Ok(Response::new(made.into()))
+    }
+
+    async fn list_links(&self, r: Request<NoArgs>) -> Result<Response<LinkListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let links = accounts::links_of(self.core.client(), &caller.user).await;
+        Ok(Response::new(links.into()))
     }
 
     async fn delete_volume(
