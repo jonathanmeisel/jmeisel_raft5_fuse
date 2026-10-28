@@ -335,6 +335,7 @@ const methods = {
   whoami: () => session().whoami(),
   readdir: (path) => session().readdir(path),
   stat: (path) => session().stat(path),
+  sharingHere: (path) => session().sharingHere(path),
   mkdir: (path) => session().mkdir(path),
   remove: (path) => session().remove(path),
   rename: (from, to) => session().rename(from, to),

@@ -13,12 +13,14 @@
   import Viewer from "./Viewer.svelte";
   import InviteDialog from "./InviteDialog.svelte";
   import AccountMenu from "./AccountMenu.svelte";
+  import SharingBar from "./SharingBar.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
   import { pathHash, readRoute } from "../lib/route.js";
+  import { sharedIcon } from "../lib/sharedIcons.js";
 
   let { fs, me, storageError, onlogout } = $props();
   /// A public link's visitor: read-only, one folder, nothing of an account.
@@ -60,6 +62,7 @@
       type: e.kind === "folder" ? "folder" : "file",
       size: e.size,
       date: new Date(e.modified),
+      shared: e.shared ?? null,
       ...(e.kind === "folder" ? { lazy: true } : {}),
     }));
   }
@@ -188,8 +191,9 @@
   let following = false;
 
   /// Opens `path`: a folder, or a file in its folder (then opened as a
-  /// double-click would). Loads each folder on the way, which SVAR only
-  /// knows once its parent is listed.
+  /// double-click would). Lists each folder on the way, which SVAR only
+  /// knows once its parent is listed, and the folder itself: listing a
+  /// parent again makes SVAR forget what was in it.
   async function goTo(path, { fromUrl = false } = {}) {
     let kind = "folder";
     try {
@@ -200,7 +204,7 @@
     }
     const folder = kind === "folder" ? path : parentOf(path);
     const names = folder.split("/").filter(Boolean);
-    for (let i = 1; i < names.length; i++) await reload("/" + names.slice(0, i).join("/"));
+    for (let i = 1; i <= names.length; i++) await reload("/" + names.slice(0, i).join("/"));
     following = fromUrl;
     try {
       await api.exec("set-path", { id: folder });
@@ -210,8 +214,27 @@
     if (kind !== "folder") await api.exec("open-file", { id: path });
   }
 
+  /// The open folder, and how it is shared (see SharingBar).
+  let current = $state("/");
+  let here = $state(null);
+  let hereAsked = 0;
+
+  async function showSharing(path) {
+    current = path;
+    const asked = ++hereAsked;
+    let found = null;
+    if (!visitor && path !== "/") {
+      try {
+        found = await fs.sharingHere(path);
+      } catch {}
+    }
+    // A later move asked again meanwhile: its answer wins.
+    if (asked === hereAsked) here = found;
+  }
+
   /// Adds a history entry for the folder SVAR moved to.
   function moved({ id }) {
+    if (id) showSharing(id);
     if (following || !id || location.hash === pathHash(id)) return;
     history.pushState(null, "", pathHash(id));
   }
@@ -336,6 +359,16 @@
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
 
+  /// Closes a dialog that may have changed what is shared, and lists
+  /// again the folder that shows it, so its mark is right.
+  function closeSharing() {
+    const path = dialog?.path;
+    dialog = null;
+    const state = api?.getState();
+    reload(path ? parentOf(path) : (state?.panels[state.activePanel]?.path ?? "/"));
+    showSharing(current);
+  }
+
   function chose(id) {
     if (id === "logout") onlogout();
     else dialog = { kind: id };
@@ -393,6 +426,8 @@
     </div>
   {/each}
 
+  <SharingBar {here} {current} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
+
   <div class="fm">
     {#if initial}
         <Filemanager
@@ -400,7 +435,7 @@
           {init}
           {menuOptions}
           readonly={visitor}
-          icons="simple"
+          icons={sharedIcon}
           previews={(file) => preview.url(file)}
         />
     {/if}
@@ -422,13 +457,13 @@
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "share"}
-  <ShareDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
+  <ShareDialog {fs} path={dialog.path} onclose={closeSharing} />
 {:else if dialog?.kind === "shared-with"}
-  <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={() => (dialog = null)} />
+  <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={closeSharing} />
 {:else if dialog?.kind === "link"}
-  <LinkDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
+  <LinkDialog {fs} path={dialog.path} onclose={closeSharing} />
 {:else if dialog?.kind === "links"}
-  <LinksDialog {fs} onclose={() => (dialog = null)} />
+  <LinksDialog {fs} onclose={closeSharing} />
 {:else if dialog?.kind === "invite"}
   <InviteDialog {fs} caps={account.caps} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "pending"}

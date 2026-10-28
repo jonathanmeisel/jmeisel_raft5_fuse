@@ -50,6 +50,7 @@ export function connect({ onStorageError } = {}) {
     whoami: () => call("whoami", []),
     readdir: (path) => call("readdir", [path]),
     stat: (path) => call("stat", [path]),
+    sharingHere: (path) => call("sharingHere", [path]),
     mkdir: (path) => call("mkdir", [path]),
     remove: (path) => call("remove", [path]),
     rename: (from, to) => call("rename", [from, to]),

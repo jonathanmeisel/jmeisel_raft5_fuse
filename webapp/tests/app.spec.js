@@ -137,6 +137,16 @@ const item = (page, name) =>
     .getByText(name, { exact: true })
     .first();
 
+/// How folder `name`'s card is marked as shared: "people", "link", or
+/// null for SVAR's plain folder.
+async function sharedMark(page, name) {
+  const card = page.locator(".wx-item").filter({ has: page.getByText(name, { exact: true }) }).first();
+  const src = await card.locator("img").first().getAttribute("src", { timeout: 2_000 }).catch(() => null);
+  if (!src) return null;
+  const svg = decodeURIComponent(src);
+  return svg.includes("<rect") ? "link" : svg.includes("<circle") ? "people" : "?";
+}
+
 async function addFolder(page, name) {
   await page.getByText("Add New").click();
   await page.getByText("Add new folder").click();
@@ -191,6 +201,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
 
   await test.step("alice makes a volume and uploads", async () => {
     await addFolder(alice, "docs");
+    expect(await sharedMark(alice, "docs")).toBe(null);
     await open(alice, "docs");
     await alice.locator("input[type=file]").setInputFiles([
       { name: "small.txt", mimeType: "text/plain", buffer: small },
@@ -291,11 +302,22 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.getByRole("button", { name: "Share", exact: true }).click();
     await expect(alice.getByText(/Shared with bob/)).toBeVisible(SLOW);
     await alice.getByRole("button", { name: "Done" }).click();
+    await expect.poll(() => sharedMark(alice, "docs"), SLOW).toBe("people");
   });
 
   await test.step("a subfolder shows the share it inherits, without revoke", async () => {
     await open(alice, "docs");
+    // The bar above the files says how the open folder is shared.
+    const bar = alice.locator(".sharing-bar");
+    await expect(bar).toHaveText(/^\s*Shared with bob\.\s*Details\s*$/, SLOW);
     await addFolder(alice, "sub");
+    await open(alice, "sub");
+    await expect(bar).toContainText("Shared with bob through docs", SLOW);
+    await bar.getByRole("button", { name: "Details" }).click();
+    await expect(alice.getByRole("dialog", { name: "Shared with: /docs" })).toBeVisible();
+    await alice.getByRole("button", { name: "Close" }).click();
+    await alice.goBack();
+    await expect(item(alice, "sub")).toBeVisible(SLOW);
     await menu(alice, "sub", "Shared with…");
     const row = alice.getByRole("row").filter({ hasText: "bob" });
     await expect(row).toContainText("via docs", SLOW);
@@ -317,6 +339,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await expect(bob.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Close" }).click();
     await open(bob, "docs");
+    await expect(bob.locator(".sharing-bar")).toContainText("Shared with alice", SLOW);
     expect((await download(bob, "small.txt")).equals(small)).toBe(true);
   });
 
@@ -469,6 +492,7 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     link = await frank.getByLabel("Public link").inputValue();
     expect(link).toMatch(/^http:\/\/localhost:4173\/#link=[\w-]+$/);
     await frank.getByRole("button", { name: "Done" }).click();
+    await expect.poll(() => sharedMark(frank, "public"), SLOW).toBe("link");
     await accountMenu(frank, "Public links");
     await expect(frank.getByRole("cell", { name: "/public" })).toBeVisible(SLOW);
     await frank.getByRole("button", { name: "Show link" }).click();

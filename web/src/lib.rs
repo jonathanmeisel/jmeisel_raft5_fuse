@@ -31,7 +31,7 @@ use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault};
-use raft5fs_crypto::identity::{PUBLIC_KEY_LEN, fingerprint, fingerprint_words};
+use raft5fs_crypto::identity::{PUBLIC_KEY_LEN, fingerprint, fingerprint_words, grant_sender};
 use raft5fs_crypto::password::{AUTH_LEN, KdfParams, check_new_password};
 use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
@@ -367,6 +367,7 @@ async fn open(
         pruner: RefCell::new(None),
         handles: RefCell::new(HashMap::new()),
         next_handle: Cell::new(1),
+        sharing: RefCell::new(HashMap::new()),
     })))
 }
 
@@ -387,6 +388,9 @@ struct Inner {
     /// number (snapshots' are above 2^63), so the app gets small handles.
     handles: RefCell<HashMap<u32, u64>>,
     next_handle: Cell<u32>,
+    /// Each volume's sharing, by inode, and when it was read (see
+    /// `sharing`). Any share or revoke here empties it.
+    sharing: RefCell<HashMap<u64, (f64, Option<Sharing>)>>,
 }
 
 /// One entry of a listing.
@@ -399,6 +403,11 @@ struct Entry {
     size: u64,
     /// Milliseconds since the Unix epoch.
     modified: f64,
+    /// For a folder: `link` if it has a public link, `people` if it is
+    /// shared with anyone else (or with this account, by someone else).
+    shared: Option<&'static str>,
+    #[serde(skip)]
+    ino: u64,
 }
 
 impl Entry {
@@ -415,13 +424,177 @@ impl Entry {
                 .mtime
                 .duration_since(UNIX_EPOCH)
                 .map_or(0.0, |d| d.as_millis() as f64),
+            shared: None,
+            ino: attr.ino,
         }
     }
+}
+
+/// How each shared node in a volume is shared, by inode (see
+/// `Entry::shared`).
+type Sharing = Rc<HashMap<u64, NodeSharing>>;
+
+/// Whom a node is shared with besides this account, as the server says.
+#[derive(Serialize, Clone)]
+struct NodeSharing {
+    /// Their names, in order; public links aren't among them.
+    people: Vec<String>,
+    /// Whether it has a public link.
+    link: bool,
+}
+
+impl NodeSharing {
+    /// How a folder's mark shows it (see `Entry::shared`).
+    fn mark(&self) -> &'static str {
+        if self.link { "link" } else { "people" }
+    }
+}
+
+/// How a folder is shared, for the bar above the files.
+#[derive(Serialize)]
+struct Here {
+    /// The folders, from the top down, whose sharing reaches it: it and
+    /// those above it.
+    sources: Vec<Source>,
+    /// For a folder that this account can only read: who shared it.
+    from: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Source {
+    path: String,
+    #[serde(flatten)]
+    sharing: NodeSharing,
+}
+
+/// How long a volume's sharing, as `Inner::sharing` reads it, is reused.
+const SHARING_TTL_MS: f64 = 30_000.0;
+
+/// Whom a node with `grantees` is shared with besides `me`, if anyone.
+fn sharing_of(grantees: &[raft5fs_proto::types::Grantee], me: &str) -> Option<NodeSharing> {
+    let link = grantees
+        .iter()
+        .any(|g| g.user.starts_with(raft5fs_proto::types::LINK_PREFIX));
+    let mut people: Vec<String> = grantees
+        .iter()
+        .filter(|g| g.user != me && !g.user.starts_with(raft5fs_proto::types::LINK_PREFIX))
+        .map(|g| g.user.clone())
+        .collect();
+    people.sort();
+    (link || !people.is_empty()).then_some(NodeSharing { people, link })
 }
 
 impl Inner {
     fn vault(&self) -> &Arc<Vault> {
         self.session.vault()
+    }
+
+    /// How each shared node in volume `volume` is shared, by inode (see
+    /// `Entry::shared`), or `None` if this account can't list the volume's
+    /// grants: it only reads it. Only for showing: it is the server's word.
+    async fn sharing(&self, volume: u64) -> Option<Sharing> {
+        let now = js_sys::Date::now();
+        if let Some((at, known)) = self.sharing.borrow().get(&volume)
+            && now - at < SHARING_TTL_MS
+        {
+            return known.clone();
+        }
+        let me = self.vault().remote().username().to_string();
+        let known = match self.vault().remote().grants_under(volume).await {
+            Ok(nodes) => Some(Rc::new(
+                nodes
+                    .iter()
+                    .filter_map(|n| sharing_of(&n.grantees, &me).map(|how| (n.ino, how)))
+                    .collect(),
+            )),
+            Err(e) if e.errno == errno::EACCES || e.errno == errno::EROFS => None,
+            // Not known this time; ask again next time.
+            Err(_) => return Some(Rc::new(HashMap::new())),
+        };
+        self.sharing
+            .borrow_mut()
+            .insert(volume, (now, known.clone()));
+        known
+    }
+
+    /// Marks the folders among `entries` (of directory `path`) that are
+    /// shared. A top-level folder that this account can't list the grants
+    /// of was shared with it by someone else.
+    async fn mark_shared(&self, path: &str, entries: &mut [Entry]) -> Result<(), FsError> {
+        let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
+        if names.first() == Some(&".snapshot") {
+            return Ok(());
+        }
+        if names.is_empty() {
+            let folders: Vec<&mut Entry> = entries
+                .iter_mut()
+                .filter(|e| e.kind == "folder" && e.name != ".snapshot")
+                .collect();
+            let known = join_all(folders.iter().map(|e| self.sharing(e.ino))).await;
+            for (entry, known) in folders.into_iter().zip(known) {
+                entry.shared = match known {
+                    Some(known) => known.get(&entry.ino).map(NodeSharing::mark),
+                    None => Some("people"),
+                };
+            }
+            return Ok(());
+        }
+        let volume = self.resolve(&format!("/{}", names[0])).await?.ino;
+        if let Some(known) = self.sharing(volume).await {
+            for entry in entries.iter_mut().filter(|e| e.kind == "folder") {
+                entry.shared = known.get(&entry.ino).map(NodeSharing::mark);
+            }
+        }
+        Ok(())
+    }
+
+    /// How folder `path` is shared, for the bar above the files (see
+    /// `Fs::sharing_here`).
+    async fn sharing_here(&self, path: &str) -> Result<Option<Here>, FsError> {
+        let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
+        if names.is_empty() || names[0] == ".snapshot" {
+            return Ok(None);
+        }
+        let top = self.resolve(&format!("/{}", names[0])).await?.ino;
+        let Some(known) = self.sharing(top).await else {
+            // Only shared with this account, to read: say by whom.
+            let sender = self
+                .vault()
+                .remote()
+                .list_grants()
+                .await?
+                .into_iter()
+                .find(|g| g.ino == top)
+                .and_then(|g| grant_sender(&g.sealed_key).ok().map(str::to_string));
+            return Ok(Some(Here {
+                sources: Vec::new(),
+                from: sender,
+            }));
+        };
+        let mut sources = Vec::new();
+        for depth in 1..=names.len() {
+            let folder = format!("/{}", names[..depth].join("/"));
+            let ino = if depth == 1 {
+                top
+            } else {
+                self.resolve(&folder).await?.ino
+            };
+            if let Some(shared) = known.get(&ino) {
+                sources.push(Source {
+                    path: folder,
+                    sharing: shared.clone(),
+                });
+            }
+        }
+        Ok((!sources.is_empty()).then_some(Here {
+            sources,
+            from: None,
+        }))
+    }
+
+    /// Forgets what `sharing` read, after this tab changed it.
+    fn sharing_changed(&self) {
+        self.sharing.borrow_mut().clear();
     }
 
     async fn resolve(&self, path: &str) -> Result<Attr, FsError> {
@@ -578,8 +751,22 @@ impl Fs {
                     .await?;
                 entries.push(Entry::new(OsStr::new(".snapshot"), &snapshots));
             }
+            inner.mark_shared(&path, &mut entries).await?;
             Ok(entries)
         })
+    }
+
+    /// How folder `path` is shared, or null if it isn't: `{sources: [{path,
+    /// people, link}], from}`. `sources` are the folders, from the top down,
+    /// whose sharing reaches it (it, and those above it), with whom each is
+    /// shared besides this account, and whether it has a public link. For
+    /// a folder that this account can only read, `sources` is empty and
+    /// `from` names who shared it. Only for showing: it is the server's
+    /// word.
+    #[wasm_bindgen(js_name = sharingHere)]
+    pub fn sharing_here(&self, path: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.sharing_here(&path).await })
     }
 
     /// What `path` is.
@@ -766,6 +953,7 @@ impl Fs {
                 .grant(ino, &user, writable, OsStr::new(&label))
                 .await
                 .map_err(fs_failure)?;
+            inner.sharing_changed();
             to_js(&Fingerprint::of(&key))
         })
     }
@@ -859,6 +1047,7 @@ impl Fs {
         promise(async move {
             let ino = inner.resolve(&path).await?.ino;
             inner.vault().revoke(ino, &user).await?;
+            inner.sharing_changed();
             inner
                 .queue
                 .add(ino, &format!("{path} (revoked {user})"))
@@ -967,6 +1156,7 @@ impl Fs {
                 .vault()
                 .create_link(ino, &path, OsStr::new(&label), expires.map(|at| at as u64))
                 .await?;
+            inner.sharing_changed();
             #[derive(Serialize)]
             struct Made {
                 user: String,
@@ -1042,6 +1232,7 @@ impl Fs {
                 .ok_or_else(|| FsError::new(errno::ENOENT, "there's no such link"))?;
             let ino = link.info.folder;
             inner.vault().revoke(ino, &user).await?;
+            inner.sharing_changed();
             let path = path.unwrap_or_else(|| format!("folder {ino}"));
             inner
                 .queue

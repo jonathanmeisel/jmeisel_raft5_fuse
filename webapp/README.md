@@ -22,6 +22,15 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   its images to make them. It also says what the viewer can open, and as
   what type: always from the extension, never the file's contents. SVG is
   never shown, because it can carry scripts.
+- `src/lib/sharedIcons.js`: shared folders show SVAR's folder with a
+  white person (shared with someone) or chain link (a public link) on it,
+  in the card and list views. The Worker learns which folders are shared
+  from each volume's grants (one request per volume, kept 30 seconds), so
+  only those who can change a volume see its marks; folders shared with
+  this account are marked in the top folder. `SharingBar.svelte`, above
+  the files, says how the open folder is shared: with whom, by public
+  link, and through which folder above it; or, in a folder this account
+  only reads, who shared it.
 - `src/components/Viewer.svelte`: double-clicking an image, text, a video,
   audio or a PDF opens it here; "Open in new tab" too.
 - `public/sw.js` and `src/lib/streams.js`: a service worker that streams
