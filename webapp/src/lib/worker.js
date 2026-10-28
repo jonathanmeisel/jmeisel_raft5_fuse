@@ -455,6 +455,7 @@ const methods = {
   pending: () => session().pending(),
   trust: (user, words) => session().trust(user, words),
   forgetKey: (user) => session().forgetKey(user),
+  replaceKey: (user, words) => session().replaceKey(user, words),
   account: () => session().account(),
   issueInvite: (user, caps) => session().issueInvite(user, caps),
   listInvites: () => session().listInvites(),

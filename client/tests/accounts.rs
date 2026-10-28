@@ -33,7 +33,7 @@ fn connect(backend: &Backend, user: &str) -> Remote {
         .unwrap_or_else(|e| panic!("log in as {user}: {e}"))
 }
 
-fn enrol_with(backend: &Backend, user: &str, code: &str) {
+fn enrol_with(backend: &Backend, user: &str, code: &str) -> [u8; 32] {
     backend
         .runtime
         .block_on(Remote::enrol(
@@ -43,7 +43,7 @@ fn enrol_with(backend: &Backend, user: &str, code: &str) {
             code,
             KdfParams::TESTING,
         ))
-        .unwrap_or_else(|e| panic!("enrol {user}: {e}"));
+        .unwrap_or_else(|e| panic!("enrol {user}: {e}"))
 }
 
 /// Asks the servers for a volume, with made-up keys: the capability check
@@ -420,4 +420,48 @@ fn public_links_read_one_folder_until_any_writer_revokes() {
         ))),
         libc::EINVAL
     );
+}
+
+#[test]
+fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
+    use raft5fs_crypto::identity::fingerprint_words;
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let old = backend.enrol("bob");
+    let tester = vault(&backend, TESTER);
+    let docs = rt
+        .block_on(tester.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.trust("bob", &fingerprint_words(&old)))
+        .unwrap();
+    assert!(!rt.block_on(tester.key_changed("bob")).unwrap());
+
+    // Bob forgets his password and enrolls again, with a new key.
+    let code = rt
+        .block_on(accounts::issue_code(&backend.client, "bob"))
+        .unwrap();
+    let new = enrol_with(&backend, "bob", &code);
+    assert!(rt.block_on(tester.key_changed("bob")).unwrap());
+    assert_eq!(
+        errno(rt.block_on(tester.grant(docs, "bob", true, OsStr::new("docs")))),
+        libc::EPERM
+    );
+    // A trust can't replace a pin, and a wrong fingerprint leaves it.
+    assert_eq!(
+        errno(rt.block_on(tester.trust("bob", &fingerprint_words(&new)))),
+        libc::EPERM
+    );
+    assert_eq!(
+        errno(rt.block_on(tester.replace_key("bob", &fingerprint_words(&old)))),
+        libc::EPERM
+    );
+    assert_eq!(tester.known_keys().pinned("bob"), Some(old));
+
+    rt.block_on(tester.replace_key("bob", &fingerprint_words(&new)))
+        .unwrap();
+    assert_eq!(tester.known_keys().pinned("bob"), Some(new));
+    assert!(!rt.block_on(tester.key_changed("bob")).unwrap());
+    rt.block_on(tester.grant(docs, "bob", true, OsStr::new("docs")))
+        .unwrap();
 }

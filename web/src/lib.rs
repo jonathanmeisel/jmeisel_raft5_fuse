@@ -742,6 +742,16 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         future_to_promise(async move {
             let vault = inner.vault();
+            // Asked before the grant, which would only say the keys differ.
+            if vault.key_changed(&user).await.map_err(fs_failure)? {
+                return Err(failure(
+                    "EKEYCHANGED",
+                    &format!(
+                        "{user}'s key has changed since you last shared with them: they may \
+                         have enrolled again. Ask them for their new fingerprint."
+                    ),
+                ));
+            }
             if vault.known_keys().pinned(&user).is_none() {
                 let Some(expected) = &fingerprint else {
                     return Err(failure(
@@ -1051,12 +1061,16 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
             struct Pending {
                 label: String,
                 sender: String,
                 /// `untrusted` or `unreadable`.
                 state: &'static str,
                 message: String,
+                /// The sender's key differs from the one pinned here, so
+                /// trusting them means replacing it (`replaceKey`).
+                key_changed: bool,
             }
             let mut pending = Vec::new();
             for share in inner.vault().shares().await? {
@@ -1065,11 +1079,17 @@ impl Fs {
                     ShareTrust::Untrusted { .. } => ("untrusted", String::new()),
                     ShareTrust::Unreadable(e) => ("unreadable", e.message),
                 };
+                let key_changed = inner
+                    .vault()
+                    .key_changed(&share.sender)
+                    .await
+                    .unwrap_or(false);
                 pending.push(Pending {
                     label: share.label.to_string_lossy().into_owned(),
                     sender: share.sender,
                     state,
                     message,
+                    key_changed,
                 });
             }
             Ok(pending)
@@ -1082,6 +1102,17 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let key = inner.vault().trust(&user, &words).await?;
+            Ok(Fingerprint::of(&key))
+        })
+    }
+
+    /// Pins `user`'s new key in place of the old one, after they enrolled
+    /// again, if its fingerprint is `words`. The old one stays if not.
+    #[wasm_bindgen(js_name = replaceKey)]
+    pub fn replace_key(&self, user: String, words: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let key = inner.vault().replace_key(&user, &words).await?;
             Ok(Fingerprint::of(&key))
         })
     }

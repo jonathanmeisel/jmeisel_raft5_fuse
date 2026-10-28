@@ -509,6 +509,94 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
   expect(problems.flat()).toEqual([]);
 });
 
+/// Makes the key that `page`'s browser has pinned for `user` a wrong one,
+/// as if `user` had enrolled again since. Run it logged out: the Worker
+/// reads the pins at login.
+async function stalePin(page, me, user) {
+  await page.evaluate(
+    async ([me, user]) => {
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("raft5fs", 2);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const ask = (request) =>
+        new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      const blobs = db.transaction("blobs", "readwrite").objectStore("blobs");
+      const name = (await ask(blobs.getAllKeys())).find((k) => k.endsWith(`/${me}/known_keys`));
+      const text = new TextDecoder().decode(await ask(blobs.get(name)));
+      const changed = text.replace(new RegExp(`^${user} .*$`, "m"), `${user} ${"00".repeat(32)}`);
+      await ask(blobs.put(new TextEncoder().encode(changed).buffer, name));
+    },
+    [me, user],
+  );
+}
+
+test("a changed key is trusted again only by its new fingerprint", async ({ browser }) => {
+  const hank = await (await browser.newContext()).newPage();
+  const iris = await (await browser.newContext()).newPage();
+  const problems = [hank, iris].map(watch);
+  let hankWords, irisWords;
+
+  await test.step("hank shares with iris, who trusts him", async () => {
+    hankWords = await enrol(hank, "hank");
+    irisWords = await enrol(iris, "iris");
+    await login(hank, "hank");
+    await login(iris, "iris");
+    await addFolder(hank, "team");
+    await menu(hank, "team", "Share…");
+    await hank.getByLabel("User", { exact: true }).fill("iris");
+    await hank.getByRole("button", { name: "Share", exact: true }).click();
+    await hank.getByLabel("iris's fingerprint").fill(irisWords);
+    await hank.getByRole("button", { name: "Share", exact: true }).click();
+    await hank.getByRole("button", { name: "Done" }).click();
+    await iris.reload();
+    await login(iris, "iris");
+    await iris.getByRole("button", { name: "Review" }).click();
+    await iris.getByRole("button", { name: "Trust…" }).click();
+    await iris.getByLabel("fingerprint").fill(hankWords);
+    await iris.getByRole("button", { name: "Trust", exact: true }).click();
+    await expect(iris.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await iris.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("hank shares again after iris's key changed", async () => {
+    await accountMenu(hank, "Log out");
+    await stalePin(hank, "hank", "iris");
+    await login(hank, "hank");
+    await menu(hank, "team", "Share…");
+    await hank.getByLabel("User", { exact: true }).fill("iris");
+    await hank.getByRole("button", { name: "Share", exact: true }).click();
+    await expect(hank.getByText(/iris's key has changed/)).toBeVisible(SLOW);
+    // The wrong fingerprint leaves the old key in place.
+    await hank.getByLabel("iris's fingerprint").fill(hankWords);
+    await hank.getByRole("button", { name: "Share", exact: true }).click();
+    await expect(hank.getByText(/not the one given/)).toBeVisible(SLOW);
+    await hank.getByLabel("iris's fingerprint").fill(irisWords);
+    await hank.getByRole("button", { name: "Share", exact: true }).click();
+    await expect(hank.getByText(/Shared with iris/)).toBeVisible(SLOW);
+    await hank.getByRole("button", { name: "Done" }).click();
+  });
+
+  await test.step("iris trusts hank again after his key changed", async () => {
+    await accountMenu(iris, "Log out");
+    await stalePin(iris, "iris", "hank");
+    await login(iris, "iris");
+    await iris.getByRole("button", { name: "Review" }).click();
+    await expect(iris.getByText(/hank's key has changed/)).toBeVisible(SLOW);
+    await iris.getByRole("button", { name: "Check new fingerprint…" }).click();
+    await iris.getByLabel("fingerprint").fill(hankWords);
+    await iris.getByRole("button", { name: "Trust", exact: true }).click();
+    await expect(iris.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await iris.getByRole("button", { name: "Close" }).click();
+  });
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

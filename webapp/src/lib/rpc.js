@@ -70,6 +70,7 @@ export function connect({ onStorageError } = {}) {
     pending: () => call("pending", []),
     trust: (user, words) => call("trust", [user, words]),
     forgetKey: (user) => call("forgetKey", [user]),
+    replaceKey: (user, words) => call("replaceKey", [user, words]),
     account: () => call("account", []),
     issueInvite: (user, caps) => call("issueInvite", [user, caps]),
     listInvites: () => call("listInvites", []),

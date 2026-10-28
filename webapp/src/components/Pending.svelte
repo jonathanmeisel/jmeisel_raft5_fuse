@@ -1,10 +1,13 @@
 <script>
   // Shares from people whose keys aren't pinned here. They're read-only
-  // until trusted, by the fingerprint the sender reads out.
+  // until trusted, by the fingerprint the sender reads out. A sender whose
+  // key changed (they enrolled again) is trusted the same way: their new
+  // key replaces the old one only if it matches.
   import Dialog from "./Dialog.svelte";
 
   let { fs, onclose } = $props();
   let pending = $state(null);
+  /// {sender, keyChanged} being trusted.
   let trusting = $state(null);
   let words = $state("");
   let error = $state("");
@@ -25,7 +28,8 @@
     busy = true;
     error = "";
     try {
-      await fs.trust(trusting, words.trim());
+      if (trusting.keyChanged) await fs.replaceKey(trusting.sender, words.trim());
+      else await fs.trust(trusting.sender, words.trim());
       trusting = null;
       words = "";
       await load();
@@ -42,7 +46,14 @@
     <p class="note">Loading…</p>
   {:else if trusting}
     <form onsubmit={trust}>
-      <p>Ask <strong>{trusting}</strong> to read you their fingerprint, in person or on a call, and type it here.</p>
+      {#if trusting.keyChanged}
+        <p>
+          <strong>{trusting.sender}</strong>'s key has changed: they may have enrolled again. Ask them
+          to read you their new fingerprint, in person or on a call, and type it here.
+        </p>
+      {:else}
+        <p>Ask <strong>{trusting.sender}</strong> to read you their fingerprint, in person or on a call, and type it here.</p>
+      {/if}
       <textarea rows="3" bind:value={words} required aria-label="fingerprint"></textarea>
       <p>
         <button class="primary" type="submit" disabled={busy}>Trust</button>
@@ -55,9 +66,12 @@
     {#each pending as p}
       <div class="item">
         <strong>{p.label}</strong>, from {p.sender}:
-        {#if p.state === "untrusted"}
+        {#if p.state === "untrusted" && p.keyChanged}
+          {p.sender}'s key has changed, so it is read-only until you check their new fingerprint.
+          <button onclick={() => (trusting = { sender: p.sender, keyChanged: true })}>Check new fingerprint…</button>
+        {:else if p.state === "untrusted"}
           read-only until you trust {p.sender}.
-          <button onclick={() => (trusting = p.sender)}>Trust…</button>
+          <button onclick={() => (trusting = { sender: p.sender, keyChanged: false })}>Trust…</button>
         {:else}
           <span class="error">doesn't open: {p.message}</span>
         {/if}

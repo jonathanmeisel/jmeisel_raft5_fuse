@@ -1679,6 +1679,49 @@ impl Vault {
     /// Returns `EPERM` if the fingerprint is different, or if a different
     /// key is already pinned.
     pub async fn trust(&self, user: &str, expected: &str) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        let served = self.matching_served_key(user, expected).await?;
+        let key = self.known.check(user, &served)?;
+        // Grants from this user were opened as untrusted before, so open
+        // them again.
+        self.forget_all();
+        Ok(key)
+    }
+
+    /// `trust`, for a user whose pinned key is no longer theirs because
+    /// they enrolled again: pins their new key in place of the old one, if
+    /// its fingerprint matches `expected`. The old pin goes only once the
+    /// new key has matched, so a server can't swap a key in this way.
+    pub async fn replace_key(
+        &self,
+        user: &str,
+        expected: &str,
+    ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
+        let served = self.matching_served_key(user, expected).await?;
+        self.known.forget(user).map_err(|e| {
+            FsError::new(errno::EIO, format!("cannot forget {user}'s old key: {e}"))
+        })?;
+        let key = self.known.check(user, &served)?;
+        self.forget_all();
+        Ok(key)
+    }
+
+    /// Whether the key pinned for `user` differs from the one the server
+    /// gives now: most likely, they enrolled again. False if none is
+    /// pinned.
+    pub async fn key_changed(&self, user: &str) -> Result<bool, FsError> {
+        let Some(pinned) = self.known.pinned(user) else {
+            return Ok(false);
+        };
+        Ok(self.served_key(user).await? != pinned)
+    }
+
+    /// The key that the server gives for `user`, if its fingerprint is
+    /// `expected` (spaces and case aside). `EPERM` if not.
+    async fn matching_served_key(
+        &self,
+        user: &str,
+        expected: &str,
+    ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
         let served = self.served_key(user).await?;
         let matches = fingerprint_matches(&served, expected)
@@ -1693,11 +1736,7 @@ impl Vault {
                 ),
             ));
         }
-        let key = self.known.check(user, &served)?;
-        // Grants from this user were opened as untrusted before, so open
-        // them again.
-        self.forget_all();
-        Ok(key)
+        Ok(served)
     }
 
     /// The public key that the server gives for `user`. Only the server
