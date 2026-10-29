@@ -176,6 +176,15 @@ service Fs {
   // Removes an account (or an unused invitation, or a public link), and
   // every grant made to it.
   rpc DeleteUser(UsernameRequest) returns (EmptyResponse);
+  // Folders and files that no account can reach any more (protocol 5 on):
+  // the largest such parts of the tree that hold no grant anywhere inside.
+  rpc ListUnreachable(NoArgs) returns (UnreachableListResponse);
+  // Deletes one of them, with everything in it, from the store and object
+  // storage. EINVAL for anything not on that list.
+  rpc DeleteUnreachable(InodeRequest) returns (EmptyResponse);
+  // What removing a user, or letting them enroll again, would leave that
+  // no account can reach: the parts that only they can reach now.
+  rpc RemovalImpact(UsernameRequest) returns (UnreachableListResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -857,6 +866,28 @@ message UserList {
 message UserListResponse {
   oneof result {
     UserList list = 1;
+    Error error = 2;
+  }
+}
+
+message Unreachable {
+  uint64 ino = 1;
+  // A whole volume (a top-level folder).
+  bool volume = 2;
+  uint64 files = 3;
+  // Folders, itself included if it is one.
+  uint64 folders = 4;
+  uint64 bytes = 5;
+  Timestamp modified = 6;
+}
+
+message UnreachableList {
+  repeated Unreachable items = 1;
+}
+
+message UnreachableListResponse {
+  oneof result {
+    UnreachableList list = 1;
     Error error = 2;
   }
 }

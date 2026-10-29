@@ -467,6 +467,33 @@ struct Source {
     sharing: NodeSharing,
 }
 
+/// An unreachable part of the tree, for JavaScript.
+#[derive(Serialize)]
+struct UnreachableJs {
+    ino: f64,
+    volume: bool,
+    files: u64,
+    folders: u64,
+    bytes: u64,
+    modified: f64,
+}
+
+impl From<&raft5fs_proto::types::Unreachable> for UnreachableJs {
+    fn from(u: &raft5fs_proto::types::Unreachable) -> Self {
+        Self {
+            ino: u.ino as f64,
+            volume: u.volume,
+            files: u.files,
+            folders: u.folders,
+            bytes: u.bytes,
+            modified: u
+                .modified
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_millis() as f64),
+        }
+    }
+}
+
 /// The capabilities called `names`.
 fn caps_named(names: &[String]) -> Result<Caps, FsError> {
     names.iter().try_fold(Caps::NONE, |caps, name| {
@@ -1180,6 +1207,36 @@ impl Fs {
                 code: String,
             }
             Ok(Issued { invitation, code })
+        })
+    }
+
+    /// Folders and files that no account can reach any more, as an admin:
+    /// `[{ino, volume, files, folders, bytes, modified}]` (`modified` in
+    /// milliseconds since 1970). Their names can't be read by anyone.
+    #[wasm_bindgen(js_name = listUnreachable)]
+    pub fn list_unreachable(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let found = inner.vault().remote().list_unreachable().await?;
+            Ok(found.iter().map(UnreachableJs::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Deletes unreachable part `ino`, with everything in it, as an admin.
+    #[wasm_bindgen(js_name = deleteUnreachable)]
+    pub fn delete_unreachable(&self, ino: f64) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().remote().delete_unreachable(ino as u64).await })
+    }
+
+    /// What removing `user`, or letting them enroll again, would leave that
+    /// no account can reach, as `listUnreachable` lists them.
+    #[wasm_bindgen(js_name = removalImpact)]
+    pub fn removal_impact(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let found = inner.vault().remote().removal_impact(&user).await?;
+            Ok(found.iter().map(UnreachableJs::from).collect::<Vec<_>>())
         })
     }
 

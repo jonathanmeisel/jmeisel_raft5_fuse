@@ -46,7 +46,8 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UserListResponse, UsernameRequest,
+    PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UnreachableListResponse,
+    UserListResponse, UsernameRequest,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -709,6 +710,46 @@ impl Fs for FsService {
         )
         .await;
         Ok(Response::new(set.into()))
+    }
+
+    async fn list_unreachable(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<UnreachableListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let found = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.unreachable().await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn delete_unreachable(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let removed = async {
+            live_only(&r.snapshot)?;
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.remove_unreachable(r.ino).await
+        }
+        .await;
+        Ok(Response::new(removed.into()))
+    }
+
+    async fn removal_impact(
+        &self,
+        r: Request<UsernameRequest>,
+    ) -> Result<Response<UnreachableListResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let impact = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.removal_impact(&r.username).await
+        }
+        .await;
+        Ok(Response::new(impact.into()))
     }
 
     async fn delete_user(

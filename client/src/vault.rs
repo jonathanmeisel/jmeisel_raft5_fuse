@@ -52,8 +52,8 @@ use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
     Attr, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Layout, LinkAccount, NewNode, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody,
-    WriteError, check_username,
+    LINK_PREFIX, Layout, LinkAccount, NewNode, Rotation, SealedChunk, SealedMove, SetAttr,
+    WriteBody, WriteError, check_username,
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
@@ -687,6 +687,17 @@ impl Vault {
                     });
                 }
             }
+            // This account pins each public link it makes, to share with it.
+            // Once a link is gone, so is its pin, everywhere. Link names are
+            // random and never reused, so no marker is needed: a device that
+            // still has the pin sends it back, and its next merge drops it.
+            // Here too: another device may have dropped it from the copy.
+            let dead = self
+                .dead_link_pins(merged.keys().chain(local.keys()))
+                .await?;
+            for user in &dead {
+                merged.remove(user);
+            }
             if merged != before {
                 let entries: Vec<PinEntry> = merged.values().cloned().collect();
                 match self
@@ -701,6 +712,9 @@ impl Vault {
             }
             let io = |e: std::io::Error| FsError::new(errno::EIO, format!("trusted keys: {e}"));
             let mut changed_here = false;
+            for user in dead.iter().filter(|user| local.contains_key(*user)) {
+                self.known.forget(user).map_err(io)?;
+            }
             for entry in merged.values() {
                 match &entry.key {
                     Some(key) if local.get(&entry.user) != Some(key) => {
@@ -725,6 +739,30 @@ impl Vault {
             errno::EAGAIN,
             "the trusted keys kept changing on the servers",
         ))
+    }
+
+    /// The users among `pinned` that are public links which no longer
+    /// exist. Asks the servers only if there are any links among them.
+    async fn dead_link_pins<'a>(
+        &self,
+        pinned: impl Iterator<Item = &'a String>,
+    ) -> Result<Vec<String>, FsError> {
+        let links: HashSet<&String> = pinned.filter(|u| u.starts_with(LINK_PREFIX)).collect();
+        if links.is_empty() {
+            return Ok(Vec::new());
+        }
+        let alive: HashSet<String> = self
+            .remote
+            .list_links()
+            .await?
+            .into_iter()
+            .map(|link| link.user)
+            .collect();
+        Ok(links
+            .into_iter()
+            .filter(|user| !alive.contains(*user))
+            .cloned()
+            .collect())
     }
 
     /// `sync_pins` after a change here. A failure is no loss: the change

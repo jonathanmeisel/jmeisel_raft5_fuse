@@ -290,9 +290,14 @@ screen or the command line:
   raft5fs admin set dave --links on
   raft5fs admin reenroll dave        # a new invitation: he enrolls again
   raft5fs admin delete dave
+  raft5fs admin unreachable          # what nobody can reach any more
+  raft5fs admin unreachable --delete <INODE>
 
 She can't take away her own `admin` or remove herself: another admin
-can, or `raft5fs-server user`. Re-enrolling gives the user a new key, as
+can, or `raft5fs-server user`. Removing someone, or re-enrolling them,
+leaves what only they could reach sealed under keys nobody has: `delete`
+and `reenroll` say what that is and want --yes first, and `unreachable`
+lists such folders, by size, for deleting. Re-enrolling gives the user a new key, as
 `user add` does for an existing user above. For her invitations to hold
 the servers' addresses and CA, as `user add`'s do, serve with the same
 --invite-server and --invite-ca options. Without them she gets only a

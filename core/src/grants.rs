@@ -183,6 +183,27 @@ pub(crate) fn reservation_key(ino: u64) -> Vec<u8> {
     key
 }
 
+/// A reservation's value: who it is for, a 0 byte (which no name has), and
+/// when it was made, in seconds since the Unix epoch.
+pub(crate) fn reservation_value(user: &str, at: u64) -> Vec<u8> {
+    let mut value = user.as_bytes().to_vec();
+    value.push(0);
+    value.extend_from_slice(&at.to_be_bytes());
+    value
+}
+
+/// Who a reservation is for, and when it was made. Reservations made before
+/// they had a time are only the name, and have no time.
+pub(crate) fn reservation_parts(value: &[u8]) -> (&[u8], Option<u64>) {
+    match value.iter().position(|&b| b == 0) {
+        Some(end) => (
+            &value[..end],
+            value[end + 1..].try_into().ok().map(u64::from_be_bytes),
+        ),
+        None => (value, None),
+    }
+}
+
 /// Refuses a username that `raft5fs_proto::types::check_username` does not
 /// allow, wherever one would be written or looked up. That check also
 /// blocks the zero byte that the index's keys end at.

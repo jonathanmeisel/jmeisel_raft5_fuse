@@ -238,6 +238,11 @@ impl FsCore {
                 Ok(_) => {}
                 Err(why) => eprintln!("object gc: sweep abandoned, nothing deleted: {why}"),
             }
+            match self.sweep_reservations(crate::fs::RESERVATION_AGE).await {
+                Ok(0) => {}
+                Ok(n) => eprintln!("removed {n} inode reservations that no create used"),
+                Err(e) => eprintln!("could not remove old inode reservations: {e}"),
+            }
         }
     }
 }

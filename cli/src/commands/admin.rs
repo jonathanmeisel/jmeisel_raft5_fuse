@@ -20,10 +20,29 @@ pub enum AdminCommand {
     Set(SetArgs),
     /// Let a user enroll again, after they forgot their password. Prints
     /// a new invitation, for them alone.
-    Reenroll(NameArg),
+    Reenroll(ConfirmArg),
     /// Remove a user (or an invitation, or a public link) and every share
     /// made to them.
-    Delete(NameArg),
+    Delete(ConfirmArg),
+    /// List folders and files that no account can reach any more (their
+    /// account was removed, or enrolled again), or delete one.
+    Unreachable(UnreachableArgs),
+}
+
+#[derive(Args)]
+pub struct ConfirmArg {
+    #[arg(value_name = "USER")]
+    pub name: String,
+    /// Go ahead even though it leaves folders that nobody can reach.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args)]
+pub struct UnreachableArgs {
+    /// Delete this one (an inode from the list), with everything in it.
+    #[arg(long, value_name = "INODE")]
+    pub delete: Option<u64>,
 }
 
 #[derive(Args)]
@@ -123,6 +142,7 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
             println!("{} can now: {}", args.name, caps_text(info.caps));
         }
         AdminCommand::Reenroll(args) => {
+            check_impact(&runtime, remote, &args, "letting them enroll again")?;
             let issued = runtime
                 .block_on(remote.reissue_invite(&args.name))
                 .map_err(|e| format!("cannot let {} enroll again: {e}", args.name))?;
@@ -134,13 +154,92 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
             );
         }
         AdminCommand::Delete(args) => {
+            check_impact(&runtime, remote, &args, "removing them")?;
             runtime
                 .block_on(remote.delete_user(&args.name))
                 .map_err(|e| format!("cannot remove {}: {e}", args.name))?;
             println!("removed {} and every share made to them", args.name);
         }
+        AdminCommand::Unreachable(args) => match args.delete {
+            Some(ino) => {
+                runtime
+                    .block_on(remote.delete_unreachable(ino))
+                    .map_err(|e| format!("cannot delete inode {ino}: {e}"))?;
+                println!("deleted inode {ino} and everything in it");
+            }
+            None => {
+                let found = runtime
+                    .block_on(remote.list_unreachable())
+                    .map_err(|e| format!("cannot list unreachable folders: {e}"))?;
+                if found.is_empty() {
+                    println!("every folder and file is reachable by some account");
+                }
+                for u in &found {
+                    println!("{}\t{}", u.ino, describe(u));
+                }
+                if !found.is_empty() {
+                    println!("(raft5fs admin unreachable --delete <INODE> deletes one, for good)");
+                }
+            }
+        },
     }
     Ok(0)
+}
+
+/// Refuses to go on, unless `--yes`, when `doing` to the user would leave
+/// folders that nobody can reach, and says what they hold.
+fn check_impact(
+    runtime: &tokio::runtime::Runtime,
+    remote: &raft5fs_client::remote::Remote,
+    args: &ConfirmArg,
+    doing: &str,
+) -> Result<(), String> {
+    let lost = runtime
+        .block_on(remote.removal_impact(&args.name))
+        .map_err(|e| format!("cannot tell what {doing} would leave: {e}"))?;
+    if lost.is_empty() || args.yes {
+        return Ok(());
+    }
+    let mut why = format!(
+        "{doing} leaves what only {} can reach now, which nobody could then open:",
+        args.name
+    );
+    for u in &lost {
+        why.push_str(&format!("\n  {}", describe(u)));
+    }
+    why.push_str("\ngive --yes to go ahead; `raft5fs admin unreachable` can delete it later");
+    Err(why)
+}
+
+/// What an unreachable part holds, as people read it.
+fn describe(u: &raft5fs_proto::types::Unreachable) -> String {
+    let what = if u.volume {
+        "a top-level folder"
+    } else if u.folders > 0 {
+        "a folder"
+    } else {
+        "a file"
+    };
+    let days = std::time::SystemTime::now()
+        .duration_since(u.modified)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400;
+    format!(
+        "{what}: {} files, {} folders, {}, last changed {days} days ago",
+        u.files,
+        u.folders,
+        size(u.bytes)
+    )
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{b} bytes"),
+    }
 }
 
 fn print_invitation(name: &str, (code, invitation): (String, Option<String>)) {

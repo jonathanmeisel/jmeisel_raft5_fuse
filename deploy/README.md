@@ -682,6 +682,8 @@ raft5fs admin invite dave --volumes       # a new name only; any capabilities, a
 raft5fs admin set dave --links on --admin off
 raft5fs admin reenroll dave               # a new invitation, after a forgotten password
 raft5fs admin delete dave                 # also an unused invitation, or a public link
+raft5fs admin unreachable                 # folders no account can reach any more
+raft5fs admin unreachable --delete 4711   # delete one, for good
 ```
 
 - An admin can't take away their own `admin` or remove themselves; another
@@ -693,6 +695,15 @@ raft5fs admin delete dave                 # also an unused invitation, or a publ
   name, but not what was shared with it.
 - The servers put the same addresses and `fs-ca.pem` in admins'
   invitations as `user add` does.
+- Removing a user, or letting them enroll again, leaves what only they
+  could reach (their own folders, unless shared) in the store and object
+  storage, sealed under keys nobody has. `admin delete` and `admin
+  reenroll` say what that would be, and want `--yes` before going ahead;
+  the web app's confirmations say so too. Such folders are listed under
+  `admin unreachable` (web app: Users → Unreachable folders) by size and
+  age (their names can't be read), and deleting one frees its space. A
+  folder that still has a shared folder somewhere inside it stays, as the
+  way down to it.
 - Backups, restores and snapshots stay with `fsadmin.sh`.
 
 **Public links** let anyone with a URL read one folder, without an

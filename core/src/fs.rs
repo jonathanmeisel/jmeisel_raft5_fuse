@@ -2,6 +2,8 @@
 //! operation. There is no buffering and no FUSE here: a front end (the
 //! server) decides when to call these.
 
+mod unreachable;
+
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -75,6 +77,17 @@ where
             other => return other,
         }
     }
+}
+
+/// How old a reservation must be for `sweep_reservations` to remove it: a
+/// create takes moments, so a day leaves room for clocks and slow clients.
+pub(crate) const RESERVATION_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// `t` in whole seconds since the Unix epoch.
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// In a transaction attempt, unwraps a filesystem decision, or ends the
@@ -437,6 +450,9 @@ impl FsCore {
         // the next instance tries again.
         if let Err(e) = core.reap_tombstones().await {
             eprintln!("could not finish interrupted deletions: {e}");
+        }
+        if let Err(e) = core.sweep_reservations(RESERVATION_AGE).await {
+            eprintln!("could not remove old inode reservations: {e}");
         }
         Ok(core)
     }
@@ -836,7 +852,8 @@ impl FsCore {
         let user = caller.user.as_str();
         let ino = allocate_inode(&self.client).await?;
         let key = reservation_key(ino);
-        let write = self.client.write(&key, Some(user.as_bytes()));
+        let value = grants::reservation_value(user, unix_secs(SystemTime::now()));
+        let write = self.client.write(&key, Some(&value));
         timing::other("write", write).await?;
         Ok(ino)
     }
@@ -864,7 +881,7 @@ impl FsCore {
         let dirent = &dirent_key(parent, name);
         let value = &dirent_value(ino, &new.sealed_name);
 
-        retrying(move || async move {
+        let made = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
             // The new node's key and name are sealed under the parent's
@@ -911,7 +928,84 @@ impl FsCore {
             txn.commit().await?;
             Ok(Ok(entry.attr))
         })
-        .await?
+        .await?;
+        self.release_if_failed(caller, new.ino, made).await
+    }
+
+    /// Passes `made` through. When a create failed for good (the name is
+    /// taken, the caller may not, ...), it stored nothing, and the inode's
+    /// reservation goes too: nothing else would ever use or remove it. A
+    /// failure that asks for a retry (`EKEYEXPIRED`, `EAGAIN`) keeps it, for
+    /// the retry; if none comes, `sweep_reservations` removes it later. (A
+    /// create whose outcome is unknown never gets here: see the callers.)
+    async fn release_if_failed<T>(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        made: Result<T, FsError>,
+    ) -> Result<T, FsError> {
+        let retry =
+            |e: &FsError| e.errno == raft5fs_proto::errno::EKEYEXPIRED || e.errno == libc::EAGAIN;
+        if made.as_ref().is_err_and(|e| !retry(e)) {
+            let user = caller.user.as_bytes();
+            let key = &reservation_key(ino);
+            let released = retrying(move || async move {
+                let txn = self.client.transaction(TXN_TTL).await?;
+                let held = txn.read_one(key).await?.value;
+                if held.as_deref().map(|v| grants::reservation_parts(v).0) == Some(user) {
+                    txn.write(key, None).await?;
+                    txn.commit().await?;
+                }
+                Ok(())
+            })
+            .await;
+            if let Err(e) = released {
+                eprintln!("could not release inode {ino}'s reservation: {e}");
+            }
+        }
+        made
+    }
+
+    /// Removes reservations older than `age`: from clients that reserved an
+    /// inode and never created it (they crashed, or lost the connection).
+    /// Reservations from before they had a time count as old. Returns how
+    /// many it removed.
+    pub async fn sweep_reservations(&self, age: Duration) -> Result<usize, FsError> {
+        let cutoff = unix_secs(SystemTime::now()).saturating_sub(age.as_secs());
+        let mut keys = Vec::new();
+        let mut iter = self
+            .client
+            .key_iterator(crate::layout::RESERVATION_PREFIX, Consistency::Stale);
+        while let Some(key) = next_key(&mut iter).await? {
+            if !key.starts_with(crate::layout::RESERVATION_PREFIX) {
+                break;
+            }
+            keys.push(key);
+        }
+        let mut removed = 0;
+        for (key, value) in keys.iter().zip(self.client.get_many(&keys).await?) {
+            let Some(value) = value else { continue };
+            if grants::reservation_parts(&value)
+                .1
+                .is_some_and(|at| at > cutoff)
+            {
+                continue;
+            }
+            // Only if it is still the same reservation.
+            let value = &value;
+            let gone = retrying(move || async move {
+                let txn = self.client.transaction(TXN_TTL).await?;
+                if txn.read_one(key).await?.value.as_ref() != Some(value) {
+                    return Ok(false);
+                }
+                txn.write(key, None).await?;
+                txn.commit().await?;
+                Ok(true)
+            })
+            .await?;
+            removed += usize::from(gone);
+        }
+        Ok(removed)
     }
 
     /// Uses `new`'s reserved inode for `caller` and stores its key record,
@@ -929,7 +1023,12 @@ impl FsCore {
             txn.read_many(&[reservation_key(new.ino), attr_key(new.ino)])
                 .await?,
         );
-        if reserved.value.as_deref() != Some(user.as_bytes()) {
+        if reserved
+            .value
+            .as_deref()
+            .map(|v| grants::reservation_parts(v).0)
+            != Some(user.as_bytes())
+        {
             return Ok(Err(FsError::new(
                 libc::EACCES,
                 format!("inode {} isn't reserved for {user}", new.ino),
@@ -1659,7 +1758,7 @@ impl FsCore {
             sealed_key: sealed_key.to_vec(),
             sealed_label: sealed_label.to_vec(),
         };
-        retrying(move || async move {
+        let made = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
             if txn.read_one(dirent).await?.value.is_some() {
@@ -1691,7 +1790,8 @@ impl FsCore {
             txn.commit().await?;
             Ok(Ok(entry.attr))
         })
-        .await?
+        .await?;
+        self.release_if_failed(caller, new.ino, made).await
     }
 
     /// Every node at or below `top` that is granted to anyone (see

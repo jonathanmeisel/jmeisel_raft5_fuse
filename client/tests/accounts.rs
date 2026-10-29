@@ -521,3 +521,172 @@ fn trusted_keys_follow_the_account_to_its_other_devices() {
         (0, Vec::new())
     );
 }
+
+#[test]
+fn folders_nobody_can_reach_are_listed_and_deleted() {
+    let mut backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    rt_set_admin(&backend, TESTER);
+    backend.enrol("carol");
+    backend.enrol("eve");
+    let rt = &backend.runtime;
+    let carol = vault(&backend, "carol");
+    carol
+        .known_keys()
+        .check(TESTER, &backend.tester_key)
+        .unwrap();
+    // carol's own volume, and one she shares a folder of.
+    let solo = rt
+        .block_on(carol.create_volume(OsStr::new("solo"), 0o755))
+        .unwrap()
+        .ino;
+    let file = rt
+        .block_on(carol.create(solo, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(carol.write(file, 0, &[7; 3000])).unwrap();
+    let both = rt
+        .block_on(carol.create_volume(OsStr::new("both"), 0o755))
+        .unwrap()
+        .ino;
+    let kept = rt
+        .block_on(carol.mkdir(both, OsStr::new("kept"), 0o755))
+        .unwrap()
+        .ino;
+    let other = rt
+        .block_on(carol.mkdir(both, OsStr::new("other"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(carol.grant(kept, TESTER, false, OsStr::new("kept")))
+        .unwrap();
+
+    let admin = connect(&backend, TESTER);
+    assert!(rt.block_on(admin.list_unreachable()).unwrap().is_empty());
+    // Removing carol would leave all of `solo`, and `other` in `both`:
+    // not `kept`, which the tester can still reach, or `both`, the way to it.
+    let inos = |found: Vec<raft5fs_proto::types::Unreachable>| {
+        let mut inos: Vec<u64> = found.iter().map(|u| u.ino).collect();
+        inos.sort();
+        inos
+    };
+    let impact = rt.block_on(admin.removal_impact("carol")).unwrap();
+    let whole = impact.iter().find(|u| u.ino == solo).unwrap();
+    assert!(whole.volume);
+    assert_eq!((whole.files, whole.folders, whole.bytes), (1, 1, 3000));
+    assert_eq!(inos(impact), [solo.min(other), solo.max(other)]);
+
+    rt.block_on(admin.delete_user("carol")).unwrap();
+    assert_eq!(
+        inos(rt.block_on(admin.list_unreachable()).unwrap()),
+        [solo.min(other), solo.max(other)]
+    );
+
+    // Only admins, and only what nobody can reach.
+    assert_eq!(
+        errno(rt.block_on(connect(&backend, "eve").list_unreachable())),
+        libc::EACCES
+    );
+    assert_eq!(
+        errno(rt.block_on(admin.delete_unreachable(kept))),
+        libc::EINVAL
+    );
+
+    // Deleting takes it out of the store, chunks and all.
+    assert!(
+        !backend
+            .keys_with_prefix(&raft5fs_core::chunk_prefix(file))
+            .is_empty()
+    );
+    rt.block_on(admin.delete_unreachable(solo)).unwrap();
+    assert!(
+        backend
+            .keys_with_prefix(&raft5fs_core::chunk_prefix(file))
+            .is_empty()
+    );
+    assert_eq!(
+        inos(rt.block_on(admin.list_unreachable()).unwrap()),
+        [other]
+    );
+    let tester = vault(&backend, TESTER);
+    let roots: Vec<_> = rt
+        .block_on(tester.root_entries())
+        .unwrap()
+        .into_iter()
+        .map(|(_, ino)| ino)
+        .collect();
+    assert_eq!(roots, [kept]);
+
+    // New servers start the same way: nothing about this needs memory.
+    drop(backend.replace_servers(TEST_CHUNK_SIZE));
+    let admin = connect(&backend, TESTER);
+    assert_eq!(
+        inos(backend.runtime.block_on(admin.list_unreachable()).unwrap()),
+        [other]
+    );
+}
+
+fn rt_set_admin(backend: &Backend, user: &str) {
+    backend
+        .runtime
+        .block_on(accounts::set_caps(
+            &backend.client,
+            user,
+            Caps::ADMIN | Caps::LINKS,
+            Caps::NONE,
+        ))
+        .unwrap();
+}
+
+#[test]
+fn reservations_go_when_a_create_fails_and_when_old() {
+    let mut backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let reservations = |b: &Backend| b.keys_with_prefix(&[0x0A]).len();
+    {
+        let rt = &backend.runtime;
+        let tester = vault(&backend, TESTER);
+        let v = rt
+            .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+            .unwrap()
+            .ino;
+        rt.block_on(tester.mkdir(v, OsStr::new("a"), 0o755))
+            .unwrap();
+        assert_eq!(reservations(&backend), 0);
+        // A create that fails gives its reservation back.
+        assert_eq!(
+            errno(rt.block_on(tester.mkdir(v, OsStr::new("a"), 0o755))),
+            libc::EEXIST
+        );
+        assert_eq!(reservations(&backend), 0);
+    }
+    // One left by a client that went away, from before reservations had a
+    // time: new servers remove it when they start.
+    backend.write_key(&[0x0A, 0, 0, 0, 0, 0, 0, 0x30, 0x39], Some(b"tester"));
+    assert_eq!(reservations(&backend), 1);
+    drop(backend.replace_servers(TEST_CHUNK_SIZE));
+    assert_eq!(reservations(&backend), 0);
+}
+
+#[test]
+fn a_deleted_links_pin_goes_from_every_device() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    rt_set_admin(&backend, TESTER);
+    let rt = &backend.runtime;
+    let a = vault(&backend, TESTER);
+    let b = vault(&backend, TESTER);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(b.sync_pins()).unwrap();
+    let docs = rt
+        .block_on(a.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let (link, _) = rt
+        .block_on(a.create_link(docs, "/docs", OsStr::new("docs"), None))
+        .unwrap();
+    rt.block_on(b.sync_pins()).unwrap();
+    assert!(b.known_keys().pinned(&link).is_some());
+
+    rt.block_on(a.revoke(docs, &link)).unwrap();
+    rt.block_on(a.sync_pins()).unwrap();
+    assert_eq!(a.known_keys().pinned(&link), None);
+    rt.block_on(b.sync_pins()).unwrap();
+    assert_eq!(b.known_keys().pinned(&link), None);
+}

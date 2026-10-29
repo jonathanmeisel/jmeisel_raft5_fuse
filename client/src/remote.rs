@@ -76,7 +76,7 @@ use raft5fs_proto::types::{
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
     SnapshotInfo,
 };
-use raft5fs_proto::types::{LinkAccount, UserEntry};
+use raft5fs_proto::types::{LinkAccount, Unreachable, UserEntry};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -1268,6 +1268,48 @@ impl Remote {
             .into_result()?;
         let invitation = (!issued.invitation.is_empty()).then_some(issued.invitation);
         Ok((issued.code, invitation))
+    }
+
+    /// Folders and files that no account can reach any more, as an admin.
+    pub async fn list_unreachable(&self) -> Result<Vec<Unreachable>, FsError> {
+        self.needs_protocol(5, "finding unreachable folders")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_unreachable(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Deletes unreachable part `ino`, with everything in it, as an admin.
+    pub async fn delete_unreachable(&self, ino: u64) -> Result<(), FsError> {
+        self.needs_protocol(5, "finding unreachable folders")?;
+        let req = InodeRequest {
+            ino,
+            snapshot: String::new(),
+        };
+        // Not sent again: a resend after it was done would find nothing
+        // to remove.
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.delete_unreachable(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// What removing `user`, or letting them enroll again, would leave that
+    /// no account can reach, as an admin.
+    pub async fn removal_impact(&self, user: &str) -> Result<Vec<Unreachable>, FsError> {
+        self.needs_protocol(5, "finding unreachable folders")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.removal_impact(req).await }
+        })
+        .await?
+        .into_result()
     }
 
     /// Removes `user`, as an admin.

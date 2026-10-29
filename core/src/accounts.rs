@@ -758,8 +758,9 @@ pub async fn admin_list(client: &Client, caller: &str) -> Result<Vec<UserEntry>,
     list(client).await
 }
 
-/// `require_admin`, outside a transaction.
-async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
+/// Refuses (`EACCES`) unless `caller` is an admin (`require_admin`, outside
+/// a transaction).
+pub async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
     retrying(|| async move {
         let txn = client.transaction(TXN_TTL).await?;
         require_admin(&txn, caller).await

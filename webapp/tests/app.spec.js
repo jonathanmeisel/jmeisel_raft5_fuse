@@ -486,6 +486,8 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
   await test.step("dave enrolls again from a new invitation", async () => {
     await row().getByRole("button", { name: "Re-enroll…" }).click();
     await expect(erin.getByText(/enroll again\?/)).toBeVisible();
+    // His folder `mine` would be left with nobody to reach it.
+    await expect(erin.getByText(/Only dave can reach one folder or file/)).toBeVisible(SLOW);
     await erin.getByRole("button", { name: "Make an invitation" }).click();
     const again = await erin.getByLabel("Link to enroll in this app").inputValue();
     await erin.getByRole("button", { name: "Done" }).click();
@@ -493,6 +495,15 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
     await login(dave, "dave");
     // His new key has none of what the old one had.
     await expect(item(dave, "mine")).toHaveCount(0, SLOW);
+  });
+
+  await test.step("erin deletes dave's old folder, which nobody can reach", async () => {
+    await erin.getByRole("button", { name: "Unreachable folders" }).click();
+    await expect(erin.getByText("Top-level folder")).toBeVisible(SLOW);
+    await erin.getByRole("button", { name: "Delete…" }).click();
+    await erin.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(erin.getByText("Every folder and file can be reached by someone.")).toBeVisible(SLOW);
+    await erin.getByRole("button", { name: "Back" }).click();
   });
 
   await test.step("erin removes dave", async () => {

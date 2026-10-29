@@ -46,7 +46,8 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   account may do (its capabilities) decides what the account menu
   (`AccountMenu.svelte`, the user's name in the header) offers:
   **Users** (`UsersDialog.svelte`: invite, change capabilities, re-enroll,
-  remove) needs `admin`, making a
+  remove, and delete folders nobody can reach any more) needs `admin`,
+  making a
   top-level folder needs `volumes`, and public links (`LinkDialog.svelte`
   from a folder's menu, `LinksDialog.svelte` from the account menu) need
   `links`.

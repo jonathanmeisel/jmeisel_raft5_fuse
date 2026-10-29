@@ -11,7 +11,7 @@ use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
     Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
     Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SetAttr, SetTime, SnapshotInfo, UserEntry, WriteBody,
+    SetAttr, SetTime, SnapshotInfo, Unreachable, UserEntry, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -548,6 +548,52 @@ impl pb::IssueInviteResponse {
             Some(R::Invite(i)) => Ok(i),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("invitation")),
+        }
+    }
+}
+
+impl From<Result<Vec<Unreachable>, FsError>> for pb::UnreachableListResponse {
+    fn from(r: Result<Vec<Unreachable>, FsError>) -> Self {
+        use pb::unreachable_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(items) => R::List(pb::UnreachableList {
+                    items: items
+                        .into_iter()
+                        .map(|u| pb::Unreachable {
+                            ino: u.ino,
+                            volume: u.volume,
+                            files: u.files,
+                            folders: u.folders,
+                            bytes: u.bytes,
+                            modified: Some(u.modified.into()),
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::UnreachableListResponse {
+    pub fn into_result(self) -> Result<Vec<Unreachable>, FsError> {
+        use pb::unreachable_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .items
+                .into_iter()
+                .map(|u| Unreachable {
+                    ino: u.ino,
+                    volume: u.volume,
+                    files: u.files,
+                    folders: u.folders,
+                    bytes: u.bytes,
+                    modified: time(u.modified),
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("unreachable list")),
         }
     }
 }

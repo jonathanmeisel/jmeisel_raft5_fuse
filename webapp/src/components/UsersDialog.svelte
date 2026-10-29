@@ -86,6 +86,47 @@
       await load();
     });
 
+  /// Asks about `user` (step `kind`, with `extra`), and fills in what only
+  /// they can reach, which removing them or re-enrolling them would leave
+  /// unreachable.
+  async function ask(kind, user, extra = {}) {
+    step = { kind, user, ...extra, impact: null };
+    try {
+      const impact = await fs.removalImpact(user);
+      if (step?.user === user) step = { ...step, impact };
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function showUnreachable() {
+    step = { kind: "unreachable", items: null };
+    try {
+      const items = await fs.listUnreachable();
+      if (step?.kind === "unreachable") step = { ...step, items };
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  const purge = (item) =>
+    run(async () => {
+      await fs.deleteUnreachable(item.ino);
+      await showUnreachable();
+    });
+
+  const size = (bytes) =>
+    bytes >= 1 << 30
+      ? `${(bytes / (1 << 30)).toFixed(1)} GB`
+      : bytes >= 1 << 20
+        ? `${(bytes / (1 << 20)).toFixed(1)} MB`
+        : `${Math.ceil(bytes / 1024)} KB`;
+  const kind = (u) => (u.volume ? "Top-level folder" : u.folders ? "Folder" : "File");
+  const total = (items) => ({
+    files: items.reduce((n, u) => n + u.files, 0),
+    bytes: items.reduce((n, u) => n + u.bytes, 0),
+  });
+
   const what = (u) => (u.kind === "link" ? `public link made by ${u.owner}` : u.enrolled ? "" : "invited");
 </script>
 
@@ -114,8 +155,17 @@
       key: everything shared with them, their own folders included, is unshared and has to be shared
       with them again, and the people who share with them are asked to check their new fingerprint.
     </p>
+    {#if step.impact === null}
+      <p class="note">Checking what only {step.user} can reach…</p>
+    {:else if step.impact.length}
+      <p class="error">
+        Only {step.user} can reach {step.impact.length === 1 ? "one folder or file" : `${step.impact.length} folders or files`}
+        now: {total(step.impact).files} files, {size(total(step.impact).bytes)}. Nobody could open them
+        afterwards. You can delete them later, under Unreachable folders.
+      </p>
+    {/if}
     <p>
-      <button class="danger" onclick={() => reissue(step.user)} disabled={busy}>Make an invitation</button>
+      <button class="danger" onclick={() => reissue(step.user)} disabled={busy || step.impact === null}>Make an invitation</button>
       <button onclick={() => (step = null)}>Cancel</button>
     </p>
   {:else if step?.kind === "delete"}
@@ -130,14 +180,61 @@
         could reach can't be reached by anyone.
       {/if}
     </p>
+    {#if step.impact === null}
+      <p class="note">Checking what only {step.user} can reach…</p>
+    {:else if step.impact.length}
+      <p class="error">
+        Only {step.user} can reach {step.impact.length === 1 ? "one folder or file" : `${step.impact.length} folders or files`}
+        now: {total(step.impact).files} files, {size(total(step.impact).bytes)}. Nobody could open them
+        afterwards. You can delete them later, under Unreachable folders.
+      </p>
+    {/if}
     <p>
-      <button class="danger" onclick={() => remove(step.user)} disabled={busy}>Remove</button>
+      <button class="danger" onclick={() => remove(step.user)} disabled={busy || step.impact === null}>Remove</button>
       <button onclick={() => (step = null)}>Cancel</button>
+    </p>
+  {:else if step?.kind === "unreachable"}
+    <p class="note">
+      Folders and files whose last account was removed, or enrolled again. Their names are sealed under
+      keys nobody has, so only their size and age show, and nobody can open them. Deleting one frees its
+      space, for good.
+    </p>
+    {#if step.items === null}
+      <p class="note">Looking…</p>
+    {:else if step.items.length === 0}
+      <p>Every folder and file can be reached by someone.</p>
+    {:else}
+      <table>
+        <tbody>
+          {#each step.items as u (u.ino)}
+            <tr>
+              <td><strong>{kind(u)}</strong> <span class="note">#{u.ino}</span></td>
+              <td class="note">
+                {u.files} files, {size(u.bytes)}, last changed {new Date(u.modified).toLocaleDateString()}
+              </td>
+              <td class="actions">
+                <button class="danger" onclick={() => (step = { kind: "purge", item: u })}>Delete…</button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+    <p><button onclick={() => (step = null)}>Back</button></p>
+  {:else if step?.kind === "purge"}
+    <p>Delete this {kind(step.item).toLowerCase()} ({step.item.files} files, {size(step.item.bytes)})?</p>
+    <p class="note">Nobody can open it now, and this frees its space. It can't be undone.</p>
+    <p>
+      <button class="danger" onclick={() => purge(step.item)} disabled={busy}>Delete</button>
+      <button onclick={showUnreachable}>Cancel</button>
     </p>
   {:else if users === null}
     <p class="note">Loading…</p>
   {:else}
-    <p><button class="primary" onclick={() => (step = { kind: "invite" })}>Invite someone</button></p>
+    <p>
+      <button class="primary" onclick={() => (step = { kind: "invite" })}>Invite someone</button>
+      <button onclick={showUnreachable}>Unreachable folders</button>
+    </p>
     <div class="scroll">
       <table>
         <thead>
@@ -169,14 +266,14 @@
               {/each}
               <td class="actions">
                 {#if u.kind === "person" && u.user !== me}
-                  <button onclick={() => (step = { kind: "reenroll", user: u.user })}>
+                  <button onclick={() => ask("reenroll", u.user)}>
                     {u.enrolled ? "Re-enroll…" : "New invitation…"}
                   </button>
                 {/if}
                 {#if u.user !== me}
                   <button
                     class="danger"
-                    onclick={() => (step = { kind: "delete", user: u.user, link: u.kind === "link", enrolled: u.enrolled })}
+                    onclick={() => ask("delete", u.user, { link: u.kind === "link", enrolled: u.enrolled })}
                   >
                     Remove…
                   </button>

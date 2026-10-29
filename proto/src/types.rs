@@ -482,6 +482,23 @@ pub struct UserEntry {
     pub info: AccountInfo,
 }
 
+/// A folder or file that no account can reach any more, with everything
+/// in it: the account that could was removed, or enrolled again. Its names
+/// are sealed under keys nobody has, so only its shape shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreachable {
+    pub ino: u64,
+    /// Whether it is a whole volume (a top-level folder).
+    pub volume: bool,
+    pub files: u64,
+    /// Folders, itself included if it is one.
+    pub folders: u64,
+    /// The files' sizes, added up.
+    pub bytes: u64,
+    /// When anything in it last changed.
+    pub modified: SystemTime,
+}
+
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.
 pub const LINK_PREFIX: &str = "link-";
