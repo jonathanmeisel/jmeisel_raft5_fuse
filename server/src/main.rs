@@ -146,11 +146,13 @@ Capabilities: what a user may start, beyond what is shared with them.
   --volumes [on|off]   make new top-level folders (volumes). New users
                        have it unless --no-volumes; users added before
                        capabilities existed have it too.
-  --invite [on|off]    invite new users themselves, giving them at most
-                       their own capabilities. (Serving servers need the
-                       invite options for these invitations to be whole.)
   --links [on|off]     make public links to folders.
-  --no-volumes, --no-invite, --no-links
+  --admin [on|off]     manage users from the app or `raft5fs admin`:
+                       invite them, change their capabilities, let them
+                       enroll again, remove them. Make your first admin
+                       here. (Serving servers need the invite options for
+                       their invitations to be whole.)
+  --no-volumes, --no-links, --no-admin
                        the same as `off`.
 `user add` applies them to a new user, or to an existing user's current
 ones; `user set` changes an existing user's.
@@ -620,7 +622,7 @@ async fn user_command(a: Args) {
     }
     match command {
         Some("set") if a.caps.is_empty() => {
-            usage("user set needs --volumes, --invite or --links, each on or off")
+            usage("user set needs --volumes, --links or --admin, each on or off")
         }
         Some("add" | "set") => {}
         _ if !a.caps.is_empty() => usage("only user add and user set take capabilities"),
@@ -675,17 +677,19 @@ fn caps_text(caps: Caps) -> String {
 
 /// Prints every account, each under the user who invited it (or, for a
 /// link, made it), indented a level per step.
-fn print_accounts(rows: Vec<accounts::Listed>) {
-    let names: std::collections::HashSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-    let parent = |row: &accounts::Listed| -> Option<String> {
+fn print_accounts(rows: Vec<raft5fs_proto::types::UserEntry>) {
+    let names: std::collections::HashSet<&str> = rows.iter().map(|r| r.user.as_str()).collect();
+    let parent = |row: &raft5fs_proto::types::UserEntry| -> Option<String> {
         let parent = match row.info.kind {
             AccountKind::Link => &row.info.owner,
             AccountKind::Person => &row.info.invited_by,
         };
         names.contains(parent.as_str()).then(|| parent.clone())
     };
-    let mut children: std::collections::BTreeMap<Option<String>, Vec<&accounts::Listed>> =
-        Default::default();
+    let mut children: std::collections::BTreeMap<
+        Option<String>,
+        Vec<&raft5fs_proto::types::UserEntry>,
+    > = Default::default();
     for row in &rows {
         children.entry(parent(row)).or_default().push(row);
     }
@@ -693,7 +697,7 @@ fn print_accounts(rows: Vec<accounts::Listed>) {
     // record names its parent at creation, so there are no loops; the
     // `seen` set only guards against a damaged store.
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<(&accounts::Listed, usize)> = children
+    let mut stack: Vec<(&raft5fs_proto::types::UserEntry, usize)> = children
         .get(&None)
         .into_iter()
         .flatten()
@@ -701,7 +705,7 @@ fn print_accounts(rows: Vec<accounts::Listed>) {
         .map(|row| (*row, 0))
         .collect();
     while let Some((row, depth)) = stack.pop() {
-        if !seen.insert(row.name.as_str()) {
+        if !seen.insert(row.user.as_str()) {
             continue;
         }
         let state = if row.enrolled {
@@ -716,8 +720,8 @@ fn print_accounts(rows: Vec<accounts::Listed>) {
             },
             AccountKind::Person => caps_text(row.info.caps),
         };
-        println!("{}{}\t{state}\t{what}", "  ".repeat(depth), row.name);
-        if let Some(kids) = children.get(&Some(row.name.clone())) {
+        println!("{}{}\t{state}\t{what}", "  ".repeat(depth), row.user);
+        if let Some(kids) = children.get(&Some(row.user.clone())) {
             stack.extend(kids.iter().rev().map(|kid| (*kid, depth + 1)));
         }
     }

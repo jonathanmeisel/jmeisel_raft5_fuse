@@ -35,18 +35,19 @@ use raft5fs_proto::convert::session_from_metadata;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::pb::fs_server::{Fs, FsServer};
 use raft5fs_proto::pb::{
-    AccessRequest, AccountResponse, AttrResponse, CancelInviteRequest, ChangePasswordRequest,
-    CreateLinkAccountRequest, CreateRequest, CreateVolumeRequest, EmptyResponse, EnrolRequest,
-    GrantListResponse, GrantRequest, GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse,
-    InodeRequest, InviteListResponse, IssueInviteRequest, IssueInviteResponse, IssuedInvite,
-    KdfSettings, KeyPathResponse, LinkListResponse, ListGrantsRequest, LoginRequest, LoginResponse,
-    LookupResponse, NameRequest, NoArgs, PreloginRequest, PreloginResponse, PrepareUploadsRequest,
-    PrepareUploadsResponse, PruneKeysRequest, PublicKeyRequest, PublicKeyResponse,
-    ReadChunksRequest, ReadChunksResponse, ReadDirResponse, RenameRequest, ResealChunksRequest,
-    ResealNamesRequest, RotateRequest, Session, SetAttrRequest, SnapshotListResponse,
-    WriteChunksRequest, WriteChunksResponse,
+    AccessRequest, AccountResponse, AttrResponse, ChangePasswordRequest, CreateLinkAccountRequest,
+    CreateRequest, CreateVolumeRequest, EmptyResponse, EnrolRequest, GrantListResponse,
+    GrantRequest, GrantsUnderResponse, HelloRequest, HelloResponse, InoResponse, InodeRequest,
+    IssueInviteRequest, IssueInviteResponse, IssuedInvite, KdfSettings, KeyPathResponse,
+    LinkListResponse, ListGrantsRequest, LoginRequest, LoginResponse, LookupResponse, NameRequest,
+    NoArgs, PreloginRequest, PreloginResponse, PrepareUploadsRequest, PrepareUploadsResponse,
+    PruneKeysRequest, PublicKeyRequest, PublicKeyResponse, ReadChunksRequest, ReadChunksResponse,
+    ReadDirResponse, RenameRequest, ResealChunksRequest, ResealNamesRequest, RotateRequest,
+    Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
-use raft5fs_proto::pb::{PinsResponse, PutPinsRequest};
+use raft5fs_proto::pb::{
+    PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UserListResponse, UsernameRequest,
+};
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -110,6 +111,25 @@ pub struct FsService {
 }
 
 impl FsService {
+    /// What an admin gets for a code issued to `user`: the code, and the
+    /// whole invitation if this server knows how users reach it.
+    fn issued(&self, user: &str, code: String) -> IssuedInvite {
+        let invitation = self.invites.as_ref().map(|i| {
+            Invite {
+                user: user.to_string(),
+                code: code.clone(),
+                servers: i.servers.clone(),
+                tls_server_name: i.tls_server_name.clone(),
+                ca: i.ca.clone(),
+            }
+            .encode()
+        });
+        IssuedInvite {
+            code,
+            invitation: invitation.unwrap_or_default(),
+        }
+    }
+
     /// `identity_ttl` is how long to trust that an account is still
     /// enrolled before checking again (`DEFAULT_IDENTITY_TTL`; zero checks
     /// on every request).
@@ -654,42 +674,53 @@ impl Fs for FsService {
         let caps = Caps::from_bits(r.capabilities);
         let issued = accounts::issue_invite(self.core.client(), &caller.user, &r.username, caps)
             .await
-            .map(|code| {
-                let invitation = self.invites.as_ref().map(|i| {
-                    Invite {
-                        user: r.username.clone(),
-                        code: code.clone(),
-                        servers: i.servers.clone(),
-                        tls_server_name: i.tls_server_name.clone(),
-                        ca: i.ca.clone(),
-                    }
-                    .encode()
-                });
-                IssuedInvite {
-                    code,
-                    invitation: invitation.unwrap_or_default(),
-                }
-            });
+            .map(|code| self.issued(&r.username, code));
         Ok(Response::new(issued.into()))
     }
 
-    async fn list_invites(
+    async fn reissue_invite(
         &self,
-        r: Request<NoArgs>,
-    ) -> Result<Response<InviteListResponse>, Status> {
-        let (caller, _) = self.caller(r).await?;
-        let pending = accounts::pending_invites(self.core.client(), &caller.user).await;
-        Ok(Response::new(pending.into()))
+        r: Request<UsernameRequest>,
+    ) -> Result<Response<IssueInviteResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let issued = accounts::reissue_invite(self.core.client(), &caller.user, &r.username)
+            .await
+            .map(|code| self.issued(&r.username, code));
+        Ok(Response::new(issued.into()))
     }
 
-    async fn cancel_invite(
+    async fn list_users(&self, r: Request<NoArgs>) -> Result<Response<UserListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let users = accounts::admin_list(self.core.client(), &caller.user).await;
+        Ok(Response::new(users.into()))
+    }
+
+    async fn set_capabilities(
         &self,
-        r: Request<CancelInviteRequest>,
+        r: Request<SetCapabilitiesRequest>,
+    ) -> Result<Response<AccountResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set = accounts::admin_set_caps(
+            self.core.client(),
+            &caller.user,
+            &r.username,
+            Caps::from_bits(r.on),
+            Caps::from_bits(r.off),
+        )
+        .await;
+        Ok(Response::new(set.into()))
+    }
+
+    async fn delete_user(
+        &self,
+        r: Request<UsernameRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
-        let cancelled =
-            accounts::cancel_invite(self.core.client(), &caller.user, &r.username).await;
-        Ok(Response::new(cancelled.into()))
+        let removed = accounts::admin_remove(self.core.client(), &caller.user, &r.username).await;
+        // Their sessions end at their next request, not after the cache's
+        // time.
+        self.enrolled.lock().unwrap().remove(&r.username);
+        Ok(Response::new(removed.into()))
     }
 
     async fn create_link_account(

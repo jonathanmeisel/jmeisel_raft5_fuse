@@ -62,19 +62,21 @@ use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
-    AccessRequest, AccountKeys, CancelInviteRequest, ChangePasswordRequest, CreateRequest,
-    CreateVolumeRequest, EnrolRequest, GrantRequest, HelloRequest, InodeRequest,
-    IssueInviteRequest, ListGrantsRequest, LoginRequest, NameRequest, NoArgs, PreloginRequest,
-    PrepareUploadsRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
-    ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
+    AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
+    EnrolRequest, GrantRequest, HelloRequest, InodeRequest, IssueInviteRequest, ListGrantsRequest,
+    LoginRequest, NameRequest, NoArgs, PreloginRequest, PrepareUploadsRequest, PruneKeysRequest,
+    PublicKeyRequest, ReadChunksRequest, RenameRequest, ResealChunksRequest, ResealNamesRequest,
+    RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
-use raft5fs_proto::pb::{CreateLinkAccountRequest, PutPinsRequest};
-use raft5fs_proto::types::LinkAccount;
+use raft5fs_proto::pb::{
+    CreateLinkAccountRequest, PutPinsRequest, SetCapabilitiesRequest, UsernameRequest,
+};
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
-    KeyPath, NewNode, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation,
-    SealedMove, SetAttr, SnapshotInfo,
+    KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
+    SnapshotInfo,
 };
+use raft5fs_proto::types::{LinkAccount, UserEntry};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -1189,9 +1191,9 @@ impl Remote {
         .into_result()
     }
 
-    /// Invites a new user `user`, who gets `caps`. Returns the one-time
-    /// code, and the whole invitation if the servers know how users reach
-    /// them.
+    /// Invites a new user `user`, who gets `caps`, as an admin. Returns the
+    /// one-time code, and the whole invitation if the servers know how
+    /// users reach them.
     pub async fn issue_invite(
         &self,
         user: &str,
@@ -1215,25 +1217,70 @@ impl Remote {
         Ok((issued.code, invitation))
     }
 
-    /// This account's invitations that nobody has used yet.
-    pub async fn list_invites(&self) -> Result<Vec<PendingInvite>, FsError> {
-        self.needs_protocol(2, "invitations")?;
+    /// Every account, for an admin: enrolled ones, unused invitations, and
+    /// public links.
+    pub async fn list_users(&self) -> Result<Vec<UserEntry>, FsError> {
+        self.needs_protocol(4, "user management")?;
         self.call(Retry::ReadOnly, |mut c| async move {
-            c.list_invites(NoArgs {}).await
+            c.list_users(NoArgs {}).await
         })
         .await?
         .into_result()
     }
 
-    /// Withdraws this account's unused invitation of `user`.
-    pub async fn cancel_invite(&self, user: &str) -> Result<(), FsError> {
-        self.needs_protocol(2, "invitations")?;
-        let req = CancelInviteRequest {
+    /// Turns `user`'s capabilities in `on` on, and those in `off` off, as an
+    /// admin. Returns their account as it is then.
+    pub async fn set_capabilities(
+        &self,
+        user: &str,
+        on: Caps,
+        off: Caps,
+    ) -> Result<AccountInfo, FsError> {
+        self.needs_protocol(4, "user management")?;
+        let req = SetCapabilitiesRequest {
             username: user.to_string(),
+            on: on.bits(),
+            off: off.bits(),
         };
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
-            async move { c.cancel_invite(req).await }
+            async move { c.set_capabilities(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// A new invitation for existing user `user`, so they can enroll again,
+    /// as an admin: the code, and the whole invitation if the servers know
+    /// how users reach them.
+    pub async fn reissue_invite(&self, user: &str) -> Result<(String, Option<String>), FsError> {
+        self.needs_protocol(4, "user management")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        // Not sent again: a second code would replace the first.
+        let issued = self
+            .call(Retry::Once, |mut c| {
+                let req = req.clone();
+                async move { c.reissue_invite(req).await }
+            })
+            .await?
+            .into_result()?;
+        let invitation = (!issued.invitation.is_empty()).then_some(issued.invitation);
+        Ok((issued.code, invitation))
+    }
+
+    /// Removes `user`, as an admin.
+    pub async fn delete_user(&self, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(4, "user management")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        // Not sent again: a resend after it was done would say there is no
+        // such user.
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.delete_user(req).await }
         })
         .await?
         .into_result()

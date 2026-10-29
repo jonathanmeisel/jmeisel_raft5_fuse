@@ -662,21 +662,38 @@ them:
 | Capability | Lets the user | Default |
 |---|---|---|
 | `volumes` | make top-level folders of their own | on for `user add`, and for every user added before capabilities existed |
-| `invite` | invite new users themselves (web app: **Invite someone**; CLI: `raft5fs invite`) | off |
 | `links` | make public links to folders (web app: a folder's **Share publicly…**; CLI: `raft5fs link create`) | off |
+| `admin` | manage users (web app: **Users** in the account menu; CLI: `raft5fs admin`) | off |
 
 ```sh
 ./fsadmin.sh user add carol --no-volumes          # sees only what is shared with her
-./fsadmin.sh user set alice --invite on --links on
+./fsadmin.sh user set alice --admin on --links on # your first admin
 ./fsadmin.sh user set carol --volumes on
 ```
 
 A user without `volumes` who is given only read-only shares can't change
-anything. A user who invites someone can give them only capabilities they
-have themselves, only under a name nobody has, and can have at most 10
-invitations waiting (`raft5fs invites` lists and cancels them). The
-servers put the same addresses and `fs-ca.pem` in those invitations as
-`user add` does.
+anything.
+
+**Admins** manage users from the app or the CLI, without `fsadmin.sh`:
+
+```sh
+raft5fs admin users                       # everyone, invitations not used yet, and public links
+raft5fs admin invite dave --volumes       # a new name only; any capabilities, admin too
+raft5fs admin set dave --links on --admin off
+raft5fs admin reenroll dave               # a new invitation, after a forgotten password
+raft5fs admin delete dave                 # also an unused invitation, or a public link
+```
+
+- An admin can't take away their own `admin` or remove themselves; another
+  admin can, and so can `fsadmin.sh`, which stays the way back in if no
+  admin can log in.
+- Re-enrolling gives the user a new key: everything shared with them,
+  their own folders included, has to be shared again, and those who share
+  with them are told their key changed. So an admin could take over a
+  name, but not what was shared with it.
+- The servers put the same addresses and `fs-ca.pem` in admins'
+  invitations as `user add` does.
+- Backups, restores and snapshots stay with `fsadmin.sh`.
 
 **Public links** let anyone with a URL read one folder, without an
 account. Each link is an account of its own (`link-` and 12 letters),

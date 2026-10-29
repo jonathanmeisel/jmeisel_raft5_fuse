@@ -341,15 +341,18 @@ impl Caps {
     pub const NONE: Caps = Caps(0);
     /// Make new volumes (top-level folders).
     pub const VOLUMES: Caps = Caps(1);
-    /// Invite new users.
-    pub const INVITE: Caps = Caps(2);
+    // Bit 2 was `invite`, before only admins could invite. Records that
+    // still have it read as not having it.
     /// Make public links.
     pub const LINKS: Caps = Caps(4);
+    /// Manage users: invite them, change what they may do, let them enroll
+    /// again, and remove them.
+    pub const ADMIN: Caps = Caps(8);
     /// Every capability, with its name.
     pub const NAMED: [(Caps, &'static str); 3] = [
         (Caps::VOLUMES, "volumes"),
-        (Caps::INVITE, "invite"),
         (Caps::LINKS, "links"),
+        (Caps::ADMIN, "admin"),
     ];
 
     /// The capabilities in `bits`. Bits that no capability uses are
@@ -460,14 +463,6 @@ impl Default for AccountInfo {
     }
 }
 
-/// An invitation that a user issued and nobody has used yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingInvite {
-    pub user: String,
-    pub caps: Caps,
-    pub created: u64,
-}
-
 /// A public link, as its maker sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkAccount {
@@ -478,8 +473,14 @@ pub struct LinkAccount {
 /// The longest note that a link can hold.
 pub const MAX_LINK_NOTE: usize = 4096;
 
-/// The most invitations that one user can have waiting at a time.
-pub const MAX_PENDING_INVITES: usize = 10;
+/// An account, as an administrator sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEntry {
+    pub user: String,
+    /// Whether it has keys. If not, it has only an invitation (a code).
+    pub enrolled: bool,
+    pub info: AccountInfo,
+}
 
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.

@@ -3,6 +3,7 @@
 //! and the command line can override any of it.
 
 mod account;
+mod admin;
 mod link;
 #[cfg(feature = "fuse")]
 mod mount;
@@ -104,11 +105,10 @@ pub enum Command {
     /// Show the account's key fingerprint, for others to check when they
     /// share with it, and what it may do.
     Whoami,
-    /// Invite a new user (if your account may). Prints an invitation, for
-    /// them alone.
-    Invite(account::InviteArgs),
-    /// List your invitations that nobody has used yet, or cancel one.
-    Invites(account::InvitesArgs),
+    /// Manage users (with the admin capability): list, invite, change what
+    /// they may do, let them enroll again, remove.
+    #[command(subcommand)]
+    Admin(admin::AdminCommand),
     /// Make or list public links: read-only access to a directory for
     /// anyone with the link.
     #[command(subcommand)]
@@ -144,8 +144,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Enrol(args) => account::enrol(&cli.connect, args),
         Command::Passwd => account::passwd(&cli.connect),
         Command::Whoami => account::whoami(&cli.connect),
-        Command::Invite(args) => account::invite(&cli.connect, args),
-        Command::Invites(args) => account::invites(&cli.connect, args),
+        Command::Admin(command) => admin::run(&cli.connect, command),
         Command::Link(command) => link::run(&cli.connect, command),
         Command::Grant(args) => share::grant(&cli.connect, args),
         Command::Revoke(args) => share::revoke(&cli.connect, args),
@@ -299,7 +298,9 @@ mod tests {
             vec!["raft5fs", "--user", "alice", "revoke", "p", "bob"],
             vec!["raft5fs", "--user", "alice", "forget-key", "bob"],
             vec!["raft5fs", "--user", "alice", "trust", "bob", "w"],
-            vec!["raft5fs", "--user", "alice", "invite", "bob", "--links"],
+            vec![
+                "raft5fs", "--user", "alice", "admin", "invite", "bob", "--links",
+            ],
         ] {
             let cli = Cli::try_parse_from(line).unwrap();
             assert_eq!(cli.connect.user.as_deref(), Some("alice"));
@@ -307,7 +308,7 @@ mod tests {
                 Command::Revoke(a) => a.grantee,
                 Command::ForgetKey(a) => a.who,
                 Command::Trust(a) => a.who,
-                Command::Invite(a) => a.name,
+                Command::Admin(admin::AdminCommand::Invite(a)) => a.name,
                 _ => panic!("wrong command"),
             };
             assert_eq!(who, "bob");

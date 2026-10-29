@@ -20,9 +20,10 @@
 //! keys, so enrolling again keeps it. An account with no record (one added
 //! before records existed) may make volumes and nothing else.
 //!
-//! Users with the `invite` capability can invite others (`issue_invite`),
-//! but only under new names: a code for an existing account would let its
-//! holder replace that account's keys.
+//! Users with the `admin` capability manage users: invite them under new
+//! names (`issue_invite`), let existing users enroll again
+//! (`reissue_invite`), change what they may do, and remove them. The
+//! server's own tools (`add`, `set_caps`, `remove`) need no account.
 //!
 //! A public link is an account too (`create_link`), whose password only the
 //! link holds. Its name starts with `LINK_PREFIX`, which nothing else may
@@ -41,7 +42,7 @@ use crate::timing::next_key;
 use crate::view::ReadKeys;
 use raft5fs_proto::types::{
     AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
-    MAX_PENDING_INVITES, PendingInvite,
+    UserEntry,
 };
 
 /// In a transaction attempt, unwraps a decision, or ends the attempt with
@@ -596,19 +597,29 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
     .await?
 }
 
-/// `inviter` invites a new user `user`, who gets `caps`. Returns the
-/// one-time code that `user` enrols with.
-///
-/// - `inviter` needs the `invite` capability, and `caps` must be among
-///   theirs, so a chain of invitations never gains anything (`EACCES`).
-/// - `user` must be new: no keys, code or record (`EEXIST`). A code for an
-///   existing account would let whoever holds it replace the account's keys,
-///   which removes every grant it has.
-/// - `inviter` can have at most `MAX_PENDING_INVITES` unused invitations
-///   (`EDQUOT`).
+/// Refuses (`EACCES`) unless `caller` is a person with the `admin`
+/// capability, as `txn` sees it. Read in the same transaction as what it
+/// allows, so an admin who just lost the capability can't still act.
+async fn require_admin(txn: &Transaction, caller: &str) -> Result<Result<(), FsError>, KvError> {
+    let info = decide!(info_in(txn, caller).await?).unwrap_or_default();
+    Ok(
+        if info.kind == AccountKind::Person && info.caps.contains(Caps::ADMIN) {
+            Ok(())
+        } else {
+            Err(FsError::new(
+                libc::EACCES,
+                "only administrators can manage users",
+            ))
+        },
+    )
+}
+
+/// Admin `caller` invites a new user `user`, who gets `caps`. Returns the
+/// one-time code that `user` enrolls with. `user` must be new: no keys,
+/// code or record (`EEXIST`); `reissue_invite` is for existing accounts.
 pub async fn issue_invite(
     client: &Client,
-    inviter: &str,
+    caller: &str,
     user: &str,
     caps: Caps,
 ) -> Result<String, FsError> {
@@ -620,19 +631,7 @@ pub async fn issue_invite(
         let hash = &hash;
         async move {
             let txn = client.transaction(TXN_TTL).await?;
-            let mine = decide!(info_in(&txn, inviter).await?).unwrap_or_default();
-            if mine.kind != AccountKind::Person || !mine.caps.contains(Caps::INVITE) {
-                return Ok(Err(FsError::new(
-                    libc::EACCES,
-                    "you can't invite users to this filesystem",
-                )));
-            }
-            if !mine.caps.contains(caps) {
-                return Ok(Err(FsError::new(
-                    libc::EACCES,
-                    "you can only give others what you can do yourself",
-                )));
-            }
+            decide!(require_admin(&txn, caller).await?);
             let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some()
                 || txn.read_one(&info_key(user)).await?.value.is_some();
@@ -642,20 +641,10 @@ pub async fn issue_invite(
                     format!("the name {user} is taken"),
                 )));
             }
-            let waiting = decide!(pending_in(&txn, inviter).await?);
-            if waiting.len() >= MAX_PENDING_INVITES {
-                return Ok(Err(FsError::new(
-                    libc::EDQUOT,
-                    format!(
-                        "you have {MAX_PENDING_INVITES} invitations nobody has used yet: \
-                         cancel one first"
-                    ),
-                )));
-            }
             let info = AccountInfo {
                 caps,
                 kind: AccountKind::Person,
-                invited_by: inviter.to_string(),
+                invited_by: caller.to_string(),
                 created: now_secs(),
                 ..AccountInfo::default()
             };
@@ -670,68 +659,110 @@ pub async fn issue_invite(
     Ok(code)
 }
 
-/// `inviter`'s invitations that nobody has enrolled with yet, as `txn`
-/// sees them, in name order.
-async fn pending_in(
-    txn: &Transaction,
-    inviter: &str,
-) -> Result<Result<Vec<PendingInvite>, FsError>, KvError> {
-    let mut pending = Vec::new();
-    let mut iter = txn.key_iterator(ENROLMENT_PREFIX);
-    while let Some(key) = next_key(&mut iter).await? {
-        if !key.starts_with(ENROLMENT_PREFIX) {
-            break;
+/// Admin `caller` lets existing user `user` enroll again: issues them a new
+/// one-time code, in place of any earlier one. Enrolling with it replaces
+/// their key pair and removes every grant made to them (see `enrol`).
+/// `ENOENT` for no such user; `EINVAL` for a public link, which never
+/// enrolls.
+pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result<String, FsError> {
+    crate::grants::check_username(user)?;
+    refuse_link_name(user)?;
+    let code = new_enrolment_code();
+    let hash = enrolment_code_hash(&code);
+    retrying(|| {
+        let hash = &hash;
+        async move {
+            let txn = client.transaction(TXN_TTL).await?;
+            decide!(require_admin(&txn, caller).await?);
+            let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
+                || txn.read_one(&code_key(user)).await?.value.is_some();
+            if !exists {
+                return Ok(Err(FsError::new(
+                    libc::ENOENT,
+                    format!("there is no user {user}"),
+                )));
+            }
+            txn.write(&code_key(user), Some(hash)).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
         }
-        let user = String::from_utf8_lossy(&key[ENROLMENT_PREFIX.len()..]).into_owned();
-        // A code for an account that has keys is a second enrolment, not
-        // an invitation.
-        if txn.read_one(&keys_key(&user)).await?.value.is_some() {
-            continue;
-        }
-        if let Some(info) = decide!(info_in(txn, &user).await?)
-            && info.invited_by == inviter
-        {
-            pending.push(PendingInvite {
-                user,
-                caps: info.caps,
-                created: info.created,
-            });
-        }
-    }
-    Ok(Ok(pending))
+    })
+    .await??;
+    Ok(code)
 }
 
-/// `inviter`'s invitations that nobody has enrolled with yet.
-pub async fn pending_invites(
+/// Admin `caller` turns `user`'s capabilities in `on` on and those in `off`
+/// off (`set_caps`). An admin can't take away their own `admin` (`EPERM`):
+/// so there is always one, another admin or the server's tools must.
+pub async fn admin_set_caps(
     client: &Client,
-    inviter: &str,
-) -> Result<Vec<PendingInvite>, FsError> {
+    caller: &str,
+    user: &str,
+    on: Caps,
+    off: Caps,
+) -> Result<AccountInfo, FsError> {
+    if user == caller && off.contains(Caps::ADMIN) {
+        return Err(FsError::new(
+            libc::EPERM,
+            "you can't take away your own admin capability",
+        ));
+    }
+    if user.starts_with(LINK_PREFIX) {
+        return Err(FsError::new(
+            libc::EINVAL,
+            "a public link has no capabilities",
+        ));
+    }
     retrying(|| async move {
         let txn = client.transaction(TXN_TTL).await?;
-        pending_in(&txn, inviter).await
+        decide!(require_admin(&txn, caller).await?);
+        let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
+            || txn.read_one(&code_key(user)).await?.value.is_some();
+        if !exists {
+            return Ok(Err(FsError::new(
+                libc::ENOENT,
+                format!("there is no user {user}"),
+            )));
+        }
+        let mut info = decide!(info_in(&txn, user).await?).unwrap_or_default();
+        info.caps = (info.caps | on).with(off, false);
+        txn.write(&info_key(user), Some(&encode_info(&info)))
+            .await?;
+        txn.commit().await?;
+        Ok(Ok(info))
     })
     .await?
 }
 
-/// Withdraws `inviter`'s unused invitation of `user`: removes its code and
-/// the record. `ENOENT` if `inviter` has no such invitation.
-pub async fn cancel_invite(client: &Client, inviter: &str, user: &str) -> Result<(), FsError> {
+/// Admin `caller` removes `user` (`remove`): an account, an invitation not
+/// used yet, or a public link. An admin can't remove themselves (`EPERM`).
+/// `ENOENT` if there was nothing to remove.
+pub async fn admin_remove(client: &Client, caller: &str, user: &str) -> Result<(), FsError> {
+    if user == caller {
+        return Err(FsError::new(libc::EPERM, "you can't remove yourself"));
+    }
+    is_admin(client, caller).await?;
+    if remove(client, user).await? {
+        Ok(())
+    } else {
+        Err(FsError::new(
+            libc::ENOENT,
+            format!("there is no user {user}"),
+        ))
+    }
+}
+
+/// Every account, for admin `caller` (`list`).
+pub async fn admin_list(client: &Client, caller: &str) -> Result<Vec<UserEntry>, FsError> {
+    is_admin(client, caller).await?;
+    list(client).await
+}
+
+/// `require_admin`, outside a transaction.
+async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
     retrying(|| async move {
         let txn = client.transaction(TXN_TTL).await?;
-        let info = decide!(info_in(&txn, user).await?);
-        let pending = info.is_some_and(|info| info.invited_by == inviter)
-            && txn.read_one(&code_key(user)).await?.value.is_some()
-            && txn.read_one(&keys_key(user)).await?.value.is_none();
-        if !pending {
-            return Ok(Err(FsError::new(
-                libc::ENOENT,
-                format!("you have no unused invitation for {user}"),
-            )));
-        }
-        txn.write(&code_key(user), None).await?;
-        txn.write(&info_key(user), None).await?;
-        txn.commit().await?;
-        Ok(Ok(()))
+        require_admin(&txn, caller).await
     })
     .await?
 }
@@ -868,18 +899,9 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     .await?
 }
 
-/// An account, as `list` shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Listed {
-    pub name: String,
-    /// Whether it has keys. If not, it has only a code.
-    pub enrolled: bool,
-    pub info: AccountInfo,
-}
-
 /// Every account with keys, and every account with an unused code, in name
 /// order.
-pub async fn list(client: &Client) -> Result<Vec<Listed>, FsError> {
+pub async fn list(client: &Client) -> Result<Vec<UserEntry>, FsError> {
     let mut accounts = std::collections::BTreeMap::new();
     for (prefix, enrolled) in [(ACCOUNT_KEYS_PREFIX, true), (ENROLMENT_PREFIX, false)] {
         let mut iter = client.key_iterator(prefix, Consistency::Stale);
@@ -903,8 +925,8 @@ pub async fn list(client: &Client) -> Result<Vec<Listed>, FsError> {
                 Some(bytes) => decode_info(name, &bytes)?,
                 None => AccountInfo::default(),
             };
-            Ok(Listed {
-                name: name.clone(),
+            Ok(UserEntry {
+                user: name.clone(),
                 enrolled,
                 info,
             })

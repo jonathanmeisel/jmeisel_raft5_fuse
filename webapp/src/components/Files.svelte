@@ -11,7 +11,7 @@
   import Pending from "./Pending.svelte";
   import PruneBar from "./PruneBar.svelte";
   import Viewer from "./Viewer.svelte";
-  import InviteDialog from "./InviteDialog.svelte";
+  import UsersDialog from "./UsersDialog.svelte";
   import AccountMenu from "./AccountMenu.svelte";
   import SharingBar from "./SharingBar.svelte";
   import LinkDialog from "./LinkDialog.svelte";
@@ -353,7 +353,7 @@
   /// The account menu: what the account does besides files.
   const menuItems = $derived([
     { id: "pending", text: "Shared with me", icon: "wxi-file-multiple-outline", badge: pendingCount || 0 },
-    ...(account.caps.includes("invite") ? [{ id: "invite", text: "Invite someone", icon: "wxi-plus" }] : []),
+    ...(account.caps.includes("admin") ? [{ id: "users", text: "Users", icon: "wxi-account" }] : []),
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
     { id: "fingerprint", text: "My fingerprint", icon: "wxi-information-outline" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
@@ -464,8 +464,8 @@
   <LinkDialog {fs} path={dialog.path} onclose={closeSharing} />
 {:else if dialog?.kind === "links"}
   <LinksDialog {fs} onclose={closeSharing} />
-{:else if dialog?.kind === "invite"}
-  <InviteDialog {fs} caps={account.caps} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "users"}
+  <UsersDialog {fs} me={me.user} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "pending"}
   <Pending
     {fs}

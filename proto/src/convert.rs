@@ -10,8 +10,8 @@ use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
     Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, Layout, LinkAccount, ObjectGrid, PendingInvite, PreparedUpload, ResealedName, Rotation,
-    SealedChunk, SetAttr, SetTime, SnapshotInfo, WriteBody,
+    Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedChunk,
+    SetAttr, SetTime, SnapshotInfo, UserEntry, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -552,18 +552,18 @@ impl pb::IssueInviteResponse {
     }
 }
 
-impl From<Result<Vec<PendingInvite>, FsError>> for pb::InviteListResponse {
-    fn from(r: Result<Vec<PendingInvite>, FsError>) -> Self {
-        use pb::invite_list_response::Result as R;
+impl From<Result<Vec<UserEntry>, FsError>> for pb::UserListResponse {
+    fn from(r: Result<Vec<UserEntry>, FsError>) -> Self {
+        use pb::user_list_response::Result as R;
         Self {
             result: Some(match r {
-                Ok(invites) => R::List(pb::InviteList {
-                    invites: invites
+                Ok(users) => R::List(pb::UserList {
+                    users: users
                         .into_iter()
-                        .map(|i| pb::PendingInvite {
-                            username: i.user,
-                            capabilities: i.caps.bits(),
-                            created: i.created,
+                        .map(|u| pb::UserEntry {
+                            username: u.user,
+                            enrolled: u.enrolled,
+                            account: Some(u.info.into()),
                         })
                         .collect(),
                 }),
@@ -573,21 +573,23 @@ impl From<Result<Vec<PendingInvite>, FsError>> for pb::InviteListResponse {
     }
 }
 
-impl pb::InviteListResponse {
-    pub fn into_result(self) -> Result<Vec<PendingInvite>, FsError> {
-        use pb::invite_list_response::Result as R;
+impl pb::UserListResponse {
+    pub fn into_result(self) -> Result<Vec<UserEntry>, FsError> {
+        use pb::user_list_response::Result as R;
         match self.result {
-            Some(R::List(l)) => Ok(l
-                .invites
+            Some(R::List(l)) => l
+                .users
                 .into_iter()
-                .map(|i| PendingInvite {
-                    user: i.username,
-                    caps: Caps::from_bits(i.capabilities),
-                    created: i.created,
+                .map(|u| {
+                    Ok(UserEntry {
+                        user: u.username,
+                        enrolled: u.enrolled,
+                        info: u.account.ok_or_else(|| malformed("account"))?.into(),
+                    })
                 })
-                .collect()),
+                .collect(),
             Some(R::Error(e)) => Err(e.into()),
-            None => Err(malformed("invitation list")),
+            None => Err(malformed("user list")),
         }
     }
 }

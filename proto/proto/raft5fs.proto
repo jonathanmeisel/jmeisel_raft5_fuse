@@ -155,15 +155,27 @@ service Fs {
   //
   // The caller's own account: its capabilities, and where it came from.
   rpc GetAccount(NoArgs) returns (AccountResponse);
-  // Makes a one-time code for a new user, and their account record. Needs
-  // the `invite` capability, and gives the new user only capabilities that
-  // the caller has. The name must be new: no account, code or record. A
-  // user can have at most 10 invitations waiting.
+  // Makes a one-time code for a new user, and their account record, with
+  // `capabilities`. Needs the `admin` capability (protocol 4 on; before,
+  // `invite`). The name must be new: no account, code or record.
   rpc IssueInvite(IssueInviteRequest) returns (IssueInviteResponse);
-  // The caller's invitations that nobody has used yet.
-  rpc ListInvites(NoArgs) returns (InviteListResponse);
-  // Withdraws one of the caller's unused invitations.
-  rpc CancelInvite(CancelInviteRequest) returns (EmptyResponse);
+
+  // User management, for accounts with the `admin` capability (protocol 4
+  // on). Others get EACCES. An admin can't take away their own `admin`, or
+  // remove themselves: another admin, or the server's own tools, can.
+  //
+  // Every account: enrolled ones, invitations not used yet, and public
+  // links.
+  rpc ListUsers(NoArgs) returns (UserListResponse);
+  // Turns capabilities on and off; returns the account as it is then.
+  rpc SetCapabilities(SetCapabilitiesRequest) returns (AccountResponse);
+  // A new one-time code for an existing user, so they can enroll again
+  // (after forgetting their password). Enrolling replaces their key pair
+  // and removes every grant made to them.
+  rpc ReissueInvite(UsernameRequest) returns (IssueInviteResponse);
+  // Removes an account (or an unused invitation, or a public link), and
+  // every grant made to it.
+  rpc DeleteUser(UsernameRequest) returns (EmptyResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -831,24 +843,32 @@ message IssueInviteResponse {
   }
 }
 
-message PendingInvite {
+message UserEntry {
   string username = 1;
-  uint32 capabilities = 2;
-  uint64 created = 3;
+  // False for an invitation that nobody has used yet.
+  bool enrolled = 2;
+  AccountInfo account = 3;
 }
 
-message InviteList {
-  repeated PendingInvite invites = 1;
+message UserList {
+  repeated UserEntry users = 1;
 }
 
-message InviteListResponse {
+message UserListResponse {
   oneof result {
-    InviteList list = 1;
+    UserList list = 1;
     Error error = 2;
   }
 }
 
-message CancelInviteRequest {
+message SetCapabilitiesRequest {
+  string username = 1;
+  // `Caps` bits to turn on, and to turn off.
+  uint32 on = 2;
+  uint32 off = 3;
+}
+
+message UsernameRequest {
   string username = 1;
 }
 

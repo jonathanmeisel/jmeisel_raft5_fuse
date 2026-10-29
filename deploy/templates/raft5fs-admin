@@ -2,9 +2,9 @@
 # raft5fs-admin: filesystem administration on this node, with the
 # credentials installed here. Run as root.
 #
-#   raft5fs-admin user add <NAME> [--no-volumes] [--invite] [--links]
+#   raft5fs-admin user add <NAME> [--no-volumes] [--links] [--admin]
 #                                          an invitation to enrol with
-#   raft5fs-admin user set <NAME> [--volumes on|off] [--invite on|off] [--links on|off]
+#   raft5fs-admin user set <NAME> [--volumes on|off] [--links on|off] [--admin on|off]
 #   raft5fs-admin user del <NAME>
 #   raft5fs-admin user list
 #   raft5fs-admin snapshot create [<NAME>]

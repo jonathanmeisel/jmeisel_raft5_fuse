@@ -105,7 +105,7 @@ fn main() {
         for user in users {
             // Everything, so the app's invitations and public links can be
             // tried.
-            let code = accounts::add(&client, &user, Caps::INVITE | Caps::LINKS, Caps::NONE)
+            let code = accounts::add(&client, &user, Caps::ADMIN | Caps::LINKS, Caps::NONE)
                 .await
                 .expect("an enrolment code");
             let invite = Invite {

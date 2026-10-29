@@ -467,6 +467,15 @@ struct Source {
     sharing: NodeSharing,
 }
 
+/// The capabilities called `names`.
+fn caps_named(names: &[String]) -> Result<Caps, FsError> {
+    names.iter().try_fold(Caps::NONE, |caps, name| {
+        Caps::named(name)
+            .map(|cap| caps | cap)
+            .ok_or_else(|| FsError::new(errno::EINVAL, format!("no capability {name:?}")))
+    })
+}
+
 /// How long a volume's sharing, as `Inner::sharing` reads it, is reused.
 const SHARING_TTL_MS: f64 = 30_000.0;
 
@@ -1088,20 +1097,15 @@ impl Fs {
         })
     }
 
-    /// Invites a new user `user`, who may do what `caps` names. Returns
+    /// Invites a new user `user`, who may do what `caps` names, as an
+    /// admin. Returns
     /// `{invitation, code}`: the whole invitation, or null if the servers
     /// don't say how users reach them, and the bare code.
     #[wasm_bindgen(js_name = issueInvite)]
     pub fn issue_invite(&self, user: String, caps: Vec<String>) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
-            let mut wanted = Caps::NONE;
-            for name in &caps {
-                let cap = Caps::named(name).ok_or_else(|| {
-                    FsError::new(errno::EINVAL, format!("no capability {name:?}"))
-                })?;
-                wanted = wanted | cap;
-            }
+            let wanted = caps_named(&caps)?;
             let (code, invitation) = inner.vault().remote().issue_invite(&user, wanted).await?;
             #[derive(Serialize)]
             struct Issued {
@@ -1112,35 +1116,79 @@ impl Fs {
         })
     }
 
-    /// This account's invitations that nobody has used yet, as `[{user,
-    /// caps, created}]` (`created` in seconds since 1970).
-    #[wasm_bindgen(js_name = listInvites)]
-    pub fn list_invites(&self) -> Promise {
+    /// Every account, for an admin, as `[{user, enrolled, caps, kind,
+    /// invitedBy, owner}]`: `enrolled` is false for an invitation nobody
+    /// used yet, and `kind` is `person` or `link` (made by `owner`).
+    #[wasm_bindgen(js_name = listUsers)]
+    pub fn list_users(&self) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
             #[derive(Serialize)]
-            struct Pending {
+            #[serde(rename_all = "camelCase")]
+            struct User {
                 user: String,
+                enrolled: bool,
                 caps: Vec<&'static str>,
-                created: u64,
+                kind: &'static str,
+                invited_by: String,
+                owner: String,
             }
-            let pending = inner.vault().remote().list_invites().await?;
-            Ok(pending
+            let mut users = inner.vault().remote().list_users().await?;
+            users.sort_by(|a, b| a.user.cmp(&b.user));
+            Ok(users
                 .into_iter()
-                .map(|p| Pending {
-                    user: p.user,
-                    caps: p.caps.names(),
-                    created: p.created,
+                .map(|u| User {
+                    user: u.user,
+                    enrolled: u.enrolled,
+                    caps: u.info.caps.names(),
+                    kind: match u.info.kind {
+                        AccountKind::Person => "person",
+                        AccountKind::Link => "link",
+                    },
+                    invited_by: u.info.invited_by,
+                    owner: u.info.owner,
                 })
                 .collect::<Vec<_>>())
         })
     }
 
-    /// Withdraws this account's unused invitation of `user`.
-    #[wasm_bindgen(js_name = cancelInvite)]
-    pub fn cancel_invite(&self, user: String) -> Promise {
+    /// Turns `user`'s capabilities named in `on` on and those in `off` off,
+    /// as an admin. Gives the names they have then.
+    #[wasm_bindgen(js_name = setCapabilities)]
+    pub fn set_capabilities(&self, user: String, on: Vec<String>, off: Vec<String>) -> Promise {
         let inner = Rc::clone(&self.0);
-        promise(async move { inner.vault().remote().cancel_invite(&user).await })
+        promise(async move {
+            let info = inner
+                .vault()
+                .remote()
+                .set_capabilities(&user, caps_named(&on)?, caps_named(&off)?)
+                .await?;
+            Ok(info.caps.names())
+        })
+    }
+
+    /// A new invitation for existing user `user`, so they can enroll again,
+    /// as an admin: `{invitation, code}`, as `issueInvite` gives.
+    #[wasm_bindgen(js_name = reissueInvite)]
+    pub fn reissue_invite(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let (code, invitation) = inner.vault().remote().reissue_invite(&user).await?;
+            #[derive(Serialize)]
+            struct Issued {
+                invitation: Option<String>,
+                code: String,
+            }
+            Ok(Issued { invitation, code })
+        })
+    }
+
+    /// Removes `user` (an account, an unused invitation, or a public link),
+    /// as an admin.
+    #[wasm_bindgen(js_name = deleteUser)]
+    pub fn delete_user(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().remote().delete_user(&user).await })
     }
 
     /// Makes a public link to folder `path`, under which visitors see it

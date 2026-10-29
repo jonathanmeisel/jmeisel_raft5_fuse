@@ -99,10 +99,22 @@ async function enrol(page, user, { viaLink = false } = {}) {
 /// The account button in the header.
 const accountButton = (page) => page.getByRole("button", { name: /^Account/ });
 
-/// Chooses `item` from the account menu.
+/// Chooses `item` from the account menu. Some items show only once the
+/// account's capabilities have loaded, just after login: open it again
+/// until it's there.
 async function accountMenu(page, item) {
-  await accountButton(page).click();
-  await page.getByRole("menuitem", { name: item }).click();
+  const choice = page.getByRole("menuitem", { name: item });
+  for (let tries = 0; ; tries++) {
+    await accountButton(page).click();
+    try {
+      await choice.waitFor({ timeout: 2_000 });
+      break;
+    } catch (e) {
+      if (tries === 9) throw e;
+      await page.keyboard.press("Escape");
+    }
+  }
+  await choice.click();
 }
 
 async function login(page, user, stay = false) {
@@ -401,16 +413,31 @@ test("without a service worker, files open and download whole", async ({ browser
   expect(problems).toEqual([]);
 });
 
-test("a user invites someone, who enrolls from the link", async ({ browser }) => {
+test("an admin invites, changes, re-enrolls and removes a user", async ({ browser }) => {
   const erin = await (await browser.newContext()).newPage();
   const dave = await (await browser.newContext()).newPage();
   const problems = [erin, dave].map(watch);
+  /// dave's row in erin's Users screen.
+  const row = () => erin.getByRole("row").filter({ hasText: "dave" });
   let link;
 
-  await test.step("erin invites dave from the app", async () => {
+  /// Enrolls dave in `page` from invitation link `link`.
+  async function enrolFrom(page, link) {
+    await page.goto("about:blank");
+    await page.goto(link);
+    expect(new URL(page.url()).hash).toBe("");
+    await page.getByLabel("New password").fill(PASSWORD);
+    await page.getByLabel("Again").fill(PASSWORD);
+    await page.getByRole("button", { name: "Enroll" }).click();
+    await expect(page.getByText("Enrolled dave")).toBeVisible(SLOW);
+    await page.getByRole("button", { name: "Continue to log in" }).click();
+  }
+
+  await test.step("erin, an admin, invites dave", async () => {
     await enrol(erin, "erin");
     await login(erin, "erin");
-    await accountMenu(erin, "Invite someone");
+    await accountMenu(erin, "Users");
+    await erin.getByRole("button", { name: "Invite someone" }).click();
     // A name that is taken is refused.
     await erin.getByLabel("Their account name").fill("alice");
     await erin.getByRole("button", { name: "Invite", exact: true }).click();
@@ -419,23 +446,16 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
     await erin.getByRole("button", { name: "Invite", exact: true }).click();
     link = await erin.getByLabel("Link to enroll in this app").inputValue();
     expect(link).toMatch(/^http:\/\/localhost:4173\/#invite=raft5fs-invite/);
-    await erin.getByRole("button", { name: "Invite someone else" }).click();
-    await expect(erin.getByRole("cell", { name: "dave" })).toBeVisible();
-    await erin.getByRole("button", { name: "Cancel", exact: true }).click();
+    await erin.getByRole("button", { name: "Done" }).click();
+    await expect(row()).toContainText("invited", SLOW);
   });
 
-  await test.step("dave enrolls from the link, and can't make volumes", async () => {
-    await dave.goto(link);
-    expect(new URL(dave.url()).hash).toBe("");
-    await dave.getByLabel("New password").fill(PASSWORD);
-    await dave.getByLabel("Again").fill(PASSWORD);
-    await dave.getByRole("button", { name: "Enroll" }).click();
-    await expect(dave.getByText("Enrolled dave")).toBeVisible(SLOW);
-    await dave.getByRole("button", { name: "Continue to log in" }).click();
+  await test.step("dave enrolls, and may do nothing more", async () => {
+    await enrolFrom(dave, link);
     await login(dave, "dave");
     await accountButton(dave).click();
     await expect(dave.getByRole("menuitem", { name: "Shared with me" })).toBeVisible();
-    await expect(dave.getByRole("menuitem", { name: "Invite someone" })).toHaveCount(0);
+    await expect(dave.getByRole("menuitem", { name: "Users" })).toHaveCount(0);
     await dave.keyboard.press("Escape");
     await dave.getByText("Add New").click();
     await dave.getByText("Add new folder").click();
@@ -444,10 +464,42 @@ test("a user invites someone, who enrolls from the link", async ({ browser }) =>
     await expect(dave.getByText("You can't create top-level folders here")).toBeVisible();
   });
 
-  await test.step("the invitation is used up", async () => {
-    await accountMenu(erin, "Invite someone");
-    await expect(erin.getByLabel("Their account name")).toBeVisible();
-    await expect(erin.getByRole("cell", { name: "dave" })).toHaveCount(0);
+  await test.step("erin lets dave make folders; she can't drop her own admin", async () => {
+    await erin.getByRole("button", { name: "Close" }).click();
+    await accountMenu(erin, "Users");
+    await expect(row()).not.toContainText("invited", SLOW);
+    await row().getByRole("checkbox", { name: /top-level folders: dave/ }).check();
+    await expect(row().getByRole("checkbox", { name: /top-level folders: dave/ })).toBeChecked(SLOW);
+    const mine = erin.getByRole("row").filter({ hasText: "erin (you)" });
+    await expect(mine.getByRole("checkbox", { name: /Manage users.*: erin/ })).toBeDisabled();
+    await expect(mine.getByRole("button")).toHaveCount(0);
+    // dave picks it up at his next login.
+    await dave.reload();
+    await login(dave, "dave");
+    await addFolder(dave, "mine");
+  });
+
+  await test.step("dave enrolls again from a new invitation", async () => {
+    await row().getByRole("button", { name: "Re-enroll…" }).click();
+    await expect(erin.getByText(/enroll again\?/)).toBeVisible();
+    await erin.getByRole("button", { name: "Make an invitation" }).click();
+    const again = await erin.getByLabel("Link to enroll in this app").inputValue();
+    await erin.getByRole("button", { name: "Done" }).click();
+    await enrolFrom(dave, again);
+    await login(dave, "dave");
+    // His new key has none of what the old one had.
+    await expect(item(dave, "mine")).toHaveCount(0, SLOW);
+  });
+
+  await test.step("erin removes dave", async () => {
+    await row().getByRole("button", { name: "Remove…" }).click();
+    await erin.getByRole("button", { name: "Remove", exact: true }).click();
+    await expect(row()).toHaveCount(0, SLOW);
+    await dave.reload();
+    await dave.getByLabel("User name").fill("dave");
+    await dave.getByLabel("Password").fill(PASSWORD);
+    await dave.getByRole("button", { name: "Log in" }).click();
+    await expect(dave.getByText(/login refused/)).toBeVisible(SLOW);
   });
 
   expect(problems.flat()).toEqual([]);

@@ -274,25 +274,29 @@ written from then on, even should they get hold of the raw store,
 revoke their grants first.
 
 Capabilities decide what a user may start, beyond what is shared with
-them: `volumes` (make top-level folders), `invite` (invite new users)
-and `links` (make public links). `user add` gives `volumes` alone unless
-told otherwise (--no-volumes, --invite, --links); users added before
+them: `volumes` (make top-level folders), `links` (make public links)
+and `admin` (manage users). `user add` gives `volumes` alone unless told
+otherwise (--no-volumes, --links, --admin); users added before
 capabilities existed have `volumes`. `user set` changes them:
 
   raft5fs-server user add carol --no-volumes ... $STORE https://127.0.0.1:27051
-  raft5fs-server user set alice --invite on $STORE https://127.0.0.1:27051
+  raft5fs-server user set alice --admin on $STORE https://127.0.0.1:27051
 
-With `invite`, alice invites others herself, giving them at most what
-she may do, only under names nobody has, and at most 10 at a time:
+With `admin`, alice manages users herself, from the web app's Users
+screen or the command line:
 
-  raft5fs invite dave [--volumes] [--invite] [--links]
-  raft5fs invites                    # hers that nobody has used yet
-  raft5fs invites --cancel dave
+  raft5fs admin users
+  raft5fs admin invite dave [--volumes] [--links] [--admin]
+  raft5fs admin set dave --links on
+  raft5fs admin reenroll dave        # a new invitation: he enrolls again
+  raft5fs admin delete dave
 
-For her invitations to hold the servers' addresses and CA, as `user
-add`'s do, serve with the same --invite-server and --invite-ca options.
-Without them she gets only a code. `raft5fs whoami` shows what she may
-do.
+She can't take away her own `admin` or remove herself: another admin
+can, or `raft5fs-server user`. Re-enrolling gives the user a new key, as
+`user add` does for an existing user above. For her invitations to hold
+the servers' addresses and CA, as `user add`'s do, serve with the same
+--invite-server and --invite-ca options. Without them she gets only a
+code. `raft5fs whoami` shows what she may do.
 
 With `links`, she can make public links: read-only access to one
 directory for anyone with the URL, through the web app, without an

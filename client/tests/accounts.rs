@@ -10,7 +10,7 @@ use raft5fs_client::vault::Vault;
 use raft5fs_core::accounts;
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::invite::Invite;
-use raft5fs_proto::types::{AccountKind, Caps, FsError, MAX_PENDING_INVITES, NewNode};
+use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, credentials_with, fs_tls};
 
 #[test]
@@ -112,133 +112,10 @@ fn volumes_need_the_capability() {
         errno(rt.block_on(accounts::set_caps(
             &backend.client,
             "nobody",
-            Caps::INVITE,
+            Caps::ADMIN,
             Caps::NONE
         ))),
         libc::ENOENT
-    );
-}
-
-#[test]
-fn users_invite_new_users_only() {
-    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
-    let tester = connect(&backend, TESTER);
-
-    assert_eq!(
-        errno(rt.block_on(tester.issue_invite("dave", Caps::NONE))),
-        libc::EACCES
-    );
-    rt.block_on(accounts::set_caps(
-        &backend.client,
-        TESTER,
-        Caps::INVITE,
-        Caps::NONE,
-    ))
-    .unwrap();
-
-    // Not more than the inviter has.
-    assert_eq!(
-        errno(rt.block_on(tester.issue_invite("dave", Caps::LINKS))),
-        libc::EACCES
-    );
-    // Only new names: not an account, a pending code, or a link's name.
-    rt.block_on(accounts::issue_code(&backend.client, "erin"))
-        .unwrap();
-    for (name, expected) in [
-        (TESTER, libc::EEXIST),
-        ("erin", libc::EEXIST),
-        ("link-abc", libc::EINVAL),
-        ("Bad Name", libc::EINVAL),
-    ] {
-        assert_eq!(
-            errno(rt.block_on(tester.issue_invite(name, Caps::NONE))),
-            expected,
-            "{name}"
-        );
-    }
-
-    let (code, invitation) = rt
-        .block_on(tester.issue_invite("dave", Caps::VOLUMES))
-        .unwrap();
-    let invite =
-        Invite::decode(&invitation.expect("the test servers know their addresses")).unwrap();
-    assert_eq!(
-        (invite.user.as_str(), invite.code.as_str()),
-        ("dave", code.as_str())
-    );
-    assert_eq!(invite.servers.len(), 1);
-    assert_eq!(
-        errno(rt.block_on(tester.issue_invite("dave", Caps::NONE))),
-        libc::EEXIST
-    );
-    let pending = rt.block_on(tester.list_invites()).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(
-        (pending[0].user.as_str(), pending[0].caps),
-        ("dave", Caps::VOLUMES)
-    );
-
-    enrol_with(&backend, "dave", &code);
-    assert!(rt.block_on(tester.list_invites()).unwrap().is_empty());
-    let dave = connect(&backend, "dave");
-    let info = rt.block_on(dave.account()).unwrap();
-    assert_eq!(
-        (info.caps, info.invited_by.as_str()),
-        (Caps::VOLUMES, TESTER)
-    );
-    // Dave can't invite, and can't cancel what isn't his.
-    assert_eq!(
-        errno(rt.block_on(dave.issue_invite("fay", Caps::NONE))),
-        libc::EACCES
-    );
-
-    // At most so many waiting at once; cancelling makes room.
-    for i in 0..MAX_PENDING_INVITES {
-        rt.block_on(tester.issue_invite(&format!("u{i}"), Caps::NONE))
-            .unwrap();
-    }
-    assert_eq!(
-        errno(rt.block_on(tester.issue_invite("one-more", Caps::NONE))),
-        libc::EDQUOT
-    );
-    assert_eq!(errno(rt.block_on(dave.cancel_invite("u0"))), libc::ENOENT);
-    // An enrolled account is no invitation to cancel.
-    assert_eq!(
-        errno(rt.block_on(tester.cancel_invite("dave"))),
-        libc::ENOENT
-    );
-    rt.block_on(tester.cancel_invite("u0")).unwrap();
-    rt.block_on(tester.issue_invite("one-more", Caps::NONE))
-        .unwrap();
-    // A cancelled name is free again, and its code is gone.
-    assert_eq!(
-        errno(rt.block_on(Remote::enrol(
-            &backend.addresses(),
-            Some(fs_tls()),
-            credentials("u0"),
-            "wrong",
-            KdfParams::TESTING,
-        ))),
-        libc::EACCES
-    );
-
-    // The administrator's listing knows who invited whom; removing an
-    // account removes its record.
-    let listed = rt.block_on(accounts::list(&backend.client)).unwrap();
-    let dave_row = listed.iter().find(|r| r.name == "dave").unwrap();
-    assert!(dave_row.enrolled);
-    assert_eq!(dave_row.info.invited_by, TESTER);
-    assert!(!listed.iter().any(|r| r.name == "u0"));
-    assert!(
-        rt.block_on(accounts::remove(&backend.client, "dave"))
-            .unwrap()
-    );
-    assert_eq!(
-        rt.block_on(accounts::info(&backend.client, "dave"))
-            .unwrap()
-            .invited_by,
-        ""
     );
 }
 
@@ -261,6 +138,119 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+#[test]
+fn admins_manage_users_and_nobody_else_can() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = connect(&backend, TESTER);
+
+    // Without `admin`, none of it.
+    assert_eq!(
+        errno(rt.block_on(tester.issue_invite("dave", Caps::NONE))),
+        libc::EACCES
+    );
+    assert_eq!(errno(rt.block_on(tester.list_users())), libc::EACCES);
+    assert_eq!(
+        errno(rt.block_on(tester.set_capabilities(TESTER, Caps::ADMIN, Caps::NONE))),
+        libc::EACCES
+    );
+    assert_eq!(
+        errno(rt.block_on(tester.reissue_invite(TESTER))),
+        libc::EACCES
+    );
+    assert_eq!(errno(rt.block_on(tester.delete_user("x"))), libc::EACCES);
+    rt.block_on(accounts::set_caps(
+        &backend.client,
+        TESTER,
+        Caps::ADMIN,
+        Caps::NONE,
+    ))
+    .unwrap();
+
+    // Invitations: new names only, with any capabilities, admin included.
+    rt.block_on(accounts::issue_code(&backend.client, "erin"))
+        .unwrap();
+    for (name, expected) in [
+        (TESTER, libc::EEXIST),
+        ("erin", libc::EEXIST),
+        ("link-abc", libc::EINVAL),
+        ("Bad Name", libc::EINVAL),
+    ] {
+        assert_eq!(
+            errno(rt.block_on(tester.issue_invite(name, Caps::NONE))),
+            expected,
+            "{name}"
+        );
+    }
+    let (code, invitation) = rt
+        .block_on(tester.issue_invite("dave", Caps::VOLUMES | Caps::ADMIN))
+        .unwrap();
+    let invite =
+        Invite::decode(&invitation.expect("the test servers know their addresses")).unwrap();
+    assert_eq!(
+        (invite.user.as_str(), invite.code.as_str()),
+        ("dave", code.as_str())
+    );
+    let listed = rt.block_on(tester.list_users()).unwrap();
+    let dave_row = listed.iter().find(|u| u.user == "dave").unwrap();
+    assert!(!dave_row.enrolled);
+    assert_eq!(dave_row.info.invited_by, TESTER);
+    let dave_key = enrol_with(&backend, "dave", &code);
+    let dave = connect(&backend, "dave");
+    assert_eq!(
+        rt.block_on(dave.account()).unwrap().caps,
+        Caps::VOLUMES | Caps::ADMIN
+    );
+
+    // Capabilities, for anyone but one's own admin.
+    let info = rt
+        .block_on(tester.set_capabilities("dave", Caps::LINKS, Caps::ADMIN))
+        .unwrap();
+    assert_eq!(info.caps, Caps::VOLUMES | Caps::LINKS);
+    assert_eq!(
+        errno(rt.block_on(dave.issue_invite("fay", Caps::NONE))),
+        libc::EACCES,
+        "no longer an admin"
+    );
+    assert_eq!(
+        errno(rt.block_on(tester.set_capabilities(TESTER, Caps::NONE, Caps::ADMIN))),
+        libc::EPERM
+    );
+    rt.block_on(tester.set_capabilities(TESTER, Caps::LINKS, Caps::NONE))
+        .unwrap();
+    assert_eq!(
+        errno(rt.block_on(tester.set_capabilities("nobody", Caps::LINKS, Caps::NONE))),
+        libc::ENOENT
+    );
+
+    // Enrolling again: a new code, which gives dave a new key.
+    let (code, _) = rt.block_on(tester.reissue_invite("dave")).unwrap();
+    let new_key = enrol_with(&backend, "dave", &code);
+    assert_ne!(new_key, dave_key);
+    assert_eq!(
+        errno(rt.block_on(tester.reissue_invite("nobody"))),
+        libc::ENOENT
+    );
+
+    // Removing: anyone but oneself, invitations too.
+    assert_eq!(errno(rt.block_on(tester.delete_user(TESTER))), libc::EPERM);
+    rt.block_on(tester.delete_user("erin")).unwrap();
+    rt.block_on(tester.delete_user("dave")).unwrap();
+    assert!(
+        rt.block_on(accounts::get(&backend.client, "dave"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(errno(rt.block_on(tester.delete_user("dave"))), libc::ENOENT);
+    let left: Vec<String> = rt
+        .block_on(tester.list_users())
+        .unwrap()
+        .into_iter()
+        .map(|u| u.user)
+        .collect();
+    assert_eq!(left, [TESTER]);
 }
 
 #[test]
