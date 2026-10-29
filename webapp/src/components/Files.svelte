@@ -360,12 +360,24 @@
   ]);
 
   /// Closes a dialog that may have changed what is shared, and lists
-  /// again the folder that shows it, so its mark is right.
-  function closeSharing() {
+  /// again the folder that shows it, so its mark is right. Listing a folder
+  /// makes SVAR forget what was in the folders inside it, so the folders on
+  /// the way down to the open one are listed again too.
+  async function closeSharing() {
     const path = dialog?.path;
     dialog = null;
     const state = api?.getState();
-    reload(path ? parentOf(path) : (state?.panels[state.activePanel]?.path ?? "/"));
+    const open = state?.panels[state.activePanel]?.path ?? current;
+    const top = path ? parentOf(path) : open;
+    await reload(top);
+    const inside = top === "/" ? "/" : top + "/";
+    if (open !== top && open.startsWith(inside)) {
+      let folder = top;
+      for (const name of open.slice(inside.length).split("/").filter(Boolean)) {
+        folder = join(folder, name);
+        await reload(folder);
+      }
+    }
     showSharing(current);
   }
 

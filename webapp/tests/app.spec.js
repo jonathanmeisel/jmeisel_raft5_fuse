@@ -325,6 +325,10 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     const bar = alice.locator(".sharing-bar");
     await expect(bar).toHaveText(/^\s*Shared with bob\.\s*Details\s*$/, SLOW);
     await addFolder(alice, "sub");
+    // Closing the details leaves the open folder as it was.
+    await bar.getByRole("button", { name: "Details" }).click();
+    await alice.getByRole("button", { name: "Close" }).click();
+    await expect(item(alice, "sub")).toBeVisible(SLOW);
     await open(alice, "sub");
     await expect(bar).toContainText("Shared with bob through docs", SLOW);
     await bar.getByRole("button", { name: "Details" }).click();
