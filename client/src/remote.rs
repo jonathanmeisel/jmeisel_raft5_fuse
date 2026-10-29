@@ -60,7 +60,6 @@ use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
-use raft5fs_proto::pb::CreateLinkAccountRequest;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, CancelInviteRequest, ChangePasswordRequest, CreateRequest,
@@ -69,6 +68,7 @@ use raft5fs_proto::pb::{
     PrepareUploadsRequest, PruneKeysRequest, PublicKeyRequest, ReadChunksRequest, RenameRequest,
     ResealChunksRequest, ResealNamesRequest, RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
+use raft5fs_proto::pb::{CreateLinkAccountRequest, PutPinsRequest};
 use raft5fs_proto::types::LinkAccount;
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -1269,6 +1269,36 @@ impl Remote {
         .await?
         .into_result()?;
         Ok(identity.public_key())
+    }
+
+    /// This account's sealed trusted keys and their version (see
+    /// `Vault::sync_pins`): 0 and nothing if there are none yet.
+    pub async fn get_pins(&self) -> Result<(u64, Vec<u8>), FsError> {
+        self.needs_protocol(3, "trusted keys on the servers")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.get_pins(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Replaces them if they are still at `expected`; returns the new
+    /// version. `EAGAIN` if another device changed them meanwhile, and also
+    /// for a resend after it was stored: either way, read them again.
+    pub async fn put_pins(&self, expected: u64, sealed: Vec<u8>) -> Result<u64, FsError> {
+        self.needs_protocol(3, "trusted keys on the servers")?;
+        let req = PutPinsRequest {
+            expected_version: expected,
+            sealed,
+        };
+        Ok(self
+            .call(Retry::Idempotent, |mut c| {
+                let req = req.clone();
+                async move { c.put_pins(req).await }
+            })
+            .await?
+            .into_result()?
+            .0)
     }
 
     /// The public links that this account made.

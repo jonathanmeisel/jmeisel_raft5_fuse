@@ -174,6 +174,15 @@ service Fs {
   rpc CreateLinkAccount(CreateLinkAccountRequest) returns (EmptyResponse);
   // The public links the caller made.
   rpc ListLinks(NoArgs) returns (LinkListResponse);
+
+  // The caller's trusted keys (protocol 3 on), sealed to their own key
+  // pair so the server can't read or change them (raft5fs-crypto's
+  // `pins`), so that all their devices trust the same keys. A version
+  // number goes up with each change: 0 for none yet.
+  rpc GetPins(NoArgs) returns (PinsResponse);
+  // Replaces them, if they are still at `expected_version`; EAGAIN if not.
+  // The answer has the new version, and no `sealed`.
+  rpc PutPins(PutPinsRequest) returns (PinsResponse);
 }
 
 message NoArgs {}
@@ -751,6 +760,23 @@ message AccountInfo {
   // their key.
   uint64 folder = 7;
   bytes note = 8;
+}
+
+message Pins {
+  uint64 version = 1;
+  bytes sealed = 2;
+}
+
+message PinsResponse {
+  oneof result {
+    Pins pins = 1;
+    Error error = 2;
+  }
+}
+
+message PutPinsRequest {
+  uint64 expected_version = 1;
+  bytes sealed = 2;
 }
 
 message CreateLinkAccountRequest {

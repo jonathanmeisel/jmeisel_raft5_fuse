@@ -505,6 +505,30 @@ impl pb::LinkListResponse {
     }
 }
 
+impl From<Result<(u64, Vec<u8>), FsError>> for pb::PinsResponse {
+    fn from(r: Result<(u64, Vec<u8>), FsError>) -> Self {
+        use pb::pins_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok((version, sealed)) => R::Pins(pb::Pins { version, sealed }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::PinsResponse {
+    /// The version, and the sealed trusted keys.
+    pub fn into_result(self) -> Result<(u64, Vec<u8>), FsError> {
+        use pb::pins_response::Result as R;
+        match self.result {
+            Some(R::Pins(p)) => Ok((p.version, p.sealed)),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("trusted keys")),
+        }
+    }
+}
+
 impl From<Result<pb::IssuedInvite, FsError>> for pb::IssueInviteResponse {
     fn from(r: Result<pb::IssuedInvite, FsError>) -> Self {
         use pb::issue_invite_response::Result as R;

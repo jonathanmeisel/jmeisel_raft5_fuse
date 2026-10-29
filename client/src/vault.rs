@@ -47,6 +47,7 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
+use raft5fs_crypto::pins::{PinEntry, open_pins, seal_pins};
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
@@ -361,6 +362,31 @@ impl KnownKeys {
     /// Removes `user`'s pinned key, so the vault trusts the next key it
     /// sees for them.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
+        self.rewrite(user, None)
+    }
+
+    /// Pins `key` for `user`, in place of any key pinned before. Only for
+    /// a key this account checked: `sync_pins` uses it for what its other
+    /// devices trust.
+    pub(crate) fn set(&self, user: &str, key: &[u8; PUBLIC_KEY_LEN]) -> std::io::Result<()> {
+        self.rewrite(user, Some(key))
+    }
+
+    /// Every pinned key, including those that another process pinned in
+    /// the store since this one loaded it.
+    pub(crate) fn all(&self) -> HashMap<String, [u8; PUBLIC_KEY_LEN]> {
+        let mut keys = self.keys.lock().unwrap();
+        if let Ok(stored) = read_pins(self.store.as_ref(), &self.name) {
+            for (other, key) in stored {
+                keys.entry(other).or_insert(key);
+            }
+        }
+        keys.clone()
+    }
+
+    /// Sets (`Some`) or removes (`None`) `user`'s pin, and writes the whole
+    /// blob again.
+    fn rewrite(&self, user: &str, key: Option<&[u8; PUBLIC_KEY_LEN]>) -> std::io::Result<()> {
         check_username(user).map_err(|e| std::io::Error::other(e.message))?;
         let mut keys = self.keys.lock().unwrap();
         crate::store::locked(self.store.as_ref(), &self.lock_name(), || {
@@ -370,7 +396,10 @@ impl KnownKeys {
                     keys.entry(other).or_insert(key);
                 }
             }
-            keys.remove(user);
+            match key {
+                Some(key) => keys.insert(user.to_string(), *key),
+                None => keys.remove(user),
+            };
             let mut users: Vec<_> = keys.iter().collect();
             users.sort();
             let text: String = users
@@ -492,6 +521,9 @@ pub struct Vault {
     remote: Arc<Remote>,
     identity: Arc<Identity>,
     known: KnownKeys,
+    /// This device's pins as of its last merge with the account's copy on
+    /// the servers (`sync_pins`); `None` before the first.
+    pins_synced: Mutex<Option<HashMap<String, [u8; PUBLIC_KEY_LEN]>>>,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
     /// The newest key version seen for each inode in this session. Clearing
     /// `nodes` does not clear it. It stops the server from returning an
@@ -533,6 +565,7 @@ impl Vault {
             remote,
             identity,
             known: KnownKeys::in_memory(),
+            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
@@ -562,6 +595,7 @@ impl Vault {
             remote: Arc::new(self.remote.at(name)),
             identity: Arc::clone(&self.identity),
             known: KnownKeys::in_memory(),
+            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             senders: Mutex::new(HashMap::new()),
@@ -585,7 +619,130 @@ impl Vault {
     /// Pins public keys in `known`, not only in memory.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.known = known;
+        self.pins_synced = Mutex::new(None);
         self
+    }
+
+    /// Merges this device's trusted keys with the account's copy on the
+    /// servers, so that all its devices trust the same keys:
+    ///
+    /// - What changed here since the last merge (a key trusted, replaced or
+    ///   forgotten) goes to the servers, unless another device changed the
+    ///   same user later.
+    /// - On the first merge, keys trusted only here go to the servers too.
+    ///   Where the two differ, the servers' copy wins: it is the latest
+    ///   that one of the account's devices checked.
+    /// - Then this device trusts what the merged list says.
+    ///
+    /// The servers can't read or change the list (raft5fs-crypto's
+    /// `pins`). Does nothing on servers older than protocol 3.
+    pub async fn sync_pins(&self) -> Result<(), FsError> {
+        if self.remote.protocol() < 3 {
+            return Ok(());
+        }
+        let me = self.remote.username().to_string();
+        let local = self.known.all();
+        let base = self.pins_synced.lock().unwrap().clone();
+        let now = raft5fs_proto::clock::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let changes: Vec<PinEntry> = match &base {
+            None => Vec::new(),
+            Some(base) => base
+                .keys()
+                .chain(local.keys())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter(|user| base.get(*user) != local.get(*user))
+                .map(|user| PinEntry {
+                    user: user.clone(),
+                    key: local.get(user).copied(),
+                    at: now,
+                })
+                .collect(),
+        };
+        for _ in 0..CHANGE_RETRIES {
+            let (version, sealed) = self.remote.get_pins().await?;
+            let stored = if sealed.is_empty() {
+                Vec::new()
+            } else {
+                open_pins(&self.identity, &me, &sealed)
+                    .map_err(|e| FsError::new(errno::EIO, format!("the servers' copy: {e}")))?
+            };
+            let before: BTreeMap<String, PinEntry> =
+                stored.into_iter().map(|e| (e.user.clone(), e)).collect();
+            let mut merged = before.clone();
+            for change in &changes {
+                if merged.get(&change.user).is_none_or(|e| e.at <= change.at) {
+                    merged.insert(change.user.clone(), change.clone());
+                }
+            }
+            if base.is_none() {
+                for (user, key) in &local {
+                    merged.entry(user.clone()).or_insert_with(|| PinEntry {
+                        user: user.clone(),
+                        key: Some(*key),
+                        at: now,
+                    });
+                }
+            }
+            if merged != before {
+                let entries: Vec<PinEntry> = merged.values().cloned().collect();
+                match self
+                    .remote
+                    .put_pins(version, seal_pins(&self.identity, &me, &entries))
+                    .await
+                {
+                    // Another device changed them: merge with theirs.
+                    Err(e) if changed(&e) => continue,
+                    other => other?,
+                };
+            }
+            let io = |e: std::io::Error| FsError::new(errno::EIO, format!("trusted keys: {e}"));
+            let mut changed_here = false;
+            for entry in merged.values() {
+                match &entry.key {
+                    Some(key) if local.get(&entry.user) != Some(key) => {
+                        self.known.set(&entry.user, key).map_err(io)?;
+                        changed_here = true;
+                    }
+                    None if local.contains_key(&entry.user) => {
+                        self.known.forget(&entry.user).map_err(io)?;
+                        changed_here = true;
+                    }
+                    _ => {}
+                }
+            }
+            *self.pins_synced.lock().unwrap() = Some(self.known.all());
+            // Grants from users trusted now open as trusted.
+            if changed_here {
+                self.forget_all();
+            }
+            return Ok(());
+        }
+        Err(FsError::new(
+            errno::EAGAIN,
+            "the trusted keys kept changing on the servers",
+        ))
+    }
+
+    /// `sync_pins` after a change here. A failure is no loss: the change
+    /// stays here, and the next merge sends it.
+    async fn share_pins(&self) {
+        if let Err(e) = self.sync_pins().await {
+            eprintln!("trusted keys not merged with the servers' copy yet: {e}");
+        }
+    }
+
+    /// Forgets `user`'s pinned key, here and on the account's other
+    /// devices.
+    pub async fn forget_key(&self, user: &str) -> Result<(), FsError> {
+        self.known
+            .forget(user)
+            .map_err(|e| FsError::new(errno::EIO, format!("cannot forget {user}'s key: {e}")))?;
+        self.share_pins().await;
+        Ok(())
     }
 
     pub fn known_keys(&self) -> &KnownKeys {
@@ -1609,7 +1766,12 @@ impl Vault {
                 // Another client changed the grants at the same time. Start
                 // again from their list.
                 Err(e) if changed(&e) => {}
-                other => return other.map(|()| public_key),
+                other => {
+                    other?;
+                    // A first grant to `user` pinned their key.
+                    self.share_pins().await;
+                    return Ok(public_key);
+                }
             }
         }
         Err(FsError::new(
@@ -1684,6 +1846,7 @@ impl Vault {
         // Grants from this user were opened as untrusted before, so open
         // them again.
         self.forget_all();
+        self.share_pins().await;
         Ok(key)
     }
 
@@ -1702,6 +1865,7 @@ impl Vault {
         })?;
         let key = self.known.check(user, &served)?;
         self.forget_all();
+        self.share_pins().await;
         Ok(key)
     }
 

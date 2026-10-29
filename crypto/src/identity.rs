@@ -46,6 +46,17 @@ impl Identity {
         self.secret.public_key().to_bytes()
     }
 
+    /// A key for `purpose` that only this key pair gives, for what the
+    /// account keeps sealed to itself (see `pins`).
+    pub(crate) fn derive_key(&self, purpose: &str) -> Key {
+        let secret = zeroize::Zeroizing::new(self.secret.to_bytes());
+        let hkdf = hkdf::Hkdf::<Sha256>::new(None, secret.as_ref());
+        let mut key = [0; KEY_LEN];
+        hkdf.expand(format!("raft5fs/{purpose}").as_bytes(), &mut key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        Key::from_bytes(key)
+    }
+
     /// Seals the private key under `kek`, for the server to keep. The
     /// result is bound to `user`, so the server cannot give one account's
     /// private key to another account.

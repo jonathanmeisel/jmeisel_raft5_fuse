@@ -12,6 +12,11 @@
 //!   `webapp/config/local`).
 //! - `--user`: a user to invite (default `alice` and `bob`).
 //!
+//! The port after the object store's answers `GET /reissue/<user>` with a
+//! new invitation for an existing user, as `raft5fs-server user add` would
+//! give an administrator: for tests where someone enrolls again. Only on
+//! this machine, and only here.
+//!
 //! It prints `ready` once everything serves, then serves until killed.
 //! Nothing is kept: each run is a new, empty filesystem.
 
@@ -27,6 +32,7 @@ use raft5fs_proto::types::Caps;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{FsService, InviteSettings, WebPort, parse_origin, serve, serve_web};
 use raft5fs_testkit::{TEST_BUCKET, TOKEN_KEY, TestCluster, fs_ca_der, object_settings};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 /// The production default, so files cross into object storage at 2 MiB
@@ -128,7 +134,47 @@ fn main() {
             format!("{{\n{}\n}}\n", invites.join(",\n")),
         )
         .expect("invites.json");
+        let admin = TcpListener::bind(("127.0.0.1", port + 3))
+            .await
+            .expect("the reissue port");
+        tokio::spawn(reissue(admin, client.clone(), native_address.clone(), ca.clone()));
         println!("ready");
         std::future::pending::<()>().await;
     });
+}
+
+/// Answers `GET /reissue/<user>` with a new invitation for `user`, whose
+/// code replaces any earlier one (see the top of this file).
+async fn reissue(listener: TcpListener, client: raft5_client::Client, server: String, ca: Vec<u8>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            continue;
+        };
+        let mut request = vec![0; 1024];
+        let n = socket.read(&mut request).await.unwrap_or(0);
+        let request = String::from_utf8_lossy(&request[..n]);
+        let user = request
+            .strip_prefix("GET /reissue/")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("");
+        let (status, body) = match accounts::issue_code(&client, user).await {
+            Ok(code) => (
+                "200 OK",
+                Invite {
+                    user: user.to_string(),
+                    code,
+                    servers: vec![server.clone()],
+                    tls_server_name: None,
+                    ca: ca.clone(),
+                }
+                .encode(),
+            ),
+            Err(e) => ("400 Bad Request", e.to_string()),
+        };
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(reply.as_bytes()).await;
+    }
 }

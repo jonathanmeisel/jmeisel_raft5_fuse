@@ -465,3 +465,69 @@ fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
     rt.block_on(tester.grant(docs, "bob", true, OsStr::new("docs")))
         .unwrap();
 }
+
+#[test]
+fn trusted_keys_follow_the_account_to_its_other_devices() {
+    use raft5fs_crypto::identity::fingerprint_words;
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let carol = backend.enrol("carol");
+    let erin = backend.enrol("erin");
+    // Two devices of one account, each with its own pins.
+    let a = vault(&backend, TESTER);
+    let b = vault(&backend, TESTER);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(b.sync_pins()).unwrap();
+
+    // What one device trusts, the other trusts after its next merge.
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    rt.block_on(b.sync_pins()).unwrap();
+    assert_eq!(b.known_keys().pinned("bob"), Some(bob));
+
+    // A device's first merge sends what only it trusted, and where it
+    // disagrees, takes the servers' copy.
+    let c = vault(&backend, TESTER);
+    c.known_keys().check("bob", &[9; 32]).unwrap();
+    c.known_keys().check("erin", &erin).unwrap();
+    rt.block_on(c.sync_pins()).unwrap();
+    assert_eq!(c.known_keys().pinned("bob"), Some(bob));
+    rt.block_on(a.sync_pins()).unwrap();
+    assert_eq!(a.known_keys().pinned("erin"), Some(erin));
+
+    // Changes on two devices at once both survive: b forgets bob (not yet
+    // merged) while a trusts carol.
+    b.known_keys().forget("bob").unwrap();
+    rt.block_on(a.trust("carol", &fingerprint_words(&carol)))
+        .unwrap();
+    rt.block_on(b.sync_pins()).unwrap();
+    assert_eq!(b.known_keys().pinned("bob"), None);
+    assert_eq!(b.known_keys().pinned("carol"), Some(carol));
+    rt.block_on(a.sync_pins()).unwrap();
+    assert_eq!(
+        a.known_keys().pinned("bob"),
+        None,
+        "a forgotten key stays forgotten"
+    );
+
+    // The servers keep only what they were given, sealed, and refuse a
+    // write over a newer version.
+    let (version, sealed) = rt.block_on(a.remote().get_pins()).unwrap();
+    assert!(version > 0);
+    assert_eq!(
+        errno(rt.block_on(a.remote().put_pins(version - 1, sealed))),
+        libc::EAGAIN
+    );
+
+    // Enrolling again drops them: they were sealed to the old key pair.
+    let code = rt
+        .block_on(accounts::issue_code(&backend.client, TESTER))
+        .unwrap();
+    enrol_with(&backend, TESTER, &code);
+    assert_eq!(
+        rt.block_on(accounts::pins(&backend.client, TESTER))
+            .unwrap(),
+        (0, Vec::new())
+    );
+}

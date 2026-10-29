@@ -206,9 +206,12 @@ pub fn trust(connect: &ConnectArgs, args: TrustArgs) -> Outcome {
 }
 
 pub fn forget_key(connect: &ConnectArgs, args: UserArg) -> Outcome {
-    let ctx = Context::resolve(&connect.overrides(), false)?;
-    ctx.known_keys()?
-        .forget(&args.who)
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    // Logged in, so the account's other devices forget it too.
+    let vault = log_in(&runtime, &ctx)?;
+    runtime
+        .block_on(vault.forget_key(&args.who))
         .map_err(|e| format!("cannot forget {}'s key: {e}", args.who))?;
     println!("forgot {}'s pinned key", args.who);
     Ok(0)

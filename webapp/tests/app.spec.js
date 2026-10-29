@@ -13,6 +13,8 @@ const localFsId = () =>
   JSON.parse(readFileSync(new URL("../config/local/config.json", import.meta.url)))
     .filesystems.find((f) => f.name === "local").fsId;
 const SLOW = { timeout: 60_000 };
+/// web_dev's port for new invitations: three after its native port.
+const REISSUE = "http://127.0.0.1:27163";
 /// A 1x1 PNG.
 const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url));
 const WEBM = fixture("clip.webm");
@@ -533,37 +535,46 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
   expect(problems.flat()).toEqual([]);
 });
 
-/// Makes the key that `page`'s browser has pinned for `user` a wrong one,
-/// as if `user` had enrolled again since. Run it logged out: the Worker
-/// reads the pins at login.
-async function stalePin(page, me, user) {
-  await page.evaluate(
-    async ([me, user]) => {
-      const db = await new Promise((resolve, reject) => {
-        const request = indexedDB.open("raft5fs", 2);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-      });
-      const ask = (request) =>
-        new Promise((resolve, reject) => {
-          request.onsuccess = () => resolve(request.result);
-          request.onerror = () => reject(request.error);
-        });
-      const blobs = db.transaction("blobs", "readwrite").objectStore("blobs");
-      const name = (await ask(blobs.getAllKeys())).find((k) => k.endsWith(`/${me}/known_keys`));
-      const text = new TextDecoder().decode(await ask(blobs.get(name)));
-      const changed = text.replace(new RegExp(`^${user} .*$`, "m"), `${user} ${"00".repeat(32)}`);
-      await ask(blobs.put(new TextEncoder().encode(changed).buffer, name));
-    },
-    [me, user],
-  );
+/// A new invitation for `user`, who enrolled before: what an administrator
+/// gives someone who forgot their password (web_dev's reissue port).
+async function reissue(user) {
+  const reply = await fetch(`${REISSUE}/reissue/${user}`);
+  expect(reply.ok).toBe(true);
+  return reply.text();
 }
 
-test("a changed key is trusted again only by its new fingerprint", async ({ browser }) => {
+/// Enrolls `user` again with `invitation`, from the page they are logged
+/// in on, and gives their new fingerprint's words.
+async function enrolAgain(page, user, invitation) {
+  await accountMenu(page, "Log out");
+  await visit(page, `#invite=${encodeURIComponent(invitation)}`);
+  await page.getByLabel("New password").fill(PASSWORD);
+  await page.getByLabel("Again").fill(PASSWORD);
+  await page.getByRole("button", { name: "Enroll" }).click();
+  await expect(page.getByText(`Enrolled ${user}`)).toBeVisible(SLOW);
+  const words = (await page.locator(".words").innerText()).trim();
+  await page.getByRole("button", { name: "Continue to log in" }).click();
+  await login(page, user);
+  return words;
+}
+
+test("trusted keys follow an account, and a changed key needs its new fingerprint", async ({ browser }) => {
   const hank = await (await browser.newContext()).newPage();
   const iris = await (await browser.newContext()).newPage();
   const problems = [hank, iris].map(watch);
   let hankWords, irisWords;
+
+  async function share(page, folder, user, words) {
+    await menu(page, folder, "Share…");
+    await page.getByLabel("User", { exact: true }).fill(user);
+    await page.getByRole("button", { name: "Share", exact: true }).click();
+    if (words) {
+      await page.getByLabel(`${user}'s fingerprint`).fill(words);
+      await page.getByRole("button", { name: "Share", exact: true }).click();
+    }
+    await expect(page.getByText(new RegExp(`Shared with ${user}`))).toBeVisible(SLOW);
+    await page.getByRole("button", { name: "Done" }).click();
+  }
 
   await test.step("hank shares with iris, who trusts him", async () => {
     hankWords = await enrol(hank, "hank");
@@ -571,12 +582,7 @@ test("a changed key is trusted again only by its new fingerprint", async ({ brow
     await login(hank, "hank");
     await login(iris, "iris");
     await addFolder(hank, "team");
-    await menu(hank, "team", "Share…");
-    await hank.getByLabel("User", { exact: true }).fill("iris");
-    await hank.getByRole("button", { name: "Share", exact: true }).click();
-    await hank.getByLabel("iris's fingerprint").fill(irisWords);
-    await hank.getByRole("button", { name: "Share", exact: true }).click();
-    await hank.getByRole("button", { name: "Done" }).click();
+    await share(hank, "team", "iris", irisWords);
     await iris.reload();
     await login(iris, "iris");
     await iris.getByRole("button", { name: "Review" }).click();
@@ -587,35 +593,56 @@ test("a changed key is trusted again only by its new fingerprint", async ({ brow
     await iris.getByRole("button", { name: "Close" }).click();
   });
 
-  await test.step("hank shares again after iris's key changed", async () => {
-    await accountMenu(hank, "Log out");
-    await stalePin(hank, "hank", "iris");
+  await test.step("hank's other browser already trusts iris", async () => {
+    const other = await (await browser.newContext()).newPage();
+    problems.push(watch(other));
+    await other.goto("/");
+    // A browser that never enrolled offers the first filesystem.
+    await other.getByLabel("Filesystem").selectOption(localFsId());
+    await login(other, "hank");
+    await addFolder(other, "notes");
+    // No fingerprint asked for: the servers' copy of hank's trusted keys.
+    await share(other, "notes", "iris", null);
+    await other.close();
+  });
+
+  await test.step("iris enrolls again; hank shares only by her new fingerprint", async () => {
+    const newIris = await enrolAgain(iris, "iris", await reissue("iris"));
+    await hank.reload();
     await login(hank, "hank");
     await menu(hank, "team", "Share…");
     await hank.getByLabel("User", { exact: true }).fill("iris");
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/iris's key has changed/)).toBeVisible(SLOW);
-    // The wrong fingerprint leaves the old key in place.
-    await hank.getByLabel("iris's fingerprint").fill(hankWords);
+    // Her old fingerprint doesn't match her new key.
+    await hank.getByLabel("iris's fingerprint").fill(irisWords);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/not the one given/)).toBeVisible(SLOW);
-    await hank.getByLabel("iris's fingerprint").fill(irisWords);
+    await hank.getByLabel("iris's fingerprint").fill(newIris);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/Shared with iris/)).toBeVisible(SLOW);
     await hank.getByRole("button", { name: "Done" }).click();
+    irisWords = newIris;
   });
 
-  await test.step("iris trusts hank again after his key changed", async () => {
-    await accountMenu(iris, "Log out");
-    await stalePin(iris, "iris", "hank");
+  await test.step("hank enrolls again; iris trusts him only by his new fingerprint", async () => {
+    const newHank = await enrolAgain(hank, "hank", await reissue("hank"));
+    await addFolder(hank, "fresh");
+    // This browser still trusts iris's new key, and tells the servers.
+    await share(hank, "fresh", "iris", null);
+    await iris.reload();
     await login(iris, "iris");
     await iris.getByRole("button", { name: "Review" }).click();
     await expect(iris.getByText(/hank's key has changed/)).toBeVisible(SLOW);
     await iris.getByRole("button", { name: "Check new fingerprint…" }).click();
     await iris.getByLabel("fingerprint").fill(hankWords);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await expect(iris.getByText(/not the one given/)).toBeVisible(SLOW);
+    await iris.getByLabel("fingerprint").fill(newHank);
+    await iris.getByRole("button", { name: "Trust", exact: true }).click();
+    await expect(iris.getByRole("button", { name: "Check new fingerprint…" })).toHaveCount(0, SLOW);
     await iris.getByRole("button", { name: "Close" }).click();
+    await expect(item(iris, "fresh")).toBeVisible(SLOW);
   });
 
   expect(problems.flat()).toEqual([]);

@@ -36,7 +36,7 @@ use raft5fs_crypto::password::{
 };
 
 use crate::fs::{TXN_TTL, retrying};
-use crate::layout::{ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX};
+use crate::layout::{ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX, PINS_PREFIX};
 use crate::timing::next_key;
 use crate::view::ReadKeys;
 use raft5fs_proto::types::{
@@ -65,6 +65,70 @@ fn code_key(user: &str) -> Vec<u8> {
     let mut key = ENROLMENT_PREFIX.to_vec();
     key.extend_from_slice(user.as_bytes());
     key
+}
+
+fn pins_key(user: &str) -> Vec<u8> {
+    let mut key = PINS_PREFIX.to_vec();
+    key.extend_from_slice(user.as_bytes());
+    key
+}
+
+/// The most that an account's sealed trusted keys may take: some thousands
+/// of users.
+pub const MAX_PINS_BYTES: usize = 256 * 1024;
+
+/// `user`'s sealed trusted keys and their version: 0 and nothing if they
+/// have none. The servers keep them only to give back; they can't open
+/// them (raft5fs-crypto's `pins`).
+pub async fn pins(client: &Client, user: &str) -> Result<(u64, Vec<u8>), FsError> {
+    Ok(match client.read_one(&pins_key(user)).await?.value {
+        Some(stored) => decode_pins(user, &stored)?,
+        None => (0, Vec::new()),
+    })
+}
+
+/// Replaces `user`'s sealed trusted keys with `sealed` if they are still at
+/// `expected`, the version that the caller read. Returns the new version.
+/// `EAGAIN` if another device changed them since: read, merge, try again.
+pub async fn put_pins(
+    client: &Client,
+    user: &str,
+    expected: u64,
+    sealed: &[u8],
+) -> Result<u64, FsError> {
+    if sealed.len() > MAX_PINS_BYTES {
+        return Err(FsError::new(libc::EINVAL, "too many trusted keys"));
+    }
+    retrying(|| async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        let current = match txn.read_one(&pins_key(user)).await?.value {
+            Some(stored) => decide!(decode_pins(user, &stored)).0,
+            None => 0,
+        };
+        if current != expected {
+            return Ok(Err(FsError::new(
+                libc::EAGAIN,
+                "the trusted keys changed in the meantime",
+            )));
+        }
+        let mut stored = (current + 1).to_be_bytes().to_vec();
+        stored.extend_from_slice(sealed);
+        txn.write(&pins_key(user), Some(&stored)).await?;
+        txn.commit().await?;
+        Ok(Ok(current + 1))
+    })
+    .await?
+}
+
+/// A stored pins record: its version, then the sealed list.
+fn decode_pins(user: &str, stored: &[u8]) -> Result<(u64, Vec<u8>), FsError> {
+    let (version, sealed) = stored.split_first_chunk::<8>().ok_or_else(|| {
+        FsError::new(
+            libc::EIO,
+            format!("the trusted keys stored for {user:?} are garbled"),
+        )
+    })?;
+    Ok((u64::from_be_bytes(*version), sealed.to_vec()))
 }
 
 fn info_key(user: &str) -> Vec<u8> {
@@ -440,6 +504,7 @@ pub(crate) async fn drop_unused_link(txn: &Transaction, user: &str) -> Result<()
     }
     txn.write(&keys_key(user), None).await?;
     txn.write(&code_key(user), None).await?;
+    txn.write(&pins_key(user), None).await?;
     txn.write(&info_key(user), None).await
 }
 
@@ -707,6 +772,8 @@ pub async fn enrol(
                 for ino in granted_in(&txn, user).await? {
                     crate::grants::remove_grant(&txn, user, ino).await?;
                 }
+                // Sealed to the old key pair, so no use to the new one.
+                txn.write(&pins_key(user), None).await?;
             }
             txn.write(&code_key(user), None).await?;
             txn.write(&keys_key(user), Some(encoded)).await?;
@@ -791,6 +858,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&keys_key(user), None).await?;
         txn.write(&code_key(user), None).await?;
         txn.write(&info_key(user), None).await?;
+        txn.write(&pins_key(user), None).await?;
         for &ino in granted {
             crate::grants::remove_grant(&txn, user, ino).await?;
         }

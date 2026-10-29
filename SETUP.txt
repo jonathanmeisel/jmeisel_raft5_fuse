@@ -522,6 +522,18 @@ comes from the CA certificate the profile trusts -- one file per
 filesystem, shared by every command and mount for it, and never chosen
 by a server. --known-keys puts them elsewhere.
 
+The servers also keep a copy of each account's pins, so that all of
+alice's devices (other machines, the web app in any browser) trust the
+same keys and she checks each fingerprint once. It is sealed under a key
+that only her key pair gives: the servers can't read it, or add or
+change a pin. Every login merges this machine's pins with that copy, and
+every trust, new key or forget-key updates it; where two devices
+disagree, the latest change wins. A server could hand back an older
+copy, which can only take pins away: she would be asked for a
+fingerprint again, never shown a key she didn't check. Enrolling again
+drops the copy, since a new key pair can't open it. (Servers older than
+protocol 3 keep no copy; then each device pins on its own.)
+
 
 -------------------------------------------------------------------------
 8. SNAPSHOTS

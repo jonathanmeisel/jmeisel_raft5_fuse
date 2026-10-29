@@ -228,9 +228,14 @@ fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
             ctx.tls.clone(),
         ))
         .map_err(|e| format!("cannot log in: {e}"))?;
-    Ok(Vault::new(Arc::new(remote))
+    let vault = Vault::new(Arc::new(remote))
         .map_err(|e| e.to_string())?
-        .with_known_keys(ctx.known_keys()?))
+        .with_known_keys(ctx.known_keys()?);
+    // Trust what the account's other devices trust.
+    if let Err(e) = runtime.block_on(vault.sync_pins()) {
+        eprintln!("warning: trusted keys not merged with the servers' copy: {e}");
+    }
+    Ok(vault)
 }
 
 /// A key's fingerprint as people read it: words, then hex.

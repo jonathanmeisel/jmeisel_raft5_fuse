@@ -177,6 +177,12 @@ impl Session {
         if let Some(known) = config.known_keys {
             vault = vault.with_known_keys(known);
         }
+        // Trust what the account's other devices trust. Not being able to
+        // merge isn't a reason to refuse the session: the pins here still
+        // work, and the next change merges again.
+        if let Err(e) = vault.sync_pins().await {
+            eprintln!("trusted keys not merged with the servers' copy: {e}");
+        }
         let pruner = match config.prune_queue {
             Some((queue, prune_config)) => {
                 let pruning = Vault::new(Arc::clone(vault.remote()))

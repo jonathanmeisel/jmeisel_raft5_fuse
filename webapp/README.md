@@ -9,7 +9,9 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
 ## Layout
 
 - `src/lib/worker.js`: the Worker. It holds the session and IndexedDB
-  (pins, the prune queue, and a remembered login), keeps the account's
+  (pins, the prune queue, and a remembered login; the pins are also merged
+  with the account's sealed copy on the servers at each login and change,
+  so every browser and device trusts the same keys), keeps the account's
   other tabs up to date with its saves, and runs the background prune
   when it holds the account's prune lock (one tab at a time).
 - `src/lib/rpc.js`: the page's calls into the Worker.
@@ -96,4 +98,5 @@ enough for object storage), share with a fingerprint, trust, revoke and
 re-seal; one user invites another, who enrolls from the link; a public
 link opens its folder in a fresh browser, then stops working once another
 writer revokes it. They also check that the page raises no CSP violation and refuses
-to run in a frame. Stop any other `web_dev` first: they use the same ports.
+to run in a frame. `web_dev` issues new invitations for users who enroll
+again on its fourth port (`GET /reissue/<user>`), which the tests use. Stop any other `web_dev` first: they use the same ports.

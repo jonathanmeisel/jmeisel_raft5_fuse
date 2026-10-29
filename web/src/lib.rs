@@ -1308,14 +1308,12 @@ impl Fs {
         })
     }
 
-    /// Forgets `user`'s pinned key, after they enrolled again.
+    /// Forgets `user`'s pinned key, here and on the account's other
+    /// devices.
     #[wasm_bindgen(js_name = forgetKey)]
-    pub fn forget_key(&self, user: String) -> Result<(), JsValue> {
-        self.0
-            .vault()
-            .known_keys()
-            .forget(&user)
-            .map_err(|e| failure("EIO", &e.to_string()))
+    pub fn forget_key(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().forget_key(&user).await })
     }
 
     /// What waits to be pruned, with each entry's latest status.

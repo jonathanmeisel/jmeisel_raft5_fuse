@@ -46,6 +46,7 @@ use raft5fs_proto::pb::{
     ResealNamesRequest, RotateRequest, Session, SetAttrRequest, SnapshotListResponse,
     WriteChunksRequest, WriteChunksResponse,
 };
+use raft5fs_proto::pb::{PinsResponse, PutPinsRequest};
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -712,6 +713,25 @@ impl Fs for FsService {
             }
         };
         Ok(Response::new(made.into()))
+    }
+
+    async fn get_pins(&self, r: Request<NoArgs>) -> Result<Response<PinsResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let pins = accounts::pins(self.core.client(), &caller.user).await;
+        Ok(Response::new(pins.into()))
+    }
+
+    async fn put_pins(&self, r: Request<PutPinsRequest>) -> Result<Response<PinsResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let put = accounts::put_pins(
+            self.core.client(),
+            &caller.user,
+            r.expected_version,
+            &r.sealed,
+        )
+        .await
+        .map(|version| (version, Vec::new()));
+        Ok(Response::new(put.into()))
     }
 
     async fn list_links(&self, r: Request<NoArgs>) -> Result<Response<LinkListResponse>, Status> {

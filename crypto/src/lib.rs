@@ -28,6 +28,7 @@ pub mod grantees;
 pub mod identity;
 pub mod node;
 pub mod password;
+pub mod pins;
 mod wordlist;
 
 use std::fmt;
