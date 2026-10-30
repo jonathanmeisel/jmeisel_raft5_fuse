@@ -76,7 +76,7 @@ use raft5fs_proto::types::{
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
     SnapshotInfo,
 };
-use raft5fs_proto::types::{LinkAccount, Unreachable, UserEntry};
+use raft5fs_proto::types::{LinkAccount, Unreachable, UserEntry, VolumeInfo};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -1268,6 +1268,21 @@ impl Remote {
             .into_result()?;
         let invitation = (!issued.invitation.is_empty()).then_some(issued.invitation);
         Ok((issued.code, invitation))
+    }
+
+    /// Who owns volume `ino`, and any transfer offered.
+    pub async fn get_volume(&self, ino: u64) -> Result<VolumeInfo, FsError> {
+        self.needs_protocol(6, "volume owners")?;
+        let req = InodeRequest {
+            ino,
+            snapshot: String::new(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.get_volume(req).await }
+        })
+        .await?
+        .into_result()
     }
 
     /// Folders and files that no account can reach any more, as an admin.

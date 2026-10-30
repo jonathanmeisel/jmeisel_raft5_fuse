@@ -185,6 +185,12 @@ service Fs {
   // What removing a user, or letting them enroll again, would leave that
   // no account can reach: the parts that only they can reach now.
   rpc RemovalImpact(UsernameRequest) returns (UnreachableListResponse);
+
+  // Volume ownership (protocol 6 on). Each volume has an owner, whose quota
+  // everything in it counts against, and who always has read-write access
+  // to it: nobody can revoke the owner's grant of their volume, or make it
+  // read-only. The owner of the volume `ino`, for anyone with access to it.
+  rpc GetVolume(InodeRequest) returns (VolumeResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -866,6 +872,22 @@ message UserList {
 message UserListResponse {
   oneof result {
     UserList list = 1;
+    Error error = 2;
+  }
+}
+
+message VolumeInfo {
+  // Empty for a volume with no owner.
+  string owner = 1;
+  // A transfer offered and not yet answered: to whom, and when (seconds
+  // since the Unix epoch). Empty and 0 if none.
+  string offer_to = 2;
+  uint64 offer_at = 3;
+}
+
+message VolumeResponse {
+  oneof result {
+    VolumeInfo volume = 1;
     Error error = 2;
   }
 }

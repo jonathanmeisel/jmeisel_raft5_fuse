@@ -499,6 +499,18 @@ pub struct Unreachable {
     pub modified: SystemTime,
 }
 
+/// Who owns a volume: whose quota everything in it counts against. The
+/// owner always has read-write access to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// `None` for a volume with no owner yet (from before owners, with
+    /// several writers), which counts against nobody.
+    pub owner: Option<String>,
+    /// A transfer the owner offered and the recipient hasn't answered:
+    /// to whom, and when (seconds since the Unix epoch).
+    pub offer: Option<(String, u64)>,
+}
+
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.
 pub const LINK_PREFIX: &str = "link-";

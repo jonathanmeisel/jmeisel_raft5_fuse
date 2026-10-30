@@ -11,7 +11,7 @@ use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
     Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
     Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SetAttr, SetTime, SnapshotInfo, Unreachable, UserEntry, WriteBody,
+    SetAttr, SetTime, SnapshotInfo, Unreachable, UserEntry, VolumeInfo, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -548,6 +548,39 @@ impl pb::IssueInviteResponse {
             Some(R::Invite(i)) => Ok(i),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("invitation")),
+        }
+    }
+}
+
+impl From<Result<VolumeInfo, FsError>> for pb::VolumeResponse {
+    fn from(r: Result<VolumeInfo, FsError>) -> Self {
+        use pb::volume_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(v) => {
+                    let (offer_to, offer_at) = v.offer.unwrap_or_default();
+                    R::Volume(pb::VolumeInfo {
+                        owner: v.owner.unwrap_or_default(),
+                        offer_to,
+                        offer_at,
+                    })
+                }
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::VolumeResponse {
+    pub fn into_result(self) -> Result<VolumeInfo, FsError> {
+        use pb::volume_response::Result as R;
+        match self.result {
+            Some(R::Volume(v)) => Ok(VolumeInfo {
+                owner: (!v.owner.is_empty()).then_some(v.owner),
+                offer: (!v.offer_to.is_empty()).then_some((v.offer_to, v.offer_at)),
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("volume")),
         }
     }
 }

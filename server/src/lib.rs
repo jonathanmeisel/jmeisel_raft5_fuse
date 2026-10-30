@@ -47,7 +47,7 @@ use raft5fs_proto::pb::{
 };
 use raft5fs_proto::pb::{
     PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UnreachableListResponse,
-    UserListResponse, UsernameRequest,
+    UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -710,6 +710,19 @@ impl Fs for FsService {
         )
         .await;
         Ok(Response::new(set.into()))
+    }
+
+    async fn get_volume(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<VolumeResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let found = async {
+            live_only(&r.snapshot)?;
+            self.core.volume_info(&caller, r.ino).await
+        }
+        .await;
+        Ok(Response::new(found.into()))
     }
 
     async fn list_unreachable(

@@ -2,8 +2,6 @@
 //! operation. There is no buffering and no FUSE here: a front end (the
 //! server) decides when to call these.
 
-mod unreachable;
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -101,6 +99,10 @@ macro_rules! decide {
         }
     };
 }
+
+// After `decide!`, which they use.
+mod unreachable;
+pub(crate) mod volumes;
 
 /// `ino`'s Entry as `txn` sees it. It stays locked against changes until
 /// `txn` ends. A missing or deleted inode gives `ENOENT`.
@@ -453,6 +455,9 @@ impl FsCore {
         }
         if let Err(e) = core.sweep_reservations(RESERVATION_AGE).await {
             eprintln!("could not remove old inode reservations: {e}");
+        }
+        if let Err(e) = core.assign_missing_owners().await {
+            eprintln!("could not give older volumes owners: {e}");
         }
         Ok(core)
     }
@@ -1700,6 +1705,7 @@ impl FsCore {
                 crate::accounts::check_link_grant(&txn, &caller.user, grantee, ino, grant.writable)
                     .await?
             );
+            decide!(volumes::check_owner_kept(&txn, ino, grantee, Some(grant.writable)).await?);
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(
@@ -1784,6 +1790,15 @@ impl FsCore {
             write_entry(&txn, &entry).await?;
             txn.write(dirent, Some(&dirent_value(new.ino, &[]))).await?;
             grants::put_grant(&txn, user, grant).await?;
+            let record = raft5fs_proto::types::VolumeInfo {
+                owner: Some(user.to_string()),
+                offer: None,
+            };
+            txn.write(
+                &crate::layout::volume_key(new.ino),
+                Some(&volumes::encode_volume(&record)),
+            )
+            .await?;
             txn.write(&grantees_key(new.ino), Some(sealed_grantees))
                 .await?;
             touch_dir(&txn, &mut root, now).await?;
@@ -1869,6 +1884,7 @@ impl FsCore {
                 for (user, mut grant) in existing {
                     let sealed = resealed[user.as_str()];
                     if sealed.is_empty() {
+                        decide!(volumes::check_owner_kept(&txn, ino, &user, None).await?);
                         grants::remove_grant(&txn, &user, ino).await?;
                     } else {
                         grant.key_version = new_version;
@@ -2181,6 +2197,7 @@ impl FsCore {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
+            txn.write(&crate::layout::volume_key(ino), None).await?;
             // Its grants and key record are removed with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;

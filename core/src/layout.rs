@@ -118,6 +118,8 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
 //   0x0A ++ ino(BE8)                    -> an inode number reserved for a create, by username
 //   0x0B ++ ino(BE8)                    -> who ino is granted to, sealed under its key (`grants`)
+//   0x0C ++ ino(BE8)                    -> a volume's record: its owner, any transfer offer
+//                                          (`fs::volumes`)
 //
 // **Deleting an inode** takes several transactions, because its chunks
 // cannot all fit in one. So the deletion is announced first:
@@ -180,6 +182,15 @@ pub(crate) const GRANT_INDEX_PREFIX: &[u8] = &[0x09];
 pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
 /// The prefix of every sealed grantee list; see `grants`.
 pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
+
+/// The prefix of every volume record; see `fs::volumes`.
+pub(crate) const VOLUME_PREFIX: &[u8] = &[0x0C];
+
+pub(crate) fn volume_key(ino: u64) -> Vec<u8> {
+    let mut key = VOLUME_PREFIX.to_vec();
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
 
 /// The prefix of every pending enrolment code; see `accounts`.
 pub(crate) const ENROLMENT_PREFIX: &[u8] = b"\x06e/";
