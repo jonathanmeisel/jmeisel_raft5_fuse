@@ -70,8 +70,9 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, AssignOwnerRequest, CreateLinkAccountRequest, FolderLimitRequest,
-    OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, CreateLinkAccountRequest,
+    FolderLimitRequest, OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest,
+    SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -1328,6 +1329,19 @@ impl Remote {
             let req = req.clone();
             async move { c.folder_sizes(req).await }
         })
+        .await?
+        .into_result()
+    }
+
+    /// `EDQUOT` if `bytes` more in folder `ino` would go over a quota or a
+    /// folder limit.
+    pub async fn check_room(&self, ino: u64, bytes: u64) -> Result<(), FsError> {
+        self.needs_protocol(6, "quotas")?;
+        let req = CheckRoomRequest { ino, bytes };
+        self.call(
+            Retry::ReadOnly,
+            |mut c| async move { c.check_room(req).await },
+        )
         .await?
         .into_result()
     }

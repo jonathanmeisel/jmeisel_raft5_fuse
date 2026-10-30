@@ -700,7 +700,7 @@ raft5fs admin unreachable --delete 4711   # delete one, for good
   storage, sealed under keys nobody has. `admin delete` and `admin
   reenroll` say what that would be, and want `--yes` before going ahead;
   the web app's confirmations say so too. Such folders are listed under
-  `admin unreachable` (web app: Users → Unreachable folders) by size and
+  `admin unreachable` (web app: Users → Orphaned folders) by size and
   age (their names can't be read), and deleting one frees its space. A
   folder that still has a shared folder somewhere inside it stays, as the
   way down to it.

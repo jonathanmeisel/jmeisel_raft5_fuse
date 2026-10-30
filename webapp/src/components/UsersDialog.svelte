@@ -1,9 +1,11 @@
 <script>
   // User management, for admins: every account, invitation not used yet,
   // and public link; what each may do and how much they store; inviting,
-  // letting someone enroll again, and removing. Also top-level folders
-  // whose owner is gone (orphans), which an admin gives to someone who can
-  // change them. The servers check every step: this only offers them.
+  // letting someone enroll again, and removing. Also orphaned folders, in
+  // one list: top-level folders whose owner is gone, which an admin gives
+  // to someone who can change them, and anything nobody can reach any
+  // more, which an admin deletes. The servers check every step: this only
+  // offers them.
   import Dialog from "./Dialog.svelte";
   import Invitation from "./Invitation.svelte";
   import { parseSize, sizeText } from "../lib/sizes.js";
@@ -114,10 +116,23 @@
       else if (step?.user) await ask(step.kind, step.user, step);
     });
 
+  /// Shows orphaned folders: each top-level folder without an owner who
+  /// can change it, and each part nobody can reach. A top-level folder
+  /// nobody can reach is both, and shows once, to delete.
   async function showOrphans() {
     step = { kind: "orphans", items: null };
     try {
-      const items = await fs.listOrphans();
+      const [orphans, lost] = await Promise.all([
+        fs.listOrphans().catch((e) => (e.code === "ENOTSUP" ? [] : Promise.reject(e))),
+        fs.listUnreachable(),
+      ]);
+      const unreachable = new Map(lost.map((u) => [u.ino, u]));
+      const items = [
+        ...orphans.map((o) => ({ ...o, lost: unreachable.get(o.ino) ?? null })),
+        ...lost
+          .filter((u) => !orphans.some((o) => o.ino === u.ino))
+          .map((u) => ({ ino: u.ino, path: null, owner: null, writers: [], bytes: u.bytes, lost: u })),
+      ];
       if (step?.kind === "orphans") step = { ...step, items };
     } catch (e) {
       error = e.message;
@@ -126,7 +141,8 @@
 
   /// Who each orphan in a list goes to, as chosen.
   let heir = $state({});
-  const folderName = (o) => (o.path ? o.path.slice(1) : `Top-level folder #${o.ino}`);
+  const folderName = (o) =>
+    o.path ? o.path.slice(1) : `${o.lost ? kind(o.lost) : "Top-level folder"} #${o.ino}`;
 
   // The quota form.
   let quota = $state("");
@@ -149,20 +165,10 @@
     });
   const storage = (u) => (u.quota ? `${sizeText(u.used)} of ${sizeText(u.quota)}` : sizeText(u.used));
 
-  async function showUnreachable() {
-    step = { kind: "unreachable", items: null };
-    try {
-      const items = await fs.listUnreachable();
-      if (step?.kind === "unreachable") step = { ...step, items };
-    } catch (e) {
-      error = e.message;
-    }
-  }
-
   const purge = (item) =>
     run(async () => {
       await fs.deleteUnreachable(item.ino);
-      await showUnreachable();
+      await showOrphans();
     });
 
   const size = (bytes) =>
@@ -189,7 +195,7 @@
   {:else if o.reachable}
     <span class="note">Nobody else can change it.</span>
   {:else}
-    <span class="note">Nobody can reach it: see Unreachable folders.</span>
+    <span class="note">Nobody else can reach it.</span>
   {/if}
 {/snippet}
 
@@ -243,7 +249,7 @@
       <p class="error">
         Only {step.user} can reach {step.impact.length === 1 ? "one folder or file" : `${step.impact.length} folders or files`}
         now: {total(step.impact).files} files, {size(total(step.impact).bytes)}. Nobody could open them
-        afterwards. You can delete them later, under Unreachable folders.
+        afterwards. You can delete them later, under Orphaned folders.
       </p>
     {/if}
     {@render owned(step)}
@@ -269,7 +275,7 @@
       <p class="error">
         Only {step.user} can reach {step.impact.length === 1 ? "one folder or file" : `${step.impact.length} folders or files`}
         now: {total(step.impact).files} files, {size(total(step.impact).bytes)}. Nobody could open them
-        afterwards. You can delete them later, under Unreachable folders.
+        afterwards. You can delete them later, under Orphaned folders.
       </p>
     {/if}
     {@render owned(step)}
@@ -277,43 +283,17 @@
       <button class="danger" onclick={() => remove(step.user)} disabled={busy || step.impact === null || step.owned === null}>Remove</button>
       <button onclick={() => (step = null)}>Cancel</button>
     </p>
-  {:else if step?.kind === "unreachable"}
-    <p class="note">
-      Folders and files whose last account was removed, or enrolled again. Their names are sealed under
-      keys nobody has, so only their size and age show, and nobody can open them. Deleting one frees its
-      space, for good.
-    </p>
-    {#if step.items === null}
-      <p class="note">Looking…</p>
-    {:else if step.items.length === 0}
-      <p>Every folder and file can be reached by someone.</p>
-    {:else}
-      <table>
-        <tbody>
-          {#each step.items as u (u.ino)}
-            <tr>
-              <td><strong>{kind(u)}</strong> <span class="note">#{u.ino}</span></td>
-              <td class="note">
-                {u.files} files, {size(u.bytes)}, last changed {new Date(u.modified).toLocaleDateString()}
-              </td>
-              <td class="actions">
-                <button class="danger" onclick={() => (step = { kind: "purge", item: u })}>Delete…</button>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    {/if}
-    <p><button onclick={() => (step = null)}>Back</button></p>
   {:else if step?.kind === "orphans"}
     <p class="note">
-      Top-level folders whose owner was removed, or enrolled again. They count against nobody's
-      storage until someone owns them. Give each to someone who can change it.
+      Folders left behind when their owner, or everyone who could open them, was removed or enrolled
+      again. A top-level folder without an owner counts against nobody's storage: give it to someone
+      who can change it. What nobody can reach, nobody can open (its names are sealed under keys
+      nobody has, so only its size and age show): deleting it frees its space, for good.
     </p>
     {#if step.items === null}
       <p class="note">Looking…</p>
     {:else if step.items.length === 0}
-      <p>Every top-level folder has an owner.</p>
+      <p>Every top-level folder has an owner, and every folder and file can be reached by someone.</p>
     {:else}
       <table>
         <tbody>
@@ -321,9 +301,23 @@
             <tr>
               <td>
                 <strong>{folderName(o)}</strong>
-                <span class="note">{sizeText(o.bytes)}{o.owner ? `, was ${o.owner}'s` : ""}</span>
+                <span class="note">
+                  {#if o.lost}
+                    {o.lost.files} files, {sizeText(o.bytes)}, last changed
+                    {new Date(o.lost.modified).toLocaleDateString()}{o.owner ? `, was ${o.owner}'s` : ""};
+                    nobody can reach it
+                  {:else}
+                    {sizeText(o.bytes)}{o.owner ? `, was ${o.owner}'s` : ""}
+                  {/if}
+                </span>
               </td>
-              <td class="actions">{@render heirs(o)}</td>
+              <td class="actions">
+                {#if o.lost}
+                  <button class="danger" onclick={() => (step = { kind: "purge", item: o.lost })}>Delete…</button>
+                {:else}
+                  {@render heirs(o)}
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -348,14 +342,13 @@
     <p class="note">Nobody can open it now, and this frees its space. It can't be undone.</p>
     <p>
       <button class="danger" onclick={() => purge(step.item)} disabled={busy}>Delete</button>
-      <button onclick={showUnreachable}>Cancel</button>
+      <button onclick={showOrphans}>Cancel</button>
     </p>
   {:else if users === null}
     <p class="note">Loading…</p>
   {:else}
     <p>
       <button class="primary" onclick={() => (step = { kind: "invite" })}>Invite someone</button>
-      <button onclick={showUnreachable}>Unreachable folders</button>
       <button onclick={showOrphans}>Orphaned folders</button>
       <button onclick={measure} disabled={busy}>Measure storage now</button>
     </p>

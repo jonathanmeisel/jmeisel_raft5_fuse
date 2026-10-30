@@ -498,11 +498,11 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
   });
 
   await test.step("erin deletes dave's old folder, which nobody can reach", async () => {
-    await erin.getByRole("button", { name: "Unreachable folders" }).click();
-    await expect(erin.getByText("Top-level folder")).toBeVisible(SLOW);
+    await erin.getByRole("button", { name: "Orphaned folders" }).click();
+    await expect(erin.getByText(/^Top-level folder #/)).toBeVisible(SLOW);
     await erin.getByRole("button", { name: "Delete…" }).click();
     await erin.getByRole("button", { name: "Delete", exact: true }).click();
-    await expect(erin.getByText("Every folder and file can be reached by someone.")).toBeVisible(SLOW);
+    await expect(erin.getByText("every folder and file can be reached by someone")).toBeVisible(SLOW);
     await erin.getByRole("button", { name: "Back" }).click();
   });
 
@@ -761,6 +761,8 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     ]);
     await expect(jack.getByText(/reached its size limit/)).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Dismiss" }).click();
+    // Refused before anything was made: no empty file left behind.
+    await expect(item(jack, "big.bin")).toHaveCount(0);
   });
 
   await test.step("jack offers proj to kim, who accepts it", async () => {

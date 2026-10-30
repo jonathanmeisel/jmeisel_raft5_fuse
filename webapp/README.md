@@ -47,8 +47,9 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   (`AccountMenu.svelte`, the user's name in the header) offers:
   **Users** (`UsersDialog.svelte`: invite, change capabilities and
   quotas, re-enroll, remove (giving the folders they own to someone
-  first), measure storage now, give orphaned folders an owner, and delete
-  folders nobody can reach any more) needs `admin`,
+  first), measure storage now, and, in one list of orphaned folders,
+  give top-level folders without an owner to someone and delete what
+  nobody can reach any more) needs `admin`,
   making a
   top-level folder needs `volumes`, and public links (`LinkDialog.svelte`
   from a folder's menu, `LinksDialog.svelte` from the account menu) need

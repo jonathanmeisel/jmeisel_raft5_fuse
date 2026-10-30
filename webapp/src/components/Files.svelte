@@ -67,7 +67,9 @@
     return list.map((e) => ({
       id: join(dir, e.name),
       type: e.kind === "folder" ? "folder" : "file",
-      size: e.size,
+      // SVAR shows a size only if there is one: none for a folder not
+      // measured yet.
+      ...(e.size != null ? { size: e.size } : {}),
       date: new Date(e.modified),
       shared: e.shared ?? null,
       ...(e.kind === "folder" ? { lazy: true } : {}),

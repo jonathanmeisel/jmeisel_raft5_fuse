@@ -450,6 +450,20 @@ impl FsCore {
         Ok(())
     }
 
+    /// Refuses (`EDQUOT`) if `bytes` more in folder `dir` would go over a
+    /// quota or a folder limit, for `caller`, who must be able to write
+    /// there. So a client can ask before it creates or truncates anything
+    /// (an upload), rather than leave an empty file behind.
+    pub async fn check_room_for(
+        &self,
+        caller: &Caller,
+        dir: u64,
+        bytes: u64,
+    ) -> Result<(), FsError> {
+        self.guard_now(&self.live(), caller, dir, true).await?;
+        self.check_room(dir, bytes).await
+    }
+
     /// Refuses (`EDQUOT`) a move of `moved` from folder `from` to folder
     /// `to` if what it would newly count for has no room for it: another
     /// owner, or a limited folder.

@@ -46,10 +46,10 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, AssignOwnerRequest, FolderLimitRequest, FolderSizesRequest,
-    FolderSizesResponse, OfferListResponse, OfferVolumeRequest, OrphanListResponse, PinsResponse,
-    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, StorageResponse,
-    UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
+    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, FolderLimitRequest,
+    FolderSizesRequest, FolderSizesResponse, OfferListResponse, OfferVolumeRequest,
+    OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
+    StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -754,6 +754,15 @@ impl Fs for FsService {
         Ok(Response::new(
             self.core.folder_sizes(&caller, &r.inos).await.into(),
         ))
+    }
+
+    async fn check_room(
+        &self,
+        r: Request<CheckRoomRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let checked = self.core.check_room_for(&caller, r.ino, r.bytes).await;
+        Ok(Response::new(checked.into()))
     }
 
     async fn set_folder_limit(

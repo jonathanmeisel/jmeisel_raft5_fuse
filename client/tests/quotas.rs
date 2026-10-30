@@ -286,6 +286,12 @@ fn a_quota_refuses_what_would_go_over_it_and_deleting_makes_room_at_once() {
         refused.message.contains("bob's storage is full"),
         "{refused}"
     );
+    // Asking first, as an upload does.
+    assert_eq!(
+        errno(rt.block_on(bob.remote().check_room(w, 5000))),
+        libc::EDQUOT
+    );
+    rt.block_on(bob.remote().check_room(w, 4000)).unwrap();
     assert_eq!(
         errno(rt.block_on(bob.setattr(g, resize(5000)))),
         libc::EDQUOT

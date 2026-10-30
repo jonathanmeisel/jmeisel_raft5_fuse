@@ -1545,6 +1545,21 @@ impl Fs {
         })
     }
 
+    /// Fails with `EDQUOT` if `bytes` more in folder `path` would go over
+    /// its owner's quota or a folder limit; servers too old to say never
+    /// do. For asking before an upload creates or truncates anything.
+    #[wasm_bindgen(js_name = checkRoom)]
+    pub fn check_room(&self, path: String, bytes: f64) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.resolve(&path).await?.ino;
+            match inner.vault().remote().check_room(ino, bytes as u64).await {
+                Err(e) if e.errno == errno::ENOTSUP => Ok(()),
+                other => other,
+            }
+        })
+    }
+
     /// Sets folder `path`'s size limit in bytes (null for none), as the
     /// owner of its top-level folder or an admin.
     #[wasm_bindgen(js_name = setFolderLimit)]

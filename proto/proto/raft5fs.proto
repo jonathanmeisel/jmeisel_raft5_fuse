@@ -201,6 +201,10 @@ service Fs {
   // volume or an admin. A write that would take the folder over it is
   // refused with EDQUOT, whoever writes, the owner too.
   rpc SetFolderLimit(FolderLimitRequest) returns (EmptyResponse);
+  // EDQUOT if `bytes` more in folder `ino` would go over its owner's quota
+  // or a folder limit; the caller must be able to write there. For asking
+  // before an upload creates or truncates anything.
+  rpc CheckRoom(CheckRoomRequest) returns (EmptyResponse);
   // Offers a volume to another user, as its owner. They must have
   // read-write access to it (EPERM). Replaces any earlier offer.
   rpc OfferVolume(OfferVolumeRequest) returns (EmptyResponse);
@@ -996,6 +1000,11 @@ message OfferListResponse {
     OfferList list = 1;
     Error error = 2;
   }
+}
+
+message CheckRoomRequest {
+  uint64 ino = 1;
+  uint64 bytes = 2;
 }
 
 message FolderLimitRequest {
