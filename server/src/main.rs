@@ -22,6 +22,9 @@ use raft5fs_server::{
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+
+/// How often a server measures folder sizes and usage, by default.
+const DEFAULT_USAGE_INTERVAL: Duration = Duration::from_secs(600);
 use tonic::transport::ServerTlsConfig;
 
 const USAGE: &str = "\
@@ -69,6 +72,11 @@ Serving:
                        how long an account is trusted to still exist
                        before looking again (default 5): how long removing
                        one takes to reach a user who is already mounted.
+  --usage-interval <SECS>
+                       how often to measure every folder's size and every
+                       owner's usage (default 600; 0 never). One server
+                       measures at a time; writes and deletions count
+                       within a second anyway.
   --chunk-size <SIZE>  size of each stored file chunk, as a byte count or
                        with a K/M suffix (default 1M). Only applies when
                        creating a new filesystem: an existing one keeps
@@ -299,6 +307,7 @@ struct Args {
     object_get_ttl: Option<Duration>,
     object_ca: Option<String>,
     gc_interval: Option<Duration>,
+    usage_interval: Option<Duration>,
     no_prompt_delete: bool,
     backup_endpoint: Option<String>,
     backup_bucket: Option<String>,
@@ -396,6 +405,10 @@ fn parse_args() -> Args {
                 a.gc_interval = Some(Duration::from_secs(secs.into()));
             }
             "--no-prompt-delete" => a.no_prompt_delete = true,
+            "--usage-interval" => {
+                let secs = parse_number("--usage-interval", &value("--usage-interval"));
+                a.usage_interval = Some(Duration::from_secs(secs.into()));
+            }
             "--backup-endpoint" => a.backup_endpoint = Some(value("--backup-endpoint")),
             "--backup-bucket" => a.backup_bucket = Some(value("--backup-bucket")),
             "--backup-region" => a.backup_region = Some(value("--backup-region")),
@@ -1009,6 +1022,11 @@ async fn serve_command(a: Args) {
     let gc_interval = a.gc_interval.unwrap_or(DEFAULT_GC_INTERVAL);
     if core.object_grid().is_some() && !gc_interval.is_zero() {
         tokio::spawn(Arc::clone(&core).run_gc(gc_interval));
+    }
+    tokio::spawn(Arc::clone(&core).run_tallies());
+    let usage_interval = a.usage_interval.unwrap_or(DEFAULT_USAGE_INTERVAL);
+    if !usage_interval.is_zero() {
+        tokio::spawn(Arc::clone(&core).run_measure(usage_interval));
     }
     let fs = FsService::new(core, signer, a.identity_ttl.unwrap_or(DEFAULT_IDENTITY_TTL))
         .with_timing_header(env::var("RAFT5FS_TIMING").is_ok_and(|v| v == "1"))

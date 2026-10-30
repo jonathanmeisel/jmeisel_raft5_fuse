@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
+use raft5fs_proto::pb::FolderSizesRequest;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
@@ -76,7 +77,7 @@ use raft5fs_proto::types::{
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
     SnapshotInfo,
 };
-use raft5fs_proto::types::{LinkAccount, Unreachable, UserEntry, VolumeInfo};
+use raft5fs_proto::types::{FolderSize, LinkAccount, Storage, Unreachable, UserEntry, VolumeInfo};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -1282,6 +1283,41 @@ impl Remote {
         self.call(Retry::ReadOnly, |mut c| {
             let req = req.clone();
             async move { c.get_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// How much this account's volumes hold.
+    pub async fn storage(&self) -> Result<Storage, FsError> {
+        self.needs_protocol(6, "storage use")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.get_storage(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The last measured sizes of those of folders `inos` that this account
+    /// can read.
+    pub async fn folder_sizes(&self, inos: &[u64]) -> Result<Vec<FolderSize>, FsError> {
+        self.needs_protocol(6, "folder sizes")?;
+        let req = FolderSizesRequest {
+            inos: inos.to_vec(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.folder_sizes(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Measures every folder and owner now, as an admin.
+    pub async fn measure_usage(&self) -> Result<(), FsError> {
+        self.needs_protocol(6, "measuring usage")?;
+        self.call(Retry::Idempotent, |mut c| async move {
+            c.measure_usage(NoArgs {}).await
         })
         .await?
         .into_result()

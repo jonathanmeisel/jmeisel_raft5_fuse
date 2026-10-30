@@ -9,9 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
-    Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SetAttr, SetTime, SnapshotInfo, Unreachable, UserEntry, VolumeInfo, WriteBody,
+    Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee,
+    KeyPath, Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation,
+    SealedChunk, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry, VolumeInfo,
+    WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -548,6 +549,77 @@ impl pb::IssueInviteResponse {
             Some(R::Invite(i)) => Ok(i),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("invitation")),
+        }
+    }
+}
+
+impl From<Result<Storage, FsError>> for pb::StorageResponse {
+    fn from(r: Result<Storage, FsError>) -> Self {
+        use pb::storage_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(s) => R::Storage(pb::Storage {
+                    used: s.used,
+                    measured_at: s.measured_at,
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::StorageResponse {
+    pub fn into_result(self) -> Result<Storage, FsError> {
+        use pb::storage_response::Result as R;
+        match self.result {
+            Some(R::Storage(s)) => Ok(Storage {
+                used: s.used,
+                measured_at: s.measured_at,
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("storage")),
+        }
+    }
+}
+
+impl From<Result<Vec<FolderSize>, FsError>> for pb::FolderSizesResponse {
+    fn from(r: Result<Vec<FolderSize>, FsError>) -> Self {
+        use pb::folder_sizes_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(sizes) => R::List(pb::FolderSizeList {
+                    sizes: sizes
+                        .into_iter()
+                        .map(|f| pb::FolderSize {
+                            ino: f.ino,
+                            bytes: f.bytes,
+                            files: f.files,
+                            measured_at: f.measured_at,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::FolderSizesResponse {
+    pub fn into_result(self) -> Result<Vec<FolderSize>, FsError> {
+        use pb::folder_sizes_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .sizes
+                .into_iter()
+                .map(|f| FolderSize {
+                    ino: f.ino,
+                    bytes: f.bytes,
+                    files: f.files,
+                    measured_at: f.measured_at,
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("folder sizes")),
         }
     }
 }

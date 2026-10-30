@@ -22,18 +22,18 @@ use crate::layout::{GRANTS_PREFIX, ROOT_INO, dirent_ino, dirent_prefix};
 use raft5fs_proto::types::Unreachable;
 
 /// A node of the tree, as `load_tree` reads it.
-struct Node {
-    parent: u64,
+pub(super) struct Node {
+    pub(super) parent: u64,
     /// Its directory entry's name (the tag) in `parent`.
     name: Vec<u8>,
-    kind: Kind,
-    size: u64,
+    pub(super) kind: Kind,
+    pub(super) size: u64,
     mtime: SystemTime,
-    children: Vec<u64>,
+    pub(super) children: Vec<u64>,
 }
 
 /// Every live node, by inode, the root included, as of a scan.
-type Tree = HashMap<u64, Node>;
+pub(super) type Tree = HashMap<u64, Node>;
 
 impl FsCore {
     /// The largest parts of the tree that no account can reach (see the top
@@ -137,7 +137,7 @@ impl FsCore {
     }
 
     /// Every live node from the root down, read outside a transaction.
-    async fn load_tree(&self) -> Result<Tree, FsError> {
+    pub(super) async fn load_tree(&self) -> Result<Tree, FsError> {
         let mut tree = Tree::new();
         tree.insert(
             ROOT_INO,
@@ -251,7 +251,7 @@ fn roots(tree: &Tree, granted: &HashSet<u64>) -> Vec<u64> {
 }
 
 /// `ino` and everything below it, children before their parents.
-fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
+pub(super) fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
     let mut order = vec![ino];
     let mut i = 0;
     while i < order.len() {

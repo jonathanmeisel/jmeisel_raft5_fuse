@@ -191,6 +191,15 @@ service Fs {
   // to it: nobody can revoke the owner's grant of their volume, or make it
   // read-only. The owner of the volume `ino`, for anyone with access to it.
   rpc GetVolume(InodeRequest) returns (VolumeResponse);
+  // How much the caller's volumes hold: file sizes, as last measured (every
+  // few minutes) and counted since (each second).
+  rpc GetStorage(NoArgs) returns (StorageResponse);
+  // The last measured sizes of folders, for those of `inos` that the
+  // caller can read and that have been measured.
+  rpc FolderSizes(FolderSizesRequest) returns (FolderSizesResponse);
+  // Measures every folder and every owner's usage now, as admins see fit.
+  // EBUSY if another server is measuring.
+  rpc MeasureUsage(NoArgs) returns (EmptyResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -878,6 +887,41 @@ message UserList {
 message UserListResponse {
   oneof result {
     UserList list = 1;
+    Error error = 2;
+  }
+}
+
+message Storage {
+  uint64 used = 1;
+  // Seconds since the Unix epoch; 0 if never measured.
+  uint64 measured_at = 2;
+}
+
+message StorageResponse {
+  oneof result {
+    Storage storage = 1;
+    Error error = 2;
+  }
+}
+
+message FolderSizesRequest {
+  repeated uint64 inos = 1;
+}
+
+message FolderSize {
+  uint64 ino = 1;
+  uint64 bytes = 2;
+  uint64 files = 3;
+  uint64 measured_at = 4;
+}
+
+message FolderSizeList {
+  repeated FolderSize sizes = 1;
+}
+
+message FolderSizesResponse {
+  oneof result {
+    FolderSizeList list = 1;
     Error error = 2;
   }
 }

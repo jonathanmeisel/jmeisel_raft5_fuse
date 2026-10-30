@@ -27,6 +27,8 @@ pub(crate) const OBJECT_GRID_KEY: &[u8] = b"\x04object_grid";
 /// Which server sweeps object storage for garbage, and until when (see
 /// `gc`).
 pub(crate) const GC_LEASE_KEY: &[u8] = b"\x04gc_lease";
+/// Held by the server measuring folder sizes and usage (`fs::usage`).
+pub(crate) const USAGE_LEASE_KEY: &[u8] = b"\x04usage_lease";
 
 /// Which server runs a backup job, and until when (see `backup`).
 pub(crate) const BACKUP_LEASE_KEY: &[u8] = b"\x04backup_lease";
@@ -120,6 +122,8 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x0B ++ ino(BE8)                    -> who ino is granted to, sealed under its key (`grants`)
 //   0x0C ++ ino(BE8)                    -> a volume's record: its owner, any transfer offer
 //                                          (`fs::volumes`)
+//   0x0D ++ ino(BE8)                    -> a folder's size, as last measured (`fs::usage`)
+//   0x06 ++ "q/" ++ username            -> how much the user's volumes hold (`fs::usage`)
 //
 // **Deleting an inode** takes several transactions, because its chunks
 // cannot all fit in one. So the deletion is announced first:
@@ -189,6 +193,24 @@ pub(crate) const VOLUME_PREFIX: &[u8] = &[0x0C];
 pub(crate) fn volume_key(ino: u64) -> Vec<u8> {
     let mut key = VOLUME_PREFIX.to_vec();
     key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// The prefix of every folder size record; see `fs::usage`.
+pub(crate) const FOLDER_SIZE_PREFIX: &[u8] = &[0x0D];
+
+pub(crate) fn folder_size_key(ino: u64) -> Vec<u8> {
+    let mut key = FOLDER_SIZE_PREFIX.to_vec();
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// The prefix of every user's usage record; see `fs::usage`.
+pub(crate) const USAGE_PREFIX: &[u8] = b"\x06q/";
+
+pub(crate) fn usage_key(user: &str) -> Vec<u8> {
+    let mut key = USAGE_PREFIX.to_vec();
+    key.extend_from_slice(user.as_bytes());
     key
 }
 

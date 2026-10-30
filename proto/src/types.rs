@@ -511,6 +511,25 @@ pub struct VolumeInfo {
     pub offer: Option<(String, u64)>,
 }
 
+/// How much a user's volumes hold, as their owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Storage {
+    /// File sizes added up, as last measured and counted since.
+    pub used: u64,
+    /// When last measured, in seconds since the Unix epoch; 0 if never.
+    pub measured_at: u64,
+}
+
+/// A folder's size: everything inside it, as last measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderSize {
+    pub ino: u64,
+    pub bytes: u64,
+    pub files: u64,
+    /// When measured, in seconds since the Unix epoch.
+    pub measured_at: u64,
+}
+
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.
 pub const LINK_PREFIX: &str = "link-";

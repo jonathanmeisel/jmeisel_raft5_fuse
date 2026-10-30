@@ -102,6 +102,7 @@ macro_rules! decide {
 
 // After `decide!`, which they use.
 mod unreachable;
+pub mod usage;
 pub(crate) mod volumes;
 
 /// `ino`'s Entry as `txn` sees it. It stays locked against changes until
@@ -402,6 +403,8 @@ pub struct FsCore {
     /// Where walks up to grants went, so the next walk can check the path
     /// and not walk it again (see `grants::Paths`).
     paths: grants::Paths,
+    /// This server's part of measuring usage (see `usage`).
+    usage: usage::Usage,
 }
 
 impl FsCore {
@@ -444,6 +447,7 @@ impl FsCore {
             grid,
             objects: objects.map(Objects::new),
             paths: grants::Paths::default(),
+            usage: usage::Usage::default(),
         };
         core.ensure_root()
             .await
@@ -787,12 +791,13 @@ impl FsCore {
             self.discard(self.delete_chunks_from(ino, first, layout).await?);
         }
 
-        let attr = retrying(move || async move {
+        let (attr, change, parent) = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             let Some(bytes) = txn.read_one(&attr_key(ino)).await?.value else {
                 return Ok(Err(enoent()));
             };
             let mut entry = decode_entry(ino, &bytes);
+            let before = entry.attr.size as i64;
             // A truncate rewrites the boundary chunk. It must not do that
             // to an inode whose deletion could already have removed it.
             if entry.is_deleted() {
@@ -817,9 +822,13 @@ impl FsCore {
             txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(entry.attr))
+            let change = entry.attr.size as i64 - before;
+            Ok(Ok((entry.attr, change, entry.parent)))
         })
         .await??;
+        if attr.kind == Kind::File {
+            self.count(parent, change).await;
+        }
         Ok(attr)
     }
 
@@ -1291,6 +1300,9 @@ impl FsCore {
                 eprintln!("could not finish removing inode {victim}, replaced by a rename: {e}");
             }
         }
+        if new_parent != parent {
+            self.count_move(sealed.ino, parent, new_parent).await;
+        }
         Ok(replaced)
     }
 
@@ -1603,7 +1615,7 @@ impl FsCore {
         end: u64,
     ) -> Result<(Attr, u64), FsError> {
         self.check_chunk_writes(writes)?;
-        let (attr, dropped) = retrying(move || async move {
+        let (attr, dropped, grown, parent) = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
@@ -1616,6 +1628,7 @@ impl FsCore {
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
             let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
+            let before = entry.attr.size;
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1624,10 +1637,12 @@ impl FsCore {
             entry.attr.ctime = now;
             write_entry(&txn, &entry).await?;
             let seq = txn.commit().await?;
-            Ok(Ok(((entry.attr, seq), dropped)))
+            let grown = entry.attr.size - before;
+            Ok(Ok(((entry.attr, seq), dropped, grown, entry.parent)))
         })
         .await??;
         self.discard(dropped);
+        self.count(parent, grown as i64).await;
         Ok(attr)
     }
 
@@ -2203,16 +2218,21 @@ impl FsCore {
         // The Entry, marked deleted, stays until the chunks are gone. If it
         // is missing, an earlier finish got that far, and the sweep can
         // remove any chunks that are left.
-        let layout = match self.client.read_one(&attr_key(ino)).await?.value {
-            Some(bytes) => decode_entry(ino, &bytes).attr.layout,
-            None => Layout::Inline,
-        };
+        let entry = self
+            .client
+            .read_one(&attr_key(ino))
+            .await?
+            .value
+            .map(|bytes| decode_entry(ino, &bytes));
+        let layout = entry.as_ref().map_or(Layout::Inline, |e| e.attr.layout);
         let dropped = self.delete_chunks_from(ino, 0, layout).await?;
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
             txn.write(&crate::layout::volume_key(ino), None).await?;
+            txn.write(&crate::layout::folder_size_key(ino), None)
+                .await?;
             // Its grants and key record are removed with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;
@@ -2220,6 +2240,11 @@ impl FsCore {
         })
         .await?;
         self.discard(dropped);
+        if let Some(entry) = entry
+            && entry.attr.kind == Kind::File
+        {
+            self.count(entry.parent, -(entry.attr.size as i64)).await;
+        }
         Ok(())
     }
 

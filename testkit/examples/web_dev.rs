@@ -76,8 +76,12 @@ fn main() {
         let signer = Signer::new(TOKEN_KEY.as_bytes(), DEFAULT_SESSION_TTL);
         let native_address = format!("http://127.0.0.1:{port}");
         let ca = fs_ca_der();
+        let core = Arc::new(core);
+        // Often, so folder sizes show soon while trying the app.
+        tokio::spawn(Arc::clone(&core).run_tallies());
+        tokio::spawn(Arc::clone(&core).run_measure(Duration::from_secs(20)));
         let fs = Arc::new(
-            FsService::new(Arc::new(core), signer, Duration::ZERO).with_invites(Some(
+            FsService::new(core, signer, Duration::ZERO).with_invites(Some(
                 InviteSettings {
                     servers: vec![native_address.clone()],
                     tls_server_name: None,

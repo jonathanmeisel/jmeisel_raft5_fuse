@@ -46,8 +46,8 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UnreachableListResponse,
-    UserListResponse, UsernameRequest, VolumeResponse,
+    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
+    StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -724,6 +724,37 @@ impl Fs for FsService {
         }
         .await;
         Ok(Response::new(found.into()))
+    }
+
+    async fn get_storage(&self, r: Request<NoArgs>) -> Result<Response<StorageResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.storage(&caller.user).await.into()))
+    }
+
+    async fn folder_sizes(
+        &self,
+        r: Request<FolderSizesRequest>,
+    ) -> Result<Response<FolderSizesResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.folder_sizes(&caller, &r.inos).await.into(),
+        ))
+    }
+
+    async fn measure_usage(&self, r: Request<NoArgs>) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let measured = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            match self.core.measure().await? {
+                Some(_) => Ok(()),
+                None => Err(FsError::new(
+                    libc::EBUSY,
+                    "another server is measuring now: try again in a minute",
+                )),
+            }
+        }
+        .await;
+        Ok(Response::new(measured.into()))
     }
 
     async fn list_unreachable(
