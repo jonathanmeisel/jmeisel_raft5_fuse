@@ -5,8 +5,9 @@
   // screen, with bigger targets.
   //
   // `items` is a list of {id, text, icon, badge?, danger?, separator?};
-  // choosing one calls `onselect(id)`.
-  let { user, items, onselect } = $props();
+  // choosing one calls `onselect(id)`. `note` shows under the name, such
+  // as the storage used; opening the menu calls `onopen`, to refresh it.
+  let { user, items, onselect, note = "", onopen = () => {} } = $props();
 
   let open = $state(false);
   let root = $state(null);
@@ -36,7 +37,10 @@
     aria-label={`Account (${user})`}
     aria-haspopup="menu"
     aria-expanded={open}
-    onclick={() => (open = !open)}
+    onclick={() => {
+      open = !open;
+      if (open) onopen();
+    }}
   >
     <i class="wxi-account"></i>
     <span class="name">{user}</span>
@@ -45,7 +49,10 @@
   </button>
   {#if open}
     <div class="menu" role="menu">
-      <div class="who">Logged in as <strong>{user}</strong></div>
+      <div class="who">
+        Logged in as <strong>{user}</strong>
+        {#if note}<div class="storage">{note}</div>{/if}
+      </div>
       {#each items as item (item.id)}
         {#if item.separator}<div class="separator"></div>{/if}
         <button role="menuitem" class="option" class:danger={item.danger} onclick={() => choose(item.id)}>
@@ -85,6 +92,7 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .who strong { color: var(--wx-color-font); font-weight: 600; }
+  .storage { margin-top: 4px; }
   .separator { border-top: var(--wx-border-medium); margin: 4px 0; }
   .option {
     display: flex; align-items: center; gap: 10px; width: 100%;

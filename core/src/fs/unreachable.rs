@@ -22,18 +22,18 @@ use crate::layout::{GRANTS_PREFIX, ROOT_INO, dirent_ino, dirent_prefix};
 use raft5fs_proto::types::Unreachable;
 
 /// A node of the tree, as `load_tree` reads it.
-struct Node {
-    parent: u64,
+pub(super) struct Node {
+    pub(super) parent: u64,
     /// Its directory entry's name (the tag) in `parent`.
     name: Vec<u8>,
-    kind: Kind,
-    size: u64,
+    pub(super) kind: Kind,
+    pub(super) size: u64,
     mtime: SystemTime,
-    children: Vec<u64>,
+    pub(super) children: Vec<u64>,
 }
 
 /// Every live node, by inode, the root included, as of a scan.
-type Tree = HashMap<u64, Node>;
+pub(super) type Tree = HashMap<u64, Node>;
 
 impl FsCore {
     /// The largest parts of the tree that no account can reach (see the top
@@ -137,12 +137,18 @@ impl FsCore {
     }
 
     /// Every live node from the root down, read outside a transaction.
-    async fn load_tree(&self) -> Result<Tree, FsError> {
+    pub(super) async fn load_tree(&self) -> Result<Tree, FsError> {
+        self.load_tree_at(ROOT_INO).await
+    }
+
+    /// `load_tree` for the folder `top` and everything inside it. `top`'s
+    /// own node is a stand-in: its parent is itself.
+    pub(super) async fn load_tree_at(&self, top: u64) -> Result<Tree, FsError> {
         let mut tree = Tree::new();
         tree.insert(
-            ROOT_INO,
+            top,
             Node {
-                parent: ROOT_INO,
+                parent: top,
                 name: Vec::new(),
                 kind: Kind::Directory,
                 size: 0,
@@ -150,7 +156,7 @@ impl FsCore {
                 children: Vec::new(),
             },
         );
-        let mut dirs = vec![ROOT_INO];
+        let mut dirs = vec![top];
         while let Some(dir) = dirs.pop() {
             let prefix = dirent_prefix(dir);
             let mut keys = Vec::new();
@@ -201,7 +207,7 @@ impl FsCore {
     }
 
     /// Every granted inode, with the users that hold its grants.
-    async fn granted(&self) -> Result<HashMap<u64, Vec<String>>, FsError> {
+    pub(super) async fn granted(&self) -> Result<HashMap<u64, Vec<String>>, FsError> {
         let mut granted: HashMap<u64, Vec<String>> = HashMap::new();
         let mut iter = self.client.key_iterator(GRANTS_PREFIX, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
@@ -251,7 +257,7 @@ fn roots(tree: &Tree, granted: &HashSet<u64>) -> Vec<u64> {
 }
 
 /// `ino` and everything below it, children before their parents.
-fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
+pub(super) fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
     let mut order = vec![ino];
     let mut i = 0;
     while i < order.len() {
@@ -263,7 +269,7 @@ fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
 }
 
 /// What part `ino` of `tree` holds.
-fn stats(tree: &Tree, ino: u64) -> Unreachable {
+pub(super) fn stats(tree: &Tree, ino: u64) -> Unreachable {
     let mut out = Unreachable {
         ino,
         volume: tree[&ino].parent == ROOT_INO,

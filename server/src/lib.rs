@@ -46,8 +46,10 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    PinsResponse, PutPinsRequest, SetCapabilitiesRequest, UnreachableListResponse,
-    UserListResponse, UsernameRequest,
+    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, FolderLimitRequest,
+    FolderSizesRequest, FolderSizesResponse, OfferListResponse, OfferVolumeRequest,
+    OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
+    StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -629,6 +631,7 @@ impl Fs for FsService {
                         &grant.into(),
                         &r.sealed_grantees,
                         r.expected_grantees_seq,
+                        &r.listed,
                     )
                     .await
             }
@@ -710,6 +713,152 @@ impl Fs for FsService {
         )
         .await;
         Ok(Response::new(set.into()))
+    }
+
+    async fn set_quota(
+        &self,
+        r: Request<SetQuotaRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set =
+            accounts::admin_set_quota(self.core.client(), &caller.user, &r.username, r.quota).await;
+        if set.is_ok() {
+            self.core.forget_room(&r.username);
+        }
+        Ok(Response::new(set.into()))
+    }
+
+    async fn get_volume(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<VolumeResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let found = async {
+            live_only(&r.snapshot)?;
+            self.core.volume_info(&caller, r.ino).await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn get_storage(&self, r: Request<NoArgs>) -> Result<Response<StorageResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.storage(&caller.user).await.into()))
+    }
+
+    async fn folder_sizes(
+        &self,
+        r: Request<FolderSizesRequest>,
+    ) -> Result<Response<FolderSizesResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        Ok(Response::new(
+            self.core.folder_sizes(&caller, &r.inos).await.into(),
+        ))
+    }
+
+    async fn check_room(
+        &self,
+        r: Request<CheckRoomRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let checked = self.core.check_room_for(&caller, r.ino, r.bytes).await;
+        Ok(Response::new(checked.into()))
+    }
+
+    async fn set_folder_limit(
+        &self,
+        r: Request<FolderLimitRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set = self.core.set_folder_limit(&caller, r.ino, r.limit).await;
+        Ok(Response::new(set.into()))
+    }
+
+    async fn offer_volume(
+        &self,
+        r: Request<OfferVolumeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let offered = self.core.offer_volume(&caller, r.ino, &r.username).await;
+        Ok(Response::new(offered.into()))
+    }
+
+    async fn withdraw_offer(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let withdrawn = async {
+            live_only(&r.snapshot)?;
+            self.core.withdraw_offer(&caller, r.ino).await
+        }
+        .await;
+        Ok(Response::new(withdrawn.into()))
+    }
+
+    async fn answer_offer(
+        &self,
+        r: Request<AnswerOfferRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let answered = self.core.answer_offer(&caller, r.ino, r.accept).await;
+        Ok(Response::new(answered.into()))
+    }
+
+    async fn list_offers(&self, r: Request<NoArgs>) -> Result<Response<OfferListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.offers(&caller).await.into()))
+    }
+
+    async fn list_orphans(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<OrphanListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let found = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.orphans().await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn removal_orphans(
+        &self,
+        r: Request<UsernameRequest>,
+    ) -> Result<Response<OrphanListResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let found = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.removal_orphans(&r.username).await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn assign_owner(
+        &self,
+        r: Request<AssignOwnerRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let assigned = self.core.assign_owner(&caller, r.ino, &r.username).await;
+        Ok(Response::new(assigned.into()))
+    }
+
+    async fn measure_usage(&self, r: Request<NoArgs>) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let measured = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            match self.core.measure().await? {
+                Some(_) => Ok(()),
+                None => Err(FsError::new(
+                    libc::EBUSY,
+                    "another server is measuring now: try again in a minute",
+                )),
+            }
+        }
+        .await;
+        Ok(Response::new(measured.into()))
     }
 
     async fn list_unreachable(

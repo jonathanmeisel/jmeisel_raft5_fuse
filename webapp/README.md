@@ -45,12 +45,24 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   SVAR action to the Worker and then lists the folders again. What the
   account may do (its capabilities) decides what the account menu
   (`AccountMenu.svelte`, the user's name in the header) offers:
-  **Users** (`UsersDialog.svelte`: invite, change capabilities, re-enroll,
-  remove, and delete folders nobody can reach any more) needs `admin`,
+  **Users** (`UsersDialog.svelte`: invite, change capabilities and
+  quotas, re-enroll, remove (giving the folders they own to someone
+  first), measure storage now, and, in one list of orphaned folders,
+  give top-level folders without an owner to someone and delete what
+  nobody can reach any more) needs `admin`,
   making a
   top-level folder needs `volumes`, and public links (`LinkDialog.svelte`
   from a folder's menu, `LinksDialog.svelte` from the account menu) need
   `links`.
+- Storage: the account menu shows what the account's top-level folders
+  hold, and its quota. Folders show their size, as last measured, in the
+  size column (blank until measured). A folder's **Size limit…**
+  (`LimitDialog.svelte`) shows its size, and lets the owner of its
+  top-level folder, or an admin, cap it; the bar above the files says how
+  full a capped folder is. A top-level folder's **Transfer ownership…**
+  (`TransferDialog.svelte`) offers it to someone with read-write access,
+  who sees a banner to accept or decline it. **Shared with…** names the
+  owner, who can't be revoked.
 - Public links: `#link=<…>` logs in as the link's own account, in a
   Worker that stores nothing (no IndexedDB, no prune), and shows its one
   folder read-only. The fragment leaves the address bar at once. Whoever

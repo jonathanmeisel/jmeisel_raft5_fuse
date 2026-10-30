@@ -2,8 +2,6 @@
 //! operation. There is no buffering and no FUSE here: a front end (the
 //! server) decides when to call these.
 
-mod unreachable;
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -101,6 +99,11 @@ macro_rules! decide {
         }
     };
 }
+
+// After `decide!`, which they use.
+mod unreachable;
+pub mod usage;
+pub(crate) mod volumes;
 
 /// `ino`'s Entry as `txn` sees it. It stays locked against changes until
 /// `txn` ends. A missing or deleted inode gives `ENOENT`.
@@ -400,6 +403,8 @@ pub struct FsCore {
     /// Where walks up to grants went, so the next walk can check the path
     /// and not walk it again (see `grants::Paths`).
     paths: grants::Paths,
+    /// This server's part of measuring usage (see `usage`).
+    usage: usage::Usage,
 }
 
 impl FsCore {
@@ -442,6 +447,7 @@ impl FsCore {
             grid,
             objects: objects.map(Objects::new),
             paths: grants::Paths::default(),
+            usage: usage::Usage::default(),
         };
         core.ensure_root()
             .await
@@ -453,6 +459,9 @@ impl FsCore {
         }
         if let Err(e) = core.sweep_reservations(RESERVATION_AGE).await {
             eprintln!("could not remove old inode reservations: {e}");
+        }
+        if let Err(e) = core.assign_missing_owners().await {
+            eprintln!("could not give older volumes owners: {e}");
         }
         Ok(core)
     }
@@ -782,12 +791,13 @@ impl FsCore {
             self.discard(self.delete_chunks_from(ino, first, layout).await?);
         }
 
-        let attr = retrying(move || async move {
+        let (attr, change, parent) = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             let Some(bytes) = txn.read_one(&attr_key(ino)).await?.value else {
                 return Ok(Err(enoent()));
             };
             let mut entry = decode_entry(ino, &bytes);
+            let before = entry.attr.size as i64;
             // A truncate rewrites the boundary chunk. It must not do that
             // to an inode whose deletion could already have removed it.
             if entry.is_deleted() {
@@ -798,6 +808,12 @@ impl FsCore {
                 entry.attr.perm = (mode & 0o7777) as u16;
             }
             if let Some(new_size) = changes.size {
+                if let Err(e) = self
+                    .check_room(entry.parent, new_size.saturating_sub(entry.attr.size))
+                    .await
+                {
+                    return Ok(Err(e));
+                }
                 entry.attr.size = new_size;
                 decide!(self.trim_block(&txn, &entry, new_size).await?);
             }
@@ -812,9 +828,13 @@ impl FsCore {
             txn.write(&attr_key(ino), Some(&encode_entry(&entry)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(entry.attr))
+            let change = entry.attr.size as i64 - before;
+            Ok(Ok((entry.attr, change, entry.parent)))
         })
         .await??;
+        if attr.kind == Kind::File {
+            self.count(parent, change).await;
+        }
         Ok(attr)
     }
 
@@ -1155,6 +1175,10 @@ impl FsCore {
         Self::check_entry_name(new_name, &sealed.sealed_name)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
+        if new_parent != parent {
+            // Before the move, as a write's check is: soft, like quotas.
+            self.check_move_room(sealed.ino, parent, new_parent).await?;
+        }
         let replaced = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
@@ -1285,6 +1309,9 @@ impl FsCore {
             if let Err(e) = self.finish_removal(victim).await {
                 eprintln!("could not finish removing inode {victim}, replaced by a rename: {e}");
             }
+        }
+        if new_parent != parent {
+            self.count_move(sealed.ino, parent, new_parent).await;
         }
         Ok(replaced)
     }
@@ -1515,6 +1542,16 @@ impl FsCore {
                 format!("inode {ino} keeps nothing in object storage"),
             ));
         }
+        // Refuse before the client uploads a block that the write would
+        // refuse. Up to the start of each block's last segment, since that
+        // segment may be short.
+        let ends = blocks.iter().map(|b| {
+            (b.index.saturating_add(u64::from(b.nseg.max(1)) - 1))
+                .saturating_mul(self.chunk_size)
+                .saturating_add(1)
+        });
+        let growth = ends.max().unwrap_or(0).saturating_sub(entry.attr.size);
+        self.check_room(entry.parent, growth).await?;
         let now = SystemTime::now();
         blocks
             .iter()
@@ -1598,7 +1635,7 @@ impl FsCore {
         end: u64,
     ) -> Result<(Attr, u64), FsError> {
         self.check_chunk_writes(writes)?;
-        let (attr, dropped) = retrying(move || async move {
+        let (attr, dropped, grown, parent) = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
@@ -1610,7 +1647,14 @@ impl FsCore {
             // reach.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
+            if let Err(e) = self
+                .check_room(entry.parent, end.saturating_sub(entry.attr.size))
+                .await
+            {
+                return Ok(Err(e));
+            }
             let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
+            let before = entry.attr.size;
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1619,10 +1663,12 @@ impl FsCore {
             entry.attr.ctime = now;
             write_entry(&txn, &entry).await?;
             let seq = txn.commit().await?;
-            Ok(Ok(((entry.attr, seq), dropped)))
+            let grown = entry.attr.size - before;
+            Ok(Ok(((entry.attr, seq), dropped, grown, entry.parent)))
         })
         .await??;
         self.discard(dropped);
+        self.count(parent, grown as i64).await;
         Ok(attr)
     }
 
@@ -1668,6 +1714,10 @@ impl FsCore {
     ///   stored list if that list is still at `expected_grantees_seq`, the
     ///   seq of the list it was made from. If not, returns `EAGAIN`,
     ///   because a grant made in the meantime would be lost from it.
+    /// - `listed` names the users on that list. If the node is granted to
+    ///   anyone else, also `EAGAIN`: the client read the grants before one
+    ///   that its starting list already had, so its list leaves it out, and
+    ///   the seq check can't tell. Empty (an older client) skips this.
     pub async fn grant(
         &self,
         caller: &Caller,
@@ -1675,6 +1725,7 @@ impl FsCore {
         grant: &Grant,
         sealed_grantees: &[u8],
         expected_grantees_seq: u64,
+        listed: &[String],
     ) -> Result<(), FsError> {
         grants::check_username(grantee)?;
         let ino = grant.ino;
@@ -1700,6 +1751,7 @@ impl FsCore {
                 crate::accounts::check_link_grant(&txn, &caller.user, grantee, ino, grant.writable)
                     .await?
             );
+            decide!(volumes::check_owner_kept(&txn, ino, grantee, Some(grant.writable)).await?);
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(
@@ -1713,6 +1765,16 @@ impl FsCore {
                     libc::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
                 )));
+            }
+            if !listed.is_empty() {
+                for user in grants::grants_of(&txn, ino).await?.into_keys() {
+                    if user != grantee && !listed.contains(&user) {
+                        return Ok(Err(FsError::new(
+                            libc::EAGAIN,
+                            format!("{user}'s grant of inode {ino} isn't on the new grantee list"),
+                        )));
+                    }
+                }
             }
             grants::put_grant(&txn, grantee, grant).await?;
             txn.write(&grantees_key(ino), Some(sealed_grantees)).await?;
@@ -1784,6 +1846,15 @@ impl FsCore {
             write_entry(&txn, &entry).await?;
             txn.write(dirent, Some(&dirent_value(new.ino, &[]))).await?;
             grants::put_grant(&txn, user, grant).await?;
+            let record = raft5fs_proto::types::VolumeInfo {
+                owner: Some(user.to_string()),
+                offer: None,
+            };
+            txn.write(
+                &crate::layout::volume_key(new.ino),
+                Some(&volumes::encode_volume(&record)),
+            )
+            .await?;
             txn.write(&grantees_key(new.ino), Some(sealed_grantees))
                 .await?;
             touch_dir(&txn, &mut root, now).await?;
@@ -1869,6 +1940,7 @@ impl FsCore {
                 for (user, mut grant) in existing {
                     let sealed = resealed[user.as_str()];
                     if sealed.is_empty() {
+                        decide!(volumes::check_owner_kept(&txn, ino, &user, None).await?);
                         grants::remove_grant(&txn, &user, ino).await?;
                     } else {
                         grant.key_version = new_version;
@@ -2172,15 +2244,23 @@ impl FsCore {
         // The Entry, marked deleted, stays until the chunks are gone. If it
         // is missing, an earlier finish got that far, and the sweep can
         // remove any chunks that are left.
-        let layout = match self.client.read_one(&attr_key(ino)).await?.value {
-            Some(bytes) => decode_entry(ino, &bytes).attr.layout,
-            None => Layout::Inline,
-        };
+        let entry = self
+            .client
+            .read_one(&attr_key(ino))
+            .await?
+            .value
+            .map(|bytes| decode_entry(ino, &bytes));
+        let layout = entry.as_ref().map_or(Layout::Inline, |e| e.attr.layout);
         let dropped = self.delete_chunks_from(ino, 0, layout).await?;
         retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
+            txn.write(&crate::layout::volume_key(ino), None).await?;
+            txn.write(&crate::layout::folder_size_key(ino), None)
+                .await?;
+            txn.write(&crate::layout::folder_limit_key(ino), None)
+                .await?;
             // Its grants and key record are removed with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;
@@ -2188,6 +2268,11 @@ impl FsCore {
         })
         .await?;
         self.discard(dropped);
+        if let Some(entry) = entry
+            && entry.attr.kind == Kind::File
+        {
+            self.count(entry.parent, -(entry.attr.size as i64)).await;
+        }
         Ok(())
     }
 

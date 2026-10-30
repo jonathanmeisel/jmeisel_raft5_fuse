@@ -2,10 +2,14 @@
   // A line above the files saying how the open folder is shared: with
   // whom, whether by public link, and through which folder, when the
   // sharing was set up on a folder above it. For a folder this account can
-  // only read, who shared it. `here` is the Worker's `sharingHere`.
+  // only read, who shared it. `here` is the Worker's `sharingHere`. It
+  // also names the top-level folder's owner, if someone else, and, for a
+  // folder with a size limit (`limited`, the Worker's `folderSize`), how
+  // full it is.
   import { markUrl } from "../lib/sharedIcons.js";
+  import { sizeText } from "../lib/sizes.js";
 
-  let { here, current, ondetails } = $props();
+  let { here, current, limited = null, ondetails } = $props();
 
   /// "bob", "bob and carol", "bob, carol and dave", "bob, carol and 3 others".
   function names(people) {
@@ -25,11 +29,13 @@
   const link = $derived(here?.sources?.some((s) => s.link));
 </script>
 
-{#if here}
+{#if here || limited}
   <div class="sharing-bar">
-    <img src={markUrl(link ? "link" : "people")} alt="" width="22" height="22" />
+    {#if here}<img src={markUrl(link ? "link" : "people")} alt="" width="22" height="22" />{/if}
     <div class="text">
-      {#if here.from}
+      {#if !here}
+        <!-- Only a size limit to show. -->
+      {:else if here.from}
         <p class="source">Shared with you by <strong>{here.from}</strong>, read-only.</p>
       {:else}
         {#each here.sources as source}
@@ -38,6 +44,12 @@
             <button class="details" onclick={() => ondetails(source.path)}>Details</button>
           </p>
         {/each}
+      {/if}
+      {#if here?.owner}<p class="source">Owned by <strong>{here.owner}</strong>.</p>{/if}
+      {#if limited}
+        <p class="source">
+          Holds {sizeText(limited.bytes)} of its {sizeText(limited.limit)} limit.
+        </p>
       {/if}
     </div>
   </div>

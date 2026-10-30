@@ -516,7 +516,11 @@ pub fn serve_if_requested() {
         let signer = Signer::new(token_key.as_bytes(), DEFAULT_SESSION_TTL);
         // Check accounts on every request, so a test that removes one sees
         // the result at once.
-        let fs = FsService::new(Arc::new(core), signer, Duration::ZERO)
+        let core = Arc::new(core);
+        // Usage counts as on a real server; tests measure when they want
+        // (`MeasureUsage`).
+        tokio::spawn(Arc::clone(&core).run_tallies());
+        let fs = FsService::new(core, signer, Duration::ZERO)
             .with_timing_header(true)
             .with_invites(Some(InviteSettings {
                 servers: vec![format!("https://{listen}")],

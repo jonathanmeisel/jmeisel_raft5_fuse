@@ -9,9 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
-    Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode, Grantee, KeyPath,
-    Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SetAttr, SetTime, SnapshotInfo, Unreachable, UserEntry, WriteBody,
+    Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee,
+    KeyPath, Kind, Layout, LinkAccount, ObjectGrid, Offer, Orphan, PreparedUpload, ResealedName,
+    Rotation, SealedChunk, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry,
+    VolumeInfo, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -420,6 +421,7 @@ impl From<AccountInfo> for pb::AccountInfo {
             expires: a.expires.unwrap_or(0),
             folder: a.folder,
             note: a.note,
+            quota: a.quota,
         }
     }
 }
@@ -438,6 +440,7 @@ impl From<pb::AccountInfo> for AccountInfo {
             expires: (a.expires != 0).then_some(a.expires),
             folder: a.folder,
             note: a.note,
+            quota: a.quota,
         }
     }
 }
@@ -552,6 +555,202 @@ impl pb::IssueInviteResponse {
     }
 }
 
+impl From<Result<Storage, FsError>> for pb::StorageResponse {
+    fn from(r: Result<Storage, FsError>) -> Self {
+        use pb::storage_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(s) => R::Storage(pb::Storage {
+                    used: s.used,
+                    measured_at: s.measured_at,
+                    quota: s.quota,
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::StorageResponse {
+    pub fn into_result(self) -> Result<Storage, FsError> {
+        use pb::storage_response::Result as R;
+        match self.result {
+            Some(R::Storage(s)) => Ok(Storage {
+                used: s.used,
+                measured_at: s.measured_at,
+                quota: s.quota,
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("storage")),
+        }
+    }
+}
+
+impl From<Result<Vec<FolderSize>, FsError>> for pb::FolderSizesResponse {
+    fn from(r: Result<Vec<FolderSize>, FsError>) -> Self {
+        use pb::folder_sizes_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(sizes) => R::List(pb::FolderSizeList {
+                    sizes: sizes
+                        .into_iter()
+                        .map(|f| pb::FolderSize {
+                            ino: f.ino,
+                            bytes: f.bytes,
+                            files: f.files,
+                            measured_at: f.measured_at,
+                            limit: f.limit,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::FolderSizesResponse {
+    pub fn into_result(self) -> Result<Vec<FolderSize>, FsError> {
+        use pb::folder_sizes_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .sizes
+                .into_iter()
+                .map(|f| FolderSize {
+                    ino: f.ino,
+                    bytes: f.bytes,
+                    files: f.files,
+                    measured_at: f.measured_at,
+                    limit: f.limit,
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("folder sizes")),
+        }
+    }
+}
+
+impl From<Result<Vec<Orphan>, FsError>> for pb::OrphanListResponse {
+    fn from(r: Result<Vec<Orphan>, FsError>) -> Self {
+        use pb::orphan_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(orphans) => R::List(pb::OrphanList {
+                    orphans: orphans
+                        .into_iter()
+                        .map(|o| pb::Orphan {
+                            volume: o.volume,
+                            owner: o.owner,
+                            writers: o.writers,
+                            reachable: o.reachable,
+                            bytes: o.bytes,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::OrphanListResponse {
+    pub fn into_result(self) -> Result<Vec<Orphan>, FsError> {
+        use pb::orphan_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .orphans
+                .into_iter()
+                .map(|o| Orphan {
+                    volume: o.volume,
+                    owner: o.owner,
+                    writers: o.writers,
+                    reachable: o.reachable,
+                    bytes: o.bytes,
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("orphaned volumes")),
+        }
+    }
+}
+
+impl From<Result<Vec<Offer>, FsError>> for pb::OfferListResponse {
+    fn from(r: Result<Vec<Offer>, FsError>) -> Self {
+        use pb::offer_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(offers) => R::List(pb::OfferList {
+                    offers: offers
+                        .into_iter()
+                        .map(|o| pb::Offer {
+                            volume: o.volume,
+                            from: o.from,
+                            to: o.to,
+                            at: o.at,
+                            bytes: o.bytes,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::OfferListResponse {
+    pub fn into_result(self) -> Result<Vec<Offer>, FsError> {
+        use pb::offer_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .offers
+                .into_iter()
+                .map(|o| Offer {
+                    volume: o.volume,
+                    from: o.from,
+                    to: o.to,
+                    at: o.at,
+                    bytes: o.bytes,
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("offers")),
+        }
+    }
+}
+
+impl From<Result<VolumeInfo, FsError>> for pb::VolumeResponse {
+    fn from(r: Result<VolumeInfo, FsError>) -> Self {
+        use pb::volume_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(v) => {
+                    let (offer_to, offer_at) = v.offer.unwrap_or_default();
+                    R::Volume(pb::VolumeInfo {
+                        owner: v.owner.unwrap_or_default(),
+                        offer_to,
+                        offer_at,
+                    })
+                }
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::VolumeResponse {
+    pub fn into_result(self) -> Result<VolumeInfo, FsError> {
+        use pb::volume_response::Result as R;
+        match self.result {
+            Some(R::Volume(v)) => Ok(VolumeInfo {
+                owner: (!v.owner.is_empty()).then_some(v.owner),
+                offer: (!v.offer_to.is_empty()).then_some((v.offer_to, v.offer_at)),
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("volume")),
+        }
+    }
+}
+
 impl From<Result<Vec<Unreachable>, FsError>> for pb::UnreachableListResponse {
     fn from(r: Result<Vec<Unreachable>, FsError>) -> Self {
         use pb::unreachable_list_response::Result as R;
@@ -610,6 +809,7 @@ impl From<Result<Vec<UserEntry>, FsError>> for pb::UserListResponse {
                             username: u.user,
                             enrolled: u.enrolled,
                             account: Some(u.info.into()),
+                            used: u.used,
                         })
                         .collect(),
                 }),
@@ -631,6 +831,7 @@ impl pb::UserListResponse {
                         user: u.username,
                         enrolled: u.enrolled,
                         info: u.account.ok_or_else(|| malformed("account"))?.into(),
+                        used: u.used,
                     })
                 })
                 .collect(),

@@ -342,20 +342,30 @@ const methods = {
   copy: (from, to) => session().copy(from, to),
 
   /// Writes `file` (a File) to `path`, a piece at a time.
+  ///
+  /// - First asks the servers for room for it, so an upload over a quota
+  ///   or a folder limit fails before it creates or truncates anything.
+  /// - If a write still fails (others wrote meanwhile: quotas are soft),
+  ///   a file this upload made is removed again; a replaced one stays as
+  ///   far as it got.
   async upload(path, file, overwrite) {
     const s = session();
-    if (!overwrite) {
-      const exists = await s.stat(path).then(
-        () => true,
-        (e) => (e.code === "ENOENT" ? false : Promise.reject(e)),
-      );
-      if (exists) {
-        throw Object.assign(new Error(`${path} already exists`), {
-          code: "EEXIST",
-        });
-      }
+    const existing = await s.stat(path).then(
+      (entry) => entry,
+      (e) => (e.code === "ENOENT" ? null : Promise.reject(e)),
+    );
+    if (existing && !overwrite) {
+      throw Object.assign(new Error(`${path} already exists`), {
+        code: "EEXIST",
+      });
+    }
+    const growth = file.size - (existing?.size ?? 0);
+    if (growth > 0) {
+      await s.checkRoom(path.slice(0, path.lastIndexOf("/")) || "/", growth);
     }
     const handle = await s.open(path, true, true);
+    // Closing stores what is buffered, so it can fail as a write does.
+    let closing = false;
     try {
       for (let at = 0; at < file.size; at += PIECE) {
         const piece = new Uint8Array(
@@ -364,8 +374,12 @@ const methods = {
         await s.write(handle, at, piece);
         this.progress(Math.min(at + PIECE, file.size), file.size);
       }
-    } finally {
+      closing = true;
       await s.close(handle);
+    } catch (e) {
+      if (!closing) await s.close(handle).catch(() => {});
+      if (!existing) await s.remove(path).catch(() => {});
+      throw e;
     }
   },
 
@@ -466,6 +480,19 @@ const methods = {
   listUnreachable: () => session().listUnreachable(),
   deleteUnreachable: (ino) => session().deleteUnreachable(ino),
   removalImpact: (user) => session().removalImpact(user),
+  setQuota: (user, quota) => session().setQuota(user, quota ?? undefined),
+  measureUsage: () => session().measureUsage(),
+  listOrphans: () => session().listOrphans(),
+  removalOrphans: (user) => session().removalOrphans(user),
+  assignOwner: (ino, user) => session().assignOwner(ino, user),
+  storage: () => session().storage(),
+  volume: (path) => session().volume(path),
+  offerVolume: (path, user) => session().offerVolume(path, user),
+  withdrawOffer: (path) => session().withdrawOffer(path),
+  answerOffer: (path, accept) => session().answerOffer(path, accept),
+  offers: () => session().offers(),
+  folderSize: (path) => session().folderSize(path),
+  setFolderLimit: (path, limit) => session().setFolderLimit(path, limit ?? undefined),
   createLink: (path, label, expires) => session().createLink(path, label, expires ?? undefined),
   listLinks: () => session().listLinks(),
   revokeLink: (user) => session().revokeLink(user),

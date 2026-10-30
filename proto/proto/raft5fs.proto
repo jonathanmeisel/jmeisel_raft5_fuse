@@ -185,6 +185,54 @@ service Fs {
   // What removing a user, or letting them enroll again, would leave that
   // no account can reach: the parts that only they can reach now.
   rpc RemovalImpact(UsernameRequest) returns (UnreachableListResponse);
+
+  // Volume ownership (protocol 6 on). Each volume has an owner, whose quota
+  // everything in it counts against, and who always has read-write access
+  // to it: nobody can revoke the owner's grant of their volume, or make it
+  // read-only. The owner of the volume `ino`, for anyone with access to it.
+  rpc GetVolume(InodeRequest) returns (VolumeResponse);
+  // How much the caller's volumes hold: file sizes, as last measured (every
+  // few minutes) and counted since (each second).
+  rpc GetStorage(NoArgs) returns (StorageResponse);
+  // The last measured sizes of folders, and their size limits, for those
+  // of `inos` that the caller can read and that have either.
+  rpc FolderSizes(FolderSizesRequest) returns (FolderSizesResponse);
+  // Sets a folder's size limit (absent: no limit), as the owner of its
+  // volume or an admin. A write that would take the folder over it is
+  // refused with EDQUOT, whoever writes, the owner too.
+  rpc SetFolderLimit(FolderLimitRequest) returns (EmptyResponse);
+  // EDQUOT if `bytes` more in folder `ino` would go over its owner's quota
+  // or a folder limit; the caller must be able to write there. For asking
+  // before an upload creates or truncates anything.
+  rpc CheckRoom(CheckRoomRequest) returns (EmptyResponse);
+  // Offers a volume to another user, as its owner. They must have
+  // read-write access to it (EPERM). Replaces any earlier offer.
+  rpc OfferVolume(OfferVolumeRequest) returns (EmptyResponse);
+  // Withdraws the offer of a volume, as its owner.
+  rpc WithdrawOffer(InodeRequest) returns (EmptyResponse);
+  // Accepts or declines the offer of a volume, as the user it was made to.
+  // Accepting needs read-write access still (EPERM), and room in the
+  // caller's quota (EDQUOT). The old owner keeps their share.
+  rpc AnswerOffer(AnswerOfferRequest) returns (EmptyResponse);
+  // The offers made to the caller, and by them.
+  rpc ListOffers(NoArgs) returns (OfferListResponse);
+  // Every orphaned volume, as an admin: its owner can't write it any more
+  // (removed, or enrolled again), or it has none. It counts against nobody.
+  rpc ListOrphans(NoArgs) returns (OrphanListResponse);
+  // The volumes that removing a user, or letting them enroll again, would
+  // orphan, as an admin: those they own, each with who could take it over.
+  rpc RemovalOrphans(UsernameRequest) returns (OrphanListResponse);
+  // Makes a user the owner of a volume, as an admin: for an orphan, or to
+  // hand it over before its owner is removed. They must have read-write
+  // access to it (EPERM).
+  rpc AssignOwner(AssignOwnerRequest) returns (EmptyResponse);
+  // Measures every folder and every owner's usage now, as admins see fit.
+  // EBUSY if another server is measuring.
+  rpc MeasureUsage(NoArgs) returns (EmptyResponse);
+  // Sets a user's quota, as an admin: how much the volumes they own may
+  // hold (absent: no limit). A write that would take an owner over it is
+  // refused with EDQUOT; deleting, truncating and moving out always work.
+  rpc SetQuota(SetQuotaRequest) returns (EmptyResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -542,6 +590,12 @@ message GrantRequest {
   // server refuses the grant if the list changed, so a grant made at the
   // same time is not lost.
   uint64 expected_grantees_seq = 4;
+  // The users on the new sealed list. The server refuses the grant (EAGAIN)
+  // if the node is granted to anyone else: the client read the grants
+  // before a grant that the sealed list it started from already had, so its
+  // list leaves that grant out. Empty from clients before protocol 6, which
+  // the server then doesn't check.
+  repeated string listed = 5;
 }
 
 message CreateVolumeRequest {
@@ -781,6 +835,9 @@ message AccountInfo {
   // their key.
   uint64 folder = 7;
   bytes note = 8;
+  // How much the volumes this account owns may hold (protocol 6 on);
+  // absent for no limit.
+  optional uint64 quota = 9;
 }
 
 message Pins {
@@ -857,6 +914,8 @@ message UserEntry {
   // False for an invitation that nobody has used yet.
   bool enrolled = 2;
   AccountInfo account = 3;
+  // How much the volumes they own hold (protocol 6 on).
+  uint64 used = 4;
 }
 
 message UserList {
@@ -866,6 +925,135 @@ message UserList {
 message UserListResponse {
   oneof result {
     UserList list = 1;
+    Error error = 2;
+  }
+}
+
+message Storage {
+  uint64 used = 1;
+  // Seconds since the Unix epoch; 0 if never measured.
+  uint64 measured_at = 2;
+  // Absent for no limit.
+  optional uint64 quota = 3;
+}
+
+message StorageResponse {
+  oneof result {
+    Storage storage = 1;
+    Error error = 2;
+  }
+}
+
+message AssignOwnerRequest {
+  uint64 ino = 1;
+  string username = 2;
+}
+
+message Orphan {
+  uint64 volume = 1;
+  // Absent if it never had one.
+  optional string owner = 2;
+  // The users with read-write access to it: who could own it.
+  repeated string writers = 3;
+  // Whether anyone can reach it, or a folder in it.
+  bool reachable = 4;
+  uint64 bytes = 5;
+}
+
+message OrphanList {
+  repeated Orphan orphans = 1;
+}
+
+message OrphanListResponse {
+  oneof result {
+    OrphanList list = 1;
+    Error error = 2;
+  }
+}
+
+message OfferVolumeRequest {
+  uint64 ino = 1;
+  string username = 2;
+}
+
+message AnswerOfferRequest {
+  uint64 ino = 1;
+  bool accept = 2;
+}
+
+message Offer {
+  uint64 volume = 1;
+  string from = 2;
+  string to = 3;
+  // Seconds since the Unix epoch.
+  uint64 at = 4;
+  // The volume's size, as last measured.
+  uint64 bytes = 5;
+}
+
+message OfferList {
+  repeated Offer offers = 1;
+}
+
+message OfferListResponse {
+  oneof result {
+    OfferList list = 1;
+    Error error = 2;
+  }
+}
+
+message CheckRoomRequest {
+  uint64 ino = 1;
+  uint64 bytes = 2;
+}
+
+message FolderLimitRequest {
+  uint64 ino = 1;
+  optional uint64 limit = 2;
+}
+
+message SetQuotaRequest {
+  string username = 1;
+  optional uint64 quota = 2;
+}
+
+message FolderSizesRequest {
+  repeated uint64 inos = 1;
+}
+
+message FolderSize {
+  uint64 ino = 1;
+  uint64 bytes = 2;
+  uint64 files = 3;
+  // Seconds since the Unix epoch; 0 if never measured.
+  uint64 measured_at = 4;
+  // Absent for no limit.
+  optional uint64 limit = 5;
+}
+
+message FolderSizeList {
+  repeated FolderSize sizes = 1;
+}
+
+message FolderSizesResponse {
+  oneof result {
+    FolderSizeList list = 1;
+    Error error = 2;
+  }
+}
+
+message VolumeInfo {
+  // Empty for a volume with no owner.
+  string owner = 1;
+  // A transfer offered and not yet answered: to whom, and when (seconds
+  // since the Unix epoch). Empty and 0 if none.
+  string offer_to = 2;
+  uint64 offer_at = 3;
+}
+
+message VolumeResponse {
+  oneof result {
+    VolumeInfo volume = 1;
     Error error = 2;
   }
 }

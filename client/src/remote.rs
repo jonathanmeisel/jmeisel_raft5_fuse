@@ -60,6 +60,7 @@ use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
+use raft5fs_proto::pb::FolderSizesRequest;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
@@ -69,14 +70,18 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    CreateLinkAccountRequest, PutPinsRequest, SetCapabilitiesRequest, UsernameRequest,
+    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, CreateLinkAccountRequest,
+    FolderLimitRequest, OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest,
+    SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
     SnapshotInfo,
 };
-use raft5fs_proto::types::{LinkAccount, Unreachable, UserEntry};
+use raft5fs_proto::types::{
+    FolderSize, LinkAccount, Offer, Orphan, Storage, Unreachable, UserEntry, VolumeInfo,
+};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -978,12 +983,14 @@ impl Remote {
         grant: Grant,
         sealed_grantees: Vec<u8>,
         expected_grantees_seq: u64,
+        listed: Vec<String>,
     ) -> Result<(), FsError> {
         let req = GrantRequest {
             username: user.to_string(),
             grant: Some(grant.into()),
             sealed_grantees,
             expected_grantees_seq,
+            listed,
         };
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
@@ -1250,6 +1257,22 @@ impl Remote {
         .into_result()
     }
 
+    /// Sets how much the volumes `user` owns may hold (`None`: no limit),
+    /// as an admin.
+    pub async fn set_quota(&self, user: &str, quota: Option<u64>) -> Result<(), FsError> {
+        self.needs_protocol(6, "quotas")?;
+        let req = SetQuotaRequest {
+            username: user.to_string(),
+            quota,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.set_quota(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
     /// A new invitation for existing user `user`, so they can enroll again,
     /// as an admin: the code, and the whole invitation if the servers know
     /// how users reach them.
@@ -1268,6 +1291,174 @@ impl Remote {
             .into_result()?;
         let invitation = (!issued.invitation.is_empty()).then_some(issued.invitation);
         Ok((issued.code, invitation))
+    }
+
+    /// Who owns volume `ino`, and any transfer offered.
+    pub async fn get_volume(&self, ino: u64) -> Result<VolumeInfo, FsError> {
+        self.needs_protocol(6, "volume owners")?;
+        let req = InodeRequest {
+            ino,
+            snapshot: String::new(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.get_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// How much this account's volumes hold.
+    pub async fn storage(&self) -> Result<Storage, FsError> {
+        self.needs_protocol(6, "storage use")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.get_storage(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The last measured sizes of those of folders `inos` that this account
+    /// can read.
+    pub async fn folder_sizes(&self, inos: &[u64]) -> Result<Vec<FolderSize>, FsError> {
+        self.needs_protocol(6, "folder sizes")?;
+        let req = FolderSizesRequest {
+            inos: inos.to_vec(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.folder_sizes(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// `EDQUOT` if `bytes` more in folder `ino` would go over a quota or a
+    /// folder limit.
+    pub async fn check_room(&self, ino: u64, bytes: u64) -> Result<(), FsError> {
+        self.needs_protocol(6, "quotas")?;
+        let req = CheckRoomRequest { ino, bytes };
+        self.call(
+            Retry::ReadOnly,
+            |mut c| async move { c.check_room(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// Sets folder `ino`'s size limit (`None`: no limit), as the owner of
+    /// its volume or an admin.
+    pub async fn set_folder_limit(&self, ino: u64, limit: Option<u64>) -> Result<(), FsError> {
+        self.needs_protocol(6, "folder size limits")?;
+        let req = FolderLimitRequest { ino, limit };
+        self.call(Retry::Idempotent, |mut c| async move {
+            c.set_folder_limit(req).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Offers volume `ino` to `user`, as its owner. They must have
+    /// read-write access to it already.
+    pub async fn offer_volume(&self, ino: u64, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = OfferVolumeRequest {
+            ino,
+            username: user.to_string(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.offer_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Withdraws the offer of volume `ino`, as its owner.
+    pub async fn withdraw_offer(&self, ino: u64) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = InodeRequest {
+            ino,
+            snapshot: String::new(),
+        };
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.withdraw_offer(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Accepts or declines the offer of volume `ino` to this account.
+    pub async fn answer_offer(&self, ino: u64, accept: bool) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = AnswerOfferRequest { ino, accept };
+        self.call(
+            Retry::Once,
+            |mut c| async move { c.answer_offer(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// The offers made to this account, and by it.
+    pub async fn offers(&self) -> Result<Vec<Offer>, FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_offers(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Every orphaned volume, as an admin.
+    pub async fn orphans(&self) -> Result<Vec<Orphan>, FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_orphans(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The volumes that removing `user`, or letting them enroll again,
+    /// would orphan, as an admin.
+    pub async fn removal_orphans(&self, user: &str) -> Result<Vec<Orphan>, FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.removal_orphans(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Makes `user` the owner of volume `ino`, as an admin.
+    pub async fn assign_owner(&self, ino: u64, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        let req = AssignOwnerRequest {
+            ino,
+            username: user.to_string(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.assign_owner(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Measures every folder and owner now, as an admin.
+    pub async fn measure_usage(&self) -> Result<(), FsError> {
+        self.needs_protocol(6, "measuring usage")?;
+        self.call(Retry::Idempotent, |mut c| async move {
+            c.measure_usage(NoArgs {}).await
+        })
+        .await?
+        .into_result()
     }
 
     /// Folders and files that no account can reach any more, as an admin.

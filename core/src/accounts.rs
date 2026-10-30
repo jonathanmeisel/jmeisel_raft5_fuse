@@ -37,7 +37,9 @@ use raft5fs_crypto::password::{
 };
 
 use crate::fs::{TXN_TTL, retrying};
-use crate::layout::{ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX, PINS_PREFIX};
+use crate::layout::{
+    ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX, PINS_PREFIX, usage_key,
+};
 use crate::timing::next_key;
 use crate::view::ReadKeys;
 use raft5fs_proto::types::{
@@ -154,6 +156,10 @@ fn encode_info(info: &AccountInfo) -> Vec<u8> {
     out.extend_from_slice(&info.expires.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&info.folder.to_be_bytes());
     put(&mut out, &info.note);
+    // Added later: a record without it has no quota.
+    if let Some(quota) = info.quota {
+        out.extend_from_slice(&quota.to_be_bytes());
+    }
     out
 }
 
@@ -188,6 +194,10 @@ fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
     let folder = u64::from_be_bytes(take(8)?.try_into().unwrap());
     let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
     let note = take(n)?.to_vec();
+    // Added later: older records end here.
+    let quota = take(8)
+        .ok()
+        .map(|b| u64::from_be_bytes(b.try_into().unwrap()));
     if !rest.is_empty() {
         return Err(garbled());
     }
@@ -200,6 +210,7 @@ fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
         expires: (expires != 0).then_some(expires),
         folder,
         note,
+        quota,
     })
 }
 
@@ -525,6 +536,13 @@ async fn list_granted(client: &Client, user: &str) -> Result<Vec<u64>, FsError> 
     Ok(granted)
 }
 
+/// Whether `user` has an account (keys, or a code to enroll with), as
+/// `txn` sees it.
+pub(crate) async fn exists_in(txn: &Transaction, user: &str) -> Result<bool, KvError> {
+    Ok(txn.read_one(&keys_key(user)).await?.value.is_some()
+        || txn.read_one(&code_key(user)).await?.value.is_some())
+}
+
 /// `user`'s record, or the default for an account with none.
 pub async fn info(client: &Client, user: &str) -> Result<AccountInfo, FsError> {
     match client.read_one(&info_key(user)).await?.value {
@@ -595,6 +613,69 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
         Ok(Ok(info.caps))
     })
     .await?
+}
+
+/// For an administrator: sets how much the volumes `user` owns may hold
+/// (`None`: no limit). `ENOENT` if there is no such account and no code
+/// for one.
+pub async fn set_quota(client: &Client, user: &str, quota: Option<u64>) -> Result<(), FsError> {
+    retrying(|| async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        decide!(change_info(&txn, user, |info| info.quota = quota).await?);
+        txn.commit().await?;
+        Ok(Ok(()))
+    })
+    .await?
+}
+
+/// Admin `caller` sets `user`'s quota (`set_quota`).
+pub async fn admin_set_quota(
+    client: &Client,
+    caller: &str,
+    user: &str,
+    quota: Option<u64>,
+) -> Result<(), FsError> {
+    refuse_link_quota(user)?;
+    retrying(|| async move {
+        let txn = client.transaction(TXN_TTL).await?;
+        decide!(require_admin(&txn, caller).await?);
+        decide!(change_info(&txn, user, |info| info.quota = quota).await?);
+        txn.commit().await?;
+        Ok(Ok(()))
+    })
+    .await?
+}
+
+fn refuse_link_quota(user: &str) -> Result<(), FsError> {
+    if user.starts_with(LINK_PREFIX) {
+        return Err(FsError::new(
+            libc::EINVAL,
+            "a public link owns nothing, so has no quota",
+        ));
+    }
+    Ok(())
+}
+
+/// Changes `user`'s record with `change`, in `txn`. `ENOENT` if there is
+/// no such account and no code for one.
+async fn change_info(
+    txn: &Transaction,
+    user: &str,
+    change: impl FnOnce(&mut AccountInfo),
+) -> Result<Result<AccountInfo, FsError>, KvError> {
+    let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
+        || txn.read_one(&code_key(user)).await?.value.is_some();
+    if !exists {
+        return Ok(Err(FsError::new(
+            libc::ENOENT,
+            format!("there is no user {user}"),
+        )));
+    }
+    let mut info = decide!(info_in(txn, user).await?).unwrap_or_default();
+    change(&mut info);
+    txn.write(&info_key(user), Some(&encode_info(&info)))
+        .await?;
+    Ok(Ok(info))
 }
 
 /// Refuses (`EACCES`) unless `caller` is a person with the `admin`
@@ -891,6 +972,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&code_key(user), None).await?;
         txn.write(&info_key(user), None).await?;
         txn.write(&pins_key(user), None).await?;
+        txn.write(&usage_key(user), None).await?;
         for &ino in granted {
             crate::grants::remove_grant(&txn, user, ino).await?;
         }
@@ -918,18 +1000,26 @@ pub async fn list(client: &Client) -> Result<Vec<UserEntry>, FsError> {
     let names: Vec<&String> = accounts.keys().collect();
     let keys: Vec<Vec<u8>> = names.iter().map(|name| info_key(name)).collect();
     let records = client.read_many(&keys).await?;
+    let keys: Vec<Vec<u8>> = names.iter().map(|name| usage_key(name)).collect();
+    let usage = client.read_many(&keys).await?;
     accounts
         .iter()
         .zip(records)
-        .map(|((name, &enrolled), record)| {
+        .zip(usage)
+        .map(|(((name, &enrolled), record), usage)| {
             let info = match record.value {
                 Some(bytes) => decode_info(name, &bytes)?,
                 None => AccountInfo::default(),
             };
+            let used = usage
+                .value
+                .and_then(|v| crate::fs::usage::decode_usage(&v))
+                .map_or(0, |(bytes, _)| bytes);
             Ok(UserEntry {
                 user: name.clone(),
                 enrolled,
                 info,
+                used,
             })
         })
         .collect()
@@ -974,11 +1064,15 @@ mod tests {
             expires: Some(1_800_000_000),
             folder: 42,
             note: vec![7; 20],
+            quota: Some(10 << 30),
         };
         assert_eq!(decode_info("u", &encode_info(&info)).unwrap(), info);
         let plain = AccountInfo::default();
         assert_eq!(decode_info("u", &encode_info(&plain)).unwrap(), plain);
         let bytes = encode_info(&info);
+        // A record from before quotas: no quota.
+        let older = decode_info("u", &bytes[..bytes.len() - 8]).unwrap();
+        assert_eq!(older.quota, None);
         assert_eq!(
             decode_info("u", &bytes[..bytes.len() - 1])
                 .unwrap_err()

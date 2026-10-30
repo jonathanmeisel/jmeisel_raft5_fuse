@@ -700,11 +700,50 @@ raft5fs admin unreachable --delete 4711   # delete one, for good
   storage, sealed under keys nobody has. `admin delete` and `admin
   reenroll` say what that would be, and want `--yes` before going ahead;
   the web app's confirmations say so too. Such folders are listed under
-  `admin unreachable` (web app: Users → Unreachable folders) by size and
+  `admin unreachable` (web app: Users → Orphaned folders) by size and
   age (their names can't be read), and deleting one frees its space. A
   folder that still has a shared folder somewhere inside it stays, as the
   way down to it.
 - Backups, restores and snapshots stay with `fsadmin.sh`.
+
+**Owners, quotas and folder limits.** Each top-level folder (volume) has
+an owner: whoever made it. Everything in it counts against the owner,
+whoever writes it; what is shared with someone costs them nothing. The
+owner always keeps read-write access to it.
+
+```sh
+./fsadmin.sh user set alice --quota 10G   # K, M, G, T: powers of 1024
+./fsadmin.sh user set alice --quota none  # no limit (the default)
+raft5fs admin set alice --quota 10G       # admins, from the CLI (or the Users screen)
+raft5fs whoami                            # storage: 4.2 GB of 10.0 GB used
+raft5fs folder limit photos/shared 5G     # the volume's owner, or an admin
+raft5fs volume transfer photos bob        # bob must accept: raft5fs volume accept photos
+raft5fs admin orphans                     # volumes whose owner is gone
+raft5fs admin assign 4711 bob             # give one to someone who can write it
+```
+
+- Quotas are soft. One server at a time measures every folder and every
+  owner's usage every `--usage-interval` seconds (default 600; 0 never);
+  between runs, each server adds what is written and deleted within a
+  second. A write that would take the owner over their quota fails
+  (`EDQUOT`, "alice's storage is full"); deleting always works, and makes
+  room at once. Writes on other servers in the last few seconds can go a
+  little over.
+- Usage is file sizes as users see them. Snapshots, backups, encryption
+  overhead and garbage not yet collected don't count.
+- A folder limit caps everything inside one folder, for everyone who
+  writes there, the owner too: so a shared folder can't fill up the
+  owner's quota.
+- A transfer needs the recipient to have read-write access already, and
+  room in their quota. The old owner keeps their share until the new one
+  revokes it. Nothing is encrypted again.
+- A volume whose owner was removed, or enrolled again, is an orphan and
+  counts against nobody. `admin delete` and `admin reenroll` (and the web
+  app's confirmations) list the volumes they would orphan, so an admin
+  can give each to someone who can write it first. One that nobody can
+  reach at all is deleted under `admin unreachable`.
+- Folder sizes show in the web app's listings (size column) once
+  measured.
 
 **Public links** let anyone with a URL read one folder, without an
 account. Each link is an account of its own (`link-` and 12 letters),

@@ -4,10 +4,10 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use raft5fs_client::cli::Context;
-use raft5fs_proto::types::{AccountKind, Caps};
+use raft5fs_proto::types::{AccountKind, Caps, size_text};
 
 use super::account::caps_text;
-use super::{ConnectArgs, Outcome, log_in, runtime};
+use super::{ConnectArgs, Outcome, SizeLimit, log_in, parse_size_limit, runtime};
 
 #[derive(Subcommand)]
 pub enum AdminCommand {
@@ -27,13 +27,29 @@ pub enum AdminCommand {
     /// List folders and files that no account can reach any more (their
     /// account was removed, or enrolled again), or delete one.
     Unreachable(UnreachableArgs),
+    /// List orphaned volumes: their owner can't write them any more
+    /// (removed, or enrolled again), or they have none. They count against
+    /// nobody's quota until someone owns them.
+    Orphans,
+    /// Make a user the owner of a volume (an inode from `orphans`, or from
+    /// the list `delete` shows). They must have read-write access to it.
+    Assign(AssignArgs),
+}
+
+#[derive(Args)]
+pub struct AssignArgs {
+    #[arg(value_name = "INODE")]
+    pub ino: u64,
+    #[arg(value_name = "USER")]
+    pub name: String,
 }
 
 #[derive(Args)]
 pub struct ConfirmArg {
     #[arg(value_name = "USER")]
     pub name: String,
-    /// Go ahead even though it leaves folders that nobody can reach.
+    /// Go ahead even though it leaves folders that nobody can reach, or
+    /// volumes without an owner.
     #[arg(long)]
     pub yes: bool,
 }
@@ -77,6 +93,10 @@ pub struct SetArgs {
     pub links: Option<Switch>,
     #[arg(long, value_name = "on|off")]
     pub admin: Option<Switch>,
+    /// How much the volumes they own may hold, whoever writes there, such
+    /// as 10G (K, M, G, T: powers of 1024), or `none` for no limit.
+    #[arg(long, value_name = "SIZE|none", value_parser = parse_size_limit)]
+    pub quota: Option<SizeLimit>,
 }
 
 #[derive(Args)]
@@ -100,7 +120,12 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 let state = if u.enrolled { "enrolled" } else { "invited" };
                 let what = match u.info.kind {
                     AccountKind::Link => format!("public link made by {}", u.info.owner),
-                    AccountKind::Person => caps_text(u.info.caps),
+                    AccountKind::Person => format!(
+                        "{}\t{} used of {}",
+                        caps_text(u.info.caps),
+                        size_text(u.used),
+                        quota_text(u.info.quota)
+                    ),
                 };
                 println!("{}\t{state}\t{what}", u.user);
             }
@@ -133,13 +158,23 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                     None => {}
                 }
             }
-            if on == Caps::NONE && off == Caps::NONE {
-                return Err("give --volumes, --links or --admin, each on or off".to_string());
+            if on == Caps::NONE && off == Caps::NONE && args.quota.is_none() {
+                return Err(
+                    "give --volumes, --links or --admin, each on or off, or --quota".to_string(),
+                );
             }
-            let info = runtime
-                .block_on(remote.set_capabilities(&args.name, on, off))
-                .map_err(|e| format!("cannot change {}: {e}", args.name))?;
-            println!("{} can now: {}", args.name, caps_text(info.caps));
+            if let Some(SizeLimit(quota)) = args.quota {
+                runtime
+                    .block_on(remote.set_quota(&args.name, quota))
+                    .map_err(|e| format!("cannot set {}'s quota: {e}", args.name))?;
+                println!("{}'s quota is now {}", args.name, quota_text(quota));
+            }
+            if on != Caps::NONE || off != Caps::NONE {
+                let info = runtime
+                    .block_on(remote.set_capabilities(&args.name, on, off))
+                    .map_err(|e| format!("cannot change {}: {e}", args.name))?;
+                println!("{} can now: {}", args.name, caps_text(info.caps));
+            }
         }
         AdminCommand::Reenroll(args) => {
             check_impact(&runtime, remote, &args, "letting them enroll again")?;
@@ -182,32 +217,95 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 }
             }
         },
+        AdminCommand::Orphans => {
+            let orphans = runtime
+                .block_on(remote.orphans())
+                .map_err(|e| format!("cannot list orphaned volumes: {e}"))?;
+            if orphans.is_empty() {
+                println!("every volume has an owner who can write it");
+            }
+            for o in &orphans {
+                println!("{}	{}", o.volume, describe_orphan(o));
+            }
+            if !orphans.is_empty() {
+                println!(
+                    "(raft5fs admin assign <INODE> <USER> gives one to a user who can write it)"
+                );
+            }
+        }
+        AdminCommand::Assign(args) => {
+            runtime
+                .block_on(remote.assign_owner(args.ino, &args.name))
+                .map_err(|e| format!("cannot give inode {} to {}: {e}", args.ino, args.name))?;
+            println!("{} owns inode {} now", args.name, args.ino);
+        }
     }
     Ok(0)
 }
 
+/// An orphaned volume, as people read it.
+fn describe_orphan(o: &raft5fs_proto::types::Orphan) -> String {
+    let had = match &o.owner {
+        Some(owner) => format!("was {owner}'s"),
+        None => "never had an owner".to_string(),
+    };
+    let who = if !o.writers.is_empty() {
+        format!("can go to: {}", o.writers.join(", "))
+    } else if o.reachable {
+        "nobody can write it, but some can read it or folders in it".to_string()
+    } else {
+        "nobody can reach it: `raft5fs admin unreachable` deletes it".to_string()
+    };
+    format!("{}, {had}; {who}", size_text(o.bytes))
+}
+
 /// Refuses to go on, unless `--yes`, when `doing` to the user would leave
-/// folders that nobody can reach, and says what they hold.
+/// folders that nobody can reach, or volumes without an owner, and says
+/// what they are.
 fn check_impact(
     runtime: &tokio::runtime::Runtime,
     remote: &raft5fs_client::remote::Remote,
     args: &ConfirmArg,
     doing: &str,
 ) -> Result<(), String> {
-    let lost = runtime
-        .block_on(remote.removal_impact(&args.name))
+    let (lost, orphans) = runtime
+        .block_on(async {
+            Ok::<_, raft5fs_proto::types::FsError>((
+                remote.removal_impact(&args.name).await?,
+                remote.removal_orphans(&args.name).await?,
+            ))
+        })
         .map_err(|e| format!("cannot tell what {doing} would leave: {e}"))?;
-    if lost.is_empty() || args.yes {
+    if (lost.is_empty() && orphans.is_empty()) || args.yes {
         return Ok(());
     }
-    let mut why = format!(
-        "{doing} leaves what only {} can reach now, which nobody could then open:",
-        args.name
-    );
-    for u in &lost {
-        why.push_str(&format!("\n  {}", describe(u)));
+    let mut why = String::new();
+    if !lost.is_empty() {
+        why.push_str(&format!(
+            "{doing} leaves what only {} can reach now, which nobody could then open:",
+            args.name
+        ));
+        for u in &lost {
+            why.push_str(&format!("\n  {}", describe(u)));
+        }
+        why.push_str("\n(`raft5fs admin unreachable` can delete it later)\n");
     }
-    why.push_str("\ngive --yes to go ahead; `raft5fs admin unreachable` can delete it later");
+    if !orphans.is_empty() {
+        why.push_str(&format!(
+            "{} owns these volumes, which would have no owner:",
+            args.name
+        ));
+        for o in &orphans {
+            let who = if o.writers.is_empty() {
+                "nobody else can write it".to_string()
+            } else {
+                format!("can go to: {}", o.writers.join(", "))
+            };
+            why.push_str(&format!("\n  {}\t{}; {who}", o.volume, size_text(o.bytes)));
+        }
+        why.push_str("\n(`raft5fs admin assign <INODE> <USER>` gives one away first)\n");
+    }
+    why.push_str("give --yes to go ahead");
     Err(why)
 }
 
@@ -229,17 +327,12 @@ fn describe(u: &raft5fs_proto::types::Unreachable) -> String {
         "{what}: {} files, {} folders, {}, last changed {days} days ago",
         u.files,
         u.folders,
-        size(u.bytes)
+        size_text(u.bytes)
     )
 }
 
-fn size(bytes: u64) -> String {
-    match bytes {
-        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
-        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
-        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
-        b => format!("{b} bytes"),
-    }
+fn quota_text(quota: Option<u64>) -> String {
+    quota.map_or("no limit".to_string(), size_text)
 }
 
 fn print_invitation(name: &str, (code, invitation): (String, Option<String>)) {
