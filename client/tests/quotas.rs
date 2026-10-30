@@ -537,3 +537,85 @@ fn a_volume_changes_owner_when_the_recipient_accepts() {
     assert_eq!(errno(rt.block_on(tester.revoke(v, "bob"))), libc::EPERM);
     rt.block_on(bob.revoke(v, TESTER)).unwrap();
 }
+
+#[test]
+fn admins_find_orphaned_volumes_and_give_them_to_a_writer() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    make_admin(&backend, TESTER);
+    let carol_key = backend.enrol("carol");
+    backend.enrol("bob");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    let carol = pinned(&backend, "carol");
+    bob.known_keys().check("carol", &carol_key).unwrap();
+    let make = |name: &str| {
+        rt.block_on(bob.create_volume(OsStr::new(name), 0o755))
+            .unwrap()
+            .ino
+    };
+    let (shared, solo, read) = (make("shared"), make("solo"), make("read"));
+    rt.block_on(bob.grant(shared, "carol", true, OsStr::new("shared")))
+        .unwrap();
+    rt.block_on(bob.grant(read, "carol", false, OsStr::new("read")))
+        .unwrap();
+    let f = rt
+        .block_on(bob.create(shared, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.write(f, 0, &[1; 1000])).unwrap();
+
+    // Before removing bob: what it would orphan, and who could take each.
+    let summary = |mut orphans: Vec<raft5fs_proto::types::Orphan>| {
+        orphans.sort_by_key(|o| o.volume);
+        orphans
+            .into_iter()
+            .map(|o| (o.volume, o.owner, o.writers, o.reachable))
+            .collect::<Vec<_>>()
+    };
+    let bob_name = Some("bob".to_string());
+    let expected = vec![
+        (shared, bob_name.clone(), vec!["carol".to_string()], true),
+        (solo, bob_name.clone(), vec![], false),
+        (read, bob_name.clone(), vec![], true),
+    ];
+    assert_eq!(
+        summary(rt.block_on(tester.remote().removal_orphans("bob")).unwrap()),
+        expected
+    );
+    assert!(rt.block_on(tester.remote().orphans()).unwrap().is_empty());
+    assert_eq!(errno(rt.block_on(carol.remote().orphans())), libc::EACCES);
+
+    // Removed, bob's volumes are orphans, and bob's usage record goes.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    rt.block_on(accounts::remove(&backend.client, "bob"))
+        .unwrap();
+    assert_eq!(
+        summary(rt.block_on(tester.remote().orphans()).unwrap()),
+        expected
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(backend.read_key(b"\x06q/bob").is_none());
+
+    // Only an admin assigns one, and only to someone who can write it.
+    assert_eq!(
+        errno(rt.block_on(carol.remote().assign_owner(shared, "carol"))),
+        libc::EACCES
+    );
+    assert_eq!(
+        errno(rt.block_on(tester.remote().assign_owner(shared, TESTER))),
+        libc::EPERM
+    );
+    assert_eq!(
+        errno(rt.block_on(tester.remote().assign_owner(read, "carol"))),
+        libc::EPERM
+    );
+    rt.block_on(tester.remote().measure_usage()).unwrap();
+    rt.block_on(tester.remote().assign_owner(shared, "carol"))
+        .unwrap();
+    assert_eq!(owner(&backend, &carol, shared).as_deref(), Some("carol"));
+    assert_eq!(rt.block_on(tester.remote().orphans()).unwrap().len(), 2);
+    eventually("the volume counts against its new owner", || {
+        used(&backend, &carol) == 1000
+    });
+}

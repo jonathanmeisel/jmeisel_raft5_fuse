@@ -527,6 +527,21 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+/// A volume whose owner can't write it (their account was removed, or
+/// enrolled again), or that has no owner. It counts against nobody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub volume: u64,
+    /// The owner the servers have for it, who no longer can write it.
+    pub owner: Option<String>,
+    /// Who could own it: the users with read-write access to the volume.
+    pub writers: Vec<String>,
+    /// Whether anyone can reach it, or any folder in it. If nobody can,
+    /// the unreachable-folders tool deletes it.
+    pub reachable: bool,
+    pub bytes: u64,
+}
+
 /// An offer to give a volume to another user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {

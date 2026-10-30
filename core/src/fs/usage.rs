@@ -40,7 +40,7 @@ use super::*;
 use crate::gc::{release_lease, take_lease};
 use crate::layout::{
     FOLDER_LIMIT_PREFIX, FOLDER_SIZE_PREFIX, ROOT_INO, USAGE_LEASE_KEY, USAGE_PREFIX,
-    folder_limit_key, folder_size_key, usage_key, volume_key,
+    folder_limit_key, folder_size_key, usage_key,
 };
 use raft5fs_proto::types::{FolderSize, Storage, size_text};
 
@@ -262,17 +262,15 @@ impl FsCore {
         Ok(paths[&dir].1.clone())
     }
 
-    /// Who owns `volume`, read again every `OWNER_TTL`.
+    /// Who owns `volume` (`volumes::acting_owner`), read again every
+    /// `OWNER_TTL`.
     pub(crate) async fn owner_of(&self, volume: u64) -> Result<Option<String>, FsError> {
         if let Some((seen, owner)) = self.usage.owners.lock().unwrap().get(&volume)
             && seen.elapsed() < OWNER_TTL
         {
             return Ok(owner.clone());
         }
-        let owner = match self.client.read_one(&volume_key(volume)).await?.value {
-            Some(bytes) => volumes::decode_volume(volume, &bytes)?.owner,
-            None => None,
-        };
+        let owner = volumes::acting_owner(&self.client, volume).await?;
         self.usage
             .owners
             .lock()
@@ -385,6 +383,7 @@ impl FsCore {
     }
 
     /// Adds `changes` to `owner`'s usage record; returns what it holds then.
+    /// Nothing for an account that is gone: its record went with it.
     async fn add_to_usage(
         &self,
         owner: &str,
@@ -402,6 +401,9 @@ impl FsCore {
             let delta = since(changes, at);
             if delta == 0 {
                 return Ok(Some(bytes));
+            }
+            if !crate::accounts::exists_in(&txn, owner).await? {
+                return Ok(None);
             }
             let bytes = bytes.saturating_add_signed(delta);
             txn.write(key, Some(&encode_usage(bytes, at))).await?;
@@ -609,10 +611,7 @@ impl FsCore {
         let Some(&volume) = self.path_of(ino).await?.last() else {
             return Err(enoent());
         };
-        let owner = match self.client.read_one(&volume_key(volume)).await?.value {
-            Some(bytes) => volumes::decode_volume(volume, &bytes)?.owner,
-            None => None,
-        };
+        let owner = volumes::acting_owner(&self.client, volume).await?;
         if owner.as_deref() != Some(caller.user.as_str())
             && crate::accounts::is_admin(&self.client, &caller.user)
                 .await
@@ -749,17 +748,9 @@ impl FsCore {
 
         // Usage: each owner's volumes, and 0 for anyone with a record but
         // no volumes any more.
-        let tops: Vec<u64> = tree[&ROOT_INO].children.clone();
-        let records = self
-            .client
-            .get_many(&tops.iter().map(|&v| volume_key(v)).collect::<Vec<_>>())
-            .await?;
         let mut usage: HashMap<String, u64> = HashMap::new();
-        for (&volume, record) in tops.iter().zip(records) {
-            let owner = match record {
-                Some(bytes) => volumes::decode_volume(volume, &bytes)?.owner,
-                None => None,
-            };
+        for &volume in &tree[&ROOT_INO].children {
+            let owner = volumes::acting_owner(&self.client, volume).await?;
             if let (Some(owner), Some(&(bytes, _))) = (owner, sizes.get(&volume)) {
                 *usage.entry(owner).or_default() += bytes;
             }

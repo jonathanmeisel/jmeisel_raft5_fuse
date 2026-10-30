@@ -46,10 +46,10 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, FolderLimitRequest, FolderSizesRequest, FolderSizesResponse,
-    OfferListResponse, OfferVolumeRequest, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
-    SetQuotaRequest, StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest,
-    VolumeResponse,
+    AnswerOfferRequest, AssignOwnerRequest, FolderLimitRequest, FolderSizesRequest,
+    FolderSizesResponse, OfferListResponse, OfferVolumeRequest, OrphanListResponse, PinsResponse,
+    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, StorageResponse,
+    UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -799,6 +799,41 @@ impl Fs for FsService {
     async fn list_offers(&self, r: Request<NoArgs>) -> Result<Response<OfferListResponse>, Status> {
         let (caller, _) = self.caller(r).await?;
         Ok(Response::new(self.core.offers(&caller).await.into()))
+    }
+
+    async fn list_orphans(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<OrphanListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let found = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.orphans().await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn removal_orphans(
+        &self,
+        r: Request<UsernameRequest>,
+    ) -> Result<Response<OrphanListResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let found = async {
+            accounts::is_admin(self.core.client(), &caller.user).await?;
+            self.core.removal_orphans(&r.username).await
+        }
+        .await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn assign_owner(
+        &self,
+        r: Request<AssignOwnerRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let assigned = self.core.assign_owner(&caller, r.ino, &r.username).await;
+        Ok(Response::new(assigned.into()))
     }
 
     async fn measure_usage(&self, r: Request<NoArgs>) -> Result<Response<EmptyResponse>, Status> {

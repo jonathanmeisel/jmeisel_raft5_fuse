@@ -27,13 +27,29 @@ pub enum AdminCommand {
     /// List folders and files that no account can reach any more (their
     /// account was removed, or enrolled again), or delete one.
     Unreachable(UnreachableArgs),
+    /// List orphaned volumes: their owner can't write them any more
+    /// (removed, or enrolled again), or they have none. They count against
+    /// nobody's quota until someone owns them.
+    Orphans,
+    /// Make a user the owner of a volume (an inode from `orphans`, or from
+    /// the list `delete` shows). They must have read-write access to it.
+    Assign(AssignArgs),
+}
+
+#[derive(Args)]
+pub struct AssignArgs {
+    #[arg(value_name = "INODE")]
+    pub ino: u64,
+    #[arg(value_name = "USER")]
+    pub name: String,
 }
 
 #[derive(Args)]
 pub struct ConfirmArg {
     #[arg(value_name = "USER")]
     pub name: String,
-    /// Go ahead even though it leaves folders that nobody can reach.
+    /// Go ahead even though it leaves folders that nobody can reach, or
+    /// volumes without an owner.
     #[arg(long)]
     pub yes: bool,
 }
@@ -201,32 +217,95 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 }
             }
         },
+        AdminCommand::Orphans => {
+            let orphans = runtime
+                .block_on(remote.orphans())
+                .map_err(|e| format!("cannot list orphaned volumes: {e}"))?;
+            if orphans.is_empty() {
+                println!("every volume has an owner who can write it");
+            }
+            for o in &orphans {
+                println!("{}	{}", o.volume, describe_orphan(o));
+            }
+            if !orphans.is_empty() {
+                println!(
+                    "(raft5fs admin assign <INODE> <USER> gives one to a user who can write it)"
+                );
+            }
+        }
+        AdminCommand::Assign(args) => {
+            runtime
+                .block_on(remote.assign_owner(args.ino, &args.name))
+                .map_err(|e| format!("cannot give inode {} to {}: {e}", args.ino, args.name))?;
+            println!("{} owns inode {} now", args.name, args.ino);
+        }
     }
     Ok(0)
 }
 
+/// An orphaned volume, as people read it.
+fn describe_orphan(o: &raft5fs_proto::types::Orphan) -> String {
+    let had = match &o.owner {
+        Some(owner) => format!("was {owner}'s"),
+        None => "never had an owner".to_string(),
+    };
+    let who = if !o.writers.is_empty() {
+        format!("can go to: {}", o.writers.join(", "))
+    } else if o.reachable {
+        "nobody can write it, but some can read it or folders in it".to_string()
+    } else {
+        "nobody can reach it: `raft5fs admin unreachable` deletes it".to_string()
+    };
+    format!("{}, {had}; {who}", size_text(o.bytes))
+}
+
 /// Refuses to go on, unless `--yes`, when `doing` to the user would leave
-/// folders that nobody can reach, and says what they hold.
+/// folders that nobody can reach, or volumes without an owner, and says
+/// what they are.
 fn check_impact(
     runtime: &tokio::runtime::Runtime,
     remote: &raft5fs_client::remote::Remote,
     args: &ConfirmArg,
     doing: &str,
 ) -> Result<(), String> {
-    let lost = runtime
-        .block_on(remote.removal_impact(&args.name))
+    let (lost, orphans) = runtime
+        .block_on(async {
+            Ok::<_, raft5fs_proto::types::FsError>((
+                remote.removal_impact(&args.name).await?,
+                remote.removal_orphans(&args.name).await?,
+            ))
+        })
         .map_err(|e| format!("cannot tell what {doing} would leave: {e}"))?;
-    if lost.is_empty() || args.yes {
+    if (lost.is_empty() && orphans.is_empty()) || args.yes {
         return Ok(());
     }
-    let mut why = format!(
-        "{doing} leaves what only {} can reach now, which nobody could then open:",
-        args.name
-    );
-    for u in &lost {
-        why.push_str(&format!("\n  {}", describe(u)));
+    let mut why = String::new();
+    if !lost.is_empty() {
+        why.push_str(&format!(
+            "{doing} leaves what only {} can reach now, which nobody could then open:",
+            args.name
+        ));
+        for u in &lost {
+            why.push_str(&format!("\n  {}", describe(u)));
+        }
+        why.push_str("\n(`raft5fs admin unreachable` can delete it later)\n");
     }
-    why.push_str("\ngive --yes to go ahead; `raft5fs admin unreachable` can delete it later");
+    if !orphans.is_empty() {
+        why.push_str(&format!(
+            "{} owns these volumes, which would have no owner:",
+            args.name
+        ));
+        for o in &orphans {
+            let who = if o.writers.is_empty() {
+                "nobody else can write it".to_string()
+            } else {
+                format!("can go to: {}", o.writers.join(", "))
+            };
+            why.push_str(&format!("\n  {}\t{}; {who}", o.volume, size_text(o.bytes)));
+        }
+        why.push_str("\n(`raft5fs admin assign <INODE> <USER>` gives one away first)\n");
+    }
+    why.push_str("give --yes to go ahead");
     Err(why)
 }
 

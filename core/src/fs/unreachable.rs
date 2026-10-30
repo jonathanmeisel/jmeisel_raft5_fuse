@@ -207,7 +207,7 @@ impl FsCore {
     }
 
     /// Every granted inode, with the users that hold its grants.
-    async fn granted(&self) -> Result<HashMap<u64, Vec<String>>, FsError> {
+    pub(super) async fn granted(&self) -> Result<HashMap<u64, Vec<String>>, FsError> {
         let mut granted: HashMap<u64, Vec<String>> = HashMap::new();
         let mut iter = self.client.key_iterator(GRANTS_PREFIX, Consistency::Stale);
         while let Some(key) = next_key(&mut iter).await? {
@@ -269,7 +269,7 @@ pub(super) fn post_order(tree: &Tree, ino: u64) -> Vec<u64> {
 }
 
 /// What part `ino` of `tree` holds.
-fn stats(tree: &Tree, ino: u64) -> Unreachable {
+pub(super) fn stats(tree: &Tree, ino: u64) -> Unreachable {
     let mut out = Unreachable {
         ino,
         volume: tree[&ino].parent == ROOT_INO,

@@ -70,8 +70,8 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, CreateLinkAccountRequest, FolderLimitRequest, OfferVolumeRequest,
-    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    AnswerOfferRequest, AssignOwnerRequest, CreateLinkAccountRequest, FolderLimitRequest,
+    OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -79,7 +79,7 @@ use raft5fs_proto::types::{
     SnapshotInfo,
 };
 use raft5fs_proto::types::{
-    FolderSize, LinkAccount, Offer, Storage, Unreachable, UserEntry, VolumeInfo,
+    FolderSize, LinkAccount, Offer, Orphan, Storage, Unreachable, UserEntry, VolumeInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -1392,6 +1392,46 @@ impl Remote {
         self.needs_protocol(6, "volume transfers")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_offers(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Every orphaned volume, as an admin.
+    pub async fn orphans(&self) -> Result<Vec<Orphan>, FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_orphans(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The volumes that removing `user`, or letting them enroll again,
+    /// would orphan, as an admin.
+    pub async fn removal_orphans(&self, user: &str) -> Result<Vec<Orphan>, FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.removal_orphans(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Makes `user` the owner of volume `ino`, as an admin.
+    pub async fn assign_owner(&self, ino: u64, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(6, "orphaned volumes")?;
+        let req = AssignOwnerRequest {
+            ino,
+            username: user.to_string(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.assign_owner(req).await }
         })
         .await?
         .into_result()

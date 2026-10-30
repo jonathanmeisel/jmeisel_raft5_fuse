@@ -17,13 +17,21 @@
 //!   new owner has room. The old owner keeps their share, which the new
 //!   owner can then revoke. Nothing is encrypted again: ownership is the
 //!   servers' record alone.
+//! - **Orphans:** a volume whose owner has no writable grant of it any more,
+//!   or that has no owner, counts against nobody (`acting_owner`). Admins
+//!   list them (`orphans`) and give each to a user who can write it
+//!   (`assign_owner`). Before removing a user, admins see what that would
+//!   orphan (`removal_orphans`), to give it away first. A volume that
+//!   nobody can reach at all is deleted with the unreachable-folders tool.
 //!
 //! A record, under `VOLUME_PREFIX`, is a format byte, the owner (empty for
 //! none), and a pending transfer offer: to whom (empty for none), and when.
 
 use super::*;
 use crate::layout::{ROOT_INO, VOLUME_PREFIX, dirent_ino, dirent_prefix, volume_key};
-use raft5fs_proto::types::{LINK_PREFIX, Offer, VolumeInfo};
+use raft5fs_proto::types::{LINK_PREFIX, Offer, Orphan, VolumeInfo};
+
+use super::unreachable::{post_order, stats};
 
 const FORMAT: u8 = 1;
 
@@ -98,6 +106,26 @@ pub(crate) async fn check_owner_kept(
     } else {
         Ok(())
     })
+}
+
+/// Who volume `ino` counts against: its owner while they have a writable
+/// grant of it; nobody for an orphan.
+pub(crate) async fn acting_owner(client: &Client, ino: u64) -> Result<Option<String>, FsError> {
+    let Some(owner) = (match client.read_one(&volume_key(ino)).await?.value {
+        Some(bytes) => decode_volume(ino, &bytes)?.owner,
+        None => None,
+    }) else {
+        return Ok(None);
+    };
+    let writes = match client
+        .read_one(&grants::grant_key(ino, &owner))
+        .await?
+        .value
+    {
+        Some(bytes) => grants::decode_grant(ino, &bytes)?.writable,
+        None => false,
+    };
+    Ok(writes.then_some(owner))
 }
 
 /// Whether `user` has a writable grant of `ino` itself.
@@ -264,6 +292,97 @@ impl FsCore {
             });
         }
         Ok(offers)
+    }
+
+    /// Every orphaned volume (see the top of this file), for an admin.
+    pub async fn orphans(&self) -> Result<Vec<Orphan>, FsError> {
+        self.find_orphans(None).await
+    }
+
+    /// The volumes that removing `user`, or letting them enroll again,
+    /// would orphan: those they own. Each lists who else could take it
+    /// over.
+    pub async fn removal_orphans(&self, user: &str) -> Result<Vec<Orphan>, FsError> {
+        self.find_orphans(Some(user)).await
+    }
+
+    /// The orphaned volumes, as they would be without `gone`'s grants: if
+    /// `gone` is given, only the volumes they own.
+    async fn find_orphans(&self, gone: Option<&str>) -> Result<Vec<Orphan>, FsError> {
+        let tree = self.load_tree().await?;
+        let mut granted = self.granted().await?;
+        if let Some(gone) = gone {
+            for users in granted.values_mut() {
+                users.retain(|u| u != gone);
+            }
+            granted.retain(|_, users| !users.is_empty());
+        }
+        let mut orphans = Vec::new();
+        for &volume in &tree[&ROOT_INO].children {
+            let owner = match self.client.read_one(&volume_key(volume)).await?.value {
+                Some(bytes) => decode_volume(volume, &bytes)?.owner,
+                None => None,
+            };
+            if gone.is_some() && owner.as_deref() != gone {
+                continue;
+            }
+            let users = granted.get(&volume).cloned().unwrap_or_default();
+            let keys: Vec<Vec<u8>> = users.iter().map(|u| grants::grant_key(volume, u)).collect();
+            let mut writers = Vec::new();
+            for (user, value) in users.into_iter().zip(self.client.get_many(&keys).await?) {
+                let writes = match value {
+                    Some(bytes) => grants::decode_grant(volume, &bytes)?.writable,
+                    None => false,
+                };
+                if writes && !user.starts_with(LINK_PREFIX) {
+                    writers.push(user);
+                }
+            }
+            if owner.as_ref().is_some_and(|o| writers.contains(o)) {
+                continue;
+            }
+            writers.sort();
+            orphans.push(Orphan {
+                volume,
+                owner,
+                writers,
+                reachable: post_order(&tree, volume)
+                    .iter()
+                    .any(|ino| granted.contains_key(ino)),
+                bytes: stats(&tree, volume).bytes,
+            });
+        }
+        Ok(orphans)
+    }
+
+    /// Makes `user` the owner of volume `ino`, as an admin: for an orphan,
+    /// or to hand a volume over before its owner is removed. `user` must
+    /// have a writable grant of it.
+    pub async fn assign_owner(&self, caller: &Caller, ino: u64, user: &str) -> Result<(), FsError> {
+        crate::accounts::is_admin(&self.client, &caller.user).await?;
+        let size = self.moved_size(ino).await?;
+        let old = acting_owner(&self.client, ino).await?;
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let mut record = decide!(record_of(&txn, ino).await?);
+            if !decide!(writes_at(&txn, ino, user).await?) || user.starts_with(LINK_PREFIX) {
+                return Ok(Err(FsError::new(
+                    libc::EPERM,
+                    format!("{user} has no read-write access to it, so can't own it"),
+                )));
+            }
+            record.owner = Some(user.to_string());
+            record.offer = None;
+            txn.write(&volume_key(ino), Some(&encode_volume(&record)))
+                .await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await??;
+        if old.as_deref() != Some(user) {
+            self.count_transfer(ino, old, user, size);
+        }
+        Ok(())
     }
 
     /// Gives every volume without a record one (see the top of this file).

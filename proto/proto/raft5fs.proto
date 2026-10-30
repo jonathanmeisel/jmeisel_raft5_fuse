@@ -212,6 +212,16 @@ service Fs {
   rpc AnswerOffer(AnswerOfferRequest) returns (EmptyResponse);
   // The offers made to the caller, and by them.
   rpc ListOffers(NoArgs) returns (OfferListResponse);
+  // Every orphaned volume, as an admin: its owner can't write it any more
+  // (removed, or enrolled again), or it has none. It counts against nobody.
+  rpc ListOrphans(NoArgs) returns (OrphanListResponse);
+  // The volumes that removing a user, or letting them enroll again, would
+  // orphan, as an admin: those they own, each with who could take it over.
+  rpc RemovalOrphans(UsernameRequest) returns (OrphanListResponse);
+  // Makes a user the owner of a volume, as an admin: for an orphan, or to
+  // hand it over before its owner is removed. They must have read-write
+  // access to it (EPERM).
+  rpc AssignOwner(AssignOwnerRequest) returns (EmptyResponse);
   // Measures every folder and every owner's usage now, as admins see fit.
   // EBUSY if another server is measuring.
   rpc MeasureUsage(NoArgs) returns (EmptyResponse);
@@ -926,6 +936,33 @@ message Storage {
 message StorageResponse {
   oneof result {
     Storage storage = 1;
+    Error error = 2;
+  }
+}
+
+message AssignOwnerRequest {
+  uint64 ino = 1;
+  string username = 2;
+}
+
+message Orphan {
+  uint64 volume = 1;
+  // Absent if it never had one.
+  optional string owner = 2;
+  // The users with read-write access to it: who could own it.
+  repeated string writers = 3;
+  // Whether anyone can reach it, or a folder in it.
+  bool reachable = 4;
+  uint64 bytes = 5;
+}
+
+message OrphanList {
+  repeated Orphan orphans = 1;
+}
+
+message OrphanListResponse {
+  oneof result {
+    OrphanList list = 1;
     Error error = 2;
   }
 }

@@ -536,6 +536,13 @@ async fn list_granted(client: &Client, user: &str) -> Result<Vec<u64>, FsError> 
     Ok(granted)
 }
 
+/// Whether `user` has an account (keys, or a code to enroll with), as
+/// `txn` sees it.
+pub(crate) async fn exists_in(txn: &Transaction, user: &str) -> Result<bool, KvError> {
+    Ok(txn.read_one(&keys_key(user)).await?.value.is_some()
+        || txn.read_one(&code_key(user)).await?.value.is_some())
+}
+
 /// `user`'s record, or the default for an account with none.
 pub async fn info(client: &Client, user: &str) -> Result<AccountInfo, FsError> {
     match client.read_one(&info_key(user)).await?.value {
@@ -965,6 +972,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&code_key(user), None).await?;
         txn.write(&info_key(user), None).await?;
         txn.write(&pins_key(user), None).await?;
+        txn.write(&usage_key(user), None).await?;
         for &ino in granted {
             crate::grants::remove_grant(&txn, user, ino).await?;
         }
