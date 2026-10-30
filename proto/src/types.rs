@@ -527,6 +527,19 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+/// An offer to give a volume to another user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub volume: u64,
+    /// The owner, who made it.
+    pub from: String,
+    pub to: String,
+    /// When made, in seconds since the Unix epoch.
+    pub at: u64,
+    /// The volume's size, as last measured.
+    pub bytes: u64,
+}
+
 /// A quota or a size limit as people type it: a byte count, or a whole
 /// number with a K, M, G or T suffix (powers of 1024); `none` for no limit.
 pub fn parse_limit(s: &str) -> Result<Option<u64>, String> {

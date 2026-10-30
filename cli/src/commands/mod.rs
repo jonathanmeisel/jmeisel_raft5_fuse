@@ -11,6 +11,7 @@ mod mount;
 mod profile;
 mod prune;
 mod share;
+mod volume;
 #[cfg(feature = "webdav")]
 mod webdav;
 
@@ -117,6 +118,9 @@ pub enum Command {
     /// Show a folder's size, or cap it.
     #[command(subcommand)]
     Folder(folder::FolderCommand),
+    /// Show who owns a volume, or give it to another user.
+    #[command(subcommand)]
+    Volume(volume::VolumeCommand),
     /// Share a directory, and everything below it, with a user.
     Grant(share::GrantArgs),
     /// Remove a user's share of a directory. Data written there after this
@@ -151,6 +155,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Admin(command) => admin::run(&cli.connect, command),
         Command::Link(command) => link::run(&cli.connect, command),
         Command::Folder(command) => folder::run(&cli.connect, command),
+        Command::Volume(command) => volume::run(&cli.connect, command),
         Command::Grant(args) => share::grant(&cli.connect, args),
         Command::Revoke(args) => share::revoke(&cli.connect, args),
         Command::Grants(args) => share::grants(&cli.connect, args),

@@ -70,14 +70,17 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    CreateLinkAccountRequest, FolderLimitRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    AnswerOfferRequest, CreateLinkAccountRequest, FolderLimitRequest, OfferVolumeRequest,
+    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
     SnapshotInfo,
 };
-use raft5fs_proto::types::{FolderSize, LinkAccount, Storage, Unreachable, UserEntry, VolumeInfo};
+use raft5fs_proto::types::{
+    FolderSize, LinkAccount, Offer, Storage, Unreachable, UserEntry, VolumeInfo,
+};
 use tonic::Code;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -1336,6 +1339,59 @@ impl Remote {
         let req = FolderLimitRequest { ino, limit };
         self.call(Retry::Idempotent, |mut c| async move {
             c.set_folder_limit(req).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Offers volume `ino` to `user`, as its owner. They must have
+    /// read-write access to it already.
+    pub async fn offer_volume(&self, ino: u64, user: &str) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = OfferVolumeRequest {
+            ino,
+            username: user.to_string(),
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.offer_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Withdraws the offer of volume `ino`, as its owner.
+    pub async fn withdraw_offer(&self, ino: u64) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = InodeRequest {
+            ino,
+            snapshot: String::new(),
+        };
+        self.call(Retry::Once, |mut c| {
+            let req = req.clone();
+            async move { c.withdraw_offer(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Accepts or declines the offer of volume `ino` to this account.
+    pub async fn answer_offer(&self, ino: u64, accept: bool) -> Result<(), FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        let req = AnswerOfferRequest { ino, accept };
+        self.call(
+            Retry::Once,
+            |mut c| async move { c.answer_offer(req).await },
+        )
+        .await?
+        .into_result()
+    }
+
+    /// The offers made to this account, and by it.
+    pub async fn offers(&self) -> Result<Vec<Offer>, FsError> {
+        self.needs_protocol(6, "volume transfers")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_offers(NoArgs {}).await
         })
         .await?
         .into_result()

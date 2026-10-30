@@ -10,13 +10,20 @@
 //!   read-only (`check_owner_kept`, from `rotate` and `grant`). Removing the
 //!   owner's account, or enrolling it again, still drops it: the volume is
 //!   then orphaned.
+//! - **Transfers:** the owner offers the volume to a user who has
+//!   read-write access to it (`offer_volume`); that user accepts or
+//!   declines it (`answer_offer`), or the owner withdraws it. On accepting,
+//!   the volume's size moves from one owner's usage to the other's, if the
+//!   new owner has room. The old owner keeps their share, which the new
+//!   owner can then revoke. Nothing is encrypted again: ownership is the
+//!   servers' record alone.
 //!
 //! A record, under `VOLUME_PREFIX`, is a format byte, the owner (empty for
 //! none), and a pending transfer offer: to whom (empty for none), and when.
 
 use super::*;
-use crate::layout::{ROOT_INO, dirent_ino, dirent_prefix, volume_key};
-use raft5fs_proto::types::{LINK_PREFIX, VolumeInfo};
+use crate::layout::{ROOT_INO, VOLUME_PREFIX, dirent_ino, dirent_prefix, volume_key};
+use raft5fs_proto::types::{LINK_PREFIX, Offer, VolumeInfo};
 
 const FORMAT: u8 = 1;
 
@@ -93,6 +100,26 @@ pub(crate) async fn check_owner_kept(
     })
 }
 
+/// Whether `user` has a writable grant of `ino` itself.
+async fn writes_at(
+    txn: &Transaction,
+    ino: u64,
+    user: &str,
+) -> Result<Result<bool, FsError>, KvError> {
+    Ok(
+        match txn.read_one(&grants::grant_key(ino, user)).await?.value {
+            Some(bytes) => grants::decode_grant(ino, &bytes).map(|g| g.writable),
+            None => Ok(false),
+        },
+    )
+}
+
+/// Volume `ino`'s record, in `txn`; `EINVAL` if `ino` isn't a volume.
+async fn record_of(txn: &Transaction, ino: u64) -> Result<Result<VolumeInfo, FsError>, KvError> {
+    Ok(decide!(volume_of(txn, ino).await?)
+        .ok_or_else(|| FsError::new(libc::EINVAL, format!("inode {ino} isn't a volume"))))
+}
+
 impl FsCore {
     /// Who owns volume `ino`, for `caller`, who needs access to it.
     pub async fn volume_info(&self, caller: &Caller, ino: u64) -> Result<VolumeInfo, FsError> {
@@ -105,6 +132,138 @@ impl FsCore {
             ));
         }
         Ok(volume_of(&view, ino).await??.unwrap_or_default())
+    }
+
+    /// Offers volume `ino` to `to`, as its owner. `to` must have
+    /// read-write access to it. Replaces any offer made before.
+    pub async fn offer_volume(&self, caller: &Caller, ino: u64, to: &str) -> Result<(), FsError> {
+        if to == caller.user {
+            return Err(FsError::new(libc::EINVAL, "it is yours already"));
+        }
+        if to.starts_with(LINK_PREFIX) {
+            return Err(FsError::new(
+                libc::EINVAL,
+                "a public link can't own a volume",
+            ));
+        }
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let mut record = decide!(record_of(&txn, ino).await?);
+            if record.owner.as_deref() != Some(caller.user.as_str()) {
+                return Ok(Err(FsError::new(
+                    libc::EPERM,
+                    "only the volume's owner can give it away",
+                )));
+            }
+            if !decide!(writes_at(&txn, ino, to).await?) {
+                return Ok(Err(FsError::new(
+                    libc::EPERM,
+                    format!("{to} needs read-write access to it first: share it with them"),
+                )));
+            }
+            record.offer = Some((to.to_string(), unix_secs(SystemTime::now())));
+            txn.write(&volume_key(ino), Some(&encode_volume(&record)))
+                .await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// Withdraws the offer of volume `ino`, as its owner.
+    pub async fn withdraw_offer(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let mut record = decide!(record_of(&txn, ino).await?);
+            if record.owner.as_deref() != Some(caller.user.as_str()) {
+                return Ok(Err(FsError::new(
+                    libc::EPERM,
+                    "only the volume's owner can withdraw its offer",
+                )));
+            }
+            if record.offer.take().is_none() {
+                return Ok(Err(FsError::new(libc::ENOENT, "there is no offer")));
+            }
+            txn.write(&volume_key(ino), Some(&encode_volume(&record)))
+                .await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
+    /// Accepts or declines the offer of volume `ino`, as the user it was
+    /// made to. Accepting needs read-write access to the volume still, and
+    /// room for it in the caller's quota (`EDQUOT`).
+    pub async fn answer_offer(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        accept: bool,
+    ) -> Result<(), FsError> {
+        let size = if accept {
+            let size = self.moved_size(ino).await?;
+            self.check_owner_room(&caller.user, size).await?;
+            size
+        } else {
+            0
+        };
+        let old = retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let mut record = decide!(record_of(&txn, ino).await?);
+            if record.offer.as_ref().map(|(to, _)| to.as_str()) != Some(caller.user.as_str()) {
+                return Ok(Err(FsError::new(
+                    libc::ENOENT,
+                    "this volume isn't offered to you",
+                )));
+            }
+            record.offer = None;
+            let old = if accept {
+                if !decide!(writes_at(&txn, ino, &caller.user).await?) {
+                    return Ok(Err(FsError::new(
+                        libc::EPERM,
+                        "you need read-write access to it, to own it",
+                    )));
+                }
+                record.owner.replace(caller.user.clone())
+            } else {
+                None
+            };
+            txn.write(&volume_key(ino), Some(&encode_volume(&record)))
+                .await?;
+            txn.commit().await?;
+            Ok(Ok(old))
+        })
+        .await??;
+        if accept {
+            self.count_transfer(ino, old, &caller.user, size);
+        }
+        Ok(())
+    }
+
+    /// The offers made to `caller`, and by them.
+    pub async fn offers(&self, caller: &Caller) -> Result<Vec<Offer>, FsError> {
+        let mut offers = Vec::new();
+        for (key, value) in usage::scan(&self.client, VOLUME_PREFIX).await? {
+            let Some(ino) = usage::ino_of(&key) else {
+                continue;
+            };
+            let record = decode_volume(ino, &value)?;
+            let (Some((to, at)), Some(from)) = (record.offer, record.owner) else {
+                continue;
+            };
+            if to != caller.user && from != caller.user {
+                continue;
+            }
+            offers.push(Offer {
+                volume: ino,
+                from,
+                to,
+                at,
+                bytes: self.moved_size(ino).await?,
+            });
+        }
+        Ok(offers)
     }
 
     /// Gives every volume without a record one (see the top of this file).

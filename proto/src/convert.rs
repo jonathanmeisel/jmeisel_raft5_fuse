@@ -10,7 +10,7 @@ use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
     Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee,
-    KeyPath, Kind, Layout, LinkAccount, ObjectGrid, PreparedUpload, ResealedName, Rotation,
+    KeyPath, Kind, Layout, LinkAccount, ObjectGrid, Offer, PreparedUpload, ResealedName, Rotation,
     SealedChunk, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry, VolumeInfo,
     WriteBody,
 };
@@ -626,6 +626,50 @@ impl pb::FolderSizesResponse {
                 .collect()),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("folder sizes")),
+        }
+    }
+}
+
+impl From<Result<Vec<Offer>, FsError>> for pb::OfferListResponse {
+    fn from(r: Result<Vec<Offer>, FsError>) -> Self {
+        use pb::offer_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(offers) => R::List(pb::OfferList {
+                    offers: offers
+                        .into_iter()
+                        .map(|o| pb::Offer {
+                            volume: o.volume,
+                            from: o.from,
+                            to: o.to,
+                            at: o.at,
+                            bytes: o.bytes,
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::OfferListResponse {
+    pub fn into_result(self) -> Result<Vec<Offer>, FsError> {
+        use pb::offer_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .offers
+                .into_iter()
+                .map(|o| Offer {
+                    volume: o.volume,
+                    from: o.from,
+                    to: o.to,
+                    at: o.at,
+                    bytes: o.bytes,
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("offers")),
         }
     }
 }

@@ -46,8 +46,10 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, FolderLimitRequest,
-    StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
+    AnswerOfferRequest, FolderLimitRequest, FolderSizesRequest, FolderSizesResponse,
+    OfferListResponse, OfferVolumeRequest, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
+    SetQuotaRequest, StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest,
+    VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use tokio::net::TcpListener;
@@ -719,8 +721,7 @@ impl Fs for FsService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let set =
-            accounts::admin_set_quota(self.core.client(), &caller.user, &r.username, r.quota)
-                .await;
+            accounts::admin_set_quota(self.core.client(), &caller.user, &r.username, r.quota).await;
         if set.is_ok() {
             self.core.forget_room(&r.username);
         }
@@ -762,6 +763,42 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let set = self.core.set_folder_limit(&caller, r.ino, r.limit).await;
         Ok(Response::new(set.into()))
+    }
+
+    async fn offer_volume(
+        &self,
+        r: Request<OfferVolumeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let offered = self.core.offer_volume(&caller, r.ino, &r.username).await;
+        Ok(Response::new(offered.into()))
+    }
+
+    async fn withdraw_offer(
+        &self,
+        r: Request<InodeRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let withdrawn = async {
+            live_only(&r.snapshot)?;
+            self.core.withdraw_offer(&caller, r.ino).await
+        }
+        .await;
+        Ok(Response::new(withdrawn.into()))
+    }
+
+    async fn answer_offer(
+        &self,
+        r: Request<AnswerOfferRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let answered = self.core.answer_offer(&caller, r.ino, r.accept).await;
+        Ok(Response::new(answered.into()))
+    }
+
+    async fn list_offers(&self, r: Request<NoArgs>) -> Result<Response<OfferListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.offers(&caller).await.into()))
     }
 
     async fn measure_usage(&self, r: Request<NoArgs>) -> Result<Response<EmptyResponse>, Status> {

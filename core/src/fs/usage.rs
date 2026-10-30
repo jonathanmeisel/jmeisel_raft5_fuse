@@ -166,7 +166,10 @@ fn decode_limit(value: &[u8]) -> Option<u64> {
 }
 
 /// Every key under `prefix`, with its value, read outside a transaction.
-async fn scan(client: &Client, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FsError> {
+pub(super) async fn scan(
+    client: &Client,
+    prefix: &[u8],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FsError> {
     let mut keys = Vec::new();
     let mut iter = client.key_iterator(prefix, Consistency::Stale);
     while let Some(key) = next_key(&mut iter).await? {
@@ -183,8 +186,8 @@ async fn scan(client: &Client, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
         .collect())
 }
 
-/// The inode at the end of a `0x0D` or `0x0E` key.
-fn ino_of(key: &[u8]) -> Option<u64> {
+/// The inode at the end of a key of one byte and an inode.
+pub(super) fn ino_of(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(key.get(1..9)?.try_into().ok()?))
 }
 
@@ -317,10 +320,14 @@ impl FsCore {
         let now = now_ms();
         let mut all = self.usage.tallies.lock().unwrap();
         for tally in before.iter().filter(|t| !after.contains(t)) {
-            all.entry(tally.clone()).or_default().push((now, -(size as i64)));
+            all.entry(tally.clone())
+                .or_default()
+                .push((now, -(size as i64)));
         }
         for tally in after.iter().filter(|t| !before.contains(t)) {
-            all.entry(tally.clone()).or_default().push((now, size as i64));
+            all.entry(tally.clone())
+                .or_default()
+                .push((now, size as i64));
         }
     }
 
@@ -411,11 +418,8 @@ impl FsCore {
         let key = &folder_size_key(ino);
         Ok(retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
-            let Some((bytes, files, at)) = txn
-                .read_one(key)
-                .await?
-                .value
-                .and_then(|v| decode_size(&v))
+            let Some((bytes, files, at)) =
+                txn.read_one(key).await?.value.and_then(|v| decode_size(&v))
             else {
                 return Ok(None);
             };
@@ -447,7 +451,12 @@ impl FsCore {
     /// Refuses (`EDQUOT`) a move of `moved` from folder `from` to folder
     /// `to` if what it would newly count for has no room for it: another
     /// owner, or a limited folder.
-    pub(crate) async fn check_move_room(&self, moved: u64, from: u64, to: u64) -> Result<(), FsError> {
+    pub(crate) async fn check_move_room(
+        &self,
+        moved: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<(), FsError> {
         let before = self.tallies_over(from).await?;
         let gaining: Vec<Tally> = self
             .tallies_over(to)
@@ -463,6 +472,29 @@ impl FsCore {
             self.check_tally(tally, size).await?;
         }
         Ok(())
+    }
+
+    /// Refuses (`EDQUOT`) `growth` more bytes for `owner` if they take
+    /// them over their quota.
+    pub(super) async fn check_owner_room(&self, owner: &str, growth: u64) -> Result<(), FsError> {
+        self.check_tally(&Tally::Owner(owner.to_string()), growth)
+            .await
+    }
+
+    /// Moves volume `ino`'s `size` from `old`'s usage to `new`'s, after
+    /// `new` took it over.
+    pub(super) fn count_transfer(&self, ino: u64, old: Option<String>, new: &str, size: u64) {
+        self.usage.owners.lock().unwrap().remove(&ino);
+        let now = now_ms();
+        let mut all = self.usage.tallies.lock().unwrap();
+        if let Some(old) = old {
+            all.entry(Tally::Owner(old))
+                .or_default()
+                .push((now, -(size as i64)));
+        }
+        all.entry(Tally::Owner(new.to_string()))
+            .or_default()
+            .push((now, size as i64));
     }
 
     /// Refuses (`EDQUOT`) `growth` more bytes for `tally` if they take it
@@ -527,11 +559,7 @@ impl FsCore {
             limit,
             used,
         };
-        self.usage
-            .rooms
-            .lock()
-            .unwrap()
-            .insert(tally.clone(), room);
+        self.usage.rooms.lock().unwrap().insert(tally.clone(), room);
         Ok(room)
     }
 
@@ -609,11 +637,7 @@ impl FsCore {
         })
         .await??;
         *self.usage.limited.lock().unwrap() = None;
-        self.usage
-            .rooms
-            .lock()
-            .unwrap()
-            .remove(&Tally::Folder(ino));
+        self.usage.rooms.lock().unwrap().remove(&Tally::Folder(ino));
         if limit.is_some() {
             self.measure_folder(ino).await?;
         }

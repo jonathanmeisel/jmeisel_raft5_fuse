@@ -451,3 +451,89 @@ fn a_folder_limit_holds_for_everyone_writing_or_moving_there() {
     rt.block_on(tester.rmdir(v, OsStr::new("s"))).unwrap();
     assert!(backend.keys_with_prefix(&[0x0E]).is_empty());
 }
+
+#[test]
+fn a_volume_changes_owner_when_the_recipient_accepts() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    make_admin(&backend, TESTER);
+    backend.enrol("bob");
+    backend.enrol("carol");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    let carol = pinned(&backend, "carol");
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(tester.create(v, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.write(f, 0, &[1; 5000])).unwrap();
+    rt.block_on(tester.remote().measure_usage()).unwrap();
+
+    // Only the owner offers, and only to someone with read-write access.
+    assert_eq!(
+        errno(rt.block_on(tester.remote().offer_volume(v, "bob"))),
+        libc::EPERM
+    );
+    rt.block_on(tester.grant(v, "bob", true, OsStr::new("v")))
+        .unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.remote().offer_volume(v, "bob"))),
+        libc::EINVAL
+    );
+    assert_eq!(
+        errno(rt.block_on(bob.remote().offer_volume(v, "carol"))),
+        libc::EPERM
+    );
+    rt.block_on(tester.remote().offer_volume(v, "bob")).unwrap();
+    let offered = |v: &Vault| rt.block_on(v.remote().offers()).unwrap();
+    let [offer] = offered(&bob).try_into().unwrap();
+    assert_eq!(
+        (
+            offer.volume,
+            offer.from.as_str(),
+            offer.to.as_str(),
+            offer.bytes
+        ),
+        (v, TESTER, "bob", 5000)
+    );
+    assert_eq!(offered(&tester).len(), 1);
+    assert!(offered(&carol).is_empty());
+    assert_eq!(
+        errno(rt.block_on(carol.remote().answer_offer(v, true))),
+        libc::ENOENT
+    );
+
+    // Declined, or withdrawn: nothing changes.
+    rt.block_on(bob.remote().answer_offer(v, false)).unwrap();
+    assert!(offered(&bob).is_empty());
+    rt.block_on(tester.remote().offer_volume(v, "bob")).unwrap();
+    rt.block_on(tester.remote().withdraw_offer(v)).unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.remote().answer_offer(v, true))),
+        libc::ENOENT
+    );
+
+    // Accepting needs room in the recipient's quota.
+    rt.block_on(tester.remote().offer_volume(v, "bob")).unwrap();
+    rt.block_on(tester.remote().set_quota("bob", Some(1000)))
+        .unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.remote().answer_offer(v, true))),
+        libc::EDQUOT
+    );
+    rt.block_on(tester.remote().set_quota("bob", None)).unwrap();
+    rt.block_on(bob.remote().answer_offer(v, true)).unwrap();
+    assert_eq!(owner(&backend, &bob, v).as_deref(), Some("bob"));
+    eventually("the volume's size moves", || {
+        used(&backend, &bob) == 5000 && used(&backend, &tester) == 0
+    });
+
+    // The new owner keeps read-write access, and can revoke the old one's.
+    assert_eq!(errno(rt.block_on(tester.revoke(v, "bob"))), libc::EPERM);
+    rt.block_on(bob.revoke(v, TESTER)).unwrap();
+}

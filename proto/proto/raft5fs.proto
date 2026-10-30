@@ -201,6 +201,17 @@ service Fs {
   // volume or an admin. A write that would take the folder over it is
   // refused with EDQUOT, whoever writes, the owner too.
   rpc SetFolderLimit(FolderLimitRequest) returns (EmptyResponse);
+  // Offers a volume to another user, as its owner. They must have
+  // read-write access to it (EPERM). Replaces any earlier offer.
+  rpc OfferVolume(OfferVolumeRequest) returns (EmptyResponse);
+  // Withdraws the offer of a volume, as its owner.
+  rpc WithdrawOffer(InodeRequest) returns (EmptyResponse);
+  // Accepts or declines the offer of a volume, as the user it was made to.
+  // Accepting needs read-write access still (EPERM), and room in the
+  // caller's quota (EDQUOT). The old owner keeps their share.
+  rpc AnswerOffer(AnswerOfferRequest) returns (EmptyResponse);
+  // The offers made to the caller, and by them.
+  rpc ListOffers(NoArgs) returns (OfferListResponse);
   // Measures every folder and every owner's usage now, as admins see fit.
   // EBUSY if another server is measuring.
   rpc MeasureUsage(NoArgs) returns (EmptyResponse);
@@ -915,6 +926,37 @@ message Storage {
 message StorageResponse {
   oneof result {
     Storage storage = 1;
+    Error error = 2;
+  }
+}
+
+message OfferVolumeRequest {
+  uint64 ino = 1;
+  string username = 2;
+}
+
+message AnswerOfferRequest {
+  uint64 ino = 1;
+  bool accept = 2;
+}
+
+message Offer {
+  uint64 volume = 1;
+  string from = 2;
+  string to = 3;
+  // Seconds since the Unix epoch.
+  uint64 at = 4;
+  // The volume's size, as last measured.
+  uint64 bytes = 5;
+}
+
+message OfferList {
+  repeated Offer offers = 1;
+}
+
+message OfferListResponse {
+  oneof result {
+    OfferList list = 1;
     Error error = 2;
   }
 }
