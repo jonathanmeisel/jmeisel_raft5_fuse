@@ -7,7 +7,7 @@ use std::sync::Arc;
 use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::Vault;
 use raft5fs_core::accounts;
-use raft5fs_proto::types::{Caps, FsError};
+use raft5fs_proto::types::{Caps, FsError, SetAttr};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
 #[test]
@@ -222,4 +222,136 @@ fn usage_and_folder_sizes_are_measured_and_counted_at_once() {
         errno(rt.block_on(bob.remote().measure_usage())),
         libc::EACCES
     );
+}
+
+/// A vault on the first server alone, so that the quota and tallies it
+/// sees are that server's.
+fn pinned(backend: &Backend, user: &str) -> Vault {
+    let remote = backend
+        .runtime
+        .block_on(Remote::connect(
+            &backend.addresses()[..1],
+            credentials(user),
+            Some(fs_tls()),
+        ))
+        .unwrap_or_else(|e| panic!("log in as {user}: {e}"));
+    Vault::new(Arc::new(remote)).unwrap()
+}
+
+fn resize(size: u64) -> SetAttr {
+    SetAttr {
+        size: Some(size),
+        ..SetAttr::default()
+    }
+}
+
+#[test]
+fn a_quota_refuses_what_would_go_over_it_and_deleting_makes_room_at_once() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    make_admin(&backend, TESTER);
+    backend.enrol("bob");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+
+    // Only admins set quotas.
+    assert_eq!(
+        errno(rt.block_on(bob.remote().set_quota("bob", None))),
+        libc::EACCES
+    );
+    rt.block_on(tester.remote().set_quota("bob", Some(10_000)))
+        .unwrap();
+    assert_eq!(
+        rt.block_on(bob.remote().storage()).unwrap().quota,
+        Some(10_000)
+    );
+
+    let w = rt
+        .block_on(bob.create_volume(OsStr::new("w"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(bob.create(w, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.write(f, 0, &[1; 6000])).unwrap();
+    let g = rt
+        .block_on(bob.create(w, OsStr::new("g"), 0o644))
+        .unwrap()
+        .ino;
+    let refused = rt.block_on(bob.write(g, 0, &[2; 5000])).unwrap_err().error;
+    assert_eq!(refused.errno, libc::EDQUOT);
+    assert!(
+        refused.message.contains("bob's storage is full"),
+        "{refused}"
+    );
+    assert_eq!(
+        errno(rt.block_on(bob.setattr(g, resize(5000)))),
+        libc::EDQUOT
+    );
+    // Writing over what is there, and truncating, still work.
+    rt.block_on(bob.write(f, 0, &[3; 1000])).unwrap();
+    rt.block_on(bob.setattr(f, resize(5000))).unwrap();
+
+    // Deleting makes room at once.
+    rt.block_on(bob.unlink(w, OsStr::new("f"))).unwrap();
+    rt.block_on(bob.write(g, 0, &[2; 9000])).unwrap();
+
+    // A move into a full owner's volume is refused; a move out credits
+    // them at once.
+    let t = rt
+        .block_on(tester.create_volume(OsStr::new("t"), 0o755))
+        .unwrap()
+        .ino;
+    let h = rt
+        .block_on(tester.create(t, OsStr::new("h"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.write(h, 0, &[4; 3000])).unwrap();
+    rt.block_on(tester.grant(t, "bob", true, OsStr::new("t")))
+        .unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.rename(t, OsStr::new("h"), w, OsStr::new("h"), true))),
+        libc::EDQUOT
+    );
+    rt.block_on(bob.rename(w, OsStr::new("g"), t, OsStr::new("g"), true))
+        .unwrap();
+    rt.block_on(bob.rename(t, OsStr::new("h"), w, OsStr::new("h"), true))
+        .unwrap();
+    eventually("moves count", || {
+        used(&backend, &bob) == 3000 && used(&backend, &tester) == 9000
+    });
+
+    // Another owner's room is theirs alone, and no quota means no limit.
+    rt.block_on(bob.write(h, 3000, &[4; 7000])).unwrap();
+    rt.block_on(tester.remote().set_quota("bob", None)).unwrap();
+    rt.block_on(bob.write(h, 10_000, &[4; 7000])).unwrap();
+}
+
+#[test]
+fn a_quota_refuses_blocks_before_they_are_uploaded() {
+    use raft5fs_testkit::{TEST_BLOCK_CHUNKS, TEST_OBJECT_FROM_CHUNKS};
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, true, true);
+    make_admin(&backend, TESTER);
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let inline = TEST_OBJECT_FROM_CHUNKS * TEST_CHUNK_SIZE;
+    let block = TEST_BLOCK_CHUNKS * TEST_CHUNK_SIZE;
+    rt.block_on(tester.remote().set_quota(TESTER, Some(inline + block / 2)))
+        .unwrap();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(tester.create(v, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    let puts = backend.store().stats().puts;
+    let data = vec![5; (inline + 2 * block) as usize];
+    let refused = rt.block_on(tester.write(f, 0, &data)).unwrap_err();
+    assert_eq!(refused.error.errno, libc::EDQUOT);
+    assert_eq!(backend.store().stats().puts, puts, "nothing uploaded");
 }

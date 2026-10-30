@@ -4,7 +4,7 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use raft5fs_client::cli::Context;
-use raft5fs_proto::types::{AccountKind, Caps};
+use raft5fs_proto::types::{AccountKind, Caps, parse_limit, size_text};
 
 use super::account::caps_text;
 use super::{ConnectArgs, Outcome, log_in, runtime};
@@ -77,6 +77,18 @@ pub struct SetArgs {
     pub links: Option<Switch>,
     #[arg(long, value_name = "on|off")]
     pub admin: Option<Switch>,
+    /// How much the volumes they own may hold, whoever writes there, such
+    /// as 10G (K, M, G, T: powers of 1024), or `none` for no limit.
+    #[arg(long, value_name = "SIZE|none", value_parser = parse_size_limit)]
+    pub quota: Option<SizeLimit>,
+}
+
+/// A size limit, or none (`parse_limit`).
+#[derive(Clone, Copy)]
+pub struct SizeLimit(pub Option<u64>);
+
+pub fn parse_size_limit(s: &str) -> Result<SizeLimit, String> {
+    parse_limit(s).map(SizeLimit)
 }
 
 #[derive(Args)]
@@ -100,7 +112,12 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 let state = if u.enrolled { "enrolled" } else { "invited" };
                 let what = match u.info.kind {
                     AccountKind::Link => format!("public link made by {}", u.info.owner),
-                    AccountKind::Person => caps_text(u.info.caps),
+                    AccountKind::Person => format!(
+                        "{}\t{} used of {}",
+                        caps_text(u.info.caps),
+                        size_text(u.used),
+                        quota_text(u.info.quota)
+                    ),
                 };
                 println!("{}\t{state}\t{what}", u.user);
             }
@@ -133,13 +150,23 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                     None => {}
                 }
             }
-            if on == Caps::NONE && off == Caps::NONE {
-                return Err("give --volumes, --links or --admin, each on or off".to_string());
+            if on == Caps::NONE && off == Caps::NONE && args.quota.is_none() {
+                return Err(
+                    "give --volumes, --links or --admin, each on or off, or --quota".to_string(),
+                );
             }
-            let info = runtime
-                .block_on(remote.set_capabilities(&args.name, on, off))
-                .map_err(|e| format!("cannot change {}: {e}", args.name))?;
-            println!("{} can now: {}", args.name, caps_text(info.caps));
+            if let Some(SizeLimit(quota)) = args.quota {
+                runtime
+                    .block_on(remote.set_quota(&args.name, quota))
+                    .map_err(|e| format!("cannot set {}'s quota: {e}", args.name))?;
+                println!("{}'s quota is now {}", args.name, quota_text(quota));
+            }
+            if on != Caps::NONE || off != Caps::NONE {
+                let info = runtime
+                    .block_on(remote.set_capabilities(&args.name, on, off))
+                    .map_err(|e| format!("cannot change {}: {e}", args.name))?;
+                println!("{} can now: {}", args.name, caps_text(info.caps));
+            }
         }
         AdminCommand::Reenroll(args) => {
             check_impact(&runtime, remote, &args, "letting them enroll again")?;
@@ -229,17 +256,12 @@ fn describe(u: &raft5fs_proto::types::Unreachable) -> String {
         "{what}: {} files, {} folders, {}, last changed {days} days ago",
         u.files,
         u.folders,
-        size(u.bytes)
+        size_text(u.bytes)
     )
 }
 
-fn size(bytes: u64) -> String {
-    match bytes {
-        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
-        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
-        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
-        b => format!("{b} bytes"),
-    }
+fn quota_text(quota: Option<u64>) -> String {
+    quota.map_or("no limit".to_string(), size_text)
 }
 
 fn print_invitation(name: &str, (code, invitation): (String, Option<String>)) {

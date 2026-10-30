@@ -46,7 +46,7 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
+    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
     StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
@@ -710,6 +710,20 @@ impl Fs for FsService {
             Caps::from_bits(r.off),
         )
         .await;
+        Ok(Response::new(set.into()))
+    }
+
+    async fn set_quota(
+        &self,
+        r: Request<SetQuotaRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set =
+            accounts::admin_set_quota(self.core.client(), &caller.user, &r.username, r.quota)
+                .await;
+        if set.is_ok() {
+            self.core.forget_room(&r.username);
+        }
         Ok(Response::new(set.into()))
     }
 

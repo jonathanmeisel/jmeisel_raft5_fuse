@@ -35,8 +35,8 @@ usage: raft5fs-server --listen <ADDR> --token-key-file <PATH>
                       <store options> <kv-seed-address>...
        raft5fs-server user add <NAME> [<capabilities>] [<invite options>]
                       <store options> <kv-seed-address>...
-       raft5fs-server user set <NAME> <capabilities> <store options>
-                      <kv-seed-address>...
+       raft5fs-server user set <NAME> [<capabilities>] [--quota <SIZE>]
+                      <store options> <kv-seed-address>...
        raft5fs-server user del <NAME> <store options> <kv-seed-address>...
        raft5fs-server user list <store options> <kv-seed-address>...
        raft5fs-server snapshot create [<NAME>] <store options> <kv-seed-address>...
@@ -164,6 +164,11 @@ Capabilities: what a user may start, beyond what is shared with them.
                        the same as `off`.
 `user add` applies them to a new user, or to an existing user's current
 ones; `user set` changes an existing user's.
+  --quota <SIZE>       how much the volumes they own may hold, whoever
+                       writes there, such as 10G (K, M, G, T: powers of
+                       1024), or `none` for no limit (the default). Writes
+                       that would go over it are refused; deleting always
+                       works.
 
 Snapshots: `snapshot create` pins the whole filesystem as it is now,
 under NAME (letters, digits, '.', '_', '-', ':' and '+'; the time if left
@@ -322,6 +327,8 @@ struct Args {
     invite_server_name: Option<String>,
     /// Capability flags, in order: each turns one on or off.
     caps: Vec<(Caps, bool)>,
+    /// `--quota`: `Some(None)` for no limit.
+    quota: Option<Option<u64>>,
     web_listen: Option<String>,
     web_origin: Option<String>,
     web_tls_cert: Option<String>,
@@ -405,6 +412,12 @@ fn parse_args() -> Args {
                 a.gc_interval = Some(Duration::from_secs(secs.into()));
             }
             "--no-prompt-delete" => a.no_prompt_delete = true,
+            "--quota" => {
+                a.quota = Some(
+                    raft5fs_proto::types::parse_limit(&value("--quota"))
+                        .unwrap_or_else(|why| usage(&why)),
+                );
+            }
             "--usage-interval" => {
                 let secs = parse_number("--usage-interval", &value("--usage-interval"));
                 a.usage_interval = Some(Duration::from_secs(secs.into()));
@@ -634,11 +647,13 @@ async fn user_command(a: Args) {
         off = off.with(cap, !turn_on);
     }
     match command {
-        Some("set") if a.caps.is_empty() => {
-            usage("user set needs --volumes, --links or --admin, each on or off")
+        Some("set") if a.caps.is_empty() && a.quota.is_none() => {
+            usage("user set needs --volumes, --links or --admin, each on or off, or --quota")
         }
         Some("add" | "set") => {}
-        _ if !a.caps.is_empty() => usage("only user add and user set take capabilities"),
+        _ if !a.caps.is_empty() || a.quota.is_some() => {
+            usage("only user add and user set take capabilities and --quota")
+        }
         _ => {}
     }
     let seeds = positional.cloned().collect();
@@ -646,6 +661,16 @@ async fn user_command(a: Args) {
     // code.
     let invite_ca = invite_ca(&a);
     let client = store_client(&a, seeds).await;
+    if let (Some("set"), Some(name), Some(quota)) = (command, &name, a.quota) {
+        accounts::set_quota(&client, name, quota)
+            .await
+            .unwrap_or_else(|e| fail(e));
+        println!("{name}'s quota is now {}", quota_text(quota));
+        if a.caps.is_empty() {
+            return;
+        }
+    }
+    let added = name.clone().filter(|_| command == Some("add"));
     let result = match (command, name) {
         (Some("add"), Some(name)) => accounts::add(&client, &name, on, off).await.map(|code| {
             println!("enrolment code for {name}: {code}");
@@ -678,6 +703,16 @@ async fn user_command(a: Args) {
         _ => accounts::list(&client).await.map(print_accounts),
     };
     result.unwrap_or_else(|e| fail(e));
+    if let (Some(name), Some(quota)) = (added, a.quota) {
+        accounts::set_quota(&client, &name, quota)
+            .await
+            .unwrap_or_else(|e| fail(format!("cannot set {name}'s quota: {e}")));
+        println!("{name}'s quota is {}", quota_text(quota));
+    }
+}
+
+fn quota_text(quota: Option<u64>) -> String {
+    quota.map_or("no limit".to_string(), raft5fs_proto::types::size_text)
 }
 
 fn caps_text(caps: Caps) -> String {
@@ -731,7 +766,12 @@ fn print_accounts(rows: Vec<raft5fs_proto::types::UserEntry>) {
                 Some(at) => format!("public link, expires {at}"),
                 None => "public link".to_string(),
             },
-            AccountKind::Person => caps_text(row.info.caps),
+            AccountKind::Person => format!(
+                "{}\t{} used of {}",
+                caps_text(row.info.caps),
+                raft5fs_proto::types::size_text(row.used),
+                quota_text(row.info.quota)
+            ),
         };
         println!("{}{}\t{state}\t{what}", "  ".repeat(depth), row.user);
         if let Some(kids) = children.get(&Some(row.user.clone())) {

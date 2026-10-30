@@ -808,6 +808,12 @@ impl FsCore {
                 entry.attr.perm = (mode & 0o7777) as u16;
             }
             if let Some(new_size) = changes.size {
+                if let Err(e) = self
+                    .check_room(entry.parent, new_size.saturating_sub(entry.attr.size))
+                    .await
+                {
+                    return Ok(Err(e));
+                }
                 entry.attr.size = new_size;
                 decide!(self.trim_block(&txn, &entry, new_size).await?);
             }
@@ -1169,6 +1175,10 @@ impl FsCore {
         Self::check_entry_name(new_name, &sealed.sealed_name)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
+        if new_parent != parent {
+            // Before the move, as a write's check is: soft, like quotas.
+            self.check_move_room(sealed.ino, parent, new_parent).await?;
+        }
         let replaced = retrying(move || async move {
             let txn = self.client.transaction(TXN_TTL).await?;
             decide!(self.guard(&txn, caller, parent, true).await?);
@@ -1532,6 +1542,16 @@ impl FsCore {
                 format!("inode {ino} keeps nothing in object storage"),
             ));
         }
+        // Refuse before the client uploads a block that the write would
+        // refuse. Up to the start of each block's last segment, since that
+        // segment may be short.
+        let ends = blocks.iter().map(|b| {
+            (b.index.saturating_add(u64::from(b.nseg.max(1)) - 1))
+                .saturating_mul(self.chunk_size)
+                .saturating_add(1)
+        });
+        let growth = ends.max().unwrap_or(0).saturating_sub(entry.attr.size);
+        self.check_room(entry.parent, growth).await?;
         let now = SystemTime::now();
         blocks
             .iter()
@@ -1627,6 +1647,12 @@ impl FsCore {
             // reach.
             let mut entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
+            if let Err(e) = self
+                .check_room(entry.parent, end.saturating_sub(entry.attr.size))
+                .await
+            {
+                return Ok(Err(e));
+            }
             let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
             let before = entry.attr.size;
             if end > entry.attr.size {

@@ -435,6 +435,9 @@ pub struct AccountInfo {
     /// For a link: a note for its maker alone (the folder's path), sealed
     /// to their key, so the servers can't read it.
     pub note: Vec<u8>,
+    /// How much the volumes this account owns may hold, in bytes; `None`
+    /// for no limit.
+    pub quota: Option<u64>,
 }
 
 impl AccountInfo {
@@ -459,6 +462,7 @@ impl Default for AccountInfo {
             expires: None,
             folder: 0,
             note: Vec::new(),
+            quota: None,
         }
     }
 }
@@ -480,6 +484,8 @@ pub struct UserEntry {
     /// Whether it has keys. If not, it has only an invitation (a code).
     pub enrolled: bool,
     pub info: AccountInfo,
+    /// How much the volumes they own hold (`Storage::used`).
+    pub used: u64,
 }
 
 /// A folder or file that no account can reach any more, with everything
@@ -511,6 +517,37 @@ pub struct VolumeInfo {
     pub offer: Option<(String, u64)>,
 }
 
+/// `bytes` as people read it, as in "4.2 GB".
+pub fn size_text(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{b} bytes"),
+    }
+}
+
+/// A quota or a size limit as people type it: a byte count, or a whole
+/// number with a K, M, G or T suffix (powers of 1024); `none` for no limit.
+pub fn parse_limit(s: &str) -> Result<Option<u64>, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let (digits, shift) = match s.chars().last() {
+        Some('K' | 'k') => (&s[..s.len() - 1], 10),
+        Some('M' | 'm') => (&s[..s.len() - 1], 20),
+        Some('G' | 'g') => (&s[..s.len() - 1], 30),
+        Some('T' | 't') => (&s[..s.len() - 1], 40),
+        _ => (s, 0),
+    };
+    let n = digits
+        .parse::<u64>()
+        .map_err(|_| format!("not a size, such as 10G, or none: {s}"))?;
+    n.checked_mul(1 << shift)
+        .map(Some)
+        .ok_or_else(|| format!("size too large: {s}"))
+}
+
 /// How much a user's volumes hold, as their owner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Storage {
@@ -518,6 +555,8 @@ pub struct Storage {
     pub used: u64,
     /// When last measured, in seconds since the Unix epoch; 0 if never.
     pub measured_at: u64,
+    /// The owner's quota; `None` for no limit.
+    pub quota: Option<u64>,
 }
 
 /// A folder's size: everything inside it, as last measured.

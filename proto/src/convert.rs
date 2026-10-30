@@ -421,6 +421,7 @@ impl From<AccountInfo> for pb::AccountInfo {
             expires: a.expires.unwrap_or(0),
             folder: a.folder,
             note: a.note,
+            quota: a.quota,
         }
     }
 }
@@ -439,6 +440,7 @@ impl From<pb::AccountInfo> for AccountInfo {
             expires: (a.expires != 0).then_some(a.expires),
             folder: a.folder,
             note: a.note,
+            quota: a.quota,
         }
     }
 }
@@ -561,6 +563,7 @@ impl From<Result<Storage, FsError>> for pb::StorageResponse {
                 Ok(s) => R::Storage(pb::Storage {
                     used: s.used,
                     measured_at: s.measured_at,
+                    quota: s.quota,
                 }),
                 Err(e) => R::Error(e.into()),
             }),
@@ -575,6 +578,7 @@ impl pb::StorageResponse {
             Some(R::Storage(s)) => Ok(Storage {
                 used: s.used,
                 measured_at: s.measured_at,
+                quota: s.quota,
             }),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("storage")),
@@ -715,6 +719,7 @@ impl From<Result<Vec<UserEntry>, FsError>> for pb::UserListResponse {
                             username: u.user,
                             enrolled: u.enrolled,
                             account: Some(u.info.into()),
+                            used: u.used,
                         })
                         .collect(),
                 }),
@@ -736,6 +741,7 @@ impl pb::UserListResponse {
                         user: u.username,
                         enrolled: u.enrolled,
                         info: u.account.ok_or_else(|| malformed("account"))?.into(),
+                        used: u.used,
                     })
                 })
                 .collect(),

@@ -16,6 +16,13 @@
 //!   the measuring that set it started. Only changes after that are added:
 //!   the measuring counted the earlier ones already.
 //!
+//! - **Quotas** (`check_room`): a write that makes a file bigger is
+//!   refused (`EDQUOT`) if the owner's usage, with this server's tallies not
+//!   stored yet, would go over their quota. Both are read outside the
+//!   write's transaction and kept for `ROOM_TTL`, so the check never makes
+//!   writes retry. Quotas are soft: other servers' writes of the last
+//!   second or so are not seen yet.
+//!
 //! Sizes are file sizes as users see them. Unowned volumes count against
 //! nobody. The servers already see sizes and the tree's shape, so this
 //! tells them nothing new.
@@ -24,6 +31,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tokio::sync::Notify;
+
 use super::unreachable::{Tree, post_order};
 use super::*;
 use crate::gc::{release_lease, take_lease};
@@ -31,7 +40,7 @@ use crate::layout::{
     FOLDER_SIZE_PREFIX, ROOT_INO, USAGE_LEASE_KEY, USAGE_PREFIX, folder_size_key, usage_key,
     volume_key,
 };
-use raft5fs_proto::types::{FolderSize, Storage};
+use raft5fs_proto::types::{FolderSize, Storage, size_text};
 
 /// How long a volume's owner, as read, is used before reading it again.
 const OWNER_TTL: Duration = Duration::from_secs(10);
@@ -42,6 +51,21 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// How many records one transaction of a measuring writes.
 const WRITE_BATCH: usize = 100;
 
+/// How long an owner's quota and usage, as read, are used before reading
+/// them again.
+const ROOM_TTL: Duration = Duration::from_secs(5);
+
+/// How often a refused write may ask for a measuring now.
+const REMEASURE_GAP: Duration = Duration::from_secs(60);
+
+/// An owner's quota and stored usage, and when they were read.
+#[derive(Clone, Copy)]
+struct Room {
+    seen: Instant,
+    quota: Option<u64>,
+    used: u64,
+}
+
 /// One server's part: its lease id, the tallies not yet stored, and what it
 /// knows of which volume each folder is in, and who owns each volume.
 pub(crate) struct Usage {
@@ -51,6 +75,10 @@ pub(crate) struct Usage {
     tallies: Mutex<HashMap<String, Vec<(u64, i64)>>>,
     volumes: Mutex<HashMap<u64, u64>>,
     owners: Mutex<HashMap<u64, (Instant, Option<String>)>>,
+    rooms: Mutex<HashMap<String, Room>>,
+    /// When a refused write last asked for a measuring, and how it asks.
+    remeasured: Mutex<Option<Instant>>,
+    remeasure: Notify,
 }
 
 impl Default for Usage {
@@ -62,6 +90,9 @@ impl Default for Usage {
             tallies: Mutex::default(),
             volumes: Mutex::default(),
             owners: Mutex::default(),
+            rooms: Mutex::default(),
+            remeasured: Mutex::default(),
+            remeasure: Notify::new(),
         }
     }
 }
@@ -107,7 +138,7 @@ fn encode_usage(bytes: u64, at: u64) -> Vec<u8> {
     [bytes, at].iter().flat_map(|n| n.to_be_bytes()).collect()
 }
 
-fn decode_usage(value: &[u8]) -> Option<(u64, u64)> {
+pub(crate) fn decode_usage(value: &[u8]) -> Option<(u64, u64)> {
     let n = |i: usize| {
         Some(u64::from_be_bytes(
             value.get(i * 8..i * 8 + 8)?.try_into().ok()?,
@@ -248,13 +279,22 @@ impl FsCore {
     }
 
     /// Adds the tallies to the owners' usage records, never below 0: each
-    /// change made after the measuring that set the record started.
+    /// change made after the measuring that set the record started. A
+    /// tally stays in memory until it is stored, so quota checks always
+    /// see it in one place or the other.
     pub async fn flush_tallies(&self) -> Result<(), FsError> {
-        let tallies = std::mem::take(&mut *self.usage.tallies.lock().unwrap());
+        let tallies: Vec<(String, Vec<(u64, i64)>)> = self
+            .usage
+            .tallies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(owner, changes)| (owner.clone(), changes.clone()))
+            .collect();
         for (owner, changes) in tallies {
             let key = &usage_key(&owner);
             let changes_ref = &changes;
-            let stored = retrying(move || async move {
+            let bytes = retrying(move || async move {
                 let txn = self.client.transaction(TXN_TTL).await?;
                 let (bytes, at) = txn
                     .read_one(key)
@@ -267,27 +307,146 @@ impl FsCore {
                     .filter(|(when, _)| *when > at)
                     .map(|(_, d)| d)
                     .sum();
-                if delta != 0 {
-                    let bytes = bytes.saturating_add_signed(delta);
-                    txn.write(key, Some(&encode_usage(bytes, at))).await?;
-                    txn.commit().await?;
+                if delta == 0 {
+                    return Ok(bytes);
                 }
-                Ok(())
+                let bytes = bytes.saturating_add_signed(delta);
+                txn.write(key, Some(&encode_usage(bytes, at))).await?;
+                txn.commit().await?;
+                Ok(bytes)
             })
-            .await;
-            if let Err(e) = stored {
-                // Back into the tally, for the next try.
-                self.usage
-                    .tallies
-                    .lock()
-                    .unwrap()
-                    .entry(owner)
-                    .or_default()
-                    .extend(changes);
-                return Err(e.into());
+            .await?;
+            // New changes go after these, so these are still the first.
+            let mut tallies = self.usage.tallies.lock().unwrap();
+            if let Some(list) = tallies.get_mut(&owner) {
+                list.drain(..changes.len());
+                if list.is_empty() {
+                    tallies.remove(&owner);
+                }
+            }
+            if let Some(room) = self.usage.rooms.lock().unwrap().get_mut(&owner) {
+                room.used = bytes;
             }
         }
         Ok(())
+    }
+
+    /// Refuses (`EDQUOT`) to make a file in folder `dir` `growth` bytes
+    /// bigger if that takes the volume's owner over their quota. Unowned
+    /// volumes, and owners with no quota, have no limit.
+    pub(crate) async fn check_room(&self, dir: u64, growth: u64) -> Result<(), FsError> {
+        if growth == 0 {
+            return Ok(());
+        }
+        let Some(volume) = self.volume_containing(dir).await? else {
+            return Ok(());
+        };
+        let Some(owner) = self.owner_of(volume).await? else {
+            return Ok(());
+        };
+        self.check_owner_room(&owner, growth).await
+    }
+
+    /// `check_room` for a known owner.
+    pub(crate) async fn check_owner_room(&self, owner: &str, growth: u64) -> Result<(), FsError> {
+        // The stored usage first, then the tally: a flush between the two
+        // can then only make this count less, never twice.
+        let (quota, stored) = self.room_of(owner).await?;
+        let Some(quota) = quota else {
+            return Ok(());
+        };
+        let pending: i64 = self
+            .usage
+            .tallies
+            .lock()
+            .unwrap()
+            .get(owner)
+            .map_or(0, |changes| changes.iter().map(|(_, d)| d).sum());
+        let used = stored.saturating_add_signed(pending);
+        if used.saturating_add(growth) <= quota {
+            return Ok(());
+        }
+        self.ask_remeasure();
+        Err(FsError::new(
+            libc::EDQUOT,
+            format!(
+                "{owner}'s storage is full ({} of {})",
+                size_text(used),
+                size_text(quota)
+            ),
+        ))
+    }
+
+    /// Refuses (`EDQUOT`) a move of `moved` from folder `from` to folder
+    /// `to` if it goes to another owner who has no room for it.
+    pub(crate) async fn check_move_room(&self, moved: u64, from: u64, to: u64) -> Result<(), FsError> {
+        let (Some(a), Some(b)) = (
+            self.volume_containing(from).await?,
+            self.volume_containing(to).await?,
+        ) else {
+            return Ok(());
+        };
+        if a == b {
+            return Ok(());
+        }
+        let Some(owner) = self.owner_of(b).await? else {
+            return Ok(());
+        };
+        if self.owner_of(a).await?.as_deref() == Some(owner.as_str()) {
+            return Ok(());
+        }
+        let size = self.moved_size(moved).await?;
+        self.check_owner_room(&owner, size).await
+    }
+
+    /// `owner`'s quota and stored usage, read again every `ROOM_TTL`.
+    async fn room_of(&self, owner: &str) -> Result<(Option<u64>, u64), FsError> {
+        if let Some(room) = self.usage.rooms.lock().unwrap().get(owner)
+            && room.seen.elapsed() < ROOM_TTL
+        {
+            return Ok((room.quota, room.used));
+        }
+        let quota = crate::accounts::info(&self.client, owner).await?.quota;
+        let used = self.stored_usage(owner).await?.0;
+        let room = Room {
+            seen: Instant::now(),
+            quota,
+            used,
+        };
+        self.usage
+            .rooms
+            .lock()
+            .unwrap()
+            .insert(owner.to_string(), room);
+        Ok((quota, used))
+    }
+
+    /// Forgets `user`'s quota as read, after it changed.
+    pub fn forget_room(&self, user: &str) {
+        self.usage.rooms.lock().unwrap().remove(user);
+    }
+
+    /// Asks `run_measure` to measure now, at most once every
+    /// `REMEASURE_GAP`: usage may have drifted above what it is.
+    fn ask_remeasure(&self) {
+        let mut last = self.usage.remeasured.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < REMEASURE_GAP) {
+            return;
+        }
+        *last = Some(Instant::now());
+        self.usage.remeasure.notify_one();
+    }
+
+    /// `user`'s usage record: bytes, and when the measuring that set it
+    /// started (ms); zeros if there is none.
+    async fn stored_usage(&self, user: &str) -> Result<(u64, u64), FsError> {
+        Ok(self
+            .client
+            .read_one(&usage_key(user))
+            .await?
+            .value
+            .and_then(|v| decode_usage(&v))
+            .unwrap_or((0, 0)))
     }
 
     /// Stores the tallies every second, until the process ends.
@@ -300,10 +459,14 @@ impl FsCore {
         }
     }
 
-    /// Measures every `interval`, when no other server is.
+    /// Measures every `interval`, when no other server is, and when a
+    /// refused write asks.
     pub async fn run_measure(self: Arc<Self>, interval: Duration) {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = self.usage.remeasure.notified() => {}
+            }
             match self.measure().await {
                 Ok(Some(stats)) => eprintln!(
                     "measured {} folders ({} sizes changed, {} gone) and {} owners' usage",
@@ -413,16 +576,11 @@ impl FsCore {
     /// How much `user`'s volumes hold, and when it was last measured
     /// (seconds since the Unix epoch; 0 if never).
     pub async fn storage(&self, user: &str) -> Result<Storage, FsError> {
-        let (used, measured_ms) = self
-            .client
-            .read_one(&usage_key(user))
-            .await?
-            .value
-            .and_then(|v| decode_usage(&v))
-            .unwrap_or((0, 0));
+        let (used, measured_ms) = self.stored_usage(user).await?;
         Ok(Storage {
             used,
             measured_at: measured_ms / 1000,
+            quota: crate::accounts::info(&self.client, user).await?.quota,
         })
     }
 

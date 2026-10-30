@@ -70,7 +70,7 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    CreateLinkAccountRequest, PutPinsRequest, SetCapabilitiesRequest, UsernameRequest,
+    CreateLinkAccountRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -1248,6 +1248,22 @@ impl Remote {
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();
             async move { c.set_capabilities(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Sets how much the volumes `user` owns may hold (`None`: no limit),
+    /// as an admin.
+    pub async fn set_quota(&self, user: &str, quota: Option<u64>) -> Result<(), FsError> {
+        self.needs_protocol(6, "quotas")?;
+        let req = SetQuotaRequest {
+            username: user.to_string(),
+            quota,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.set_quota(req).await }
         })
         .await?
         .into_result()

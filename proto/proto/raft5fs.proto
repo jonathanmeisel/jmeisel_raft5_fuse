@@ -200,6 +200,10 @@ service Fs {
   // Measures every folder and every owner's usage now, as admins see fit.
   // EBUSY if another server is measuring.
   rpc MeasureUsage(NoArgs) returns (EmptyResponse);
+  // Sets a user's quota, as an admin: how much the volumes they own may
+  // hold (absent: no limit). A write that would take an owner over it is
+  // refused with EDQUOT; deleting, truncating and moving out always work.
+  rpc SetQuota(SetQuotaRequest) returns (EmptyResponse);
   // Makes the account for a public link, with keys that the caller made
   // from a secret that only the link holds. Needs the `links` capability.
   // The name must be new and start with "link-". The account may do
@@ -802,6 +806,9 @@ message AccountInfo {
   // their key.
   uint64 folder = 7;
   bytes note = 8;
+  // How much the volumes this account owns may hold (protocol 6 on);
+  // absent for no limit.
+  optional uint64 quota = 9;
 }
 
 message Pins {
@@ -878,6 +885,8 @@ message UserEntry {
   // False for an invitation that nobody has used yet.
   bool enrolled = 2;
   AccountInfo account = 3;
+  // How much the volumes they own hold (protocol 6 on).
+  uint64 used = 4;
 }
 
 message UserList {
@@ -895,6 +904,8 @@ message Storage {
   uint64 used = 1;
   // Seconds since the Unix epoch; 0 if never measured.
   uint64 measured_at = 2;
+  // Absent for no limit.
+  optional uint64 quota = 3;
 }
 
 message StorageResponse {
@@ -902,6 +913,11 @@ message StorageResponse {
     Storage storage = 1;
     Error error = 2;
   }
+}
+
+message SetQuotaRequest {
+  string username = 1;
+  optional uint64 quota = 2;
 }
 
 message FolderSizesRequest {
