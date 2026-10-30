@@ -978,12 +978,14 @@ impl Remote {
         grant: Grant,
         sealed_grantees: Vec<u8>,
         expected_grantees_seq: u64,
+        listed: Vec<String>,
     ) -> Result<(), FsError> {
         let req = GrantRequest {
             username: user.to_string(),
             grant: Some(grant.into()),
             sealed_grantees,
             expected_grantees_seq,
+            listed,
         };
         self.call(Retry::Idempotent, |mut c| {
             let req = req.clone();

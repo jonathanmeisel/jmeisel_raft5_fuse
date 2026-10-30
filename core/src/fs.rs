@@ -1673,6 +1673,10 @@ impl FsCore {
     ///   stored list if that list is still at `expected_grantees_seq`, the
     ///   seq of the list it was made from. If not, returns `EAGAIN`,
     ///   because a grant made in the meantime would be lost from it.
+    /// - `listed` names the users on that list. If the node is granted to
+    ///   anyone else, also `EAGAIN`: the client read the grants before one
+    ///   that its starting list already had, so its list leaves it out, and
+    ///   the seq check can't tell. Empty (an older client) skips this.
     pub async fn grant(
         &self,
         caller: &Caller,
@@ -1680,6 +1684,7 @@ impl FsCore {
         grant: &Grant,
         sealed_grantees: &[u8],
         expected_grantees_seq: u64,
+        listed: &[String],
     ) -> Result<(), FsError> {
         grants::check_username(grantee)?;
         let ino = grant.ino;
@@ -1719,6 +1724,16 @@ impl FsCore {
                     libc::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
                 )));
+            }
+            if !listed.is_empty() {
+                for user in grants::grants_of(&txn, ino).await?.into_keys() {
+                    if user != grantee && !listed.contains(&user) {
+                        return Ok(Err(FsError::new(
+                            libc::EAGAIN,
+                            format!("{user}'s grant of inode {ino} isn't on the new grantee list"),
+                        )));
+                    }
+                }
             }
             grants::put_grant(&txn, grantee, grant).await?;
             txn.write(&grantees_key(ino), Some(sealed_grantees)).await?;

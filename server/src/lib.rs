@@ -629,6 +629,7 @@ impl Fs for FsService {
                         &grant.into(),
                         &r.sealed_grantees,
                         r.expected_grantees_seq,
+                        &r.listed,
                     )
                     .await
             }

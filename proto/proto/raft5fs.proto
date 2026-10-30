@@ -548,6 +548,12 @@ message GrantRequest {
   // server refuses the grant if the list changed, so a grant made at the
   // same time is not lost.
   uint64 expected_grantees_seq = 4;
+  // The users on the new sealed list. The server refuses the grant (EAGAIN)
+  // if the node is granted to anyone else: the client read the grants
+  // before a grant that the sealed list it started from already had, so its
+  // list leaves that grant out. Empty from clients before protocol 6, which
+  // the server then doesn't check.
+  repeated string listed = 5;
 }
 
 message CreateVolumeRequest {

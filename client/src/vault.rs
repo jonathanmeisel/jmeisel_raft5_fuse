@@ -1796,7 +1796,12 @@ impl Vault {
                 sealed_label: seal_label(&public_key, ino, os_bytes::bytes(label)),
             };
             let sealed_grantees = seal_grantees(&node.key, version, ino, &entries);
-            match self.remote.grant(user, grant, sealed_grantees, seq).await {
+            let listed = entries.iter().map(|e| e.user.clone()).collect();
+            match self
+                .remote
+                .grant(user, grant, sealed_grantees, seq, listed)
+                .await
+            {
                 Err(e) if expired(&e) && !expired_once => {
                     expired_once = true;
                     self.freshen(ino).await?;
