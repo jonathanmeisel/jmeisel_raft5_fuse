@@ -123,6 +123,7 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x0C ++ ino(BE8)                    -> a volume's record: its owner, any transfer offer
 //                                          (`fs::volumes`)
 //   0x0D ++ ino(BE8)                    -> a folder's size, as last measured (`fs::usage`)
+//   0x0E ++ ino(BE8)                    -> a folder's size limit (`fs::usage`)
 //   0x06 ++ "q/" ++ username            -> how much the user's volumes hold (`fs::usage`)
 //
 // **Deleting an inode** takes several transactions, because its chunks
@@ -201,6 +202,15 @@ pub(crate) const FOLDER_SIZE_PREFIX: &[u8] = &[0x0D];
 
 pub(crate) fn folder_size_key(ino: u64) -> Vec<u8> {
     let mut key = FOLDER_SIZE_PREFIX.to_vec();
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// The prefix of every folder size limit; see `fs::usage`.
+pub(crate) const FOLDER_LIMIT_PREFIX: &[u8] = &[0x0E];
+
+pub(crate) fn folder_limit_key(ino: u64) -> Vec<u8> {
+    let mut key = FOLDER_LIMIT_PREFIX.to_vec();
     key.extend_from_slice(&ino.to_be_bytes());
     key
 }

@@ -46,7 +46,7 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
+    FolderSizesRequest, FolderSizesResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, FolderLimitRequest,
     StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
@@ -753,6 +753,15 @@ impl Fs for FsService {
         Ok(Response::new(
             self.core.folder_sizes(&caller, &r.inos).await.into(),
         ))
+    }
+
+    async fn set_folder_limit(
+        &self,
+        r: Request<FolderLimitRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set = self.core.set_folder_limit(&caller, r.ino, r.limit).await;
+        Ok(Response::new(set.into()))
     }
 
     async fn measure_usage(&self, r: Request<NoArgs>) -> Result<Response<EmptyResponse>, Status> {

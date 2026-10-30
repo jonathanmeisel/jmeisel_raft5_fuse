@@ -70,7 +70,7 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    CreateLinkAccountRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    CreateLinkAccountRequest, FolderLimitRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -1324,6 +1324,18 @@ impl Remote {
         self.call(Retry::ReadOnly, |mut c| {
             let req = req.clone();
             async move { c.folder_sizes(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Sets folder `ino`'s size limit (`None`: no limit), as the owner of
+    /// its volume or an admin.
+    pub async fn set_folder_limit(&self, ino: u64, limit: Option<u64>) -> Result<(), FsError> {
+        self.needs_protocol(6, "folder size limits")?;
+        let req = FolderLimitRequest { ino, limit };
+        self.call(Retry::Idempotent, |mut c| async move {
+            c.set_folder_limit(req).await
         })
         .await?
         .into_result()

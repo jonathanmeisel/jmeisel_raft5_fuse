@@ -2259,6 +2259,8 @@ impl FsCore {
             txn.write(&crate::layout::volume_key(ino), None).await?;
             txn.write(&crate::layout::folder_size_key(ino), None)
                 .await?;
+            txn.write(&crate::layout::folder_limit_key(ino), None)
+                .await?;
             // Its grants and key record are removed with it.
             grants::forget_inode(&txn, ino).await?;
             txn.commit().await?;

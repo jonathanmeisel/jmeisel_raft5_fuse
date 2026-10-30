@@ -138,11 +138,17 @@ impl FsCore {
 
     /// Every live node from the root down, read outside a transaction.
     pub(super) async fn load_tree(&self) -> Result<Tree, FsError> {
+        self.load_tree_at(ROOT_INO).await
+    }
+
+    /// `load_tree` for the folder `top` and everything inside it. `top`'s
+    /// own node is a stand-in: its parent is itself.
+    pub(super) async fn load_tree_at(&self, top: u64) -> Result<Tree, FsError> {
         let mut tree = Tree::new();
         tree.insert(
-            ROOT_INO,
+            top,
             Node {
-                parent: ROOT_INO,
+                parent: top,
                 name: Vec::new(),
                 kind: Kind::Directory,
                 size: 0,
@@ -150,7 +156,7 @@ impl FsCore {
                 children: Vec::new(),
             },
         );
-        let mut dirs = vec![ROOT_INO];
+        let mut dirs = vec![top];
         while let Some(dir) = dirs.pop() {
             let prefix = dirent_prefix(dir);
             let mut keys = Vec::new();

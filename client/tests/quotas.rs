@@ -355,3 +355,99 @@ fn a_quota_refuses_blocks_before_they_are_uploaded() {
     assert_eq!(refused.error.errno, libc::EDQUOT);
     assert_eq!(backend.store().stats().puts, puts, "nothing uploaded");
 }
+
+fn folder(backend: &Backend, v: &Vault, ino: u64) -> raft5fs_proto::types::FolderSize {
+    backend
+        .runtime
+        .block_on(v.remote().folder_sizes(&[ino]))
+        .unwrap()
+        .pop()
+        .expect("a size or a limit")
+}
+
+#[test]
+fn a_folder_limit_holds_for_everyone_writing_or_moving_there() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    backend.enrol("bob");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let s = rt
+        .block_on(tester.mkdir(v, OsStr::new("s"), 0o755))
+        .unwrap()
+        .ino;
+    let old = rt
+        .block_on(tester.create(s, OsStr::new("old"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.write(old, 0, &[1; 2000])).unwrap();
+    rt.block_on(tester.grant(v, "bob", true, OsStr::new("v")))
+        .unwrap();
+
+    // Only the volume's owner, or an admin, sets one; setting it measures
+    // the folder.
+    assert_eq!(
+        errno(rt.block_on(bob.remote().set_folder_limit(s, Some(1)))),
+        libc::EACCES
+    );
+    rt.block_on(tester.remote().set_folder_limit(s, Some(10_000)))
+        .unwrap();
+    let size = folder(&backend, &bob, s);
+    assert_eq!((size.bytes, size.limit), (2000, Some(10_000)));
+
+    // Writes inside it, at any depth and by anyone, stop at the limit.
+    let deep = rt
+        .block_on(bob.mkdir(s, OsStr::new("deep"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(bob.create(deep, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    let refused = rt.block_on(bob.write(f, 0, &[2; 9000])).unwrap_err().error;
+    assert_eq!(refused.errno, libc::EDQUOT);
+    assert!(refused.message.contains("size limit"), "{refused}");
+    rt.block_on(bob.write(f, 0, &[2; 7000])).unwrap();
+    assert_eq!(
+        errno(rt.block_on(tester.setattr(old, resize(4000)))),
+        libc::EDQUOT,
+        "the owner too"
+    );
+    // Outside it, nothing changes.
+    let out = rt
+        .block_on(bob.create(v, OsStr::new("out"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.write(out, 0, &[3; 50_000])).unwrap();
+    // Its size keeps up within a second.
+    eventually("the limited folder's size counts writes", || {
+        folder(&backend, &bob, s).bytes == 9000
+    });
+
+    // Moves in are checked; moves out make room.
+    assert_eq!(
+        errno(rt.block_on(bob.rename(v, OsStr::new("out"), s, OsStr::new("out"), true))),
+        libc::EDQUOT
+    );
+    rt.block_on(bob.rename(deep, OsStr::new("f"), v, OsStr::new("f"), true))
+        .unwrap();
+    rt.block_on(bob.write(old, 2000, &[1; 7000])).unwrap();
+    eventually("moves count", || folder(&backend, &bob, s).bytes == 9000);
+
+    // An admin can change it; deleting the folder deletes it.
+    make_admin(&backend, "bob");
+    rt.block_on(bob.remote().set_folder_limit(s, None)).unwrap();
+    rt.block_on(bob.write(old, 9000, &[1; 5000])).unwrap();
+    rt.block_on(tester.remote().set_folder_limit(s, Some(1 << 30)))
+        .unwrap();
+    assert_eq!(backend.keys_with_prefix(&[0x0E]).len(), 1);
+    rt.block_on(tester.rmdir(s, OsStr::new("deep"))).unwrap();
+    rt.block_on(tester.unlink(s, OsStr::new("old"))).unwrap();
+    rt.block_on(tester.rmdir(v, OsStr::new("s"))).unwrap();
+    assert!(backend.keys_with_prefix(&[0x0E]).is_empty());
+}

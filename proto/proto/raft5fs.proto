@@ -194,9 +194,13 @@ service Fs {
   // How much the caller's volumes hold: file sizes, as last measured (every
   // few minutes) and counted since (each second).
   rpc GetStorage(NoArgs) returns (StorageResponse);
-  // The last measured sizes of folders, for those of `inos` that the
-  // caller can read and that have been measured.
+  // The last measured sizes of folders, and their size limits, for those
+  // of `inos` that the caller can read and that have either.
   rpc FolderSizes(FolderSizesRequest) returns (FolderSizesResponse);
+  // Sets a folder's size limit (absent: no limit), as the owner of its
+  // volume or an admin. A write that would take the folder over it is
+  // refused with EDQUOT, whoever writes, the owner too.
+  rpc SetFolderLimit(FolderLimitRequest) returns (EmptyResponse);
   // Measures every folder and every owner's usage now, as admins see fit.
   // EBUSY if another server is measuring.
   rpc MeasureUsage(NoArgs) returns (EmptyResponse);
@@ -915,6 +919,11 @@ message StorageResponse {
   }
 }
 
+message FolderLimitRequest {
+  uint64 ino = 1;
+  optional uint64 limit = 2;
+}
+
 message SetQuotaRequest {
   string username = 1;
   optional uint64 quota = 2;
@@ -928,7 +937,10 @@ message FolderSize {
   uint64 ino = 1;
   uint64 bytes = 2;
   uint64 files = 3;
+  // Seconds since the Unix epoch; 0 if never measured.
   uint64 measured_at = 4;
+  // Absent for no limit.
+  optional uint64 limit = 5;
 }
 
 message FolderSizeList {

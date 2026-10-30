@@ -4,6 +4,7 @@
 
 mod account;
 mod admin;
+mod folder;
 mod link;
 #[cfg(feature = "fuse")]
 mod mount;
@@ -113,6 +114,9 @@ pub enum Command {
     /// anyone with the link.
     #[command(subcommand)]
     Link(link::LinkCommand),
+    /// Show a folder's size, or cap it.
+    #[command(subcommand)]
+    Folder(folder::FolderCommand),
     /// Share a directory, and everything below it, with a user.
     Grant(share::GrantArgs),
     /// Remove a user's share of a directory. Data written there after this
@@ -146,6 +150,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Whoami => account::whoami(&cli.connect),
         Command::Admin(command) => admin::run(&cli.connect, command),
         Command::Link(command) => link::run(&cli.connect, command),
+        Command::Folder(command) => folder::run(&cli.connect, command),
         Command::Grant(args) => share::grant(&cli.connect, args),
         Command::Revoke(args) => share::revoke(&cli.connect, args),
         Command::Grants(args) => share::grants(&cli.connect, args),
@@ -166,6 +171,14 @@ pub fn run(cli: Cli) -> i32 {
 
 /// The result of a subcommand: an exit status, or why it failed.
 type Outcome = Result<i32, String>;
+
+/// A quota or a size limit, or none (`parse_limit`).
+#[derive(Clone, Copy)]
+pub struct SizeLimit(pub Option<u64>);
+
+pub fn parse_size_limit(s: &str) -> Result<SizeLimit, String> {
+    raft5fs_proto::types::parse_limit(s).map(SizeLimit)
+}
 
 /// How a mount or a WebDAV server runs its session.
 #[derive(Args)]

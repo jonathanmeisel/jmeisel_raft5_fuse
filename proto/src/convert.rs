@@ -599,6 +599,7 @@ impl From<Result<Vec<FolderSize>, FsError>> for pb::FolderSizesResponse {
                             bytes: f.bytes,
                             files: f.files,
                             measured_at: f.measured_at,
+                            limit: f.limit,
                         })
                         .collect(),
                 }),
@@ -620,6 +621,7 @@ impl pb::FolderSizesResponse {
                     bytes: f.bytes,
                     files: f.files,
                     measured_at: f.measured_at,
+                    limit: f.limit,
                 })
                 .collect()),
             Some(R::Error(e)) => Err(e.into()),

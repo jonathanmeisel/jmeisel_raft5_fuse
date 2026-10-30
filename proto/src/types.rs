@@ -559,14 +559,17 @@ pub struct Storage {
     pub quota: Option<u64>,
 }
 
-/// A folder's size: everything inside it, as last measured.
+/// A folder's size: everything inside it, as last measured; and its size
+/// limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderSize {
     pub ino: u64,
     pub bytes: u64,
     pub files: u64,
-    /// When measured, in seconds since the Unix epoch.
+    /// When measured, in seconds since the Unix epoch; 0 if never.
     pub measured_at: u64,
+    /// `None` for no limit.
+    pub limit: Option<u64>,
 }
 
 /// What every public link's account name starts with. Nobody can invite a

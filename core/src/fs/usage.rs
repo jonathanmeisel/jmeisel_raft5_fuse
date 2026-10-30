@@ -1,4 +1,5 @@
-//! How much each owner's volumes hold, and how big each folder is.
+//! How much each owner's volumes hold, how big each folder is, and the
+//! limits on both.
 //!
 //! - **Measuring** (`measure`, on a timer with `run_measure`): one server at
 //!   a time (a lease) walks the whole tree and works out each folder's size
@@ -6,28 +7,29 @@
 //!   It writes a folder's record only if its size changed, deletes the
 //!   records of folders that are gone, and sets each owner's usage.
 //! - **Tallies** (`count`, applied by `flush_tallies` every second): a write,
-//!   a truncate, a deletion or a move between volumes adds its change in
-//!   size to an in-memory tally for the owner of the volume. Each second the
-//!   tallies are added to the owners' usage records, outside any user's
-//!   transaction, so writes never wait on them. Usage is then a second
-//!   behind; the next measuring corrects any drift (say a tally that a crash
-//!   lost).
-//! - Each change in a tally keeps its time, and a usage record keeps when
-//!   the measuring that set it started. Only changes after that are added:
-//!   the measuring counted the earlier ones already.
-//!
-//! - **Quotas** (`check_room`): a write that makes a file bigger is
-//!   refused (`EDQUOT`) if the owner's usage, with this server's tallies not
-//!   stored yet, would go over their quota. Both are read outside the
-//!   write's transaction and kept for `ROOM_TTL`, so the check never makes
-//!   writes retry. Quotas are soft: other servers' writes of the last
-//!   second or so are not seen yet.
+//!   a truncate, a deletion or a move adds its change in size to an
+//!   in-memory tally for the owner of the volume, and for each folder with
+//!   a size limit above it. Each second the tallies are added to the
+//!   owners' usage records and those folders' size records, outside any
+//!   user's transaction, so writes never wait on them. They are then a
+//!   second behind; the next measuring corrects any drift (say a tally that
+//!   a crash lost). Other folders' sizes change only when measured.
+//! - Each change in a tally keeps its time, and a record keeps when the
+//!   measuring that set it started. Only changes after that are added: the
+//!   measuring counted the earlier ones already.
+//! - **Quotas and folder limits** (`check_room`): a write that makes a file
+//!   bigger is refused (`EDQUOT`) if it would take the owner over their
+//!   quota, or a folder above it over its size limit. The stored sizes and
+//!   limits are read outside the write's transaction and kept for
+//!   `ROOM_TTL`, with this server's tallies not stored yet added, so the
+//!   check never makes writes retry. They are soft: other servers' writes
+//!   of the last few seconds are not seen yet.
 //!
 //! Sizes are file sizes as users see them. Unowned volumes count against
 //! nobody. The servers already see sizes and the tree's shape, so this
 //! tells them nothing new.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,12 +39,13 @@ use super::unreachable::{Tree, post_order};
 use super::*;
 use crate::gc::{release_lease, take_lease};
 use crate::layout::{
-    FOLDER_SIZE_PREFIX, ROOT_INO, USAGE_LEASE_KEY, USAGE_PREFIX, folder_size_key, usage_key,
-    volume_key,
+    FOLDER_LIMIT_PREFIX, FOLDER_SIZE_PREFIX, ROOT_INO, USAGE_LEASE_KEY, USAGE_PREFIX,
+    folder_limit_key, folder_size_key, usage_key, volume_key,
 };
 use raft5fs_proto::types::{FolderSize, Storage, size_text};
 
-/// How long a volume's owner, as read, is used before reading it again.
+/// How long a volume's owner, a folder's path, or the set of limited
+/// folders, as read, is used before reading it again.
 const OWNER_TTL: Duration = Duration::from_secs(10);
 
 /// How often tallies go to the store.
@@ -51,31 +54,43 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// How many records one transaction of a measuring writes.
 const WRITE_BATCH: usize = 100;
 
-/// How long an owner's quota and usage, as read, are used before reading
+/// How long a stored size and its limit, as read, are used before reading
 /// them again.
 const ROOM_TTL: Duration = Duration::from_secs(5);
 
 /// How often a refused write may ask for a measuring now.
 const REMEASURE_GAP: Duration = Duration::from_secs(60);
 
-/// An owner's quota and stored usage, and when they were read.
+/// What a tally counts for: an owner's usage, or a limited folder's size.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Tally {
+    Owner(String),
+    Folder(u64),
+}
+
+/// Something read, and when.
+type Seen<T> = Mutex<HashMap<u64, (Instant, T)>>;
+
+/// A stored size, its limit, and when they were read.
 #[derive(Clone, Copy)]
 struct Room {
     seen: Instant,
-    quota: Option<u64>,
+    limit: Option<u64>,
     used: u64,
 }
 
 /// One server's part: its lease id, the tallies not yet stored, and what it
-/// knows of which volume each folder is in, and who owns each volume.
+/// knows of each folder's path, each volume's owner, and the limits.
 pub(crate) struct Usage {
     holder: [u8; 16],
-    /// Per owner: each change not yet stored, with when it happened (ms
-    /// since the Unix epoch).
-    tallies: Mutex<HashMap<String, Vec<(u64, i64)>>>,
-    volumes: Mutex<HashMap<u64, u64>>,
-    owners: Mutex<HashMap<u64, (Instant, Option<String>)>>,
-    rooms: Mutex<HashMap<String, Room>>,
+    /// Each change not yet stored, with when it happened (ms since the Unix
+    /// epoch).
+    tallies: Mutex<HashMap<Tally, Vec<(u64, i64)>>>,
+    /// Per folder: it and the folders above it, up to its volume.
+    paths: Seen<Arc<[u64]>>,
+    owners: Seen<Option<String>>,
+    limited: Mutex<Option<(Instant, Arc<HashSet<u64>>)>>,
+    rooms: Mutex<HashMap<Tally, Room>>,
     /// When a refused write last asked for a measuring, and how it asks.
     remeasured: Mutex<Option<Instant>>,
     remeasure: Notify,
@@ -88,8 +103,9 @@ impl Default for Usage {
         Self {
             holder,
             tallies: Mutex::default(),
-            volumes: Mutex::default(),
+            paths: Mutex::default(),
             owners: Mutex::default(),
+            limited: Mutex::default(),
             rooms: Mutex::default(),
             remeasured: Mutex::default(),
             remeasure: Notify::new(),
@@ -106,16 +122,14 @@ pub struct MeasureStats {
     pub owners: usize,
 }
 
-fn now_secs() -> u64 {
-    unix_secs(SystemTime::now())
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// A folder size record: bytes, files, and when the measuring that set it
+/// started (ms since the Unix epoch).
 fn encode_size(bytes: u64, files: u64, at: u64) -> Vec<u8> {
     [bytes, files, at]
         .iter()
@@ -147,6 +161,10 @@ pub(crate) fn decode_usage(value: &[u8]) -> Option<(u64, u64)> {
     Some((n(0)?, n(1)?))
 }
 
+fn decode_limit(value: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(value.try_into().ok()?))
+}
+
 /// Every key under `prefix`, with its value, read outside a transaction.
 async fn scan(client: &Client, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FsError> {
     let mut keys = Vec::new();
@@ -165,54 +183,80 @@ async fn scan(client: &Client, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
         .collect())
 }
 
+/// The inode at the end of a `0x0D` or `0x0E` key.
+fn ino_of(key: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(key.get(1..9)?.try_into().ok()?))
+}
+
 impl FsCore {
-    /// Adds `delta` bytes to the tally of the owner of the volume that
-    /// folder `dir` is in. Never fails: if the volume or owner can't be
-    /// found, the next measuring counts it.
+    /// Adds `delta` bytes to the tallies of what folder `dir` counts for.
+    /// Never fails: if those can't be found, the next measuring counts it.
     pub(crate) async fn count(&self, dir: u64, delta: i64) {
         if delta == 0 {
             return;
         }
-        let owner = match self.volume_containing(dir).await {
-            Ok(Some(volume)) => self.owner_of(volume).await.ok().flatten(),
-            _ => None,
+        let Ok(tallies) = self.tallies_over(dir).await else {
+            return;
         };
-        if let Some(owner) = owner {
-            let change = (now_ms(), delta);
-            self.usage
-                .tallies
-                .lock()
-                .unwrap()
-                .entry(owner)
-                .or_default()
-                .push(change);
+        let change = (now_ms(), delta);
+        let mut all = self.usage.tallies.lock().unwrap();
+        for tally in tallies {
+            all.entry(tally).or_default().push(change);
         }
     }
 
-    /// The volume that folder `dir` is in (itself, if it is one), or `None`
-    /// for the root or a folder no longer in the tree.
-    pub(crate) async fn volume_containing(&self, dir: u64) -> Result<Option<u64>, FsError> {
-        if let Some(&volume) = self.usage.volumes.lock().unwrap().get(&dir) {
-            return Ok(Some(volume));
+    /// What a file in folder `dir` counts for: the owner of its volume, if
+    /// it has one, and each limited folder from `dir` up.
+    async fn tallies_over(&self, dir: u64) -> Result<Vec<Tally>, FsError> {
+        let path = self.path_of(dir).await?;
+        let Some(&volume) = path.last() else {
+            return Ok(Vec::new());
+        };
+        let mut tallies = Vec::new();
+        if let Some(owner) = self.owner_of(volume).await? {
+            tallies.push(Tally::Owner(owner));
+        }
+        let limited = self.limited().await?;
+        tallies.extend(
+            path.iter()
+                .filter(|ino| limited.contains(ino))
+                .map(|&ino| Tally::Folder(ino)),
+        );
+        Ok(tallies)
+    }
+
+    /// Folder `dir` and the folders above it, up to its volume; empty for
+    /// the root or a folder no longer in the tree. Read again every
+    /// `OWNER_TTL`, or after a move here.
+    async fn path_of(&self, dir: u64) -> Result<Arc<[u64]>, FsError> {
+        if let Some((seen, path)) = self.usage.paths.lock().unwrap().get(&dir)
+            && seen.elapsed() < OWNER_TTL
+        {
+            return Ok(path.clone());
         }
         let mut path = vec![];
         let mut at = dir;
-        while at != ROOT_INO {
+        loop {
+            if at == ROOT_INO {
+                return Ok(Arc::from([]));
+            }
             let Some(bytes) = self.client.read_one(&attr_key(at)).await?.value else {
-                return Ok(None);
+                return Ok(Arc::from([]));
             };
-            let parent = decode_entry(at, &bytes).parent;
             path.push(at);
+            let parent = decode_entry(at, &bytes).parent;
             if parent == ROOT_INO {
-                let mut volumes = self.usage.volumes.lock().unwrap();
-                for ino in path {
-                    volumes.insert(ino, at);
-                }
-                return Ok(Some(at));
+                break;
             }
             at = parent;
         }
-        Ok(None)
+        let now = Instant::now();
+        let mut paths = self.usage.paths.lock().unwrap();
+        // Each folder on the way has the rest of it as its path.
+        for i in (0..path.len()).rev() {
+            paths.insert(path[i], (now, Arc::from(&path[i..])));
+        }
+        Ok(paths[&dir].1.clone())
     }
 
     /// Who owns `volume`, read again every `OWNER_TTL`.
@@ -234,30 +278,50 @@ impl FsCore {
         Ok(owner)
     }
 
-    /// Forgets which volume each folder is in, after a folder moved.
-    pub(crate) fn forget_volumes(&self) {
-        self.usage.volumes.lock().unwrap().clear();
+    /// Every folder with a size limit, read again every `OWNER_TTL`.
+    async fn limited(&self) -> Result<Arc<HashSet<u64>>, FsError> {
+        if let Some((seen, limited)) = &*self.usage.limited.lock().unwrap()
+            && seen.elapsed() < OWNER_TTL
+        {
+            return Ok(limited.clone());
+        }
+        let limited: Arc<HashSet<u64>> = Arc::new(
+            scan(&self.client, FOLDER_LIMIT_PREFIX)
+                .await?
+                .iter()
+                .filter_map(|(key, _)| ino_of(key))
+                .collect(),
+        );
+        *self.usage.limited.lock().unwrap() = Some((Instant::now(), limited.clone()));
+        Ok(limited)
     }
 
-    /// Moves usage between owners after `moved` went from folder `from` to
-    /// folder `to`: a file's size, or a folder's last measured size.
+    /// Forgets each folder's path, after a folder moved.
+    fn forget_paths(&self) {
+        self.usage.paths.lock().unwrap().clear();
+    }
+
+    /// Moves sizes between tallies after `moved` went from folder `from` to
+    /// folder `to`: a file's size, or a folder's last measured size. Only
+    /// what one of the two folders counts for and the other doesn't
+    /// changes.
     pub(crate) async fn count_move(&self, moved: u64, from: u64, to: u64) {
-        self.forget_volumes();
-        let (Ok(a), Ok(b)) = (
-            self.volume_containing(from).await,
-            self.volume_containing(to).await,
-        ) else {
+        self.forget_paths();
+        let (Ok(before), Ok(after)) = (self.tallies_over(from).await, self.tallies_over(to).await)
+        else {
             return;
         };
-        if a == b {
+        let Ok(size) = self.moved_size(moved).await else {
             return;
+        };
+        let now = now_ms();
+        let mut all = self.usage.tallies.lock().unwrap();
+        for tally in before.iter().filter(|t| !after.contains(t)) {
+            all.entry(tally.clone()).or_default().push((now, -(size as i64)));
         }
-        let size = match self.moved_size(moved).await {
-            Ok(size) => size as i64,
-            Err(_) => return,
-        };
-        self.count(from, -size).await;
-        self.count(to, size).await;
+        for tally in after.iter().filter(|t| !before.contains(t)) {
+            all.entry(tally.clone()).or_default().push((now, size as i64));
+        }
     }
 
     /// A file's size, or a folder's size as last measured.
@@ -278,81 +342,136 @@ impl FsCore {
         })
     }
 
-    /// Adds the tallies to the owners' usage records, never below 0: each
+    /// Adds the tallies to the records they count for, never below 0: each
     /// change made after the measuring that set the record started. A
-    /// tally stays in memory until it is stored, so quota checks always
-    /// see it in one place or the other.
+    /// tally stays in memory until it is stored, so checks always see it in
+    /// one place or the other.
     pub async fn flush_tallies(&self) -> Result<(), FsError> {
-        let tallies: Vec<(String, Vec<(u64, i64)>)> = self
+        let tallies: Vec<(Tally, Vec<(u64, i64)>)> = self
             .usage
             .tallies
             .lock()
             .unwrap()
             .iter()
-            .map(|(owner, changes)| (owner.clone(), changes.clone()))
+            .map(|(tally, changes)| (tally.clone(), changes.clone()))
             .collect();
-        for (owner, changes) in tallies {
-            let key = &usage_key(&owner);
-            let changes_ref = &changes;
-            let bytes = retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
-                let (bytes, at) = txn
-                    .read_one(key)
-                    .await?
-                    .value
-                    .and_then(|v| decode_usage(&v))
-                    .unwrap_or((0, 0));
-                let delta: i64 = changes_ref
-                    .iter()
-                    .filter(|(when, _)| *when > at)
-                    .map(|(_, d)| d)
-                    .sum();
-                if delta == 0 {
-                    return Ok(bytes);
-                }
-                let bytes = bytes.saturating_add_signed(delta);
-                txn.write(key, Some(&encode_usage(bytes, at))).await?;
-                txn.commit().await?;
-                Ok(bytes)
-            })
-            .await?;
+        for (tally, changes) in tallies {
+            let stored = match &tally {
+                Tally::Owner(owner) => self.add_to_usage(owner, &changes).await?,
+                Tally::Folder(ino) => self.add_to_size(*ino, &changes).await?,
+            };
             // New changes go after these, so these are still the first.
-            let mut tallies = self.usage.tallies.lock().unwrap();
-            if let Some(list) = tallies.get_mut(&owner) {
+            let mut all = self.usage.tallies.lock().unwrap();
+            if let Some(list) = all.get_mut(&tally) {
                 list.drain(..changes.len());
                 if list.is_empty() {
-                    tallies.remove(&owner);
+                    all.remove(&tally);
                 }
             }
-            if let Some(room) = self.usage.rooms.lock().unwrap().get_mut(&owner) {
+            if let (Some(room), Some(bytes)) =
+                (self.usage.rooms.lock().unwrap().get_mut(&tally), stored)
+            {
                 room.used = bytes;
             }
         }
         Ok(())
     }
 
+    /// Adds `changes` to `owner`'s usage record; returns what it holds then.
+    async fn add_to_usage(
+        &self,
+        owner: &str,
+        changes: &[(u64, i64)],
+    ) -> Result<Option<u64>, FsError> {
+        let key = &usage_key(owner);
+        Ok(retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let (bytes, at) = txn
+                .read_one(key)
+                .await?
+                .value
+                .and_then(|v| decode_usage(&v))
+                .unwrap_or((0, 0));
+            let delta = since(changes, at);
+            if delta == 0 {
+                return Ok(Some(bytes));
+            }
+            let bytes = bytes.saturating_add_signed(delta);
+            txn.write(key, Some(&encode_usage(bytes, at))).await?;
+            txn.commit().await?;
+            Ok(Some(bytes))
+        })
+        .await?)
+    }
+
+    /// Adds `changes` to folder `ino`'s size record; returns what it holds
+    /// then. A folder with no record (deleted, or not measured yet) gets
+    /// none: measuring makes it.
+    async fn add_to_size(&self, ino: u64, changes: &[(u64, i64)]) -> Result<Option<u64>, FsError> {
+        let key = &folder_size_key(ino);
+        Ok(retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            let Some((bytes, files, at)) = txn
+                .read_one(key)
+                .await?
+                .value
+                .and_then(|v| decode_size(&v))
+            else {
+                return Ok(None);
+            };
+            let delta = since(changes, at);
+            if delta == 0 {
+                return Ok(Some(bytes));
+            }
+            let bytes = bytes.saturating_add_signed(delta);
+            txn.write(key, Some(&encode_size(bytes, files, at))).await?;
+            txn.commit().await?;
+            Ok(Some(bytes))
+        })
+        .await?)
+    }
+
     /// Refuses (`EDQUOT`) to make a file in folder `dir` `growth` bytes
-    /// bigger if that takes the volume's owner over their quota. Unowned
-    /// volumes, and owners with no quota, have no limit.
+    /// bigger if that takes the volume's owner over their quota, or a
+    /// folder from `dir` up over its size limit.
     pub(crate) async fn check_room(&self, dir: u64, growth: u64) -> Result<(), FsError> {
         if growth == 0 {
             return Ok(());
         }
-        let Some(volume) = self.volume_containing(dir).await? else {
-            return Ok(());
-        };
-        let Some(owner) = self.owner_of(volume).await? else {
-            return Ok(());
-        };
-        self.check_owner_room(&owner, growth).await
+        for tally in self.tallies_over(dir).await? {
+            self.check_tally(&tally, growth).await?;
+        }
+        Ok(())
     }
 
-    /// `check_room` for a known owner.
-    pub(crate) async fn check_owner_room(&self, owner: &str, growth: u64) -> Result<(), FsError> {
-        // The stored usage first, then the tally: a flush between the two
+    /// Refuses (`EDQUOT`) a move of `moved` from folder `from` to folder
+    /// `to` if what it would newly count for has no room for it: another
+    /// owner, or a limited folder.
+    pub(crate) async fn check_move_room(&self, moved: u64, from: u64, to: u64) -> Result<(), FsError> {
+        let before = self.tallies_over(from).await?;
+        let gaining: Vec<Tally> = self
+            .tallies_over(to)
+            .await?
+            .into_iter()
+            .filter(|t| !before.contains(t))
+            .collect();
+        if gaining.is_empty() {
+            return Ok(());
+        }
+        let size = self.moved_size(moved).await?;
+        for tally in &gaining {
+            self.check_tally(tally, size).await?;
+        }
+        Ok(())
+    }
+
+    /// Refuses (`EDQUOT`) `growth` more bytes for `tally` if they take it
+    /// over its limit.
+    async fn check_tally(&self, tally: &Tally, growth: u64) -> Result<(), FsError> {
+        // The stored size first, then the tally: a flush between the two
         // can then only make this count less, never twice.
-        let (quota, stored) = self.room_of(owner).await?;
-        let Some(quota) = quota else {
+        let room = self.room_of(tally).await?;
+        let Some(limit) = room.limit else {
             return Ok(());
         };
         let pending: i64 = self
@@ -360,74 +479,73 @@ impl FsCore {
             .tallies
             .lock()
             .unwrap()
-            .get(owner)
+            .get(tally)
             .map_or(0, |changes| changes.iter().map(|(_, d)| d).sum());
-        let used = stored.saturating_add_signed(pending);
-        if used.saturating_add(growth) <= quota {
+        let used = room.used.saturating_add_signed(pending);
+        if used.saturating_add(growth) <= limit {
             return Ok(());
         }
         self.ask_remeasure();
+        let (used, limit) = (size_text(used), size_text(limit));
         Err(FsError::new(
             libc::EDQUOT,
-            format!(
-                "{owner}'s storage is full ({} of {})",
-                size_text(used),
-                size_text(quota)
-            ),
+            match tally {
+                Tally::Owner(owner) => format!("{owner}'s storage is full ({used} of {limit})"),
+                Tally::Folder(_) => {
+                    format!("a folder here has reached its size limit ({used} of {limit})")
+                }
+            },
         ))
     }
 
-    /// Refuses (`EDQUOT`) a move of `moved` from folder `from` to folder
-    /// `to` if it goes to another owner who has no room for it.
-    pub(crate) async fn check_move_room(&self, moved: u64, from: u64, to: u64) -> Result<(), FsError> {
-        let (Some(a), Some(b)) = (
-            self.volume_containing(from).await?,
-            self.volume_containing(to).await?,
-        ) else {
-            return Ok(());
-        };
-        if a == b {
-            return Ok(());
-        }
-        let Some(owner) = self.owner_of(b).await? else {
-            return Ok(());
-        };
-        if self.owner_of(a).await?.as_deref() == Some(owner.as_str()) {
-            return Ok(());
-        }
-        let size = self.moved_size(moved).await?;
-        self.check_owner_room(&owner, size).await
-    }
-
-    /// `owner`'s quota and stored usage, read again every `ROOM_TTL`.
-    async fn room_of(&self, owner: &str) -> Result<(Option<u64>, u64), FsError> {
-        if let Some(room) = self.usage.rooms.lock().unwrap().get(owner)
+    /// `tally`'s stored size and limit, read again every `ROOM_TTL`.
+    async fn room_of(&self, tally: &Tally) -> Result<Room, FsError> {
+        if let Some(room) = self.usage.rooms.lock().unwrap().get(tally)
             && room.seen.elapsed() < ROOM_TTL
         {
-            return Ok((room.quota, room.used));
+            return Ok(*room);
         }
-        let quota = crate::accounts::info(&self.client, owner).await?.quota;
-        let used = self.stored_usage(owner).await?.0;
+        let (limit, used) = match tally {
+            Tally::Owner(owner) => (
+                crate::accounts::info(&self.client, owner).await?.quota,
+                self.stored_usage(owner).await?.0,
+            ),
+            Tally::Folder(ino) => {
+                let keys = [folder_limit_key(*ino), folder_size_key(*ino)];
+                let mut values = self.client.get_many(&keys).await?.into_iter();
+                let limit = values.next().flatten().and_then(|v| decode_limit(&v));
+                let used = values
+                    .next()
+                    .flatten()
+                    .and_then(|v| decode_size(&v))
+                    .map_or(0, |(bytes, _, _)| bytes);
+                (limit, used)
+            }
+        };
         let room = Room {
             seen: Instant::now(),
-            quota,
+            limit,
             used,
         };
         self.usage
             .rooms
             .lock()
             .unwrap()
-            .insert(owner.to_string(), room);
-        Ok((quota, used))
+            .insert(tally.clone(), room);
+        Ok(room)
     }
 
     /// Forgets `user`'s quota as read, after it changed.
     pub fn forget_room(&self, user: &str) {
-        self.usage.rooms.lock().unwrap().remove(user);
+        self.usage
+            .rooms
+            .lock()
+            .unwrap()
+            .remove(&Tally::Owner(user.to_string()));
     }
 
     /// Asks `run_measure` to measure now, at most once every
-    /// `REMEASURE_GAP`: usage may have drifted above what it is.
+    /// `REMEASURE_GAP`: sizes may have drifted above what they are.
     fn ask_remeasure(&self) {
         let mut last = self.usage.remeasured.lock().unwrap();
         if last.is_some_and(|at| at.elapsed() < REMEASURE_GAP) {
@@ -447,6 +565,79 @@ impl FsCore {
             .value
             .and_then(|v| decode_usage(&v))
             .unwrap_or((0, 0)))
+    }
+
+    /// Sets folder `ino`'s size limit (`None`: no limit), as the owner of
+    /// its volume or an admin. Applies to everyone writing there, the
+    /// owner too. A new limit measures the folder at once, so its size is
+    /// known from the start.
+    pub async fn set_folder_limit(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        limit: Option<u64>,
+    ) -> Result<(), FsError> {
+        self.forget_paths();
+        let Some(&volume) = self.path_of(ino).await?.last() else {
+            return Err(enoent());
+        };
+        let owner = match self.client.read_one(&volume_key(volume)).await?.value {
+            Some(bytes) => volumes::decode_volume(volume, &bytes)?.owner,
+            None => None,
+        };
+        if owner.as_deref() != Some(caller.user.as_str())
+            && crate::accounts::is_admin(&self.client, &caller.user)
+                .await
+                .is_err()
+        {
+            return Err(FsError::new(
+                libc::EACCES,
+                "only the volume's owner or an admin sets size limits",
+            ));
+        }
+        let key = &folder_limit_key(ino);
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            // Not for a folder whose deletion has begun: its record would
+            // stay after it.
+            let entry = decide!(live_entry(&txn, ino).await?);
+            decide!(check_kind(&entry, Kind::Directory));
+            let value = limit.map(u64::to_be_bytes);
+            txn.write(key, value.as_ref().map(|v| &v[..])).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await??;
+        *self.usage.limited.lock().unwrap() = None;
+        self.usage
+            .rooms
+            .lock()
+            .unwrap()
+            .remove(&Tally::Folder(ino));
+        if limit.is_some() {
+            self.measure_folder(ino).await?;
+        }
+        Ok(())
+    }
+
+    /// Measures folder `ino` alone, and stores its size.
+    async fn measure_folder(&self, ino: u64) -> Result<(), FsError> {
+        let started = now_ms();
+        let tree = self.load_tree_at(ino).await?;
+        let (bytes, files) = folder_sizes(&tree, ino)[&ino];
+        let key = &folder_size_key(ino);
+        retrying(move || async move {
+            let txn = self.client.transaction(TXN_TTL).await?;
+            if live_entry(&txn, ino).await?.is_err() {
+                return Ok(());
+            }
+            txn.write(key, Some(&encode_size(bytes, files, started)))
+                .await?;
+            txn.commit().await?;
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     /// Stores the tallies every second, until the process ends.
@@ -499,8 +690,7 @@ impl FsCore {
         // Changes before this are in what the walk finds.
         let started = now_ms();
         let tree = self.load_tree().await?;
-        let at = now_secs();
-        let sizes = folder_sizes(&tree);
+        let sizes = folder_sizes(&tree, ROOT_INO);
         let mut stats = MeasureStats {
             folders: sizes.len(),
             ..MeasureStats::default()
@@ -510,10 +700,7 @@ impl FsCore {
         let mut writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
         let mut stored: HashMap<u64, (u64, u64)> = HashMap::new();
         for (key, value) in scan(&self.client, FOLDER_SIZE_PREFIX).await? {
-            let Some(ino) = key
-                .get(1..9)
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
-            else {
+            let Some(ino) = ino_of(&key) else {
                 continue;
             };
             match decode_size(&value) {
@@ -528,7 +715,10 @@ impl FsCore {
         }
         for (&ino, &(bytes, files)) in &sizes {
             if stored.get(&ino) != Some(&(bytes, files)) {
-                writes.push((folder_size_key(ino), Some(encode_size(bytes, files, at))));
+                writes.push((
+                    folder_size_key(ino),
+                    Some(encode_size(bytes, files, started)),
+                ));
                 stats.written += 1;
             }
         }
@@ -584,8 +774,8 @@ impl FsCore {
         })
     }
 
-    /// The last measured sizes of the folders in `inos` that `caller` can
-    /// read and that have been measured.
+    /// The sizes and limits of the folders in `inos` that `caller` can
+    /// read and that have either.
     pub async fn folder_sizes(
         &self,
         caller: &Caller,
@@ -598,28 +788,47 @@ impl FsCore {
                 readable.push(ino);
             }
         }
-        let keys: Vec<Vec<u8>> = readable.iter().map(|&ino| folder_size_key(ino)).collect();
+        let keys: Vec<Vec<u8>> = readable
+            .iter()
+            .flat_map(|&ino| [folder_size_key(ino), folder_limit_key(ino)])
+            .collect();
+        let values = self.client.get_many(&keys).await?;
         Ok(readable
             .into_iter()
-            .zip(self.client.get_many(&keys).await?)
-            .filter_map(|(ino, value)| {
-                let (bytes, files, measured_at) = decode_size(&value?)?;
+            .zip(values.chunks(2))
+            .filter_map(|(ino, pair)| {
+                let size = pair[0].as_deref().and_then(decode_size);
+                let limit = pair[1].as_deref().and_then(decode_limit);
+                if size.is_none() && limit.is_none() {
+                    return None;
+                }
+                let (bytes, files, at) = size.unwrap_or((0, 0, 0));
                 Some(FolderSize {
                     ino,
                     bytes,
                     files,
-                    measured_at,
+                    measured_at: at / 1000,
+                    limit,
                 })
             })
             .collect())
     }
 }
 
-/// Every folder's size in `tree` (the root left out): the bytes and files
-/// of everything inside it.
-fn folder_sizes(tree: &Tree) -> HashMap<u64, (u64, u64)> {
+/// The sum of the `changes` made after `at`.
+fn since(changes: &[(u64, i64)], at: u64) -> i64 {
+    changes
+        .iter()
+        .filter(|(when, _)| *when > at)
+        .map(|(_, d)| d)
+        .sum()
+}
+
+/// Every folder's size in `tree`, from `top` down (the root left out): the
+/// bytes and files of everything inside it.
+fn folder_sizes(tree: &Tree, top: u64) -> HashMap<u64, (u64, u64)> {
     let mut sizes: HashMap<u64, (u64, u64)> = HashMap::new();
-    for ino in post_order(tree, ROOT_INO) {
+    for ino in post_order(tree, top) {
         let node = &tree[&ino];
         if node.kind != Kind::Directory || ino == ROOT_INO {
             continue;
@@ -653,5 +862,11 @@ mod tests {
         assert_eq!(decode_size(&encode_size(1, 2, 3)), Some((1, 2, 3)));
         assert_eq!(decode_usage(&encode_usage(4, 5)), Some((4, 5)));
         assert_eq!(decode_size(&[1, 2]), None);
+        assert_eq!(decode_limit(&7u64.to_be_bytes()), Some(7));
+    }
+
+    #[test]
+    fn only_changes_after_a_measuring_count() {
+        assert_eq!(since(&[(5, 10), (6, -3), (9, 100)], 6), 100);
     }
 }

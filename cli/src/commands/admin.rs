@@ -4,10 +4,10 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use raft5fs_client::cli::Context;
-use raft5fs_proto::types::{AccountKind, Caps, parse_limit, size_text};
+use raft5fs_proto::types::{AccountKind, Caps, size_text};
 
 use super::account::caps_text;
-use super::{ConnectArgs, Outcome, log_in, runtime};
+use super::{ConnectArgs, Outcome, SizeLimit, log_in, parse_size_limit, runtime};
 
 #[derive(Subcommand)]
 pub enum AdminCommand {
@@ -81,14 +81,6 @@ pub struct SetArgs {
     /// as 10G (K, M, G, T: powers of 1024), or `none` for no limit.
     #[arg(long, value_name = "SIZE|none", value_parser = parse_size_limit)]
     pub quota: Option<SizeLimit>,
-}
-
-/// A size limit, or none (`parse_limit`).
-#[derive(Clone, Copy)]
-pub struct SizeLimit(pub Option<u64>);
-
-pub fn parse_size_limit(s: &str) -> Result<SizeLimit, String> {
-    parse_limit(s).map(SizeLimit)
 }
 
 #[derive(Args)]
