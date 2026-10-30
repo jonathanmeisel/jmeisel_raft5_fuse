@@ -8,6 +8,9 @@
   //
   // Public links show as such, not by their account name. Anyone who can
   // change the folder can revoke one, as for a person.
+  //
+  // A top-level folder's owner keeps read-write access to it, so has no
+  // Revoke: they give it away first (Transfer ownership…).
   import Dialog from "./Dialog.svelte";
   import LinkField from "./LinkField.svelte";
 
@@ -18,6 +21,8 @@
   const WARN_BYTES = 1 << 30;
 
   let grantees = $state(null);
+  /// Who owns the folder, if it is a top-level one.
+  let owner = $state(null);
   let error = $state("");
   let confirming = $state(null);
   let busy = $state(false);
@@ -28,6 +33,7 @@
   async function load() {
     try {
       grantees = await fs.sharedWith(path);
+      owner = (await fs.volume(path).catch(() => null))?.owner ?? null;
       if (links && grantees.some((g) => isLink(g.user))) {
         mine = new Map((await fs.listLinks()).map((l) => [l.user, l]));
       }
@@ -117,7 +123,9 @@
                     : ""}
                 </td>
               {:else}
-                <td><strong>{g.user}</strong>{g.user === me ? " (you)" : ""}</td>
+                <td>
+                  <strong>{g.user}</strong>{g.user === me ? " (you)" : ""}{g.user === owner ? ", owner" : ""}
+                </td>
                 <td>{g.writable ? "read-write" : "read-only"}</td>
               {/if}
               <td>
@@ -126,7 +134,7 @@
                     {shown === g.user ? "Hide link" : "Show link"}
                   </button>
                 {/if}
-                {#if g.user !== me}
+                {#if g.user !== me && g.user !== owner}
                   <button class="danger" onclick={() => ask(g.user)} disabled={busy}>Revoke…</button>
                 {/if}
               </td>

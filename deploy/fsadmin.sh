@@ -2,9 +2,10 @@
 # Runs filesystem administration on a node (the first node, unless the first
 # argument names one). See templates/raft5fs-admin:
 #
-#   ./fsadmin.sh [<node>] user add <NAME> [--no-volumes] [--links] [--admin]
+#   ./fsadmin.sh [<node>] user add <NAME> [--no-volumes] [--links] [--admin] [--quota <SIZE>]
 #                                               prints an invitation to enrol with
 #   ./fsadmin.sh [<node>] user set <NAME> [--volumes on|off] [--links on|off] [--admin on|off]
+#                                       [--quota <SIZE>|none]
 #   ./fsadmin.sh [<node>] user del <NAME>
 #   ./fsadmin.sh [<node>] user list
 #   ./fsadmin.sh [<node>] snapshot create [<NAME>]

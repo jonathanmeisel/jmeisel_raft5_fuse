@@ -400,7 +400,9 @@ struct Entry {
     name: String,
     /// `file` or `folder`.
     kind: &'static str,
-    size: u64,
+    /// A file's size; a folder's, as last measured (see `mark_sizes`), or
+    /// none.
+    size: Option<u64>,
     /// Milliseconds since the Unix epoch.
     modified: f64,
     /// For a folder: `link` if it has a public link, `people` if it is
@@ -419,7 +421,7 @@ impl Entry {
                 Kind::File => "file",
                 Kind::Directory => "folder",
             },
-            size: attr.size,
+            size: (attr.kind == Kind::File).then_some(attr.size),
             modified: attr
                 .mtime
                 .duration_since(UNIX_EPOCH)
@@ -458,6 +460,8 @@ struct Here {
     sources: Vec<Source>,
     /// For a folder that this account can only read: who shared it.
     from: Option<String>,
+    /// Who owns the top-level folder it is in, if not this account.
+    owner: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -492,6 +496,17 @@ impl From<&raft5fs_proto::types::Unreachable> for UnreachableJs {
                 .map_or(0.0, |d| d.as_millis() as f64),
         }
     }
+}
+
+/// An orphaned top-level folder, for JavaScript (see `Fs::list_orphans`).
+#[derive(Serialize)]
+struct OrphanJs {
+    ino: f64,
+    path: Option<String>,
+    owner: Option<String>,
+    writers: Vec<String>,
+    reachable: bool,
+    bytes: u64,
 }
 
 /// The capabilities called `names`.
@@ -605,6 +620,7 @@ impl Inner {
             return Ok(Some(Here {
                 sources: Vec::new(),
                 from: sender,
+                owner: self.others_owner(top).await,
             }));
         };
         let mut sources = Vec::new();
@@ -622,10 +638,97 @@ impl Inner {
                 });
             }
         }
-        Ok((!sources.is_empty()).then_some(Here {
+        let owner = self.others_owner(top).await;
+        Ok((!sources.is_empty() || owner.is_some()).then_some(Here {
             sources,
             from: None,
+            owner,
         }))
+    }
+
+    /// Who owns volume `ino`, if someone other than this account. Only for
+    /// showing: none if the servers can't say.
+    async fn others_owner(&self, ino: u64) -> Option<String> {
+        let me = self.vault().remote().username();
+        let owner = self.vault().remote().get_volume(ino).await.ok()?.owner?;
+        (owner != me).then_some(owner)
+    }
+
+    /// Gives the folders among `entries` (of directory `path`) their size
+    /// as last measured. Folders not measured yet, or on servers too old
+    /// to say, have none.
+    async fn mark_sizes(&self, path: &str, entries: &mut [Entry]) {
+        if path.trim_start_matches('/').starts_with(".snapshot") {
+            return;
+        }
+        let folders: Vec<u64> = entries
+            .iter()
+            .filter(|e| e.kind == "folder" && e.name != ".snapshot")
+            .map(|e| e.ino)
+            .collect();
+        if folders.is_empty() {
+            return;
+        }
+        let Ok(sizes) = self.vault().remote().folder_sizes(&folders).await else {
+            return;
+        };
+        let sizes: HashMap<u64, u64> = sizes
+            .into_iter()
+            .filter(|s| s.measured_at > 0)
+            .map(|s| (s.ino, s.bytes))
+            .collect();
+        for entry in entries.iter_mut().filter(|e| e.kind == "folder") {
+            entry.size = sizes.get(&entry.ino).copied();
+        }
+    }
+
+    /// The inode of top-level folder `path`; `EINVAL` for any other path.
+    async fn volume_at(&self, path: &str) -> Result<u64, FsError> {
+        let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
+        if names.len() != 1 || names[0] == ".snapshot" {
+            return Err(FsError::new(
+                errno::EINVAL,
+                format!("{path} isn't a top-level folder"),
+            ));
+        }
+        Ok(self.resolve(path).await?.ino)
+    }
+
+    /// Each top-level folder's path, by inode, as this account sees them.
+    async fn volume_paths(&self) -> Result<HashMap<u64, String>, FsError> {
+        Ok(self
+            .vault()
+            .root_entries()
+            .await?
+            .into_iter()
+            .map(|(name, ino)| {
+                let name = String::from_utf8_lossy(os_bytes::bytes(&name)).into_owned();
+                (ino, format!("/{name}"))
+            })
+            .collect())
+    }
+
+    /// `orphans` for JavaScript, with the paths this account sees them at.
+    async fn orphans_js(
+        &self,
+        orphans: Vec<raft5fs_proto::types::Orphan>,
+    ) -> Result<Vec<OrphanJs>, FsError> {
+        let paths = if orphans.is_empty() {
+            HashMap::new()
+        } else {
+            self.volume_paths().await?
+        };
+        Ok(orphans
+            .into_iter()
+            .map(|o| OrphanJs {
+                ino: o.volume as f64,
+                path: paths.get(&o.volume).cloned(),
+                owner: o.owner,
+                writers: o.writers,
+                reachable: o.reachable,
+                bytes: o.bytes,
+            })
+            .collect())
     }
 
     /// Forgets what `sharing` read, after this tab changed it.
@@ -788,6 +891,7 @@ impl Fs {
                 entries.push(Entry::new(OsStr::new(".snapshot"), &snapshots));
             }
             inner.mark_shared(&path, &mut entries).await?;
+            inner.mark_sizes(&path, &mut entries).await;
             Ok(entries)
         })
     }
@@ -1144,8 +1248,10 @@ impl Fs {
     }
 
     /// Every account, for an admin, as `[{user, enrolled, caps, kind,
-    /// invitedBy, owner}]`: `enrolled` is false for an invitation nobody
-    /// used yet, and `kind` is `person` or `link` (made by `owner`).
+    /// invitedBy, owner, used, quota}]`: `enrolled` is false for an
+    /// invitation nobody used yet, `kind` is `person` or `link` (made by
+    /// `owner`), and `used` and `quota` are bytes (`quota` null for no
+    /// limit).
     #[wasm_bindgen(js_name = listUsers)]
     pub fn list_users(&self) -> Promise {
         let inner = Rc::clone(&self.0);
@@ -1159,6 +1265,8 @@ impl Fs {
                 kind: &'static str,
                 invited_by: String,
                 owner: String,
+                used: u64,
+                quota: Option<u64>,
             }
             let mut users = inner.vault().remote().list_users().await?;
             users.sort_by(|a, b| a.user.cmp(&b.user));
@@ -1174,6 +1282,8 @@ impl Fs {
                     },
                     invited_by: u.info.invited_by,
                     owner: u.info.owner,
+                    used: u.used,
+                    quota: u.info.quota,
                 })
                 .collect::<Vec<_>>())
         })
@@ -1237,6 +1347,213 @@ impl Fs {
         promise(async move {
             let found = inner.vault().remote().removal_impact(&user).await?;
             Ok(found.iter().map(UnreachableJs::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Sets how much the volumes `user` owns may hold, in bytes (null for
+    /// no limit), as an admin.
+    #[wasm_bindgen(js_name = setQuota)]
+    pub fn set_quota(&self, user: String, quota: Option<f64>) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let quota = quota.map(|q| q as u64);
+            inner.vault().remote().set_quota(&user, quota).await
+        })
+    }
+
+    /// Measures every folder's size and every owner's usage now, as an
+    /// admin. `EBUSY` if a server is measuring already.
+    #[wasm_bindgen(js_name = measureUsage)]
+    pub fn measure_usage(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().remote().measure_usage().await })
+    }
+
+    /// Orphaned top-level folders, as an admin: their owner can't write
+    /// them any more, or they have none. `[{ino, path, owner, writers,
+    /// reachable, bytes}]`: `path` if this account sees it, `owner` the
+    /// one the servers have, `writers` who could own it.
+    #[wasm_bindgen(js_name = listOrphans)]
+    pub fn list_orphans(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let found = inner.vault().remote().orphans().await?;
+            inner.orphans_js(found).await
+        })
+    }
+
+    /// The top-level folders that removing `user`, or letting them enroll
+    /// again, would orphan, as `listOrphans` gives them.
+    #[wasm_bindgen(js_name = removalOrphans)]
+    pub fn removal_orphans(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let found = inner.vault().remote().removal_orphans(&user).await?;
+            inner.orphans_js(found).await
+        })
+    }
+
+    /// Makes `user` the owner of top-level folder `ino`, as an admin.
+    #[wasm_bindgen(js_name = assignOwner)]
+    pub fn assign_owner(&self, ino: f64, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().remote().assign_owner(ino as u64, &user).await })
+    }
+
+    /// How much this account's top-level folders hold: `{used, quota,
+    /// measuredAt}`, in bytes (`quota` null for no limit) and milliseconds
+    /// since 1970 (0 if never measured). Null from servers too old to say.
+    pub fn storage(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct StorageJs {
+                used: u64,
+                quota: Option<u64>,
+                measured_at: f64,
+            }
+            Ok(match inner.vault().remote().storage().await {
+                Ok(s) => Some(StorageJs {
+                    used: s.used,
+                    quota: s.quota,
+                    measured_at: s.measured_at as f64 * 1000.0,
+                }),
+                Err(e) if e.errno == errno::ENOTSUP => None,
+                Err(e) => return Err(e),
+            })
+        })
+    }
+
+    /// Who owns top-level folder `path`, and to whom it is offered:
+    /// `{owner, offeredTo}`, either null. Null for any other folder, and
+    /// from servers too old to say.
+    pub fn volume(&self, path: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct VolumeJs {
+                owner: Option<String>,
+                offered_to: Option<String>,
+            }
+            let Ok(ino) = inner.volume_at(&path).await else {
+                return Ok(None);
+            };
+            Ok(match inner.vault().remote().get_volume(ino).await {
+                Ok(v) => Some(VolumeJs {
+                    owner: v.owner,
+                    offered_to: v.offer.map(|(to, _)| to),
+                }),
+                Err(e) if e.errno == errno::ENOTSUP => None,
+                Err(e) => return Err(e),
+            })
+        })
+    }
+
+    /// Offers top-level folder `path` to `user`, as its owner. They must
+    /// have read-write access to it already.
+    #[wasm_bindgen(js_name = offerVolume)]
+    pub fn offer_volume(&self, path: String, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.volume_at(&path).await?;
+            inner.vault().remote().offer_volume(ino, &user).await
+        })
+    }
+
+    /// Withdraws the offer of top-level folder `path`, as its owner.
+    #[wasm_bindgen(js_name = withdrawOffer)]
+    pub fn withdraw_offer(&self, path: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.volume_at(&path).await?;
+            inner.vault().remote().withdraw_offer(ino).await
+        })
+    }
+
+    /// Accepts, or declines, top-level folder `path`, offered to this
+    /// account.
+    #[wasm_bindgen(js_name = answerOffer)]
+    pub fn answer_offer(&self, path: String, accept: bool) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.volume_at(&path).await?;
+            inner.vault().remote().answer_offer(ino, accept).await
+        })
+    }
+
+    /// The offers of top-level folders made to this account, and by it:
+    /// `[{path, from, to, bytes}]`, `path` null if this account doesn't
+    /// see the folder. None from servers too old to say.
+    pub fn offers(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            struct OfferJs {
+                path: Option<String>,
+                from: String,
+                to: String,
+                bytes: u64,
+            }
+            let offers = match inner.vault().remote().offers().await {
+                Err(e) if e.errno == errno::ENOTSUP => Vec::new(),
+                other => other?,
+            };
+            if offers.is_empty() {
+                return Ok(Vec::new());
+            }
+            let paths = inner.volume_paths().await?;
+            Ok(offers
+                .into_iter()
+                .map(|o| OfferJs {
+                    path: paths.get(&o.volume).cloned(),
+                    from: o.from,
+                    to: o.to,
+                    bytes: o.bytes,
+                })
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Folder `path`'s size and size limit: `{bytes, files, measuredAt,
+    /// limit}` (`measuredAt` in milliseconds since 1970, 0 if never;
+    /// `limit` null for none). Null if neither is known.
+    #[wasm_bindgen(js_name = folderSize)]
+    pub fn folder_size(&self, path: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct SizeJs {
+                bytes: u64,
+                files: u64,
+                measured_at: f64,
+                limit: Option<u64>,
+            }
+            let ino = inner.resolve(&path).await?.ino;
+            let sizes = match inner.vault().remote().folder_sizes(&[ino]).await {
+                Err(e) if e.errno == errno::ENOTSUP => Vec::new(),
+                other => other?,
+            };
+            Ok(sizes.into_iter().next().map(|s| SizeJs {
+                bytes: s.bytes,
+                files: s.files,
+                measured_at: s.measured_at as f64 * 1000.0,
+                limit: s.limit,
+            }))
+        })
+    }
+
+    /// Sets folder `path`'s size limit in bytes (null for none), as the
+    /// owner of its top-level folder or an admin.
+    #[wasm_bindgen(js_name = setFolderLimit)]
+    pub fn set_folder_limit(&self, path: String, limit: Option<f64>) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.resolve(&path).await?.ino;
+            let limit = limit.map(|l| l as u64);
+            inner.vault().remote().set_folder_limit(ino, limit).await
         })
     }
 

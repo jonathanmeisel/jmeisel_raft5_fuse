@@ -162,6 +162,16 @@ pub fn whoami(connect: &ConnectArgs) -> Outcome {
     if let Ok(account) = runtime.block_on(vault.remote().account()) {
         println!("can: {}", caps_text(account.caps));
     }
+    if let Ok(storage) = runtime.block_on(vault.remote().storage()) {
+        let used = raft5fs_proto::types::size_text(storage.used);
+        match storage.quota {
+            Some(quota) => println!(
+                "storage: {used} of {} used",
+                raft5fs_proto::types::size_text(quota)
+            ),
+            None => println!("storage: {used} used"),
+        }
+    }
     Ok(0)
 }
 

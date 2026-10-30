@@ -1,10 +1,12 @@
 <script>
   // User management, for admins: every account, invitation not used yet,
-  // and public link; what each may do; inviting, letting someone enroll
-  // again, and removing. The servers check every step: this only offers
-  // them.
+  // and public link; what each may do and how much they store; inviting,
+  // letting someone enroll again, and removing. Also top-level folders
+  // whose owner is gone (orphans), which an admin gives to someone who can
+  // change them. The servers check every step: this only offers them.
   import Dialog from "./Dialog.svelte";
   import Invitation from "./Invitation.svelte";
+  import { parseSize, sizeText } from "../lib/sizes.js";
 
   let { fs, me, onclose } = $props();
 
@@ -88,16 +90,64 @@
 
   /// Asks about `user` (step `kind`, with `extra`), and fills in what only
   /// they can reach, which removing them or re-enrolling them would leave
-  /// unreachable.
+  /// unreachable, and the top-level folders they own, which it would leave
+  /// without an owner.
   async function ask(kind, user, extra = {}) {
-    step = { kind, user, ...extra, impact: null };
+    step = { kind, user, ...extra, impact: null, owned: null };
     try {
-      const impact = await fs.removalImpact(user);
-      if (step?.user === user) step = { ...step, impact };
+      const [impact, owned] = await Promise.all([
+        fs.removalImpact(user),
+        fs.removalOrphans(user).catch((e) => (e.code === "ENOTSUP" ? [] : Promise.reject(e))),
+      ]);
+      if (step?.user === user) step = { ...step, impact, owned };
     } catch (e) {
       error = e.message;
     }
   }
+
+  /// Gives top-level folder `ino` to `user`, then asks again what step
+  /// `kind` is about.
+  const give = (ino, user) =>
+    run(async () => {
+      await fs.assignOwner(ino, user);
+      if (step?.kind === "orphans") await showOrphans();
+      else if (step?.user) await ask(step.kind, step.user, step);
+    });
+
+  async function showOrphans() {
+    step = { kind: "orphans", items: null };
+    try {
+      const items = await fs.listOrphans();
+      if (step?.kind === "orphans") step = { ...step, items };
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  /// Who each orphan in a list goes to, as chosen.
+  let heir = $state({});
+  const folderName = (o) => (o.path ? o.path.slice(1) : `Top-level folder #${o.ino}`);
+
+  // The quota form.
+  let quota = $state("");
+  function editQuota(u) {
+    quota = u.quota ? sizeText(u.quota).replace(" ", "") : "";
+    step = { kind: "quota", user: u.user };
+  }
+  function saveQuota(event) {
+    event.preventDefault();
+    run(async () => {
+      await fs.setQuota(step.user, parseSize(quota));
+      step = null;
+      await load();
+    });
+  }
+  const measure = () =>
+    run(async () => {
+      await fs.measureUsage();
+      await load();
+    });
+  const storage = (u) => (u.quota ? `${sizeText(u.used)} of ${sizeText(u.quota)}` : sizeText(u.used));
 
   async function showUnreachable() {
     step = { kind: "unreachable", items: null };
@@ -129,6 +179,38 @@
 
   const what = (u) => (u.kind === "link" ? `public link made by ${u.owner}` : u.enrolled ? "" : "invited");
 </script>
+
+{#snippet heirs(o)}
+  {#if o.writers.length}
+    <select aria-label={`Who gets ${folderName(o)}`} bind:value={heir[o.ino]}>
+      {#each o.writers as w}<option value={w}>{w}</option>{/each}
+    </select>
+    <button onclick={() => give(o.ino, heir[o.ino] ?? o.writers[0])} disabled={busy}>Give</button>
+  {:else if o.reachable}
+    <span class="note">Nobody else can change it.</span>
+  {:else}
+    <span class="note">Nobody can reach it: see Unreachable folders.</span>
+  {/if}
+{/snippet}
+
+{#snippet owned(step)}
+  {#if step.owned?.length}
+    <p class="error">
+      {step.user} owns {step.owned.length === 1 ? "a top-level folder" : `${step.owned.length} top-level folders`},
+      which would have no owner. Give each to someone who can change it first:
+    </p>
+    <table>
+      <tbody>
+        {#each step.owned as o (o.ino)}
+          <tr>
+            <td><strong>{folderName(o)}</strong> <span class="note">{sizeText(o.bytes)}</span></td>
+            <td class="actions">{@render heirs(o)}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
+{/snippet}
 
 <Dialog title="Users" wide {onclose}>
   {#if step?.kind === "invite"}
@@ -164,8 +246,9 @@
         afterwards. You can delete them later, under Unreachable folders.
       </p>
     {/if}
+    {@render owned(step)}
     <p>
-      <button class="danger" onclick={() => reissue(step.user)} disabled={busy || step.impact === null}>Make an invitation</button>
+      <button class="danger" onclick={() => reissue(step.user)} disabled={busy || step.impact === null || step.owned === null}>Make an invitation</button>
       <button onclick={() => (step = null)}>Cancel</button>
     </p>
   {:else if step?.kind === "delete"}
@@ -189,8 +272,9 @@
         afterwards. You can delete them later, under Unreachable folders.
       </p>
     {/if}
+    {@render owned(step)}
     <p>
-      <button class="danger" onclick={() => remove(step.user)} disabled={busy || step.impact === null}>Remove</button>
+      <button class="danger" onclick={() => remove(step.user)} disabled={busy || step.impact === null || step.owned === null}>Remove</button>
       <button onclick={() => (step = null)}>Cancel</button>
     </p>
   {:else if step?.kind === "unreachable"}
@@ -221,6 +305,44 @@
       </table>
     {/if}
     <p><button onclick={() => (step = null)}>Back</button></p>
+  {:else if step?.kind === "orphans"}
+    <p class="note">
+      Top-level folders whose owner was removed, or enrolled again. They count against nobody's
+      storage until someone owns them. Give each to someone who can change it.
+    </p>
+    {#if step.items === null}
+      <p class="note">Looking…</p>
+    {:else if step.items.length === 0}
+      <p>Every top-level folder has an owner.</p>
+    {:else}
+      <table>
+        <tbody>
+          {#each step.items as o (o.ino)}
+            <tr>
+              <td>
+                <strong>{folderName(o)}</strong>
+                <span class="note">{sizeText(o.bytes)}{o.owner ? `, was ${o.owner}'s` : ""}</span>
+              </td>
+              <td class="actions">{@render heirs(o)}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+    <p><button onclick={() => (step = null)}>Back</button></p>
+  {:else if step?.kind === "quota"}
+    <form onsubmit={saveQuota}>
+      <label for="quota-size">How much {step.user}'s top-level folders may hold, such as 10G (blank for no limit)</label>
+      <input id="quota-size" bind:value={quota} autocomplete="off" />
+      <p class="note">
+        Everything in the folders they own counts, whoever writes it. Writes that would go over it are
+        refused; deleting always works.
+      </p>
+      <p>
+        <button class="primary" type="submit" disabled={busy}>Save</button>
+        <button type="button" onclick={() => (step = null)}>Cancel</button>
+      </p>
+    </form>
   {:else if step?.kind === "purge"}
     <p>Delete this {kind(step.item).toLowerCase()} ({step.item.files} files, {size(step.item.bytes)})?</p>
     <p class="note">Nobody can open it now, and this frees its space. It can't be undone.</p>
@@ -234,6 +356,8 @@
     <p>
       <button class="primary" onclick={() => (step = { kind: "invite" })}>Invite someone</button>
       <button onclick={showUnreachable}>Unreachable folders</button>
+      <button onclick={showOrphans}>Orphaned folders</button>
+      <button onclick={measure} disabled={busy}>Measure storage now</button>
     </p>
     <div class="scroll">
       <table>
@@ -241,6 +365,7 @@
           <tr>
             <th>User</th>
             {#each CAPS as c}<th title={c.title}>{c.text}</th>{/each}
+            <th>Storage</th>
             <th></th>
           </tr>
         </thead>
@@ -264,6 +389,12 @@
                   {/if}
                 </td>
               {/each}
+              <td class="storage">
+                {#if u.kind === "person"}
+                  {storage(u)}
+                  <button class="small" aria-label={`Quota: ${u.user}`} onclick={() => editQuota(u)}>Quota…</button>
+                {/if}
+              </td>
               <td class="actions">
                 {#if u.kind === "person" && u.user !== me}
                   <button onclick={() => ask("reenroll", u.user)}>
@@ -297,14 +428,16 @@
   .cap { text-align: center; }
   .cap input { width: auto; }
   .actions { text-align: right; white-space: nowrap; }
+  .storage { white-space: nowrap; font-size: 0.9em; }
+  .storage button { margin-left: 6px; }
   .actions button { margin-left: 6px; }
   /* Phones: each user's buttons on a line of their own, under the name. */
   @media (max-width: 600px) {
     tr { display: grid; grid-template-columns: 1fr repeat(3, 52px); align-items: center; }
     tr { border-bottom: 1px solid var(--border); }
     td { border: none; }
-    th:last-child { display: none; }
-    .actions { grid-column: 1 / -1; text-align: left; padding-top: 0; }
+    th:last-child, th:nth-last-child(2) { display: none; }
+    .actions, .storage { grid-column: 1 / -1; text-align: left; padding-top: 0; }
     .actions button { margin: 0 6px 0 0; }
     .actions:empty { display: none; }
   }

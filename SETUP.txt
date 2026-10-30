@@ -301,7 +301,33 @@ lists such folders, by size, for deleting. Re-enrolling gives the user a new key
 `user add` does for an existing user above. For her invitations to hold
 the servers' addresses and CA, as `user add`'s do, serve with the same
 --invite-server and --invite-ca options. Without them she gets only a
-code. `raft5fs whoami` shows what she may do.
+code. `raft5fs whoami` shows what she may do, and how much she stores.
+
+Each top-level folder has an owner, whoever made it, and everything in
+it counts against the owner, whoever writes it. An admin can cap that:
+
+  raft5fs-server user set alice --quota 10G $STORE https://127.0.0.1:27051
+  raft5fs admin set alice --quota none
+
+A write that would go over it fails with EDQUOT; deleting always works.
+One server measures every folder every --usage-interval seconds (default
+600; 0 never), and each server counts writes and deletions within a
+second in between, so the cap is close, not exact. The owner of a
+top-level folder, or an admin, can also cap one folder, for everyone
+writing there:
+
+  raft5fs folder limit photos/shared 5G
+  raft5fs folder size photos/shared
+
+The owner keeps read-write access to their folder, and can give it to
+someone who has read-write access, who must accept:
+
+  raft5fs volume transfer photos bob     # bob: raft5fs volume accept photos
+  raft5fs volume offers
+
+If an owner is removed, or enrolls again, their folders count against
+nobody until an admin gives each to someone who can write it
+(`raft5fs admin orphans`, `raft5fs admin assign <INODE> <USER>`).
 
 With `links`, she can make public links: read-only access to one
 directory for anyone with the URL, through the web app, without an

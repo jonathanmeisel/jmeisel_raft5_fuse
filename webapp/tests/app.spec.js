@@ -476,7 +476,7 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
     await expect(row().getByRole("checkbox", { name: /top-level folders: dave/ })).toBeChecked(SLOW);
     const mine = erin.getByRole("row").filter({ hasText: "erin (you)" });
     await expect(mine.getByRole("checkbox", { name: /Manage users.*: erin/ })).toBeDisabled();
-    await expect(mine.getByRole("button")).toHaveCount(0);
+    await expect(mine.getByRole("button", { name: /Re-enroll|Remove/ })).toHaveCount(0);
     // dave picks it up at his next login.
     await dave.reload();
     await login(dave, "dave");
@@ -710,6 +710,111 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     await expect(iris.getByRole("button", { name: "Check new fingerprint…" })).toHaveCount(0, SLOW);
     await iris.getByRole("button", { name: "Close" }).click();
     await expect(item(iris, "fresh")).toBeVisible(SLOW);
+  });
+
+  expect(problems.flat()).toEqual([]);
+});
+
+test("storage, size limits, and giving a folder away", async ({ browser }) => {
+  const jack = await (await browser.newContext()).newPage();
+  const kim = await (await browser.newContext()).newPage();
+  const problems = [jack, kim].map(watch);
+  let kimWords;
+
+  /// The storage line in `page`'s account menu.
+  async function storageLine(page) {
+    await accountButton(page).click();
+    const line = page.locator(".storage");
+    // Opening the menu asks again; give the answer a moment.
+    await line.waitFor({ timeout: 2_000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    const text = (await line.count()) ? await line.innerText() : "";
+    await page.keyboard.press("Escape");
+    return text;
+  }
+
+  await test.step("jack sees what his folders hold", async () => {
+    await enrol(jack, "jack");
+    kimWords = await enrol(kim, "kim");
+    await login(jack, "jack");
+    await login(kim, "kim");
+    await addFolder(jack, "proj");
+    await open(jack, "proj");
+    await jack.locator("input[type=file]").setInputFiles([
+      { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.alloc(2000, 97) },
+    ]);
+    await expect(item(jack, "notes.txt")).toBeVisible(SLOW);
+    await expect.poll(() => storageLine(jack), SLOW).toBe("2.0 KB used");
+  });
+
+  await test.step("a size limit stops what would go over it", async () => {
+    await addFolder(jack, "drop");
+    await menu(jack, "drop", "Size limit…");
+    await jack.getByLabel(/Limit, such as/).fill("1K");
+    await jack.getByRole("button", { name: "Set limit" }).click();
+    await expect(jack.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
+    await jack.getByRole("button", { name: "Close" }).click();
+    await open(jack, "drop");
+    await expect(jack.getByText(/Holds 0 bytes of its 1\.0 KB limit/)).toBeVisible(SLOW);
+    await jack.locator("input[type=file]").setInputFiles([
+      { name: "big.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(2048, 1) },
+    ]);
+    await expect(jack.getByText(/reached its size limit/)).toBeVisible(SLOW);
+    await jack.getByRole("button", { name: "Dismiss" }).click();
+  });
+
+  await test.step("jack offers proj to kim, who accepts it", async () => {
+    await jack.getByText("My files").first().click();
+    await expect(item(jack, "proj")).toBeVisible(SLOW);
+    // Only to someone who can change it.
+    await menu(jack, "proj", "Transfer ownership…");
+    await expect(jack.getByText("Share it with them read-write first", { exact: false })).toBeVisible(SLOW);
+    await jack.getByRole("button", { name: "Close" }).click();
+    await menu(jack, "proj", "Share…");
+    await jack.getByLabel("User", { exact: true }).fill("kim");
+    await jack.getByRole("button", { name: "Share", exact: true }).click();
+    await jack.getByLabel("kim's fingerprint").fill(kimWords);
+    await jack.getByRole("button", { name: "Share", exact: true }).click();
+    await expect(jack.getByText(/Shared with kim/)).toBeVisible(SLOW);
+    await jack.getByRole("button", { name: "Done" }).click();
+    await menu(jack, "proj", "Transfer ownership…");
+    await expect(jack.getByLabel("Give it to")).toHaveValue("kim", SLOW);
+    await jack.getByRole("button", { name: "Offer", exact: true }).click();
+    await expect(jack.getByText(/Offered to kim/)).toBeVisible(SLOW);
+    await jack.getByRole("button", { name: "Close" }).click();
+
+    await kim.reload();
+    await login(kim, "kim");
+    await expect(kim.getByText(/jack wants to give you proj/)).toBeVisible(SLOW);
+    await kim.getByRole("button", { name: "Accept" }).click();
+    await expect(kim.getByText(/wants to give you/)).toHaveCount(0, SLOW);
+    await expect.poll(() => storageLine(kim), SLOW).toBe("2.0 KB used");
+
+    // jack sees kim as the owner, whose access nobody can take away.
+    await menu(jack, "proj", "Shared with…");
+    const kimRow = jack.getByRole("row").filter({ hasText: "kim" });
+    await expect(kimRow).toContainText("owner", SLOW);
+    await expect(kimRow.getByRole("button", { name: "Revoke…" })).toHaveCount(0);
+    await jack.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("jack, an admin, gets proj back before removing kim", async () => {
+    await accountMenu(jack, "Users");
+    await jack.getByRole("button", { name: "Measure storage now" }).click();
+    const kimRow = jack.getByRole("row").filter({ hasText: "kim" });
+    await expect(kimRow).toContainText("2.0 KB", SLOW);
+    await kimRow.getByRole("button", { name: "Remove…" }).click();
+    await expect(jack.getByText(/kim owns a top-level folder/)).toBeVisible(SLOW);
+    await expect(jack.getByLabel("Who gets proj")).toHaveValue("jack");
+    await jack.getByRole("button", { name: "Give" }).click();
+    await expect(jack.getByText(/kim owns a top-level folder/)).toHaveCount(0, SLOW);
+    await jack.getByRole("button", { name: "Remove", exact: true }).click();
+    await expect(kimRow).toHaveCount(0, SLOW);
+    // Other tests' users enroll again, which orphans their folders; proj
+    // isn't among them.
+    await jack.getByRole("button", { name: "Orphaned folders" }).click();
+    await expect(jack.getByText("Looking…")).toHaveCount(0, SLOW);
+    await expect(jack.getByRole("dialog").getByText("proj", { exact: true })).toHaveCount(0);
   });
 
   expect(problems.flat()).toEqual([]);

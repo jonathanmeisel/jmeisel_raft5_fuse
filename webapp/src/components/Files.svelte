@@ -16,6 +16,9 @@
   import SharingBar from "./SharingBar.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
+  import TransferDialog from "./TransferDialog.svelte";
+  import LimitDialog from "./LimitDialog.svelte";
+  import { sizeText } from "../lib/sizes.js";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
@@ -51,6 +54,10 @@
   let pruneQueued = $state(0);
   /// What this account may do (see the wasm `account`).
   let account = $state({ caps: ["volumes"], kind: "person" });
+  /// How much this account's top-level folders hold (see the wasm
+  /// `storage`), and the folders offered to it.
+  let storage = $state(null);
+  let offered = $state([]);
 
   const parentOf = (path) => path.slice(0, path.lastIndexOf("/")) || "/";
   const nameOf = (path) => path.slice(path.lastIndexOf("/") + 1);
@@ -76,11 +83,45 @@
     }
     if (visitor) return;
     refreshPending();
+    refreshOffers();
+    refreshStorage();
     try {
       account = await fs.account();
     } catch {}
   }
   load();
+
+  async function refreshStorage() {
+    try {
+      storage = await fs.storage();
+    } catch {}
+  }
+
+  async function refreshOffers() {
+    try {
+      offered = (await fs.offers()).filter((o) => o.to === me.user && o.path);
+    } catch {}
+  }
+
+  /// Accepts or declines a folder offered to this account.
+  function answer(offer, accept) {
+    act(async () => {
+      try {
+        await fs.answerOffer(offer.path, accept);
+      } finally {
+        await refreshOffers();
+        await refreshStorage();
+      }
+    }, []);
+  }
+
+  const storageNote = $derived(
+    storage
+      ? storage.quota
+        ? `${sizeText(storage.used)} of ${sizeText(storage.quota)} used`
+        : `${sizeText(storage.used)} used`
+      : "",
+  );
 
   async function refreshPending() {
     try {
@@ -217,19 +258,26 @@
   /// The open folder, and how it is shared (see SharingBar).
   let current = $state("/");
   let here = $state(null);
+  /// The open folder's size and size limit, if it has a limit.
+  let limited = $state(null);
   let hereAsked = 0;
 
   async function showSharing(path) {
     current = path;
     const asked = ++hereAsked;
     let found = null;
+    let size = null;
     if (!visitor && path !== "/") {
-      try {
-        found = await fs.sharingHere(path);
-      } catch {}
+      [found, size] = await Promise.all([
+        fs.sharingHere(path).catch(() => null),
+        fs.folderSize(path).catch(() => null),
+      ]);
     }
     // A later move asked again meanwhile: its answer wins.
-    if (asked === hereAsked) here = found;
+    if (asked === hereAsked) {
+      here = found;
+      limited = size?.limit ? size : null;
+    }
   }
 
   /// Adds a history entry for the folder SVAR moved to.
@@ -328,6 +376,10 @@
       ...(account.caps.includes("links")
         ? [{ id: "share-link", text: "Share publicly…", icon: "wxi-link", handler: () => (dialog = { kind: "link", path: item.id }) }]
         : []),
+      { id: "size-limit", text: "Size limit…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "limit", path: item.id }) },
+      ...(parentOf(item.id) === "/"
+        ? [{ id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) }]
+        : []),
       { id: "prune-again", text: "Prune again", icon: "wxi-sync", handler: () => pruneAgain(item.id) },
     ];
   }
@@ -405,7 +457,7 @@
         <i class="wxi-folder logo" aria-hidden="true"></i>
         {#if several}<span class="fs">{me.filesystem}</span>{/if}
       </span>
-      <AccountMenu user={me.user} items={menuItems} onselect={chose} />
+      <AccountMenu user={me.user} items={menuItems} onselect={chose} note={storageNote} onopen={refreshStorage} />
     {/if}
   </header>
 
@@ -416,6 +468,19 @@
       <button onclick={() => (dialog = { kind: "pending" })}>Review</button>
     </div>
   {/if}
+
+  {#each offered as offer (offer.path)}
+    <div class="banner">
+      <span>
+        <strong>{offer.from}</strong> wants to give you <strong>{offer.path.slice(1)}</strong>
+        ({sizeText(offer.bytes)}). It would count against your storage.
+      </span>
+      <span>
+        <button onclick={() => answer(offer, true)}>Accept</button>
+        <button onclick={() => answer(offer, false)}>Decline</button>
+      </span>
+    </div>
+  {/each}
 
   {#if storageError}
     <div class="banner" title={storageError}>Unable to persist state to browser storage</div>
@@ -438,7 +503,7 @@
     </div>
   {/each}
 
-  <SharingBar {here} {current} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
+  <SharingBar {here} {current} {limited} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
 
   <div class="fm">
     {#if initial}
@@ -472,6 +537,19 @@
   <ShareDialog {fs} path={dialog.path} onclose={closeSharing} />
 {:else if dialog?.kind === "shared-with"}
   <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={closeSharing} />
+{:else if dialog?.kind === "transfer"}
+  <TransferDialog {fs} path={dialog.path} me={me.user} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "limit"}
+  <LimitDialog
+    {fs}
+    path={dialog.path}
+    me={me.user}
+    admin={account.caps.includes("admin")}
+    onclose={() => {
+      dialog = null;
+      showSharing(current);
+    }}
+  />
 {:else if dialog?.kind === "link"}
   <LinkDialog {fs} path={dialog.path} onclose={closeSharing} />
 {:else if dialog?.kind === "links"}
