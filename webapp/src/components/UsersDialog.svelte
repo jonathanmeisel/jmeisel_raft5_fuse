@@ -347,7 +347,7 @@
   {:else if users === null}
     <p class="note">Loading…</p>
   {:else}
-    <p>
+    <p class="toolbar">
       <button class="primary" onclick={() => (step = { kind: "invite" })}>Invite someone</button>
       <button onclick={showOrphans}>Orphaned folders</button>
       <button onclick={measure} disabled={busy}>Measure storage now</button>
@@ -372,26 +372,27 @@
               {#each CAPS as c}
                 <td class="cap">
                   {#if u.kind === "person"}
-                    <input
-                      type="checkbox"
-                      aria-label={`${c.title}: ${u.user}`}
-                      checked={u.caps.includes(c.id)}
-                      disabled={busy || (u.user === me && c.id === "admin")}
-                      onchange={(e) => toggle(u, c.id, e.target.checked)}
-                    />
+                    <label>
+                      <input
+                        type="checkbox"
+                        aria-label={`${c.title}: ${u.user}`}
+                        checked={u.caps.includes(c.id)}
+                        disabled={busy || (u.user === me && c.id === "admin")}
+                        onchange={(e) => toggle(u, c.id, e.target.checked)}
+                      />
+                      <span class="cap-name" aria-hidden="true">{c.text}</span>
+                    </label>
                   {/if}
                 </td>
               {/each}
-              <td class="storage">
-                {#if u.kind === "person"}
-                  {storage(u)}
-                  <button class="small" aria-label={`Quota: ${u.user}`} onclick={() => editQuota(u)}>Quota…</button>
-                {/if}
-              </td>
+              <td class="storage">{u.kind === "person" ? storage(u) : ""}</td>
               <td class="actions">
+                {#if u.kind === "person"}
+                  <button aria-label={`Quota: ${u.user}`} onclick={() => editQuota(u)}>Quota</button>
+                {/if}
                 {#if u.kind === "person" && u.user !== me}
                   <button onclick={() => ask("reenroll", u.user)}>
-                    {u.enrolled ? "Re-enroll…" : "New invitation…"}
+                    {u.enrolled ? "Re-enroll" : "New invitation"}
                   </button>
                 {/if}
                 {#if u.user !== me}
@@ -399,7 +400,7 @@
                     class="danger"
                     onclick={() => ask("delete", u.user, { link: u.kind === "link", enrolled: u.enrolled })}
                   >
-                    Remove…
+                    Remove
                   </button>
                 {/if}
               </td>
@@ -414,24 +415,36 @@
 </Dialog>
 
 <style>
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
   .scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; font-weight: 600; color: var(--muted); font-size: 0.85em; padding: 6px 4px; }
   td { padding: 6px 4px; border-bottom: 1px solid var(--border); }
   .cap { text-align: center; }
-  .cap input { width: auto; }
+  .cap input { width: auto; margin: 0; }
+  /* The capability's name shows next to its box on phones, where the
+     table has no header. */
+  .cap-name { display: none; }
+  .storage { white-space: nowrap; font-size: 0.9em; color: var(--muted); }
   .actions { text-align: right; white-space: nowrap; }
-  .storage { white-space: nowrap; font-size: 0.9em; }
-  .storage button { margin-left: 6px; }
   .actions button { margin-left: 6px; }
-  /* Phones: each user's buttons on a line of their own, under the name. */
+  /* Phones: a card per user. The name; the capabilities, each with its
+     name, and the storage at the right; then the buttons, small, on one
+     line. */
   @media (max-width: 600px) {
-    tr { display: grid; grid-template-columns: 1fr repeat(3, 52px); align-items: center; }
-    tr { border-bottom: 1px solid var(--border); }
-    td { border: none; }
-    th:last-child, th:nth-last-child(2) { display: none; }
-    .actions, .storage { grid-column: 1 / -1; text-align: left; padding-top: 0; }
-    .actions button { margin: 0 6px 0 0; }
+    .toolbar button { flex: 1 1 auto; }
+    thead { display: none; }
+    tr {
+      display: grid; grid-template-columns: auto auto auto 1fr; column-gap: 16px;
+      align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    td { border: none; padding: 2px 0; }
+    td:first-child { grid-column: 1 / -1; padding-bottom: 6px; }
+    .cap label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 0.9em; }
+    .cap-name { display: inline; }
+    .storage { text-align: right; }
+    .actions { grid-column: 1 / -1; text-align: left; padding-top: 8px; white-space: normal; }
+    .actions button { margin: 0 6px 0 0; padding: 4px 10px; font-size: 0.85em; }
     .actions:empty { display: none; }
   }
 </style>

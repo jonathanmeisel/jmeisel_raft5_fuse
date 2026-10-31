@@ -484,7 +484,7 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
   });
 
   await test.step("dave enrolls again from a new invitation", async () => {
-    await row().getByRole("button", { name: "Re-enroll…" }).click();
+    await row().getByRole("button", { name: "Re-enroll", exact: true }).click();
     await expect(erin.getByText(/enroll again\?/)).toBeVisible();
     // His folder `mine` would be left with nobody to reach it.
     await expect(erin.getByText(/Only dave can reach one folder or file/)).toBeVisible(SLOW);
@@ -507,7 +507,7 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
   });
 
   await test.step("erin removes dave", async () => {
-    await row().getByRole("button", { name: "Remove…" }).click();
+    await row().getByRole("button", { name: "Remove", exact: true }).click();
     await erin.getByRole("button", { name: "Remove", exact: true }).click();
     await expect(row()).toHaveCount(0, SLOW);
     await dave.reload();
@@ -805,7 +805,7 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await jack.getByRole("button", { name: "Measure storage now" }).click();
     const kimRow = jack.getByRole("row").filter({ hasText: "kim" });
     await expect(kimRow).toContainText("2.0 KB", SLOW);
-    await kimRow.getByRole("button", { name: "Remove…" }).click();
+    await kimRow.getByRole("button", { name: "Remove", exact: true }).click();
     await expect(jack.getByText(/kim owns a top-level folder/)).toBeVisible(SLOW);
     await expect(jack.getByLabel("Who gets proj")).toHaveValue("jack");
     await jack.getByRole("button", { name: "Give" }).click();
