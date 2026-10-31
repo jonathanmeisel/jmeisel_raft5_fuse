@@ -1,8 +1,10 @@
 <script>
   // A line above the files saying how the open folder is shared: with
   // whom, whether by public link, and through which folder, when the
-  // sharing was set up on a folder above it. For a folder this account can
-  // only read, who shared it. `here` is the Worker's `sharingHere`. It
+  // sharing was set up on a folder above it. For a folder in a top-level
+  // folder that this account can only read, who shared it, and whether
+  // this account can still change it (a read-write share inside a
+  // read-only one). `here` is the Worker's `sharingHere`. It
   // also names the top-level folder's owner, if someone else, and, for a
   // folder with a size limit (`limited`, the Worker's `folderSize`), how
   // full it is.
@@ -36,7 +38,7 @@
       {#if !here}
         <!-- Only a size limit to show. -->
       {:else if here.from}
-        <p class="source">Shared with you by <strong>{here.from}</strong>, read-only.</p>
+        <p class="source">Shared with you by <strong>{here.from}</strong>{here.writable ? "" : ", read-only"}.</p>
       {:else}
         {#each here.sources as source}
           <p class="source">

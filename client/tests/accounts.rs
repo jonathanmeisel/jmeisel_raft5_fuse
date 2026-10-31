@@ -690,3 +690,75 @@ fn a_deleted_links_pin_goes_from_every_device() {
     rt.block_on(b.sync_pins()).unwrap();
     assert_eq!(b.known_keys().pinned(&link), None);
 }
+
+/// A share of a folder inside another share to the same user shows once,
+/// as the outer one, and they can write wherever any share above is
+/// read-write.
+#[test]
+fn a_share_inside_a_share_shows_once_and_the_widest_access_wins() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    backend.enrol("bob");
+    backend.enrol("carol");
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = rt
+        .block_on(tester.mkdir(v, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    let names = |who: &Vault| -> Vec<String> {
+        let mut names: Vec<String> = rt
+            .block_on(who.root_entries())
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // bob reads all of v, and writes in sub.
+    rt.block_on(tester.grant(v, "bob", false, OsStr::new("v")))
+        .unwrap();
+    rt.block_on(tester.grant(sub, "bob", true, OsStr::new("sub")))
+        .unwrap();
+    let bob = vault(&backend, "bob");
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+    assert_eq!(names(&bob), ["v"]);
+    assert_eq!(
+        errno(rt.block_on(bob.create(v, OsStr::new("no"), 0o644))),
+        libc::EROFS
+    );
+    let deeper = rt
+        .block_on(bob.mkdir(sub, OsStr::new("deeper"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.create(deeper, OsStr::new("yes"), 0o644))
+        .unwrap();
+
+    // carol writes all of v: a read-only share of sub takes nothing away.
+    rt.block_on(tester.grant(v, "carol", true, OsStr::new("v")))
+        .unwrap();
+    rt.block_on(tester.grant(sub, "carol", false, OsStr::new("sub")))
+        .unwrap();
+    let carol = vault(&backend, "carol");
+    carol
+        .known_keys()
+        .check(TESTER, &backend.tester_key)
+        .unwrap();
+    assert_eq!(names(&carol), ["v"]);
+    rt.block_on(carol.create(sub, OsStr::new("mine"), 0o644))
+        .unwrap();
+
+    // Without the outer share, the inner one is a root of its own again,
+    // read-only.
+    rt.block_on(tester.revoke(v, "carol")).unwrap();
+    assert_eq!(names(&carol), ["sub"]);
+    assert_eq!(
+        errno(rt.block_on(carol.create(sub, OsStr::new("not now"), 0o644))),
+        libc::EROFS
+    );
+}

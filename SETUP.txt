@@ -489,6 +489,12 @@ she has of every volume she made.
 Grants alone decide access, and are checked on every request, so a grant
 taken back stops even files bob has open, at once.
 
+A grant of a directory inside one that bob holds already doesn't show in
+his root: he reaches it from the outer one. He may write wherever any of
+his grants above is read-write. So a read-write grant of photos/2024
+inside a read-only grant of photos lets him change 2024 and nothing else,
+and a read-only grant inside a read-write one takes nothing away.
+
 Moving a file or directory to another directory gives it a new key, so
 that whoever could read where it was can't read what is written to it
 where it went.
