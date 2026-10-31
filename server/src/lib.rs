@@ -598,7 +598,10 @@ impl Fs for FsService {
     ) -> Result<Response<GrantListResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.grants(&caller, at(&r.snapshot)).await.into(),
+            self.core
+                .grants_and_covered(&caller, at(&r.snapshot))
+                .await
+                .into(),
         ))
     }
 

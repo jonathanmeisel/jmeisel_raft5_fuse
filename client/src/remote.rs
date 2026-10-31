@@ -939,6 +939,13 @@ impl Remote {
 
     /// Every grant made to this account.
     pub async fn list_grants(&self) -> Result<Vec<Grant>, FsError> {
+        Ok(self.list_grants_covered().await?.0)
+    }
+
+    /// `list_grants`, and which of the grants are of a folder inside
+    /// another of this account's grants (none from servers before protocol
+    /// 7).
+    pub async fn list_grants_covered(&self) -> Result<(Vec<Grant>, Vec<u64>), FsError> {
         let req = ListGrantsRequest {
             snapshot: self.snapshot.clone(),
         };
@@ -947,7 +954,7 @@ impl Remote {
             async move { c.list_grants(req).await }
         })
         .await?
-        .into_result()
+        .into_parts()
     }
 
     /// Every snapshot, oldest first.

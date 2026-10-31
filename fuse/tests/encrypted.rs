@@ -860,23 +860,24 @@ fn shared_tree(h: &support::Harness) -> std::path::PathBuf {
 }
 
 #[test]
-fn a_nearer_grant_decides_even_below_a_path_the_server_knows() {
+fn a_nearer_grant_counts_even_below_a_path_the_server_knows() {
     let h = support::setup_root();
     let v = shared_tree(&h);
     h.add_user("alice");
     let mine = vault(&h, support::TESTER);
     h.runtime
-        .block_on(mine.grant(ino(&v), "alice", true, OsStr::new("v")))
+        .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
     let alice = h.mount_as("alice");
     let hers = alice.path.join("v/shared/sub/f");
     // Walked from f up to v, so the server now knows the path.
-    fs::write(&hers, b"by alice").unwrap();
+    assert_eq!(fs::read(&hers).unwrap(), b"before");
+    assert_errno(fs::write(&hers, b"by alice"), libc::EROFS);
 
     h.runtime
-        .block_on(mine.grant(ino(&v.join("shared")), "alice", false, OsStr::new("shared")))
+        .block_on(mine.grant(ino(&v.join("shared")), "alice", true, OsStr::new("shared")))
         .unwrap();
-    assert_errno(fs::write(&hers, b"again"), libc::EROFS);
+    fs::write(&hers, b"by alice").unwrap();
     assert_eq!(fs::read(v.join("shared/sub/f")).unwrap(), b"by alice");
 }
 

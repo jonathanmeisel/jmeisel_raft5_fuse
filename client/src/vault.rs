@@ -1316,9 +1316,12 @@ impl Vault {
     }
 
     /// Reads this account's grants again and returns the root's entries:
-    /// each grant's label, made unique, and its inode.
+    /// each grant's label, made unique, and its inode. A grant of a folder
+    /// inside another grant isn't one: it is reached from there, with the
+    /// write access of the nearest read-write grant above.
     pub async fn root_entries(&self) -> Result<Vec<(OsString, u64)>, FsError> {
-        let mut grants = self.remote.list_grants().await?;
+        let (mut grants, covered) = self.remote.list_grants_covered().await?;
+        grants.retain(|g| !covered.contains(&g.ino));
         grants.sort_by_key(|g| g.ino);
         let mut roots = Roots::default();
         for grant in grants {

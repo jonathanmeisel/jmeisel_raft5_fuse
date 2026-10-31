@@ -946,13 +946,14 @@ impl pb::KeyPathResponse {
     }
 }
 
-impl From<Result<Vec<Grant>, FsError>> for pb::GrantListResponse {
-    fn from(r: Result<Vec<Grant>, FsError>) -> Self {
+impl From<Result<(Vec<Grant>, Vec<u64>), FsError>> for pb::GrantListResponse {
+    fn from(r: Result<(Vec<Grant>, Vec<u64>), FsError>) -> Self {
         use pb::grant_list_response::Result as R;
         Self {
             result: Some(match r {
-                Ok(grants) => R::List(pb::GrantList {
+                Ok((grants, covered)) => R::List(pb::GrantList {
                     grants: grants.into_iter().map(Into::into).collect(),
+                    covered,
                 }),
                 Err(e) => R::Error(e.into()),
             }),
@@ -962,9 +963,15 @@ impl From<Result<Vec<Grant>, FsError>> for pb::GrantListResponse {
 
 impl pb::GrantListResponse {
     pub fn into_result(self) -> Result<Vec<Grant>, FsError> {
+        self.into_parts().map(|(grants, _)| grants)
+    }
+
+    /// The grants, and which of them are inside another of the caller's
+    /// grants (none from servers too old to say).
+    pub fn into_parts(self) -> Result<(Vec<Grant>, Vec<u64>), FsError> {
         use pb::grant_list_response::Result as R;
         match self.result {
-            Some(R::List(l)) => Ok(l.grants.into_iter().map(Into::into).collect()),
+            Some(R::List(l)) => Ok((l.grants.into_iter().map(Into::into).collect(), l.covered)),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("grant list")),
         }

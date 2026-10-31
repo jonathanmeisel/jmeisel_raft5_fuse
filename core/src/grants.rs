@@ -4,8 +4,11 @@
 //! **The walk.** A user reaches an inode only through a grant of a
 //! directory at or above it. `authorize` walks up from the inode through
 //! each Entry's `parent` until it finds the nearest directory granted to
-//! the user. That grant then decides: read-only or read-write. If the walk
-//! reaches the real root, where nothing is granted, access is refused.
+//! the user. If the walk reaches the real root, where nothing is granted,
+//! access is refused. Any grant lets the user read. To write, one of the
+//! user's grants on the way up must be read-write: a read-only share of a
+//! folder inside a read-write one takes nothing away, and a read-write
+//! share inside a read-only one lets the user write from there down.
 //!
 //! - Operations run the walk in their own transaction, so the walk's reads
 //!   and the change they protect commit together. A rename that moves the
@@ -383,8 +386,10 @@ async fn follows(r: &impl Reads, user: &str, path: &[u64]) -> Result<Option<Gran
     Ok(None)
 }
 
-/// The grant through which `user` reaches `ino`. Returns `EACCES` if there
-/// is none, and `EROFS` if `write` is asked of a read-only grant.
+/// The grant through which `user` reaches `ino`: the nearest one above it,
+/// or for `write`, the nearest read-write one. Returns `EACCES` if there is
+/// none, and `EROFS` if `write` is asked and every grant above is
+/// read-only.
 pub(crate) async fn authorize(
     r: &impl Reads,
     paths: &Paths,
@@ -392,14 +397,59 @@ pub(crate) async fn authorize(
     ino: u64,
     write: bool,
 ) -> Result<Result<Grant, FsError>, KvError> {
-    Ok(match walk(r, paths, user, ino).await? {
-        Ok((grant, _)) if write && !grant.writable => Err(FsError::new(
-            libc::EROFS,
-            format!("inode {ino} is shared with {user} read-only"),
-        )),
-        Ok((grant, _)) => Ok(grant),
-        Err(e) => Err(e),
-    })
+    let (grant, mut path) = match walk(r, paths, user, ino).await? {
+        Ok(found) => found,
+        Err(e) => return Ok(Err(e)),
+    };
+    if !write || grant.writable {
+        return Ok(Ok(grant));
+    }
+    // Read-only here: look on up for a read-write grant. Each walk's reads
+    // are the operation's, so revoking that grant conflicts with it.
+    loop {
+        let granted = *path.last().expect("a walk's path ends at its grant");
+        let Some(above) = parent_of(r, granted).await? else {
+            break;
+        };
+        match walk(r, paths, user, above).await? {
+            Ok((grant, _)) if grant.writable => return Ok(Ok(grant)),
+            Ok((_, next)) => path = next,
+            Err(_) => break,
+        }
+    }
+    Ok(Err(FsError::new(
+        libc::EROFS,
+        format!("inode {ino} is shared with {user} read-only"),
+    )))
+}
+
+/// `ino`'s parent, if it has one below the real root.
+async fn parent_of(r: &impl Reads, ino: u64) -> Result<Option<u64>, KvError> {
+    let Some(bytes) = r.get(&attr_key(ino)).await? else {
+        return Ok(None);
+    };
+    let parent = decode_entry(ino, &bytes).parent;
+    Ok((parent != ROOT_INO && parent != 0).then_some(parent))
+}
+
+/// Which of `grants`, all made to `user`, are of a folder inside another
+/// of `user`'s grants. Clients list only the others in the root: the
+/// folders inside are reached from there.
+pub(crate) async fn covered(
+    view: &View<'_>,
+    paths: &Paths,
+    user: &str,
+    grants: &[Grant],
+) -> Result<Vec<u64>, FsError> {
+    let mut covered = Vec::new();
+    for grant in grants {
+        if let Some(above) = parent_of(view, grant.ino).await?
+            && walk(view, paths, user, above).await?.is_ok()
+        {
+            covered.push(grant.ino);
+        }
+    }
+    Ok(covered)
 }
 
 /// Checks that every node from `ino` up to its volume is wrapped under its

@@ -539,6 +539,10 @@ message KeyPathResponse {
 
 message GrantList {
   repeated GrantInfo grants = 1;
+  // Those of `grants` that are of a folder inside another of the caller's
+  // grants (protocol 7 on), which clients reach from there and leave out
+  // of the root.
+  repeated uint64 covered = 2;
 }
 
 message GrantListResponse {

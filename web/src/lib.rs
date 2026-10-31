@@ -458,8 +458,12 @@ struct Here {
     /// The folders, from the top down, whose sharing reaches it: it and
     /// those above it.
     sources: Vec<Source>,
-    /// For a folder that this account can only read: who shared it.
+    /// For a folder whose top-level folder this account can only read: who
+    /// shared it.
     from: Option<String>,
+    /// Whether this account can change the folder: a read-write share of
+    /// it, or of a folder above it, inside a read-only one.
+    writable: bool,
     /// Who owns the top-level folder it is in, if not this account.
     owner: Option<String>,
 }
@@ -617,9 +621,12 @@ impl Inner {
                 .into_iter()
                 .find(|g| g.ino == top)
                 .and_then(|g| grant_sender(&g.sealed_key).ok().map(str::to_string));
+            let here = self.resolve(path).await?.ino;
+            const W_OK: u32 = 2;
             return Ok(Some(Here {
                 sources: Vec::new(),
                 from: sender,
+                writable: self.vault().remote().access(here, W_OK).await.is_ok(),
                 owner: self.others_owner(top).await,
             }));
         };
@@ -642,6 +649,7 @@ impl Inner {
         Ok((!sources.is_empty() || owner.is_some()).then_some(Here {
             sources,
             from: None,
+            writable: true,
             owner,
         }))
     }

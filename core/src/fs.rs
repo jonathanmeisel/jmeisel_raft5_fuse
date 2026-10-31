@@ -1690,6 +1690,19 @@ impl FsCore {
         grants::list(&view, &caller.user).await
     }
 
+    /// `grants`, and which of them are of a folder inside another of
+    /// `caller`'s grants (see `grants::covered`).
+    pub async fn grants_and_covered(
+        &self,
+        caller: &Caller,
+        at: Option<&[u8]>,
+    ) -> Result<(Vec<Grant>, Vec<u64>), FsError> {
+        let view = self.view(at).await?;
+        let list = grants::list(&view, &caller.user).await?;
+        let covered = grants::covered(&view, &self.paths, &caller.user, &list).await?;
+        Ok((list, covered))
+    }
+
     /// Every snapshot, oldest first.
     pub async fn snapshots(&self) -> Result<Vec<raft5fs_proto::types::SnapshotInfo>, FsError> {
         snapshots::list(&self.client).await
