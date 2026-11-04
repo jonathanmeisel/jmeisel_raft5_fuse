@@ -29,6 +29,7 @@
 //! - It checks that a looked-up name names the inode that the server
 //!   returned.
 //! - It refuses key records older than ones it already saw.
+//! - It leaves out a name that a writer sealed but no folder could hold.
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -517,6 +518,23 @@ fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
             format!("inode {ino}: a chunk in object storage, not fetched"),
         )),
     }
+}
+
+/// Whether a name can be one thing in one folder. A writer seals what names
+/// they like, and a `/` or a `..` would make a listing say something a path
+/// can't, or point somewhere else.
+fn good_name(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+}
+
+fn check_new_name(name: &OsStr) -> Result<(), FsError> {
+    if good_name(os_bytes::bytes(name)) {
+        return Ok(());
+    }
+    Err(FsError::new(
+        errno::EINVAL,
+        format!("{name:?} can't be a name: it can't be empty, . or .., or hold a / or a NUL"),
+    ))
 }
 
 fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
@@ -1402,9 +1420,13 @@ impl Vault {
     /// hasn't checked: the whole share already says that it needs checking,
     /// and its name shouldn't change when they check.
     async fn root_label(&self, grant: &Grant) -> OsString {
+        let unreadable = || OsString::from(format!("unreadable-{}", grant.ino));
         let Some((text, source)) = self.read_label(grant).await else {
-            return OsString::from(format!("unreadable-{}", grant.ino));
+            return unreadable();
         };
+        if !good_name(&text) {
+            return unreadable();
+        }
         let mut label = os_bytes::into_name(text);
         let vouched = matches!(source, LabelSource::Me | LabelSource::Checked);
         if !vouched && self.load_pin_memory().labels_signed && self.sender_checked(grant) {
@@ -1496,6 +1518,7 @@ impl Vault {
         parent: u64,
         name: &OsStr,
     ) -> Result<(NewNode, Node, OsString), FsError> {
+        check_new_name(name)?;
         let parent_node = self.fresh_node(parent).await?;
         let ino = self.remote.allocate_inode().await?;
         let (record, key) =
@@ -1619,6 +1642,9 @@ impl Vault {
                     .map_err(|e| corrupt(ino, e))
                 });
             match opened {
+                Ok(name) if !good_name(&name) => {
+                    eprintln!("inode {ino}: a bad name for inode {}; left out", item.ino)
+                }
                 Ok(name) => {
                     item.name = os_bytes::into_name(name);
                     item.sealed_name = Vec::new();
@@ -1687,6 +1713,7 @@ impl Vault {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<Option<u64>, FsError> {
+        check_new_name(new_name)?;
         if parent != new_parent {
             self.rotate_moving(parent, name).await?;
         }
@@ -1776,6 +1803,7 @@ impl Vault {
 
     /// Makes a new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
+        check_new_name(label)?;
         if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
             return Err(FsError::errno(errno::EEXIST));
         }
@@ -1863,6 +1891,7 @@ impl Vault {
         link_secret: Option<&str>,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
+        check_new_name(label)?;
         // Check this before pinning `user`'s key. A pin also makes shares
         // from `user` trusted, and sharing from an untrusted share must not
         // cause that.

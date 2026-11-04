@@ -1303,3 +1303,68 @@ fn only_the_grantee_sets_a_grants_label() {
     rt.block_on(visitor.sign_labels()).unwrap();
     assert_eq!(shown_as(&backend, &visitor, docs), "docs");
 }
+
+/// A writer seals what names they like. One that a path can't say stays out
+/// of listings, and nobody can make one through this client.
+#[test]
+fn names_a_path_cant_say_stay_out_of_listings() {
+    use raft5fs_client::vault::Node;
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    backend.enrol("bob");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.sync_pins()).unwrap();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let real = rt
+        .block_on(me.create(docs, OsStr::new("real"), 0o644))
+        .unwrap()
+        .ino;
+    let dir: Arc<Node> = rt.block_on(me.node(docs)).unwrap();
+    let forge = |name: &str| {
+        let name = OsStr::new(name);
+        let tag = dir.tag(name);
+        let key = [&[0x03], &docs.to_be_bytes()[..], tag.as_encoded_bytes()].concat();
+        let value = [
+            &real.to_be_bytes()[..],
+            &dir.seal(docs, real, &tag, name)[..],
+        ]
+        .concat();
+        backend.write_key(&key, Some(&value));
+    };
+    forge("fine");
+    for bad in ["a/b", "..", ".", "../up", "", "with\0nul"] {
+        forge(bad);
+    }
+    let mut names: Vec<String> = rt
+        .block_on(me.readdir(docs))
+        .unwrap()
+        .into_iter()
+        .map(|item| item.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".", "..", "fine", "real"]);
+
+    // A label is a name too.
+    let own = connect(&backend, TESTER).identity().unwrap();
+    let label = seal_signed_label(&own, TESTER, &own.public_key(), docs, b"a/b");
+    rt.block_on(me.remote().set_grant_label(docs, label))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), format!("unreadable-{docs}"));
+
+    for bad in ["a/b", "..", ".", ""] {
+        let bad = OsStr::new(bad);
+        for result in [
+            rt.block_on(me.mkdir(docs, bad, 0o755)).map(drop),
+            rt.block_on(me.create(docs, bad, 0o644)).map(drop),
+            rt.block_on(me.create_volume(bad, 0o755)).map(drop),
+            rt.block_on(me.grant(docs, "bob", false, bad)).map(drop),
+            rt.block_on(me.rename(docs, OsStr::new("real"), docs, bad, false))
+                .map(drop),
+        ] {
+            assert_eq!(errno(result), libc::EINVAL, "{bad:?}");
+        }
+    }
+}
