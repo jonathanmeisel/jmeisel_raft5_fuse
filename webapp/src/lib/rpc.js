@@ -47,6 +47,7 @@ export function connect({ onStorageError } = {}) {
     resume: () => call("resume", []),
     visit: (link) => call("visit", [link]),
     checkNewPassword: (password) => call("checkNewPassword", [password]),
+    checkSafetyCode: (text) => call("checkSafetyCode", [text]),
     whoami: () => call("whoami", []),
     readdir: (path) => call("readdir", [path]),
     stat: (path) => call("stat", [path]),

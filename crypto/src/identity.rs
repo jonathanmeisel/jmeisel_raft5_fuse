@@ -207,6 +207,61 @@ fn bits_at(bytes: &[u8], start: usize, n: usize) -> u32 {
     })
 }
 
+/// How far along `written` is towards a fingerprint, for someone still typing
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintProgress {
+    /// How many words so far.
+    pub words: usize,
+    /// The words that aren't in the word list.
+    pub unknown: Vec<String>,
+    /// Whether it is in a whole form, so `fingerprint_matches` can compare it.
+    pub complete: bool,
+}
+
+fn fingerprint_parts(lower: &str) -> Vec<&str> {
+    lower
+        .split(|c: char| c.is_whitespace() || c == '-' || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+fn is_fingerprint_hex(parts: &[&str]) -> bool {
+    let hex: String = parts.concat();
+    hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Says how far along `written` is. A word still being typed that only
+/// starts a real word doesn't count as unknown.
+pub fn fingerprint_progress(written: &str) -> FingerprintProgress {
+    let lower = written.to_ascii_lowercase();
+    let parts = fingerprint_parts(&lower);
+    if is_fingerprint_hex(&parts) {
+        return FingerprintProgress {
+            words: 0,
+            unknown: Vec::new(),
+            complete: true,
+        };
+    }
+    let known = |word: &str| crate::wordlist::WORDS.contains(&word);
+    let typing = |word: &str| crate::wordlist::WORDS.iter().any(|w| w.starts_with(word));
+    let finished = written.ends_with(|c: char| c.is_whitespace() || c == '-' || c == ',');
+    let unknown: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, word)| {
+            let last = *i + 1 == parts.len();
+            !known(word) && (finished || !last || !typing(word))
+        })
+        .map(|(_, word)| word.to_string())
+        .collect();
+    FingerprintProgress {
+        words: parts.len(),
+        complete: parts.len() == FINGERPRINT_WORDS && parts.iter().all(|w| known(w)),
+        unknown,
+    }
+}
+
 /// Whether `written` is `public_key`'s fingerprint, in either form:
 /// `fingerprint`'s 32 hex digits, or `fingerprint_words`' 12 words. Case,
 /// spaces, and hyphens do not matter.
@@ -218,10 +273,7 @@ pub fn fingerprint_matches(
     written: &str,
 ) -> Result<bool, String> {
     let lower = written.to_ascii_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| c.is_whitespace() || c == '-' || c == ',')
-        .filter(|w| !w.is_empty())
-        .collect();
+    let words = fingerprint_parts(&lower);
     let digest = Sha256::digest(public_key);
     let hex: String = words.concat();
     if hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -260,6 +312,31 @@ pub fn fingerprint(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_progress_follows_someone_typing() {
+        let code = fingerprint_words(&Identity::generate().public_key());
+        let words: Vec<&str> = code.split(' ').collect();
+
+        let empty = fingerprint_progress("");
+        assert_eq!((empty.words, empty.complete), (0, false));
+
+        // The word being typed isn't wrong yet, if it starts a real word.
+        let typing = format!("{} {}", words[0], &words[1][..2]);
+        let progress = fingerprint_progress(&typing);
+        assert_eq!(progress.words, 2);
+        assert!(progress.unknown.is_empty(), "{:?}", progress.unknown);
+
+        // Once something follows it, or if no word starts that way, it is.
+        assert_eq!(fingerprint_progress("zzz").unknown, ["zzz"]);
+        assert_eq!(fingerprint_progress("aband ").unknown, ["aband"]);
+
+        let whole = fingerprint_progress(&code);
+        assert!(whole.complete && whole.unknown.is_empty());
+        assert_eq!(whole.words, FINGERPRINT_WORDS);
+        assert!(fingerprint_progress(&code.to_uppercase().replace(' ', "-")).complete);
+        assert!(fingerprint_progress("0123456789abcdef0123456789ABCDEF").complete);
+    }
 
     #[test]
     fn a_wrapped_identity_opens_only_with_its_kek_and_user() {

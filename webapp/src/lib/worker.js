@@ -336,6 +336,7 @@ const methods = {
   },
 
   checkNewPassword: (password) => wasm.checkNewPassword(password),
+  checkSafetyCode: (text) => wasm.checkSafetyCode(text),
   whoami: () => session().whoami(),
   readdir: (path) => session().readdir(path),
   stat: (path) => session().stat(path),

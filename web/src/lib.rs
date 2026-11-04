@@ -31,7 +31,9 @@ use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault};
-use raft5fs_crypto::identity::{PUBLIC_KEY_LEN, fingerprint, fingerprint_words, grant_sender};
+use raft5fs_crypto::identity::{
+    PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
+};
 use raft5fs_crypto::password::{AUTH_LEN, KdfParams, check_new_password};
 use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
@@ -233,6 +235,24 @@ fn invalid_invitation() -> JsValue {
 #[wasm_bindgen(js_name = checkNewPassword)]
 pub fn check_password(password: &str) -> Result<(), JsValue> {
     check_new_password(password).map_err(|why| failure("EINVAL", &why))
+}
+
+/// How far along someone is in typing a safety code: `{words, unknown,
+/// complete}`, with the words that aren't in the word list.
+#[wasm_bindgen(js_name = checkSafetyCode)]
+pub fn check_safety_code(written: &str) -> Result<JsValue, JsValue> {
+    #[derive(Serialize)]
+    struct Progress {
+        words: usize,
+        unknown: Vec<String>,
+        complete: bool,
+    }
+    let progress = fingerprint_progress(written);
+    to_js(&Progress {
+        words: progress.words,
+        unknown: progress.unknown,
+        complete: progress.complete,
+    })
 }
 
 /// Enrols with `invitation` (from `raft5fs-server user add`), choosing

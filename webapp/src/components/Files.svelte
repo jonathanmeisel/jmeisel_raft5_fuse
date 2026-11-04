@@ -481,7 +481,7 @@
     { id: "pending", text: "Shared with me", icon: "wxi-file-multiple-outline", badge: pendingCount || 0 },
     ...(account.caps.includes("admin") ? [{ id: "users", text: "Users", icon: "wxi-account" }] : []),
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
-    { id: "fingerprint", text: "My fingerprint", icon: "wxi-information-outline" },
+    { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
 
@@ -594,8 +594,12 @@
 </WillowDark>
 
 {#if dialog?.kind === "fingerprint"}
-  <Dialog title="My fingerprint" onclose={() => (dialog = null)}>
-    <p>Your key's fingerprint</p>
+  <Dialog title="My safety code" onclose={() => (dialog = null)}>
+    <p class="note">
+      These 12 words are your safety code. The first time you share with someone, you'll each
+      read yours to the other, so you know you've really reached each other. No need to save it: it's
+      always under your name, in My safety code.
+    </p>
     <Fingerprint fingerprint={me.fingerprint} />
   </Dialog>
 {:else if dialog?.kind === "view"}

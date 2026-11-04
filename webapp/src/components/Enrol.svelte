@@ -38,7 +38,11 @@
 
 {#if enrolled}
   <p>Enrolled <strong>{enrolled.user}</strong>.</p>
-  <p>Your key's fingerprint</p>
+  <p class="note">
+    These 12 words are your safety code. The first time you share with someone, you'll each
+    read yours to the other, so you know you've really reached each other. No need to save it: it's
+    always under your name, in My safety code.
+  </p>
   <Fingerprint fingerprint={enrolled.fingerprint} />
   <p><button class="primary" onclick={() => ondone(enrolled.user)}>Continue to log in</button></p>
 {:else}
