@@ -6,8 +6,7 @@
 //!
 //! - point reads, through `view`'s `ReadKeys`, which every read uses;
 //! - batches of keys fetched by walks (`next_key`);
-//! - transaction attempts (`attempt`, which `retrying` runs each attempt
-//!   in);
+//! - transactions (`transaction`, which `run_txn` runs each one in);
 //! - the few other calls (`other`).
 //!
 //! Each call is also logged at `debug`, in the request's span. Calls
@@ -89,9 +88,12 @@ pub(crate) async fn other<T>(what: &'static str, f: impl Future<Output = T>) -> 
     out
 }
 
-/// Runs and times `f`, one attempt at a transaction. It counts only the
-/// time that the attempt's other calls do not already count.
-pub(crate) async fn attempt<T>(f: impl Future<Output = Result<T, KvError>>) -> Result<T, KvError> {
+/// Runs and times `f`, a transaction with all its attempts. It counts only
+/// the time that its other calls do not already count: opening each attempt,
+/// its commit, and the waits between attempts.
+pub(crate) async fn transaction<T>(
+    f: impl Future<Output = Result<T, KvError>>,
+) -> Result<T, KvError> {
     let before = so_far();
     let start = Instant::now();
     let out = f.await;
@@ -107,8 +109,8 @@ pub(crate) async fn attempt<T>(f: impl Future<Output = Result<T, KvError>>) -> R
     update(|t| t.txns.add(took.saturating_sub(inner)));
     tracing::debug!(
         took = ms(took),
-        aborted = matches!(out, Err(KvError::Aborted { .. })),
-        "store transaction attempt"
+        gave_up = matches!(out, Err(KvError::Aborted { .. })),
+        "store transaction"
     );
     out
 }
@@ -136,8 +138,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_attempt_counts_only_its_own_time() {
-        let (_, time) = measure(attempt(async {
+    async fn a_transaction_counts_only_its_own_time() {
+        let (_, time) = measure(transaction(async {
             read(1, false, tokio::time::sleep(Duration::from_millis(20))).await;
             Ok::<_, KvError>(())
         }))

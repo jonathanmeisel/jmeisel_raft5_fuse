@@ -44,37 +44,40 @@ pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 const R: u32 = libc::R_OK as u32;
 const W: u32 = libc::W_OK as u32;
 
-/// Runs `attempt` (one whole transaction, from open to commit) until the
-/// store stops aborting it, and returns its result.
+/// Runs `attempt`, one whole transaction from its reads to its commit, again
+/// each time the store aborts it, and returns its result (see
+/// `Client::run_transaction`, which decides when to stop).
 ///
-/// - The retry must cover the whole attempt, because `Aborted` can come
-///   from any step, not only `commit`. A contended key refuses the `read`
-///   or `write` that touches it at once (see the server's wound-wait
-///   `acquire`). It does not wait for commit to fail.
-/// - `Transaction` does not retry this itself, on purpose (see its doc
-///   comment): it does not know what the reads were, so only the caller
-///   that made them can do them again.
-/// - An aborted transaction wrote nothing, so it is always safe to run the
-///   attempt again.
-/// - An attempt that reaches its own decision ("that name is taken", "no
-///   such inode") returns it inside `Ok`, as `Ok(Err(..))`, so only the
-///   store's aborts are retried.
+/// - An attempt that reaches its own decision ("that name is taken", "no such
+///   inode") returns it inside `Ok`, as `Ok(Err(..))`, so only the store's
+///   aborts are retried.
+/// - An attempt can run more than once, so it must not change anything
+///   outside the transaction.
+/// - If the store keeps aborting it, this gives up, and callers report that
+///   as `EBUSY`.
 ///
 /// It takes a closure that returns a new future for each attempt, not an
 /// async closure. The compiler cannot show that an async closure's future
 /// is `Send` for every lifetime, and the server's runtime needs that. So
 /// callers capture only references (which copy) and `move` them into each
 /// attempt.
-pub(crate) async fn retrying<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, KvError>
+pub(crate) async fn run_txn<T, Fut>(
+    client: &Client,
+    mut attempt: impl FnMut(Transaction) -> Fut,
+) -> Result<T, KvError>
 where
     Fut: std::future::Future<Output = Result<T, KvError>>,
 {
-    loop {
-        match timing::attempt(attempt()).await {
-            Err(KvError::Aborted { .. }) => continue,
-            other => return other,
-        }
+    let mut attempts = 0u32;
+    let out = timing::transaction(client.run_transaction(TXN_TTL, |txn| {
+        attempts += 1;
+        attempt(txn)
+    }))
+    .await;
+    if attempts > 1 {
+        tracing::debug!(attempts, "store transaction retried");
     }
+    out
 }
 
 /// How old a reservation must be for `sweep_reservations` to remove it: a
@@ -89,7 +92,7 @@ fn unix_secs(t: SystemTime) -> u64 {
 }
 
 /// In a transaction attempt, unwraps a filesystem decision, or ends the
-/// attempt with it as `Ok(Err(..))`, the form that `retrying` does not
+/// attempt with it as `Ok(Err(..))`, the form that `run_txn` does not
 /// retry.
 macro_rules! decide {
     ($result:expr) => {
@@ -294,8 +297,7 @@ async fn touch_dir(txn: &Transaction, dir: &mut Entry, now: SystemTime) -> Resul
 /// at the same time safe: the loser's retry sees the winner's value and
 /// uses it.
 pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, String> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         if let Some(bytes) = txn.read_one(CHUNK_SIZE_KEY).await?.value {
             return Ok(decode_chunk_size(&bytes));
         }
@@ -316,8 +318,7 @@ pub async fn resolve_chunk_size(client: &Client, preferred: u64) -> Result<u64, 
 /// store in another format is refused, not opened, because using it would
 /// mix the two formats.
 pub async fn check_store(client: &Client) -> Result<(), String> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         let refused = || {
             Ok(Err(
                 "this store holds a filesystem made by an older raft5fs, in a format \
@@ -361,8 +362,7 @@ fn decode_chunk_size(bytes: &[u8]) -> Result<u64, String> {
 /// atomic. The KV store has no other safe counter: with a plain read and
 /// write, two `mkdir`s at the same time could get the same inode.
 async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         let next = txn
             .read_one(COUNTER_KEY)
             .await?
@@ -524,8 +524,7 @@ impl FsCore {
     /// filesystem at the same time: the one that commits second finds the
     /// root.
     async fn ensure_root(&self) -> Result<(), KvError> {
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             if txn.read_one(&attr_key(ROOT_INO)).await?.value.is_some() {
                 return Ok(());
             }
@@ -791,8 +790,7 @@ impl FsCore {
             self.discard(self.delete_chunks_from(ino, first, layout).await?);
         }
 
-        let (attr, change, parent) = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let (attr, change, parent) = run_txn(&self.client, move |txn| async move {
             let Some(bytes) = txn.read_one(&attr_key(ino)).await?.value else {
                 return Ok(Err(enoent()));
             };
@@ -901,8 +899,7 @@ impl FsCore {
         let dirent = &dirent_key(parent, name);
         let value = &dirent_value(ino, &new.sealed_name);
 
-        let made = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let made = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, parent, true).await?);
             // The new node's key and name are sealed under the parent's
             // key.
@@ -969,8 +966,7 @@ impl FsCore {
         if made.as_ref().is_err_and(|e| !retry(e)) {
             let user = caller.user.as_bytes();
             let key = &reservation_key(ino);
-            let released = retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
+            let released = run_txn(&self.client, move |txn| async move {
                 let held = txn.read_one(key).await?.value;
                 if held.as_deref().map(|v| grants::reservation_parts(v).0) == Some(user) {
                     txn.write(key, None).await?;
@@ -1013,8 +1009,7 @@ impl FsCore {
             }
             // Only if it is still the same reservation.
             let value = &value;
-            let gone = retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
+            let gone = run_txn(&self.client, move |txn| async move {
                 if txn.read_one(key).await?.value.as_ref() != Some(value) {
                     return Ok(false);
                 }
@@ -1123,8 +1118,7 @@ impl FsCore {
         guarded: u64,
     ) -> Result<(), FsError> {
         let dirent = &dirent_key(parent, name);
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, guarded, true).await?);
             let mut dir = decide!(modifiable_dir(&txn, parent).await?);
             if named(&txn, dirent).await? != Some(ino) {
@@ -1179,8 +1173,7 @@ impl FsCore {
             // Before the move, as a write's check is: soft, like quotas.
             self.check_move_room(sealed.ino, parent, new_parent).await?;
         }
-        let replaced = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let replaced = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, parent, true).await?);
             if new_parent != parent {
                 decide!(self.guard(&txn, caller, new_parent, true).await?);
@@ -1635,8 +1628,7 @@ impl FsCore {
         end: u64,
     ) -> Result<(Attr, u64), FsError> {
         self.check_chunk_writes(writes)?;
-        let (attr, dropped, grown, parent) = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let (attr, dropped, grown, parent) = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
             // Read the Entry first. This is required: a deletion marks the
@@ -1742,8 +1734,7 @@ impl FsCore {
     ) -> Result<(), FsError> {
         grants::check_username(grantee)?;
         let ino = grant.ino;
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, ino, true).await?);
             // A revoked user may still have a stale key.
             decide!(self.fresh(&txn, ino).await?);
@@ -1833,8 +1824,7 @@ impl FsCore {
             sealed_key: sealed_key.to_vec(),
             sealed_label: sealed_label.to_vec(),
         };
-        let made = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let made = run_txn(&self.client, move |txn| async move {
             let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
             if txn.read_one(dirent).await?.value.is_some() {
                 return Ok(Err(FsError::errno(libc::EEXIST)));
@@ -1902,8 +1892,7 @@ impl FsCore {
     /// client changed it in the meantime.
     pub async fn rotate(&self, caller: &Caller, rotations: &[Rotation]) -> Result<(), FsError> {
         let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             // Versions that this transaction has changed, for the children
             // that are rotated after their parents.
             let mut rotated: HashMap<u64, u32> = HashMap::new();
@@ -1996,8 +1985,7 @@ impl FsCore {
                 "a re-sealed chunk must say the seq it was read at",
             ));
         }
-        let dropped = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let dropped = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, ino, true).await?);
             decide!(self.fresh(&txn, ino).await?);
             // As in `write_chunks`, read the Entry first, so no chunk is
@@ -2032,8 +2020,7 @@ impl FsCore {
         for n in names {
             Self::check_entry_name(&n.tag, &n.sealed_name)?;
         }
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, dir, true).await?);
             decide!(self.fresh(&txn, dir).await?);
             decide!(modifiable_dir(&txn, dir).await?);
@@ -2112,8 +2099,7 @@ impl FsCore {
             ));
         }
         let before_bytes = &before_bytes;
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             if txn.read_one(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
                 return Ok(Err(FsError::new(
                     libc::EAGAIN,
@@ -2265,8 +2251,7 @@ impl FsCore {
             .map(|bytes| decode_entry(ino, &bytes));
         let layout = entry.as_ref().map_or(Layout::Inline, |e| e.attr.layout);
         let dropped = self.delete_chunks_from(ino, 0, layout).await?;
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
             txn.write(&crate::layout::volume_key(ino), None).await?;
@@ -2356,8 +2341,7 @@ impl FsCore {
                 })
                 .collect();
             dropped.extend(
-                retrying(move || async move {
-                    let txn = self.client.transaction(TXN_TTL).await?;
+                run_txn(&self.client, move |txn| async move {
                     let keys: Vec<&Vec<u8>> = starts.iter().map(|&(_, key)| key).collect();
                     let mut found = Vec::new();
                     for (&(index, _), entry) in starts.iter().zip(txn.read_many(&keys).await?) {
@@ -2381,7 +2365,7 @@ impl FsCore {
 
 /// Compile-time check only: the server runs these on tonic's multithreaded
 /// runtime, which needs every request's future to be `Send`. Generic async
-/// closures (`retrying`) are where that can stop being true without notice.
+/// closures (`run_txn`) are where that can stop being true without notice.
 #[allow(dead_code)]
 fn operations_are_send(
     core: &FsCore,

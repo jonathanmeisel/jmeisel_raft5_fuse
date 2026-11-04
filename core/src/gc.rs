@@ -44,7 +44,7 @@ use raft5fs_objstore::{ObjectName, S3Store};
 use raft5fs_proto::types::{Layout, ObjectGrid};
 
 use crate::entry::decode_entry;
-use crate::fs::{FsCore, TXN_TTL, retrying};
+use crate::fs::{FsCore, run_txn};
 use crate::layout::{ChunkValue, GC_LEASE_KEY, attr_key};
 use crate::objects::{CLOCK_SKEW, Dropped, object_name};
 use crate::timing::next_key;
@@ -256,8 +256,7 @@ pub(crate) async fn take_lease(
     holder: [u8; 16],
     now: SystemTime,
 ) -> Result<bool, String> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         if let Some(value) = txn.read_one(key).await?.value
             && let Some((other, expires_ms)) = decode_lease(&value)
             && other != holder
@@ -283,8 +282,7 @@ pub(crate) async fn release_lease(
     key: &[u8],
     holder: [u8; 16],
 ) -> Result<(), String> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         if let Some(value) = txn.read_one(key).await?.value
             && decode_lease(&value).is_some_and(|(other, _)| other == holder)
         {

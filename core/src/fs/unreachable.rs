@@ -97,8 +97,7 @@ impl FsCore {
         kind: Kind,
     ) -> Result<(), FsError> {
         let dirent = &dirent_key(parent, OsStr::from_bytes(name));
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             let Some(mut entry) = live(ino, txn.read_one(&attr_key(ino)).await?.value) else {
                 return Ok(Ok(()));
             };

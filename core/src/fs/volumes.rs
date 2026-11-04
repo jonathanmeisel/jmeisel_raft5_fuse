@@ -174,8 +174,7 @@ impl FsCore {
                 "a public link can't own a volume",
             ));
         }
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
             if record.owner.as_deref() != Some(caller.user.as_str()) {
                 return Ok(Err(FsError::new(
@@ -200,8 +199,7 @@ impl FsCore {
 
     /// Withdraws the offer of volume `ino`, as its owner.
     pub async fn withdraw_offer(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
             if record.owner.as_deref() != Some(caller.user.as_str()) {
                 return Ok(Err(FsError::new(
@@ -236,8 +234,7 @@ impl FsCore {
         } else {
             0
         };
-        let old = retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        let old = run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
             if record.offer.as_ref().map(|(to, _)| to.as_str()) != Some(caller.user.as_str()) {
                 return Ok(Err(FsError::new(
@@ -362,8 +359,7 @@ impl FsCore {
         crate::accounts::is_admin(&self.client, &caller.user).await?;
         let size = self.moved_size(ino).await?;
         let old = acting_owner(&self.client, ino).await?;
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
             if !decide!(writes_at(&txn, ino, user).await?) || user.starts_with(LINK_PREFIX) {
                 return Ok(Err(FsError::new(
@@ -400,8 +396,7 @@ impl FsCore {
         let mut owned = 0;
         for value in self.client.get_many(&keys).await?.into_iter().flatten() {
             let ino = dirent_ino(&value);
-            let given = retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
+            let given = run_txn(&self.client, move |txn| async move {
                 if txn.read_one(&volume_key(ino)).await?.value.is_some() {
                     return Ok(false);
                 }

@@ -662,8 +662,17 @@ pub fn check_username(user: &str) -> Result<(), FsError> {
 
 #[cfg(feature = "raft5")]
 impl From<raft5_client::Error> for FsError {
+    /// A transaction the store kept aborting is busy, not broken: nothing was
+    /// written, and it can work later. Its key is left out because it isn't
+    /// readable text.
     fn from(e: raft5_client::Error) -> Self {
-        Self::new(crate::errno::EIO, e.to_string())
+        match e {
+            raft5_client::Error::Aborted { reason, .. } => Self::new(
+                crate::errno::EBUSY,
+                format!("the store is busy, so nothing was changed: {reason}"),
+            ),
+            e => Self::new(crate::errno::EIO, e.to_string()),
+        }
     }
 }
 
@@ -682,6 +691,29 @@ impl std::error::Error for FsError {}
 pub struct WriteError {
     pub written: usize,
     pub error: FsError,
+}
+
+#[cfg(all(test, feature = "raft5"))]
+mod store_error_tests {
+    use super::*;
+    use raft5_client::{AbortReason, Error};
+
+    #[test]
+    fn a_transaction_the_store_kept_aborting_is_busy_and_hides_its_key() {
+        let e: FsError = Error::Aborted {
+            reason: AbortReason::LockConflict,
+            key: Some(b"\x01secret-tag".to_vec()),
+        }
+        .into();
+        assert_eq!(e.errno, crate::errno::EBUSY);
+        assert!(!e.message.contains("secret-tag"), "{}", e.message);
+    }
+
+    #[test]
+    fn other_store_errors_stay_io_errors() {
+        let e: FsError = Error::InDoubt { seq: 7 }.into();
+        assert_eq!(e.errno, crate::errno::EIO);
+    }
 }
 
 #[cfg(test)]

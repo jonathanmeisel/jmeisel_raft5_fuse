@@ -36,7 +36,7 @@ use raft5fs_crypto::password::{
     KdfParams, SALT_LEN, check_verifier, enrolment_code_hash, new_enrolment_code,
 };
 
-use crate::fs::{TXN_TTL, retrying};
+use crate::fs::run_txn;
 use crate::layout::{
     ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX, PINS_PREFIX, usage_key,
 };
@@ -48,7 +48,7 @@ use raft5fs_proto::types::{
 };
 
 /// In a transaction attempt, unwraps a decision, or ends the attempt with
-/// it as `Ok(Err(..))`, which `retrying` does not retry (as in `fs`).
+/// it as `Ok(Err(..))`, which `run_txn` does not retry (as in `fs`).
 macro_rules! decide {
     ($result:expr) => {
         match $result {
@@ -102,8 +102,7 @@ pub async fn put_pins(
     if sealed.len() > MAX_PINS_BYTES {
         return Err(FsError::new(libc::EINVAL, "too many trusted keys"));
     }
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         let current = match txn.read_one(&pins_key(user)).await?.value {
             Some(stored) => decide!(decode_pins(user, &stored)).0,
             None => 0,
@@ -428,10 +427,9 @@ pub async fn create_link(
         ..AccountInfo::default()
     };
     let record = encode_info(&info);
-    retrying(|| {
+    run_txn(client, |txn| {
         let (encoded, record) = (&encoded, &record);
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             let mine = decide!(info_in(&txn, owner).await?).unwrap_or_default();
             if mine.kind != AccountKind::Person || !mine.caps.contains(Caps::LINKS) {
                 return Ok(Err(FsError::new(
@@ -571,10 +569,9 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
     refuse_link_name(user)?;
     let code = new_enrolment_code();
     let hash = enrolment_code_hash(&code);
-    retrying(|| {
+    run_txn(client, |txn| {
         let hash = &hash;
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             let mut info = decide!(info_in(&txn, user).await?).unwrap_or_else(|| AccountInfo {
                 created: now_secs(),
                 ..AccountInfo::default()
@@ -595,8 +592,7 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
 /// in `off` for `user`, and returns what they then have. `ENOENT` if
 /// there is no such account and no code for one.
 pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Caps, FsError> {
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some();
         if !exists {
@@ -619,8 +615,7 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
 /// (`None`: no limit). `ENOENT` if there is no such account and no code
 /// for one.
 pub async fn set_quota(client: &Client, user: &str, quota: Option<u64>) -> Result<(), FsError> {
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         decide!(change_info(&txn, user, |info| info.quota = quota).await?);
         txn.commit().await?;
         Ok(Ok(()))
@@ -636,8 +631,7 @@ pub async fn admin_set_quota(
     quota: Option<u64>,
 ) -> Result<(), FsError> {
     refuse_link_quota(user)?;
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         decide!(require_admin(&txn, caller).await?);
         decide!(change_info(&txn, user, |info| info.quota = quota).await?);
         txn.commit().await?;
@@ -708,10 +702,9 @@ pub async fn issue_invite(
     refuse_link_name(user)?;
     let code = new_enrolment_code();
     let hash = enrolment_code_hash(&code);
-    retrying(|| {
+    run_txn(client, |txn| {
         let hash = &hash;
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             decide!(require_admin(&txn, caller).await?);
             let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some()
@@ -750,10 +743,9 @@ pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result
     refuse_link_name(user)?;
     let code = new_enrolment_code();
     let hash = enrolment_code_hash(&code);
-    retrying(|| {
+    run_txn(client, |txn| {
         let hash = &hash;
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             decide!(require_admin(&txn, caller).await?);
             let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some();
@@ -794,8 +786,7 @@ pub async fn admin_set_caps(
             "a public link has no capabilities",
         ));
     }
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         decide!(require_admin(&txn, caller).await?);
         let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some();
@@ -842,10 +833,10 @@ pub async fn admin_list(client: &Client, caller: &str) -> Result<Vec<UserEntry>,
 /// Refuses (`EACCES`) unless `caller` is an admin (`require_admin`, outside
 /// a transaction).
 pub async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
-        require_admin(&txn, caller).await
-    })
+    run_txn(
+        client,
+        |txn| async move { require_admin(&txn, caller).await },
+    )
     .await?
 }
 
@@ -870,10 +861,9 @@ pub async fn enrol(
     validate(keys)?;
     let hash = enrolment_code_hash(code);
     let encoded = encode(keys);
-    retrying(|| {
+    run_txn(client, |txn| {
         let (hash, encoded) = (&hash, &encoded);
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             let issued = txn.read_one(&code_key(user)).await?.value;
             if issued.as_deref() != Some(hash.as_slice()) {
                 return Ok(Err(FsError::new(
@@ -925,10 +915,9 @@ pub async fn change_password(
 ) -> Result<(), FsError> {
     validate(keys)?;
     let encoded = encode(keys);
-    retrying(|| {
+    run_txn(client, |txn| {
         let encoded = &encoded;
         async move {
-            let txn = client.transaction(TXN_TTL).await?;
             let current = match txn.read_one(&keys_key(user)).await?.value {
                 Some(bytes) => match decode(user, &bytes) {
                     Ok(current) => Some(current),
@@ -962,8 +951,7 @@ pub async fn change_password(
 /// are gone (their identity cache).
 pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
     let granted = &list_granted(client, user).await?;
-    retrying(|| async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, |txn| async move {
         let existed = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some()
             || txn.read_one(&info_key(user)).await?.value.is_some()

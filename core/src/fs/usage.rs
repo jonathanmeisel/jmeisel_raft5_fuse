@@ -390,8 +390,7 @@ impl FsCore {
         changes: &[(u64, i64)],
     ) -> Result<Option<u64>, FsError> {
         let key = &usage_key(owner);
-        Ok(retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        Ok(run_txn(&self.client, move |txn| async move {
             let (bytes, at) = txn
                 .read_one(key)
                 .await?
@@ -418,8 +417,7 @@ impl FsCore {
     /// none: measuring makes it.
     async fn add_to_size(&self, ino: u64, changes: &[(u64, i64)]) -> Result<Option<u64>, FsError> {
         let key = &folder_size_key(ino);
-        Ok(retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        Ok(run_txn(&self.client, move |txn| async move {
             let Some((bytes, files, at)) =
                 txn.read_one(key).await?.value.and_then(|v| decode_size(&v))
             else {
@@ -637,8 +635,7 @@ impl FsCore {
             ));
         }
         let key = &folder_limit_key(ino);
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             // Not for a folder whose deletion has begun: its record would
             // stay after it.
             let entry = decide!(live_entry(&txn, ino).await?);
@@ -663,8 +660,7 @@ impl FsCore {
         let tree = self.load_tree_at(ino).await?;
         let (bytes, files) = folder_sizes(&tree, ino)[&ino];
         let key = &folder_size_key(ino);
-        retrying(move || async move {
-            let txn = self.client.transaction(TXN_TTL).await?;
+        run_txn(&self.client, move |txn| async move {
             if live_entry(&txn, ino).await?.is_err() {
                 return Ok(());
             }
@@ -779,8 +775,7 @@ impl FsCore {
         }
 
         for batch in writes.chunks(WRITE_BATCH) {
-            retrying(move || async move {
-                let txn = self.client.transaction(TXN_TTL).await?;
+            run_txn(&self.client, move |txn| async move {
                 for (key, value) in batch {
                     txn.write(key, value.as_deref()).await?;
                 }

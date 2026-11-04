@@ -21,7 +21,7 @@ use raft5fs_crypto::data::CHUNK_OVERHEAD;
 use raft5fs_objstore::{ObjectName, S3Store, name::millis};
 use raft5fs_proto::types::{BlockRef, ChunkWrite, FsError, Layout, ObjectGrid, WriteBody};
 
-use crate::fs::{TXN_TTL, retrying};
+use crate::fs::{TXN_TTL, run_txn};
 use crate::layout::{OBJECT_GRID_KEY, chunk_key};
 use crate::view::ReadKeys;
 
@@ -122,8 +122,7 @@ pub(crate) async fn resolve_grid(
     client: &Client,
     wanted: ObjectGrid,
 ) -> Result<ObjectGrid, String> {
-    retrying(move || async move {
-        let txn = client.transaction(TXN_TTL).await?;
+    run_txn(client, move |txn| async move {
         if let Some(bytes) = txn.read_one(OBJECT_GRID_KEY).await?.value {
             return Ok(decode_grid(&bytes));
         }
