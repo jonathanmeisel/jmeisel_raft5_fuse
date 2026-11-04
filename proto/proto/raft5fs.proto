@@ -923,6 +923,9 @@ message UserEntry {
   AccountInfo account = 3;
   // How much the volumes they own hold (protocol 6 on).
   uint64 used = 4;
+  // When an unused invitation of theirs stops working, in seconds since the
+  // epoch; 0 if it never does. Absent if they have none.
+  optional uint64 code_expires = 5;
 }
 
 message UserList {

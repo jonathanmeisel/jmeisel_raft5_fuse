@@ -224,6 +224,7 @@ Adding a user issues an invitation (with the store options from section
 The invitation is one line: alice's one-time enrolment code, the servers'
 addresses and the CA certificate to trust for them. It is as secret as
 the code -- whoever has it can enrol as alice -- so hand it to her alone.
+It works for 14 days.
 She runs, on her own machine:
 
   raft5fs enrol 'raft5fs-invite:1:...'
@@ -738,6 +739,10 @@ as seeds.
   "no such enrolment code"
       The code is wrong, was issued to someone else, or was used: codes
       work once. `user add` issues another.
+
+  "<user>'s invitation has expired"
+      Invitations work for 14 days. `user add` issues another. `raft5fs
+      admin users` shows who has one waiting, and who has one expired.
 
   "Operation not permitted" making a file at the top of a mount
       Only volumes go there: `mkdir` one, and put files in it.

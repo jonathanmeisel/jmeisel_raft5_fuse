@@ -117,7 +117,16 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 .map_err(|e| format!("cannot list users: {e}"))?;
             users.sort_by(|a, b| a.user.cmp(&b.user));
             for u in users {
-                let state = if u.enrolled { "enrolled" } else { "invited" };
+                let now = raft5fs_proto::clock::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let state = match (u.enrolled, u.code_expires) {
+                    (_, Some(end)) if end != 0 && end < now => "invitation expired",
+                    (true, Some(_)) => "enrolled, new invitation waiting",
+                    (true, None) => "enrolled",
+                    (false, _) => "invited",
+                };
                 let what = match u.info.kind {
                     AccountKind::Link => format!("public link made by {}", u.info.owner),
                     AccountKind::Person => format!(

@@ -1368,3 +1368,136 @@ fn names_a_path_cant_say_stay_out_of_listings() {
         }
     }
 }
+
+#[test]
+fn an_invitation_works_for_two_weeks() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let key = [b"\x06e/", "dave".as_bytes()].concat();
+    let code = rt
+        .block_on(accounts::add(
+            &backend.client,
+            "dave",
+            Caps::NONE,
+            Caps::NONE,
+        ))
+        .unwrap();
+    let pending = |user: &str| {
+        let users = rt.block_on(accounts::list(&backend.client)).unwrap();
+        users
+            .into_iter()
+            .find(|u| u.user == user)
+            .unwrap()
+            .code_expires
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let end = pending("dave").unwrap();
+    assert!(
+        (now + 13 * 86400..=now + 15 * 86400).contains(&end),
+        "{end}"
+    );
+
+    // Fifteen days on, it's refused. The right code says why; a wrong one says
+    // nothing more than it ever did.
+    let stored = backend.read_key(&key).unwrap();
+    let old = [&stored[..32], &(now - 15 * 86400).to_be_bytes()[..]].concat();
+    backend.write_key(&key, Some(&old));
+    assert!(pending("dave").unwrap() < now);
+    let refused = rt
+        .block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials("dave"),
+            &code,
+            KdfParams::TESTING,
+        ))
+        .unwrap_err();
+    assert!(refused.message.contains("expired"), "{refused}");
+    let refused = rt
+        .block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials("dave"),
+            "not-the-code",
+            KdfParams::TESTING,
+        ))
+        .unwrap_err();
+    assert!(!refused.message.contains("expired"), "{refused}");
+
+    // A code from before they had an end still works.
+    backend.write_key(&key, Some(&stored[..32]));
+    assert_eq!(pending("dave"), Some(0));
+    enrol_with(&backend, "dave", &code);
+    assert_eq!(pending("dave"), None);
+}
+
+/// A name can come back as someone else. They get nothing the name had.
+#[test]
+fn a_name_that_comes_back_gets_nothing_it_had() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let erin_key = backend.enrol("erin");
+    let bob = vault(&backend, "bob");
+    rt.block_on(bob.trust("erin", &fingerprint_words(&erin_key)))
+        .unwrap();
+    let docs = rt
+        .block_on(bob.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.grant(docs, "erin", true, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(bob.remote().offer_volume(docs, "erin"))
+        .unwrap();
+    let erin = vault(&backend, "erin");
+    assert_eq!(rt.block_on(erin.remote().offers()).unwrap().len(), 1);
+
+    // Removing takes every grant, whenever it was made.
+    let tester = vault(&backend, TESTER);
+    rt.block_on(tester.trust("bob", &fingerprint_words(&bob_key)))
+        .unwrap();
+    let theirs = rt
+        .block_on(tester.create_volume(OsStr::new("theirs"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.grant(theirs, "bob", true, OsStr::new("theirs")))
+        .unwrap();
+    let grant = [&[0x07], &theirs.to_be_bytes()[..], b"bob"].concat();
+    let index = [b"\x09bob\x00", &theirs.to_be_bytes()[..]].concat();
+    let row = backend.read_key(&grant).unwrap();
+    drop(bob);
+    assert!(
+        rt.block_on(accounts::remove(&backend.client, "bob"))
+            .unwrap()
+    );
+    assert!(backend.keys_with_prefix(b"\x09bob\x00").is_empty());
+
+    // The offer of a removed owner doesn't stand.
+    assert!(rt.block_on(erin.remote().offers()).unwrap().is_empty());
+
+    // A grant that outlived the name goes when it is next enrolled.
+    backend.write_key(&grant, Some(&row));
+    backend.write_key(&index, Some(&[]));
+    let code = rt
+        .block_on(accounts::add(
+            &backend.client,
+            "bob",
+            Caps::NONE,
+            Caps::NONE,
+        ))
+        .unwrap();
+    enrol_with(&backend, "bob", &code);
+    assert!(backend.keys_with_prefix(b"\x09bob\x00").is_empty());
+    assert!(backend.read_key(&grant).is_none());
+
+    // The volume's record still names bob, but this bob can't give it away.
+    let new_bob = connect(&backend, "bob");
+    assert_eq!(
+        errno(rt.block_on(new_bob.offer_volume(docs, "erin"))),
+        libc::EPERM
+    );
+    assert!(rt.block_on(new_bob.offers()).unwrap().is_empty());
+}

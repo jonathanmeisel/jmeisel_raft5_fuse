@@ -117,15 +117,17 @@ pub(crate) async fn acting_owner(client: &Client, ino: u64) -> Result<Option<Str
     }) else {
         return Ok(None);
     };
-    let writes = match client
-        .read_one(&grants::grant_key(ino, &owner))
-        .await?
-        .value
-    {
-        Some(bytes) => grants::decode_grant(ino, &bytes)?.writable,
-        None => false,
-    };
-    Ok(writes.then_some(owner))
+    Ok(writes_now(client, ino, &owner).await?.then_some(owner))
+}
+
+/// Whether `user` has a writable grant of `ino` itself, as of now.
+async fn writes_now(client: &Client, ino: u64, user: &str) -> Result<bool, FsError> {
+    Ok(
+        match client.read_one(&grants::grant_key(ino, user)).await?.value {
+            Some(bytes) => grants::decode_grant(ino, &bytes)?.writable,
+            None => false,
+        },
+    )
 }
 
 /// Whether `user` has a writable grant of `ino` itself.
@@ -176,7 +178,11 @@ impl FsCore {
         }
         run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
-            if record.owner.as_deref() != Some(caller.user.as_str()) {
+            // The record keeps the name of a removed owner, and someone new
+            // can get that name. They must not get the volume with it.
+            if record.owner.as_deref() != Some(caller.user.as_str())
+                || !decide!(writes_at(&txn, ino, &caller.user).await?)
+            {
                 return Ok(Err(FsError::new(
                     libc::EPERM,
                     "only the volume's owner can give it away",
@@ -288,6 +294,12 @@ impl FsCore {
                 continue;
             };
             if to != caller.user && from != caller.user {
+                continue;
+            }
+            // Either name may be someone new now, with no access to it.
+            if !writes_now(&self.client, ino, &from).await?
+                || !writes_now(&self.client, ino, &to).await?
+            {
                 continue;
             }
             offers.push(Offer {

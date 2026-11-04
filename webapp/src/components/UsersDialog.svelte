@@ -183,7 +183,13 @@
     bytes: items.reduce((n, u) => n + u.bytes, 0),
   });
 
-  const what = (u) => (u.kind === "link" ? `public link made by ${u.owner}` : u.enrolled ? "" : "invited");
+  function what(u) {
+    if (u.kind === "link") return `public link made by ${u.owner}`;
+    const end = u.codeExpires ?? null;
+    if (end && end < Date.now() / 1000) return "invitation expired";
+    if (!u.enrolled) return "invited";
+    return end === null ? "" : "new invitation waiting";
+  }
 </script>
 
 {#snippet heirs(o)}

@@ -486,6 +486,9 @@ pub struct UserEntry {
     pub info: AccountInfo,
     /// How much the volumes they own hold (`Storage::used`).
     pub used: u64,
+    /// When an unused invitation of theirs stops working, in seconds since
+    /// the epoch; 0 if it never does. `None` if they have none.
+    pub code_expires: Option<u64>,
 }
 
 /// A folder or file that no account can reach any more, with everything

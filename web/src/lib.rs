@@ -1278,8 +1278,9 @@ impl Fs {
     /// Every account, for an admin, as `[{user, enrolled, caps, kind,
     /// invitedBy, owner, used, quota}]`: `enrolled` is false for an
     /// invitation nobody used yet, `kind` is `person` or `link` (made by
-    /// `owner`), and `used` and `quota` are bytes (`quota` null for no
-    /// limit).
+    /// `owner`), `used` and `quota` are bytes (`quota` null for no limit),
+    /// and `codeExpires` is when an unused invitation stops working (seconds
+    /// since the epoch; 0 never; null for none).
     #[wasm_bindgen(js_name = listUsers)]
     pub fn list_users(&self) -> Promise {
         let inner = Rc::clone(&self.0);
@@ -1295,6 +1296,7 @@ impl Fs {
                 owner: String,
                 used: u64,
                 quota: Option<u64>,
+                code_expires: Option<u64>,
             }
             let mut users = inner.vault().remote().list_users().await?;
             users.sort_by(|a, b| a.user.cmp(&b.user));
@@ -1312,6 +1314,7 @@ impl Fs {
                     owner: u.info.owner,
                     used: u.used,
                     quota: u.info.quota,
+                    code_expires: u.code_expires,
                 })
                 .collect::<Vec<_>>())
         })
