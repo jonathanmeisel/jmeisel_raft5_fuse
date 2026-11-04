@@ -617,9 +617,42 @@ pub async fn fetch_kv(
     let mut partial = out.as_os_str().to_owned();
     partial.push(".partial");
     let partial = PathBuf::from(partial);
-    let mut file = tokio::fs::File::create(&partial)
+    // It holds the store's contents in the clear, so only its owner may read
+    // it. A new file gets that from the start, whatever an old one had.
+    let _ = tokio::fs::remove_file(&partial).await;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&partial)
         .await
         .map_err(|e| format!("creating {}: {e}", partial.display()))?;
+    let written = write_parts(backup, &key, &manifest, name, &mut file, &partial).await;
+    let written = match written {
+        Ok(written) => written,
+        Err(e) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(e);
+        }
+    };
+    tokio::fs::rename(&partial, out)
+        .await
+        .map_err(|e| format!("renaming to {}: {e}", out.display()))?;
+    Ok(written)
+}
+
+/// Opens every part of backup `name`'s store backup and writes it to `file`,
+/// the temporary file at `partial`. Returns how many bytes it wrote.
+async fn write_parts(
+    backup: &BackupStore,
+    key: &Key,
+    manifest: &BackupManifest,
+    name: &str,
+    file: &mut tokio::fs::File,
+    partial: &Path,
+) -> Result<u64, String> {
     let mut written = 0;
     let count = manifest.parts.len();
     for (index, part) in manifest.parts.iter().enumerate() {
@@ -631,7 +664,7 @@ pub async fn fetch_kv(
         if sealed.len() as u64 != part.sealed_len || digest(&sealed).as_slice() != part.sha256 {
             return Err(format!("part {index} of backup {name} is damaged"));
         }
-        let plain = open_part(&key, name, index as u32, index + 1 == count, &sealed)
+        let plain = open_part(key, name, index as u32, index + 1 == count, &sealed)
             .map_err(|e| format!("part {index} of backup {name}: {e}"))?;
         file.write_all(&plain)
             .await
@@ -641,9 +674,6 @@ pub async fn fetch_kv(
     file.sync_all()
         .await
         .map_err(|e| format!("writing {}: {e}", partial.display()))?;
-    tokio::fs::rename(&partial, out)
-        .await
-        .map_err(|e| format!("renaming to {}: {e}", out.display()))?;
     Ok(written)
 }
 

@@ -2,6 +2,7 @@
 //! orphaned volumes, against a real store and servers.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use raft5fs_client::remote::Remote;
@@ -10,7 +11,8 @@ use raft5fs_core::accounts;
 use raft5fs_crypto::Key;
 use raft5fs_crypto::data::seal_chunk;
 use raft5fs_proto::types::{
-    BLOCK_RANDOM_LEN, BlockRef, Caps, ChunkWrite, FsError, Grant, NewNode, SetAttr, WriteBody,
+    BLOCK_RANDOM_LEN, BlockRef, Caps, ChunkWrite, FsError, Grant, NewNode, SealedMove, SetAttr,
+    WriteBody,
 };
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
@@ -859,4 +861,86 @@ fn sealed_values_have_size_limits() {
     let longest = "n".repeat(255);
     rt.block_on(tester.create(v, OsStr::new(&longest), 0o644))
         .unwrap();
+}
+
+/// A quota check's answer says who owns a folder, how full it is and how big
+/// something is, so nothing gets one without the right to ask.
+#[test]
+fn a_room_check_tells_nothing_to_those_with_no_right_to_ask() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    make_admin(&backend, TESTER);
+    backend.enrol("bob");
+    backend.enrol("carol");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    let carol = pinned(&backend, "carol");
+    let make_file = |v: &Vault, dir: u64, name: &str, len: usize| {
+        let ino = rt
+            .block_on(v.create(dir, OsStr::new(name), 0o644))
+            .unwrap()
+            .ino;
+        rt.block_on(v.write(ino, 0, &vec![1; len])).unwrap();
+        ino
+    };
+
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let big = make_file(&tester, v, "big", 5000);
+    rt.block_on(tester.remote().measure_usage()).unwrap();
+    rt.block_on(tester.remote().set_quota(TESTER, Some(6000)))
+        .unwrap();
+    rt.block_on(tester.remote().set_quota("carol", Some(1)))
+        .unwrap();
+
+    // A stranger's move into the full volume is refused for having no access,
+    // not with the owner's name and usage.
+    let hers = rt
+        .block_on(carol.create_volume(OsStr::new("hers"), 0o755))
+        .unwrap()
+        .ino;
+    let tag = "t".repeat(32);
+    let tag = OsStr::new(&tag);
+    let moved = |ino| SealedMove {
+        ino,
+        node_keys: Vec::new(),
+        sealed_name: vec![1; 10],
+    };
+    let refused = rt
+        .block_on(carol.remote().rename(hers, tag, v, tag, true, &moved(big)))
+        .unwrap_err();
+    assert_eq!(refused.errno, libc::EACCES, "{refused}");
+
+    // Accepting a volume nobody offered doesn't reveal if it would fit.
+    assert_eq!(
+        errno(rt.block_on(carol.remote().answer_offer(v, true))),
+        libc::ENOENT
+    );
+
+    // Someone who can write to both folders still can't size up another
+    // inode: the check is of what the name really points to.
+    let a = rt
+        .block_on(tester.mkdir(v, OsStr::new("a"), 0o755))
+        .unwrap()
+        .ino;
+    let b = rt
+        .block_on(tester.mkdir(v, OsStr::new("b"), 0o755))
+        .unwrap()
+        .ino;
+    make_file(&tester, b, "small", 10);
+    rt.block_on(tester.remote().set_quota(TESTER, None))
+        .unwrap();
+    rt.block_on(tester.remote().set_folder_limit(a, Some(100)))
+        .unwrap();
+    rt.block_on(tester.grant(v, "bob", true, OsStr::new("v")))
+        .unwrap();
+    let prefix = raft5fs_core::dirent_prefix(b);
+    let key = backend.keys_with_prefix(&prefix).remove(0);
+    let small_tag = OsStr::from_bytes(&key[prefix.len()..]);
+    let refused = rt
+        .block_on(bob.remote().rename(b, small_tag, a, tag, true, &moved(big)))
+        .unwrap_err();
+    assert_eq!(refused.errno, libc::ESTALE, "{refused}");
 }

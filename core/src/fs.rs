@@ -1261,10 +1261,6 @@ impl FsCore {
         check_sealed_size("a key record", &sealed.node_keys, MAX_SEALED_RECORD)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
-        if new_parent != parent {
-            // Before the move, as a write's check is: soft, like quotas.
-            self.check_move_room(sealed.ino, parent, new_parent).await?;
-        }
         let replaced = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, parent, true).await?);
             if new_parent != parent {
@@ -1327,6 +1323,11 @@ impl FsCore {
                     libc::ESTALE,
                     "the name moved meanwhile names another inode now",
                 )));
+            }
+            // Only now: its answer says what the target holds and what the
+            // inode's size is, for someone who may write to both folders.
+            if moves && let Err(e) = self.check_move_room(ino, parent, new_parent).await {
+                return Ok(Err(e));
             }
             // Its name is sealed under the new parent's key, and a stale
             // node must not look fresh after the move.

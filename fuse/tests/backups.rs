@@ -302,6 +302,30 @@ fn only_the_operator_key_opens_the_store_backup() {
     assert!(!out.exists());
 }
 
+/// A failed restore leaves no part of the store's contents behind.
+#[test]
+fn a_damaged_store_backup_leaves_no_file() {
+    let (h, space, backup) = setup();
+    let key = BackupKeyPair::generate();
+    h.snapshot("s1");
+    create(&h, &backup, &key, "s1").unwrap();
+    let part = space
+        .keys()
+        .into_iter()
+        .find(|k| k.contains("/kv/"))
+        .expect("a part of the store backup");
+    space.insert(&part, b"not what was stored".to_vec());
+
+    let out = support::temp_dir("restore").join("kv");
+    let why = h
+        .runtime
+        .block_on(backup::fetch_kv(&backup, &key, "s1", &out))
+        .unwrap_err();
+    assert!(why.contains("is damaged"), "{why}");
+    assert!(!out.exists());
+    assert!(!out.with_file_name("kv.partial").exists());
+}
+
 #[test]
 fn a_backup_restores_into_a_new_cluster() {
     let (h, space, _) = setup();
@@ -325,6 +349,11 @@ fn a_backup_restores_into_a_new_cluster() {
         .unwrap();
     assert!(written > 4096, "only {written} bytes");
     assert_eq!(fs::metadata(&out).unwrap().len(), written);
+    // It holds the store's contents in the clear.
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&out).unwrap().permissions()) & 0o777,
+        0o600
+    );
 
     // A new cluster and object store, as after losing both.
     let (cluster, _client) = support::TestCluster::start_from_backup(&h.runtime, &out);
