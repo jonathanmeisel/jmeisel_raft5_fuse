@@ -91,18 +91,15 @@ impl Vault {
     pub async fn grant_roots(&self) -> Result<Vec<GrantRoot>, FsError> {
         let mut grants = self.remote.list_grants().await?;
         grants.sort_by_key(|g| g.ino);
-        Ok(grants
-            .into_iter()
-            .map(|grant| GrantRoot {
-                label: self
-                    .identity
-                    .open_label(grant.ino, &grant.sealed_label)
-                    .map(os_bytes::into_name)
-                    .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino))),
+        let mut roots = Vec::with_capacity(grants.len());
+        for grant in grants {
+            roots.push(GrantRoot {
+                label: self.root_label(&grant).await,
                 ino: grant.ino,
                 writable: grant.writable,
-            })
-            .collect())
+            });
+        }
+        Ok(roots)
     }
 
     /// Prunes directory `top` and everything below it, from the top down. A

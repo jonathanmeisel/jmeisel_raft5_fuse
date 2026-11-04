@@ -71,8 +71,8 @@ use raft5fs_proto::pb::{
 };
 use raft5fs_proto::pb::{
     AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, CreateLinkAccountRequest,
-    FolderLimitRequest, OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest,
-    SetQuotaRequest, UsernameRequest,
+    FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest, PutPinsRequest,
+    SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -1033,6 +1033,18 @@ impl Remote {
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
             async move { c.create_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Replaces the label of this account's own grant of `ino`.
+    pub async fn set_grant_label(&self, ino: u64, sealed_label: Vec<u8>) -> Result<(), FsError> {
+        self.needs_protocol(8, "signed labels")?;
+        let req = GrantLabelRequest { ino, sealed_label };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.set_grant_label(req).await }
         })
         .await?
         .into_result()

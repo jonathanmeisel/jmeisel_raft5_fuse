@@ -34,6 +34,9 @@ const RESTORE_HINT: &str = "The servers may be rolling this back, or the filesys
 /// folder can meet thousands, and each save writes the whole blob.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 
+/// How the blob of `PinMemory` says that the account signed its labels.
+const LABELS_SIGNED: &str = "labels-signed";
+
 /// The newest key versions this device has seen.
 #[derive(Default)]
 pub(super) struct Versions {
@@ -48,6 +51,8 @@ pub(super) struct Versions {
 pub(super) struct PinMemory {
     /// The highest counter seen.
     pub(super) floor: u64,
+    /// Whether the account has signed its old labels (`Vault::sign_labels`).
+    pub(super) labels_signed: bool,
     /// The pins as of the last merge, or `None` before the first.
     pub(super) base: Option<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
 }
@@ -65,11 +70,9 @@ fn parse_versions(data: &[u8]) -> HashMap<u64, u32> {
 fn parse_pin_memory(data: &[u8]) -> PinMemory {
     let text = String::from_utf8_lossy(data);
     let mut lines = text.lines();
-    let floor = lines
-        .next()
-        .and_then(|line| line.strip_prefix("counter "))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+    let mut head = lines.next().unwrap_or_default().split_whitespace().skip(1);
+    let floor = head.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    let labels_signed = head.next() == Some(LABELS_SIGNED);
     let base = lines
         .filter_map(|line| {
             let (user, hex) = line.split_once(' ')?;
@@ -78,6 +81,7 @@ fn parse_pin_memory(data: &[u8]) -> PinMemory {
         .collect();
     PinMemory {
         floor,
+        labels_signed,
         base: Some(base),
     }
 }
@@ -243,7 +247,12 @@ impl Vault {
 
 impl PinMemory {
     fn to_text(&self, floor: u64) -> String {
-        let mut text = format!("counter {floor}\n");
+        let labels = if self.labels_signed {
+            LABELS_SIGNED
+        } else {
+            ""
+        };
+        let mut text = format!("counter {floor} {labels}\n");
         let mut users: Vec<_> = self.base.iter().flatten().collect();
         users.sort();
         for (user, key) in users {

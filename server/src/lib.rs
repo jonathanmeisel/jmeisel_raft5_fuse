@@ -50,9 +50,10 @@ use raft5fs_proto::pb::{
 };
 use raft5fs_proto::pb::{
     AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, FolderLimitRequest,
-    FolderSizesRequest, FolderSizesResponse, OfferListResponse, OfferVolumeRequest,
-    OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
-    StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
+    FolderSizesRequest, FolderSizesResponse, GrantLabelRequest, OfferListResponse,
+    OfferVolumeRequest, OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
+    SetQuotaRequest, StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest,
+    VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use throttle::LoginThrottle;
@@ -823,6 +824,18 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let checked = self.core.check_room_for(&caller, r.ino, r.bytes).await;
         Ok(Response::new(checked.into()))
+    }
+
+    async fn set_grant_label(
+        &self,
+        r: Request<GrantLabelRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set = self
+            .core
+            .set_grant_label(&caller, r.ino, &r.sealed_label)
+            .await;
+        Ok(Response::new(set.into()))
     }
 
     async fn set_folder_limit(

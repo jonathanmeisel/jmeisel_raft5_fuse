@@ -115,7 +115,37 @@ impl Identity {
         Ok((version, key))
     }
 
-    /// Opens the label that a grant of `ino` shows as.
+    /// Opens a label of `ino` that `seal_signed_label` sealed, with the key
+    /// of the user that `label_signer` names.
+    pub fn open_signed_label(
+        &self,
+        signer_key: &[u8; PUBLIC_KEY_LEN],
+        ino: u64,
+        sealed: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let what = "a grant's name";
+        let (&SIGNED_LABEL, sealed) = sealed.split_first().ok_or(Error(what))? else {
+            return Err(Error(what));
+        };
+        let mut r = Reader(sealed);
+        let signer = r.bytes(what)?;
+        let nonce = r.take(NONCE_LEN, what)?;
+        let boxed = r.0;
+        let plain = ChaChaBox::new(&PublicKey::from_bytes(*signer_key), &self.secret)
+            .decrypt(nonce.into(), boxed)
+            .map_err(|_| Error(what))?;
+        let mut r = Reader(&plain);
+        if r.take(LABEL_DOMAIN.len(), what)? != LABEL_DOMAIN
+            || r.bytes(what)? != signer
+            || r.take(PUBLIC_KEY_LEN, what)? != self.public_key()
+            || r.take(8, what)? != ino.to_be_bytes()
+        {
+            return Err(Error(what));
+        }
+        Ok(r.0.to_vec())
+    }
+
+    /// Opens a label sealed with `seal_label`, which anyone could have made.
     pub fn open_label(&self, ino: u64, sealed: &[u8]) -> Result<Vec<u8>, Error> {
         let what = "a grant's name";
         let plain = self.unseal(sealed, what)?;
@@ -133,6 +163,10 @@ impl Identity {
 
 const NONCE_LEN: usize = 24;
 const GRANT_DOMAIN: &[u8] = b"raft5fs/grant";
+const LABEL_DOMAIN: &[u8] = b"raft5fs/label";
+/// The first byte of a signed label. An unsigned one starts with a random
+/// key, so it can start with this too: it then doesn't open as signed.
+const SIGNED_LABEL: u8 = 0xA5;
 
 /// Seals `ino`'s key at `version` from `sender` (whose account is
 /// `sender_name`) to the holder of `public_key`. See the module doc.
@@ -170,9 +204,45 @@ pub fn grant_sender(sealed: &[u8]) -> Result<&str, Error> {
     std::str::from_utf8(name).map_err(|_| Error(what))
 }
 
-/// Seals the label that a grant of `ino` shows as in the grantee's root.
-/// The grantee cannot read the node's real name, which is sealed under its
-/// parent's key.
+/// The name a grant of `ino` shows as, sealed to `public_key` by `signer`, so
+/// that the servers can't replace it with a name of their own. A signer can be
+/// the grantee, who re-seals a label once they have checked it.
+pub fn seal_signed_label(
+    signer: &Identity,
+    signer_name: &str,
+    public_key: &[u8; PUBLIC_KEY_LEN],
+    ino: u64,
+    name: &[u8],
+) -> Vec<u8> {
+    let mut plain = LABEL_DOMAIN.to_vec();
+    put_bytes(&mut plain, signer_name.as_bytes());
+    plain.extend_from_slice(public_key);
+    plain.extend_from_slice(&ino.to_be_bytes());
+    plain.extend_from_slice(name);
+    let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+    let boxed = ChaChaBox::new(&PublicKey::from_bytes(*public_key), &signer.secret)
+        .encrypt(&nonce, plain.as_slice())
+        .expect("sealing in-memory data can't fail");
+    let mut out = vec![SIGNED_LABEL];
+    put_bytes(&mut out, signer_name.as_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&boxed);
+    out
+}
+
+/// Who a signed label claims to be from, or `None` if it isn't one. This is
+/// only a claim until `open_signed_label` opens the label with their key.
+pub fn label_signer(sealed: &[u8]) -> Option<&str> {
+    let (&SIGNED_LABEL, rest) = sealed.split_first()? else {
+        return None;
+    };
+    std::str::from_utf8(Reader(rest).bytes("a label's signer").ok()?).ok()
+}
+
+/// Seals a name for the holder of `public_key`, tied to `ino`. Anyone could
+/// have made one, the servers too. So this is for what only names something to
+/// its own maker, such as a public link's note. A grant's label needs
+/// `seal_signed_label`.
 pub fn seal_label(public_key: &[u8; PUBLIC_KEY_LEN], ino: u64, name: &[u8]) -> Vec<u8> {
     let mut plain = ino.to_be_bytes().to_vec();
     plain.extend_from_slice(name);
@@ -404,6 +474,59 @@ mod tests {
         assert_eq!(alice.open_label(7, &label).unwrap(), b"photos");
         assert!(alice.open_label(8, &label).is_err());
         assert!(Identity::generate().open_label(7, &label).is_err());
+    }
+
+    #[test]
+    fn a_signed_label_opens_only_with_its_signers_key() {
+        let (alice, bob, eve) = (
+            Identity::generate(),
+            Identity::generate(),
+            Identity::generate(),
+        );
+        let label = seal_signed_label(&bob, "bob", &alice.public_key(), 7, b"photos");
+        assert_eq!(label_signer(&label), Some("bob"));
+        assert_eq!(
+            alice
+                .open_signed_label(&bob.public_key(), 7, &label)
+                .unwrap(),
+            b"photos"
+        );
+        assert!(
+            alice
+                .open_signed_label(&bob.public_key(), 8, &label)
+                .is_err()
+        );
+        assert!(
+            alice
+                .open_signed_label(&eve.public_key(), 7, &label)
+                .is_err()
+        );
+        assert!(eve.open_signed_label(&bob.public_key(), 7, &label).is_err());
+
+        // Eve can't make one that claims to be bob's.
+        let forged = seal_signed_label(&eve, "bob", &alice.public_key(), 7, b"bills");
+        assert!(
+            alice
+                .open_signed_label(&bob.public_key(), 7, &forged)
+                .is_err()
+        );
+
+        // A grantee can seal their own, which holds whatever the sharer does later.
+        let mine = seal_signed_label(&alice, "alice", &alice.public_key(), 7, b"photos");
+        assert_eq!(
+            alice
+                .open_signed_label(&alice.public_key(), 7, &mine)
+                .unwrap(),
+            b"photos"
+        );
+
+        // An unsigned label isn't taken for a signed one.
+        let plain = seal_label(&alice.public_key(), 7, b"photos");
+        assert!(
+            alice
+                .open_signed_label(&bob.public_key(), 7, &plain)
+                .is_err()
+        );
     }
 
     #[test]

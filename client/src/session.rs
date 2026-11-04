@@ -180,8 +180,13 @@ impl Session {
         // Trust what the account's other devices trust. Not being able to
         // merge isn't a reason to refuse the session: the pins here still
         // work, and the next change merges again.
-        if let Err(e) = vault.sync_pins().await {
-            eprintln!("trusted keys not merged with the servers' copy: {e}");
+        match vault.sync_pins().await {
+            Ok(()) => {
+                if let Err(e) = vault.sign_labels().await {
+                    eprintln!("names of shares not signed yet: {e}");
+                }
+            }
+            Err(e) => eprintln!("trusted keys not merged with the servers' copy: {e}"),
         }
         let pruner = match config.prune_queue {
             Some((queue, prune_config)) => {

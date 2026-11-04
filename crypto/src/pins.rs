@@ -34,6 +34,9 @@ pub struct PinEntry {
 pub struct PinList {
     /// Goes up with every change. The servers can't read or change it.
     pub counter: u64,
+    /// Whether a device of this account has signed its old grant labels. Any
+    /// unsigned label after that didn't come from this account's check.
+    pub labels_signed: bool,
     pub entries: Vec<PinEntry>,
 }
 
@@ -42,6 +45,7 @@ pub fn seal_pins(identity: &Identity, user: &str, list: &PinList) -> Vec<u8> {
     let mut sorted: Vec<&PinEntry> = list.entries.iter().collect();
     sorted.sort_by(|a, b| a.user.cmp(&b.user));
     let mut plain = list.counter.to_be_bytes().to_vec();
+    plain.push(u8::from(list.labels_signed));
     plain.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
     for entry in sorted {
         put_bytes(&mut plain, entry.user.as_bytes());
@@ -70,10 +74,11 @@ pub fn open_pins(identity: &Identity, user: &str, sealed: &[u8]) -> Result<PinLi
     let key = identity.derive_key("pins");
     let plain = open(&key, &aad("pins", &[user.as_bytes()]), sealed, what)?;
     let mut r = Reader(&plain);
-    let counter = if version == VERSION {
-        u64::from_be_bytes(r.take(8, what)?.try_into().unwrap())
+    let (counter, labels_signed) = if version == VERSION {
+        let counter = u64::from_be_bytes(r.take(8, what)?.try_into().unwrap());
+        (counter, r.take(1, what)?[0] != 0)
     } else {
-        0
+        (0, false)
     };
     let count = r.u32(what)?;
     let mut entries: Vec<PinEntry> = Vec::new();
@@ -93,7 +98,11 @@ pub fn open_pins(identity: &Identity, user: &str, sealed: &[u8]) -> Result<PinLi
         entries.push(PinEntry { user, key, at });
     }
     r.finish(what)?;
-    Ok(PinList { counter, entries })
+    Ok(PinList {
+        counter,
+        labels_signed,
+        entries,
+    })
 }
 
 #[cfg(test)]
@@ -113,6 +122,7 @@ mod tests {
         let me = Identity::generate();
         let list = PinList {
             counter: 7,
+            labels_signed: true,
             entries: vec![entry("bob", Some(2), 20), entry("alice", None, 10)],
         };
         let sealed = seal_pins(&me, "carol", &list);
@@ -120,6 +130,7 @@ mod tests {
             open_pins(&me, "carol", &sealed).unwrap(),
             PinList {
                 counter: 7,
+                labels_signed: true,
                 entries: vec![entry("alice", None, 10), entry("bob", Some(2), 20)],
             }
         );
@@ -149,6 +160,7 @@ mod tests {
             open_pins(&me, "carol", &sealed).unwrap(),
             PinList {
                 counter: 0,
+                labels_signed: false,
                 entries: vec![entry("bob", None, 5)],
             }
         );

@@ -9,7 +9,7 @@ use raft5fs_client::remote::Remote;
 use raft5fs_client::store::{MemoryStore, Store};
 use raft5fs_client::vault::{KnownKeys, Vault};
 use raft5fs_core::accounts;
-use raft5fs_crypto::identity::fingerprint_words;
+use raft5fs_crypto::identity::{fingerprint_words, label_signer, seal_label, seal_signed_label};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
@@ -1153,4 +1153,153 @@ fn a_change_made_offline_survives_a_restart() {
     let restarted = device(&backend, TESTER, &store);
     rt.block_on(restarted.sync_pins()).unwrap();
     assert_eq!(restarted.known_keys().pinned("bob"), Some([9; 32]));
+}
+
+/// The name `ino` shows as in the root of `vault`.
+fn shown_as(backend: &Backend, vault: &Vault, ino: u64) -> String {
+    let entries = backend.runtime.block_on(vault.root_entries()).unwrap();
+    let (name, _) = entries.iter().find(|(_, i)| *i == ino).unwrap();
+    name.to_string_lossy().into_owned()
+}
+
+fn label_of(backend: &Backend, vault: &Vault, ino: u64) -> Vec<u8> {
+    let grants = backend.runtime.block_on(vault.remote().list_grants());
+    let grants = grants.unwrap();
+    let grant = grants.iter().find(|g| g.ino == ino).unwrap();
+    grant.sealed_label.clone()
+}
+
+/// Each account signs what it sees once. After that, the servers can't pass
+/// a share off as something else without it saying so.
+#[test]
+fn grant_labels_are_signed_once_and_then_checked() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    backend.enrol("eve");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.sync_pins()).unwrap();
+    let own = connect(&backend, TESTER).identity().unwrap();
+    let mine = own.public_key();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), Some(TESTER));
+
+    // A label from before signing shows as it is, and gets signed.
+    let old = seal_label(&mine, docs, b"older");
+    rt.block_on(me.remote().set_grant_label(docs, old)).unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "older");
+    rt.block_on(me.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "older");
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), Some(TESTER));
+
+    // After that, a label nobody vouches for says so. Another device learns
+    // that from the sealed pins, and doesn't sign it either.
+    let forged = seal_label(&mine, docs, b"forged");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "forged (unverified)");
+    let other = vault(&backend, TESTER);
+    rt.block_on(other.sync_pins()).unwrap();
+    rt.block_on(other.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &other, docs), "forged (unverified)");
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), None);
+
+    // So does one signed by someone this account hasn't checked, or by
+    // someone claiming to be this account.
+    let eves = connect(&backend, "eve").identity().unwrap();
+    let forged = seal_signed_label(&eves, "eve", &mine, docs, b"from eve");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "from eve (unverified)");
+    let forged = seal_signed_label(&eves, TESTER, &mine, docs, b"from me");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert!(shown_as(&backend, &me, docs).starts_with("unreadable-"));
+
+    // Its sender's label: plain while the whole share says it needs checking,
+    // and once checked, it becomes this account's own and stays so. A forgery
+    // of it says so.
+    let bobs = vault(&backend, "bob");
+    rt.block_on(bobs.trust(TESTER, &fingerprint_words(&mine)))
+        .unwrap();
+    let photos = rt
+        .block_on(bobs.create_volume(OsStr::new("photos"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(bobs.grant(photos, TESTER, false, OsStr::new("holiday")))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "holiday");
+    let forged = seal_signed_label(&eves, "eve", &mine, photos, b"bills");
+    rt.block_on(me.remote().set_grant_label(photos, forged))
+        .unwrap();
+    assert_eq!(
+        shown_as(&backend, &me, photos),
+        "bills",
+        "needs checking anyway"
+    );
+    let label = seal_signed_label(
+        &connect(&backend, "bob").identity().unwrap(),
+        "bob",
+        &mine,
+        photos,
+        b"holiday",
+    );
+    rt.block_on(me.remote().set_grant_label(photos, label))
+        .unwrap();
+    rt.block_on(me.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "holiday");
+    assert_eq!(label_signer(&label_of(&backend, &me, photos)), Some("bob"));
+    rt.block_on(me.sign_labels()).unwrap();
+    assert_eq!(label_signer(&label_of(&backend, &me, photos)), Some(TESTER));
+    let forged = seal_signed_label(&eves, "eve", &mine, photos, b"bills");
+    rt.block_on(me.remote().set_grant_label(photos, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "bills (unverified)");
+}
+
+/// A label is the holder's own: nobody changes another's, and a link only
+/// reads.
+#[test]
+fn only_the_grantee_sets_a_grants_label() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let bob = backend.enrol("bob");
+    backend.enrol("eve");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(
+        errno(
+            rt.block_on(
+                vault(&backend, "eve")
+                    .remote()
+                    .set_grant_label(docs, vec![1])
+            )
+        ),
+        libc::ENOENT
+    );
+    assert_eq!(
+        errno(rt.block_on(me.remote().set_grant_label(docs, vec![1; 8192]))),
+        libc::EINVAL
+    );
+    let (link, secret) = rt
+        .block_on(me.create_link(docs, "/docs", OsStr::new("docs"), None))
+        .unwrap();
+    let visitor = visit(&backend, &link, &secret).unwrap();
+    assert_eq!(
+        errno(rt.block_on(visitor.remote().set_grant_label(docs, vec![1]))),
+        libc::EACCES
+    );
+    // A link shows its signed label, and signs nothing.
+    rt.block_on(visitor.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &visitor, docs), "docs");
 }

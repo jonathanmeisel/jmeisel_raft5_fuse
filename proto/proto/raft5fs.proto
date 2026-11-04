@@ -86,6 +86,9 @@ service Fs {
   // grant of it that the user had. Needs read-write access to the
   // directory.
   rpc Grant(GrantRequest) returns (EmptyResponse);
+  // Replaces the sealed label of the caller's own grant of a directory. The
+  // caller's key and access stay as they are.
+  rpc SetGrantLabel(GrantLabelRequest) returns (EmptyResponse);
   // Makes a new top-level directory, granted read-write to its creator.
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume and every grant of it.
@@ -1009,6 +1012,11 @@ message OfferListResponse {
 message CheckRoomRequest {
   uint64 ino = 1;
   uint64 bytes = 2;
+}
+
+message GrantLabelRequest {
+  uint64 ino = 1;
+  bytes sealed_label = 2;
 }
 
 message FolderLimitRequest {

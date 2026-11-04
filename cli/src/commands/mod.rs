@@ -254,8 +254,13 @@ fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
         .map_err(|e| e.to_string())?
         .with_known_keys(ctx.known_keys()?);
     // Trust what the account's other devices trust.
-    if let Err(e) = runtime.block_on(vault.sync_pins()) {
-        eprintln!("warning: trusted keys not merged with the servers' copy: {e}");
+    match runtime.block_on(vault.sync_pins()) {
+        Ok(()) => {
+            if let Err(e) = runtime.block_on(vault.sign_labels()) {
+                eprintln!("warning: names of shares not signed yet: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: trusted keys not merged with the servers' copy: {e}"),
     }
     Ok(vault)
 }

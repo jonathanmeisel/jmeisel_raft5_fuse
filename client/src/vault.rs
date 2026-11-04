@@ -43,7 +43,7 @@ use raft5fs_crypto::data::{
 use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
 use raft5fs_crypto::identity::{
     Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, fingerprint_words, grant_sender,
-    seal_grant, seal_label,
+    label_signer, seal_grant, seal_label, seal_signed_label,
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
@@ -101,6 +101,18 @@ pub struct Share {
     /// The sender that the grant claims.
     pub sender: String,
     pub trust: ShareTrust,
+}
+
+/// Who vouches for a share's label.
+enum LabelSource {
+    /// This account sealed it.
+    Me,
+    /// Someone whose key this account checked.
+    Checked,
+    /// It's signed, by a key that only the servers vouch for.
+    Unchecked,
+    /// Nobody: anyone could have sealed it.
+    Unsigned,
 }
 
 /// Whether this account trusts a share's sender.
@@ -641,12 +653,18 @@ impl Vault {
     /// The servers can't read or change the list (raft5fs-crypto's
     /// `pins`). Does nothing on servers older than protocol 3.
     pub async fn sync_pins(&self) -> Result<(), FsError> {
+        self.merge_pins(false).await
+    }
+
+    /// `sync_pins`, and with `labels_signed`, records that this account has
+    /// signed its old labels.
+    async fn merge_pins(&self, labels_signed: bool) -> Result<(), FsError> {
         if self.remote.protocol() < 3 {
             return Ok(());
         }
         let me = self.remote.username().to_string();
         let local = self.known.all();
-        let rollback::PinMemory { floor, base } = self.load_pin_memory();
+        let rollback::PinMemory { floor, base, .. } = self.load_pin_memory();
         let now = raft5fs_proto::clock::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -709,11 +727,13 @@ impl Vault {
             // A list from before counters has nothing to protect it until
             // it has one.
             let uncounted = stored.counter == 0 && !sealed.is_empty();
+            let signed = stored.labels_signed || labels_signed;
             let mut counter = stored.counter;
-            if merged != before || uncounted {
+            if merged != before || uncounted || signed != stored.labels_signed {
                 counter = stored.counter.max(floor) + 1;
                 let list = PinList {
                     counter,
+                    labels_signed: signed,
                     entries: merged.values().cloned().collect(),
                 };
                 match self
@@ -746,6 +766,7 @@ impl Vault {
             }
             self.save_pin_memory(&rollback::PinMemory {
                 floor: counter,
+                labels_signed: signed,
                 base: Some(self.known.all()),
             })
             .map_err(io)?;
@@ -1325,11 +1346,7 @@ impl Vault {
         grants.sort_by_key(|g| g.ino);
         let mut roots = Roots::default();
         for grant in grants {
-            let label = self
-                .identity
-                .open_label(grant.ino, &grant.sealed_label)
-                .map(os_bytes::into_name)
-                .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
+            let label = self.root_label(&grant).await;
             let mut name = label.clone();
             let mut n = 2;
             while roots.by_name.contains_key(&name) || name.is_empty() || self.reserved(&name) {
@@ -1348,6 +1365,102 @@ impl Vault {
             .collect();
         *self.roots.lock().unwrap() = roots;
         Ok(entries)
+    }
+
+    /// Opens `grant`'s label, and says who vouches for it.
+    async fn read_label(&self, grant: &Grant) -> Option<(Vec<u8>, LabelSource)> {
+        let (ino, sealed) = (grant.ino, &grant.sealed_label);
+        if let Some(signer) = label_signer(sealed)
+            && check_username(signer).is_ok()
+        {
+            if signer == self.remote.username() {
+                let me = self.identity.public_key();
+                if let Ok(text) = self.identity.open_signed_label(&me, ino, sealed) {
+                    return Some((text, LabelSource::Me));
+                }
+            }
+            if let Some(pinned) = self.known.pinned(signer)
+                && let Ok(text) = self.identity.open_signed_label(&pinned, ino, sealed)
+            {
+                return Some((text, LabelSource::Checked));
+            }
+            if let Ok(served) = self.sender_key(signer).await
+                && let Ok(text) = self.identity.open_signed_label(&served, ino, sealed)
+            {
+                return Some((text, LabelSource::Unchecked));
+            }
+        }
+        let text = self.identity.open_label(ino, sealed).ok()?;
+        Some((text, LabelSource::Unsigned))
+    }
+
+    /// The name that `grant` shows as in the root.
+    ///
+    /// The servers could replace a label, to pass a share off as something
+    /// else. So once this account has signed its old labels, a label that
+    /// nobody it checked vouches for says so. Not for a share from someone it
+    /// hasn't checked: the whole share already says that it needs checking,
+    /// and its name shouldn't change when they check.
+    async fn root_label(&self, grant: &Grant) -> OsString {
+        let Some((text, source)) = self.read_label(grant).await else {
+            return OsString::from(format!("unreadable-{}", grant.ino));
+        };
+        let mut label = os_bytes::into_name(text);
+        let vouched = matches!(source, LabelSource::Me | LabelSource::Checked);
+        if !vouched && self.load_pin_memory().labels_signed && self.sender_checked(grant) {
+            label.push(" (unverified)");
+        }
+        label
+    }
+
+    /// Whether this account checked the sender that `grant` names.
+    fn sender_checked(&self, grant: &Grant) -> bool {
+        grant_sender(&grant.sealed_key).is_ok_and(|sender| {
+            sender == self.remote.username() || self.known.pinned(sender).is_some()
+        })
+    }
+
+    /// Seals this account's labels under its own key, where it can vouch for
+    /// them. They then hold whatever the sharer does later, like enrolling
+    /// again.
+    ///
+    /// - A label from someone this account checked: every time.
+    /// - An unsigned label: only the first time, trusting what it sees then.
+    ///   After that, this records in the sealed pins that it is done, so
+    ///   that an unsigned label means someone else wrote it.
+    ///
+    /// A failure leaves the rest for the next login. Does nothing for a public
+    /// link, which only reads, or on servers older than protocol 8.
+    pub async fn sign_labels(&self) -> Result<(), FsError> {
+        let me = self.remote.username();
+        if self.remote.protocol() < 8 || me.starts_with(LINK_PREFIX) {
+            return Ok(());
+        }
+        let done = self.load_pin_memory().labels_signed;
+        let own = self.identity.public_key();
+        for grant in self.remote.list_grants().await? {
+            let Some((text, source)) = self.read_label(&grant).await else {
+                continue;
+            };
+            let sign = match source {
+                LabelSource::Checked => true,
+                LabelSource::Unsigned => !done,
+                LabelSource::Me | LabelSource::Unchecked => false,
+            };
+            if !sign {
+                continue;
+            }
+            let sealed = seal_signed_label(&self.identity, me, &own, grant.ino, &text);
+            match self.remote.set_grant_label(grant.ino, sealed).await {
+                // Revoked in the meantime.
+                Err(e) if e.errno == errno::ENOENT => {}
+                other => other?,
+            }
+        }
+        if !done {
+            self.merge_pins(true).await?;
+        }
+        Ok(())
     }
 
     /// Whether `name` is reserved in the root. Only the live root's
@@ -1671,7 +1784,8 @@ impl Vault {
         let me = self.identity.public_key();
         let username = self.remote.username();
         let sealed_key = seal_grant(&self.identity, username, &me, ino, record.version, &key);
-        let sealed_label = seal_label(&me, ino, os_bytes::bytes(label));
+        let sealed_label =
+            seal_signed_label(&self.identity, username, &me, ino, os_bytes::bytes(label));
         let sealed_grantees = seal_grantees(
             &key,
             record.version,
@@ -1796,7 +1910,13 @@ impl Vault {
                     version,
                     &node.key,
                 ),
-                sealed_label: seal_label(&public_key, ino, os_bytes::bytes(label)),
+                sealed_label: seal_signed_label(
+                    &self.identity,
+                    self.remote.username(),
+                    &public_key,
+                    ino,
+                    os_bytes::bytes(label),
+                ),
             };
             let sealed_grantees = seal_grantees(&node.key, version, ino, &entries);
             let listed = entries.iter().map(|e| e.user.clone()).collect();
@@ -1969,11 +2089,7 @@ impl Vault {
         grants.sort_by_key(|g| g.ino);
         let mut shares = Vec::with_capacity(grants.len());
         for grant in grants {
-            let label = self
-                .identity
-                .open_label(grant.ino, &grant.sealed_label)
-                .map(os_bytes::into_name)
-                .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
+            let label = self.root_label(&grant).await;
             let sender = grant_sender(&grant.sealed_key).unwrap_or("?").to_string();
             let trust = match self.open_grant(grant.ino, &grant).await {
                 Ok((_, _, None)) => ShareTrust::Trusted,
