@@ -52,6 +52,16 @@
   let dialog = $state(null);
   let pendingCount = $state(0);
   let pruneQueued = $state(0);
+  /// Whether this tab is re-sealing now, and video or audio is playing.
+  let pruning = false;
+  let playing = false;
+
+  /// Whether work is in progress that an idle logout would kill: a transfer,
+  /// a stream the browser is reading (a download, say), playing media, or a
+  /// re-seal.
+  export function busy() {
+    return transfers.length > 0 || streaming.reading() || playing || pruning;
+  }
   /// What this account may do (see the wasm `account`).
   let account = $state({ caps: ["volumes"], kind: "person" });
   /// How much this account's top-level folders hold (see the wasm
@@ -495,7 +505,13 @@
   {/if}
 
   {#if !visitor}
-    <PruneBar {fs} onqueued={(n) => (pruneQueued = n)} />
+    <PruneBar
+      {fs}
+      onqueued={(n, running) => {
+        pruneQueued = n;
+        pruning = running;
+      }}
+    />
   {/if}
 
   {#each transfers as t}
@@ -532,6 +548,7 @@
     {fs}
     path={dialog.path}
     streams={streaming}
+    onmedia={(on) => (playing = on)}
     ondownload={() => act(() => download(dialog.path), [])}
     onclose={() => (dialog = null)}
   />

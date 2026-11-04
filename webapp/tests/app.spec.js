@@ -822,6 +822,63 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
   expect(problems.flat()).toEqual([]);
 });
 
+test("an idle logout waits for playing media, but not for ever", async ({ browser }) => {
+  const lena = await (await browser.newContext()).newPage();
+  const problems = watch(lena);
+  await lena.clock.install();
+  const loggedOut = lena.getByText("Logged out after 30 minutes without use.");
+
+  /// Opens the video, playing on a loop.
+  async function play() {
+    await item(lena, "clip.webm").dblclick();
+    const video = lena.getByRole("dialog").locator("video");
+    await expect(video).toBeVisible(SLOW);
+    await video.evaluate((v) => {
+      v.loop = true;
+      v.muted = true;
+      return v.play();
+    });
+    await expect.poll(() => video.evaluate((v) => !v.paused && v.readyState >= 2), SLOW).toBe(true);
+    return video;
+  }
+
+  await test.step("a playing video keeps the tab logged in", async () => {
+    await enrol(lena, "lena");
+    await login(lena, "lena");
+    await addFolder(lena, "films");
+    await open(lena, "films");
+    await uploadMedia(lena);
+    const video = await play();
+    await lena.clock.fastForward("31:00");
+    await expect(video).toBeVisible();
+    await expect(loggedOut).toHaveCount(0);
+    await test.step("and once it's paused, an idle tab logs out", async () => {
+      await video.evaluate(
+        (v) =>
+          new Promise((resolve) => {
+            v.addEventListener("pause", resolve, { once: true });
+            v.pause();
+          }),
+      );
+      await lena.clock.fastForward("31:00");
+      await expect(loggedOut).toBeVisible(SLOW);
+    });
+  });
+
+  await test.step("nothing keeps it logged in past 12 hours", async () => {
+    await login(lena, "lena");
+    await open(lena, "films");
+    const video = await play();
+    await lena.clock.fastForward("11:00:00");
+    await expect(video).toBeVisible();
+    await expect(loggedOut).toHaveCount(0);
+    await lena.clock.fastForward("01:01:00");
+    await expect(loggedOut).toBeVisible(SLOW);
+  });
+
+  expect(problems).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

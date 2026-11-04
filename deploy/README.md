@@ -520,8 +520,9 @@ What it trusts that the native client doesn't:
 - **"Stay logged in on this device"** (opt-in at login) keeps the
   account's unlock keys in the browser for 7 days, encrypted under a key
   the browser won't export. Anyone who can use that browser profile can
-  open the account until then; changing the password or logging out
-  ends it.
+  open the account until then. Changing the password, from any device,
+  ends it within seconds, along with every other session. Logging out
+  ends it in that browser.
 - **Pruning after a revoke runs in the browser,** only while the app is
   open. A large folder is better pruned with `raft5fs prune`.
 - **A service worker** streams video, audio, PDFs and downloads. It stays

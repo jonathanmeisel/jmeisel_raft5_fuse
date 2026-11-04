@@ -80,6 +80,34 @@ where
     out
 }
 
+/// The most that a sealed name may take. Names are 255 bytes at most on a
+/// mount, and this leaves room for longer ones from the web app.
+const MAX_SEALED_NAME: usize = 1 << 10;
+
+/// The most that a grant's sealed key, or its sealed label, may take.
+const MAX_SEALED_GRANT: usize = 4 << 10;
+
+/// The most that a key record, or a sealed grantee list, may take. Both grow
+/// with a folder's history and sharing, but this leaves room for thousands of
+/// key versions or grantees.
+const MAX_SEALED_RECORD: usize = 1 << 20;
+
+/// Refuses (`EINVAL`) a sealed value longer than `max`. The servers can't read
+/// these, but they store them on every node, and they count towards nothing.
+fn check_sealed_size(what: &str, sealed: &[u8], max: usize) -> Result<(), FsError> {
+    if sealed.len() > max {
+        return Err(FsError::new(libc::EINVAL, format!("{what} is too large")));
+    }
+    Ok(())
+}
+
+/// `check_sealed_size` for what a new grant stores.
+fn check_sealed_grant(key: &[u8], label: &[u8], grantees: &[u8]) -> Result<(), FsError> {
+    check_sealed_size("a grant's key", key, MAX_SEALED_GRANT)?;
+    check_sealed_size("a grant's label", label, MAX_SEALED_GRANT)?;
+    check_sealed_size("a grantee list", grantees, MAX_SEALED_RECORD)
+}
+
 /// How old a reservation must be for `sweep_reservations` to remove it: a
 /// create takes moments, so a day leaves room for clocks and slow clients.
 pub(crate) const RESERVATION_AGE: Duration = Duration::from_secs(24 * 3600);
@@ -165,15 +193,53 @@ fn no_objects() -> FsError {
 /// - with an `expected_seq`, find the chunk still at that seq (`EAGAIN` if
 ///   not).
 ///
-/// With `existing`, every chunk must already exist at its seq. Returns the
-/// objects that the stored blocks replaced, for `discard` after the
-/// transaction commits.
+/// How much of a file a sealed chunk holds.
+fn plain_len(sealed: &[u8]) -> u64 {
+    sealed.len().saturating_sub(CHUNK_OVERHEAD) as u64
+}
+
+/// Whether `w` stays within a file of `size` bytes. Only a file's size counts
+/// towards quotas and folder limits, so a chunk past it would be data that
+/// counts for nothing. A block's last segment can run past the end, because
+/// segments all have one length.
+fn fits_in_size(w: &ChunkWrite, size: u64, chunk_size: u64) -> bool {
+    let start = w.index.saturating_mul(chunk_size);
+    match &w.body {
+        WriteBody::Inline(blob) => start < size && plain_len(blob) <= size - start,
+        WriteBody::Block(block) => {
+            let last = w.index.saturating_add(u64::from(block.nseg.max(1)) - 1);
+            last.saturating_mul(chunk_size) < size
+        }
+    }
+}
+
+/// How much of a file `value`, a stored chunk or pointer, holds.
+fn stored_len(value: Vec<u8>, chunk_size: u64) -> u64 {
+    match ChunkValue::decode(value) {
+        ChunkValue::Inline(blob) => plain_len(&blob),
+        ChunkValue::Block(block) => u64::from(block.nseg) * chunk_size,
+    }
+}
+
+/// How much of a file `w` would hold.
+fn write_len(w: &ChunkWrite, chunk_size: u64) -> u64 {
+    match &w.body {
+        WriteBody::Inline(blob) => plain_len(blob),
+        WriteBody::Block(block) => u64::from(block.nseg) * chunk_size,
+    }
+}
+
+/// With `existing`, every chunk must already exist at its seq. Each chunk
+/// must stay within `size` bytes, or with `existing`, hold no more than the
+/// chunk it replaces. Returns the objects that the stored blocks replaced,
+/// for `discard` after the transaction commits.
 async fn put_chunks(
     core: &FsCore,
     txn: &Transaction,
     entry: &Entry,
     writes: &[ChunkWrite],
     existing: bool,
+    size: u64,
 ) -> Result<Result<Vec<Dropped>, FsError>, KvError> {
     let ino = entry.attr.ino;
     let now = SystemTime::now();
@@ -239,6 +305,24 @@ async fn put_chunks(
             )));
         }
         let key = chunk_key(ino, w.index);
+        // After the check above, so that a client racing a truncate hears that
+        // the chunk changed. A re-seal must still work on a chunk that a race
+        // left longer than the file, or its prune could never finish.
+        if !fits_in_size(w, size, core.chunk_size) {
+            let keeps_length = existing
+                && txn.read_one(&key).await?.value.is_some_and(|stored| {
+                    stored_len(stored, core.chunk_size) >= write_len(w, core.chunk_size)
+                });
+            if !keeps_length {
+                return Ok(Err(FsError::new(
+                    libc::EINVAL,
+                    format!(
+                        "chunk {} of inode {ino} doesn't fit in a file of {size} bytes",
+                        w.index
+                    ),
+                )));
+            }
+        }
         let value = match &w.body {
             WriteBody::Inline(blob) => blob.clone(),
             WriteBody::Block(block) => encode_pointer(block),
@@ -598,14 +682,16 @@ impl FsCore {
     /// name sealed. So no real name can reach the store, even from a client
     /// that tries.
     fn check_entry_name(name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
-        if name.len() == TAG_LEN && !sealed_name.is_empty() {
-            Ok(())
-        } else {
-            Err(FsError::new(
+        if name.len() != TAG_LEN || sealed_name.is_empty() {
+            return Err(FsError::new(
                 libc::EINVAL,
                 "a name here must be a tag, with the real name sealed",
-            ))
+            ));
         }
+        if sealed_name.len() > MAX_SEALED_NAME {
+            return Err(FsError::new(libc::ENAMETOOLONG, "that name is too long"));
+        }
+        Ok(())
     }
 
     /// Checks a batch of chunks to store: no more than one write takes, and
@@ -812,6 +898,9 @@ impl FsCore {
                 {
                     return Ok(Err(e));
                 }
+                if new_size < entry.attr.size {
+                    decide!(self.check_cut_short(&txn, ino, new_size).await?);
+                }
                 entry.attr.size = new_size;
                 decide!(self.trim_block(&txn, &entry, new_size).await?);
             }
@@ -868,6 +957,7 @@ impl FsCore {
     /// needs the number before it can make the record.
     pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
         let user = caller.user.as_str();
+        crate::accounts::refuse_link(user)?;
         let ino = allocate_inode(&self.client).await?;
         let key = reservation_key(ino);
         let value = grants::reservation_value(user, unix_secs(SystemTime::now()));
@@ -896,6 +986,7 @@ impl FsCore {
     ) -> Result<Attr, FsError> {
         let ino = new.ino;
         Self::check_entry_name(name, &new.sealed_name)?;
+        check_sealed_size("a key record", &new.keys, MAX_SEALED_RECORD)?;
         let dirent = &dirent_key(parent, name);
         let value = &dirent_value(ino, &new.sealed_name);
 
@@ -1167,12 +1258,9 @@ impl FsCore {
         sealed: &SealedMove,
     ) -> Result<Option<u64>, FsError> {
         Self::check_entry_name(new_name, &sealed.sealed_name)?;
+        check_sealed_size("a key record", &sealed.node_keys, MAX_SEALED_RECORD)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
-        if new_parent != parent {
-            // Before the move, as a write's check is: soft, like quotas.
-            self.check_move_room(sealed.ino, parent, new_parent).await?;
-        }
         let replaced = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, parent, true).await?);
             if new_parent != parent {
@@ -1235,6 +1323,11 @@ impl FsCore {
                     libc::ESTALE,
                     "the name moved meanwhile names another inode now",
                 )));
+            }
+            // Only now: its answer says what the target holds and what the
+            // inode's size is, for someone who may write to both folders.
+            if moves && let Err(e) = self.check_move_room(ino, parent, new_parent).await {
+                return Ok(Err(e));
             }
             // Its name is sealed under the new parent's key, and a stale
             // node must not look fresh after the move.
@@ -1575,6 +1668,34 @@ impl FsCore {
             .collect()
     }
 
+    /// Refuses a truncate to `new_size` (`EAGAIN`) while the inline chunk that
+    /// the new end falls in holds more than it keeps. The client seals that
+    /// chunk again, cut short, before it asks. If it still holds more, another
+    /// write came in between, and the client should do that again. Otherwise
+    /// the bytes past the end would be data that counts for nothing.
+    async fn check_cut_short(
+        &self,
+        txn: &Transaction,
+        ino: u64,
+        new_size: u64,
+    ) -> Result<Result<(), FsError>, KvError> {
+        let keep = new_size % self.chunk_size;
+        if keep == 0 {
+            return Ok(Ok(()));
+        }
+        let index = new_size / self.chunk_size;
+        let Some(value) = txn.read_one(&chunk_key(ino, index)).await?.value else {
+            return Ok(Ok(()));
+        };
+        Ok(match ChunkValue::decode(value) {
+            ChunkValue::Inline(blob) if plain_len(&blob) > keep => Err(FsError::new(
+                libc::EAGAIN,
+                format!("chunk {index} of inode {ino} holds more than a truncate keeps"),
+            )),
+            _ => Ok(()),
+        })
+    }
+
     /// For a truncate to `new_size`, the block that the new end falls in
     /// keeps only the segments before the end. `delete_chunks_from` already
     /// removed whole blocks past the end. This block stays, but its later
@@ -1645,8 +1766,9 @@ impl FsCore {
             {
                 return Ok(Err(e));
             }
-            let dropped = decide!(put_chunks(self, &txn, &entry, writes, false).await?);
             let before = entry.attr.size;
+            let dropped =
+                decide!(put_chunks(self, &txn, &entry, writes, false, before.max(end)).await?);
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -1702,11 +1824,38 @@ impl FsCore {
 
     /// `user`'s public key, for sealing grants to them. Returns `ENOENT`
     /// for an account that has not enrolled.
-    pub async fn public_key(&self, user: &str) -> Result<Vec<u8>, FsError> {
+    ///
+    /// A public link needs only the key of who sealed its grant, to open it.
+    /// Its holders are strangers, so for any other name they get one refusal,
+    /// which doesn't say whether the account exists.
+    pub async fn public_key(&self, caller: &Caller, user: &str) -> Result<Vec<u8>, FsError> {
+        if caller.user.starts_with(raft5fs_proto::types::LINK_PREFIX)
+            && !self.sealed_a_grant_to(caller, user).await?
+        {
+            return Err(FsError::new(
+                libc::EACCES,
+                "a public link can only ask for the key of who shared its folder",
+            ));
+        }
         crate::accounts::get(&self.client, user)
             .await?
             .map(|keys| keys.public_key)
             .ok_or_else(|| FsError::new(libc::ENOENT, format!("{user} hasn't enrolled")))
+    }
+
+    /// Whether `sender` sealed one of `caller`'s grants, now or in a snapshot,
+    /// which keeps the grants as they were then.
+    async fn sealed_a_grant_to(&self, caller: &Caller, sender: &str) -> Result<bool, FsError> {
+        if grants::has_sender(&self.live(), &caller.user, sender).await? {
+            return Ok(true);
+        }
+        for snapshot in self.client.list_snapshots().await? {
+            let view = View::at(&self.client, &snapshot.id);
+            if grants::has_sender(&view, &caller.user, sender).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Grants directory `grant.ino` to `grantee`, and replaces any grant of
@@ -1733,6 +1882,7 @@ impl FsCore {
         listed: &[String],
     ) -> Result<(), FsError> {
         grants::check_username(grantee)?;
+        check_sealed_grant(&grant.sealed_key, &grant.sealed_label, sealed_grantees)?;
         let ino = grant.ino;
         run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, ino, true).await?);
@@ -1816,6 +1966,8 @@ impl FsCore {
             ));
         }
         check_grantees_version(new.ino, sealed_grantees, 1)?;
+        check_sealed_grant(sealed_key, sealed_label, sealed_grantees)?;
+        check_sealed_size("a key record", &new.keys, MAX_SEALED_RECORD)?;
         let dirent = &dirent_key(ROOT_INO, OsStr::new(&new.ino.to_string()));
         let grant = &Grant {
             ino: new.ino,
@@ -1891,6 +2043,13 @@ impl FsCore {
     /// its grants are not the grants that the rotation seals again: another
     /// client changed it in the meantime.
     pub async fn rotate(&self, caller: &Caller, rotations: &[Rotation]) -> Result<(), FsError> {
+        for r in rotations {
+            check_sealed_size("a key record", &r.node_keys, MAX_SEALED_RECORD)?;
+            check_sealed_size("a grantee list", &r.sealed_grantees, MAX_SEALED_RECORD)?;
+            for (_, sealed) in &r.grants {
+                check_sealed_size("a grant's key", sealed, MAX_SEALED_GRANT)?;
+            }
+        }
         let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
         run_txn(&self.client, move |txn| async move {
             // Versions that this transaction has changed, for the children
@@ -1992,7 +2151,8 @@ impl FsCore {
             // stored after a deletion has started.
             let entry = decide!(live_entry(&txn, ino).await?);
             decide!(check_kind(&entry, Kind::File));
-            let dropped = decide!(put_chunks(self, &txn, &entry, writes, true).await?);
+            let size = entry.attr.size;
+            let dropped = decide!(put_chunks(self, &txn, &entry, writes, true, size).await?);
             txn.commit().await?;
             Ok(Ok(dropped))
         })
@@ -2063,6 +2223,7 @@ impl FsCore {
         expected_version: u32,
         node_keys: &[u8],
     ) -> Result<(), FsError> {
+        check_sealed_size("a key record", node_keys, MAX_SEALED_RECORD)?;
         self.guard_now(&self.live(), caller, ino, true).await?;
         let pruned = NodeKeys::decode(node_keys)
             .map_err(|e| FsError::new(libc::EINVAL, format!("inode {ino}: {e}")))?;
@@ -2389,7 +2550,7 @@ fn operations_are_send(
     send(core.key_path(caller, 1, None));
     send(core.grants(caller, None));
     send(core.snapshots());
-    send(core.public_key("u"));
+    send(core.public_key(caller, "u"));
     send(core.read_chunks(caller, 1, 0, 1, &[], true, None));
     send(core.write_chunks(caller, 1, &[], 0));
     send(core.prepare_uploads(caller, 1, &[]));

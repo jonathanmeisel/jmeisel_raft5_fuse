@@ -15,7 +15,7 @@
     try {
       queued = await fs.pruneStatus();
       state = await fs.pruning();
-      onqueued(queued.length);
+      onqueued(queued.length, queued.length > 0 && state === "running");
     } catch {}
   }
   poll();

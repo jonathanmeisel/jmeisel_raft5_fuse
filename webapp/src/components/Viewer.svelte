@@ -12,7 +12,7 @@
   import Dialog from "./Dialog.svelte";
   import { kindOf, mimeOf } from "../lib/previews.js";
 
-  let { fs, path, streams = null, ondownload, onclose } = $props();
+  let { fs, path, streams = null, ondownload, onclose, onmedia = () => {} } = $props();
   const MAX_TEXT = 1 << 20;
   const name = path.slice(path.lastIndexOf("/") + 1);
   // svelte-ignore state_referenced_locally
@@ -68,6 +68,7 @@
   }
 
   onDestroy(() => {
+    onmedia(false);
     if (token) {
       // A stream open in another tab keeps working until logout.
       if (!shared) streams.close(token);
@@ -88,9 +89,25 @@
     <img src={url} alt={name} />
   {:else if url && kind === "video"}
     <!-- svelte-ignore a11y_media_has_caption -->
-    <video src={url} controls autoplay onerror={streamFailed}></video>
+    <video
+      src={url}
+      controls
+      autoplay
+      onerror={streamFailed}
+      onplaying={() => onmedia(true)}
+      onpause={() => onmedia(false)}
+      onended={() => onmedia(false)}
+    ></video>
   {:else if url && kind === "audio"}
-    <audio src={url} controls autoplay onerror={streamFailed}></audio>
+    <audio
+      src={url}
+      controls
+      autoplay
+      onerror={streamFailed}
+      onplaying={() => onmedia(true)}
+      onpause={() => onmedia(false)}
+      onended={() => onmedia(false)}
+    ></audio>
   {:else if url && kind === "pdf"}
     <iframe src={url} title={name}></iframe>
   {:else}

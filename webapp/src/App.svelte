@@ -1,6 +1,7 @@
 <script>
   // The app's screens: log in, enrol, then the files. Logging out, or 30
-  // minutes without input, ends the Worker, which drops every key. A
+  // minutes without input, ends the Worker, which drops every key. Work in
+  // progress holds that off, for up to 12 hours since the last input. A
   // device that stays unlocked (an opt-in at login) logs back in by itself
   // when the app opens, has no idle logout, and forgets the account when
   // the user logs out. A public link opens its folder for a visitor, with
@@ -13,6 +14,10 @@
   import { clearRoute, readRoute } from "./lib/route.js";
 
   const IDLE_MS = 30 * 60 * 1000;
+  /// The longest that work in progress keeps an idle tab logged in. A re-seal
+  /// that keeps failing, or a video on a loop, must not keep it unlocked for
+  /// ever.
+  const BUSY_LIMIT_MS = 12 * 60 * 60 * 1000;
 
   let screen = $state("starting");
   let fs = $state(null);
@@ -97,13 +102,25 @@
   start();
 
   let idleTimer = null;
+  let lastInput = 0;
+  /// The files screen, which says if work is in progress.
+  let files = $state(null);
+
   function resetIdle() {
     if (!fs || me?.remembered || me?.visitor) return;
+    lastInput = Date.now();
+    waitIdle(IDLE_MS);
+  }
+
+  function waitIdle(ms) {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(
-      () => logout("Logged out after 30 minutes without use."),
-      IDLE_MS,
-    );
+    idleTimer = setTimeout(idleTimeUp, ms);
+  }
+
+  function idleTimeUp() {
+    const left = BUSY_LIMIT_MS - (Date.now() - lastInput);
+    if (left > 0 && files?.busy()) waitIdle(Math.min(IDLE_MS, left));
+    else logout("Logged out after 30 minutes without use.");
   }
   for (const event of ["pointerdown", "keydown", "wheel"]) {
     addEventListener(event, resetIdle, { passive: true });
@@ -114,7 +131,7 @@
 {#if screen === "starting"}
   <main class="card"><p class="note">Opening…</p></main>
 {:else if screen === "files" && fs}
-  <Files {fs} {me} {storageError} onlogout={() => logout()} />
+  <Files bind:this={files} {fs} {me} {storageError} onlogout={() => logout()} />
 {:else}
   <main class="card">
     {#if notice}<p class="note">{notice}</p>{/if}

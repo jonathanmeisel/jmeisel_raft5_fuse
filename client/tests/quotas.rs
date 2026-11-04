@@ -2,12 +2,18 @@
 //! orphaned volumes, against a real store and servers.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::Vault;
 use raft5fs_core::accounts;
-use raft5fs_proto::types::{Caps, FsError, SetAttr};
+use raft5fs_crypto::Key;
+use raft5fs_crypto::data::seal_chunk;
+use raft5fs_proto::types::{
+    BLOCK_RANDOM_LEN, BlockRef, Caps, ChunkWrite, FsError, Grant, NewNode, SealedMove, SetAttr,
+    WriteBody,
+};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
 #[test]
@@ -624,4 +630,317 @@ fn admins_find_orphaned_volumes_and_give_them_to_a_writer() {
     eventually("the volume counts against its new owner", || {
         used(&backend, &carol) == 1000
     });
+}
+
+/// A chunk sealed as a modified client would, by inode and index. The servers
+/// can't open it, so any key does: they only read its version.
+fn sealed(ino: u64, index: u64, len: usize) -> ChunkWrite {
+    sealed_at(ino, index, len, None)
+}
+
+fn sealed_at(ino: u64, index: u64, len: usize, expected_seq: Option<u64>) -> ChunkWrite {
+    ChunkWrite {
+        index,
+        expected_seq,
+        body: WriteBody::Inline(seal_chunk(&Key::random(), 1, ino, index, &vec![7; len])),
+    }
+}
+
+/// Only a file's size counts towards quotas and limits, so a modified client
+/// mustn't be able to store data that the size leaves out.
+#[test]
+fn a_client_cannot_store_more_than_the_file_size_says() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let remote = tester.remote();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(tester.create(v, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    let chunk = TEST_CHUNK_SIZE as usize;
+
+    // A chunk past the end the write states, or longer than it allows.
+    assert_eq!(
+        errno(rt.block_on(remote.write_chunks(f, &[sealed(f, 5, 100)], 0))),
+        libc::EINVAL
+    );
+    assert_eq!(
+        errno(rt.block_on(remote.write_chunks(f, &[sealed(f, 0, chunk)], 1))),
+        libc::EINVAL
+    );
+    assert_eq!(rt.block_on(remote.getattr(f)).unwrap().size, 0);
+    let mut prefix = vec![0x02];
+    prefix.extend_from_slice(&f.to_be_bytes());
+    assert!(backend.keys_with_prefix(&prefix).is_empty());
+
+    // What the size covers still goes in, including over what is there.
+    rt.block_on(remote.write_chunks(f, &[sealed(f, 0, chunk)], chunk as u64))
+        .unwrap();
+    rt.block_on(remote.write_chunks(f, &[sealed(f, 0, 100)], 0))
+        .unwrap();
+
+    // A truncate must not leave the bytes past the new end in place.
+    assert_eq!(
+        errno(rt.block_on(remote.setattr(f, resize(50)))),
+        libc::EAGAIN
+    );
+    assert_eq!(
+        rt.block_on(remote.getattr(f)).unwrap().size,
+        chunk as u64,
+        "refused, so the size stays"
+    );
+    // A normal client seals that chunk again first. Whole chunks need no
+    // sealing, and a grow needs none.
+    let g = rt
+        .block_on(tester.create(v, OsStr::new("g"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.write(g, 0, &vec![1; 2 * chunk]))
+        .unwrap();
+    rt.block_on(tester.setattr(g, resize(chunk as u64 + 10)))
+        .unwrap();
+    rt.block_on(tester.setattr(g, resize(chunk as u64)))
+        .unwrap();
+    rt.block_on(remote.setattr(g, resize(3 * chunk as u64)))
+        .unwrap();
+    assert_eq!(
+        rt.block_on(tester.read(g, 0, 2 * chunk)).unwrap()[..chunk],
+        vec![1; chunk]
+    );
+}
+
+/// A re-seal keeps a chunk as long as it is, even if a race left it longer
+/// than the file, or a prune could never finish. It can't make one longer.
+#[test]
+fn a_reseal_can_keep_a_chunks_length_but_not_grow_it_past_the_file() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let remote = tester.remote();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(tester.create(v, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    rt.block_on(remote.write_chunks(f, &[sealed(f, 0, 10)], 10))
+        .unwrap();
+    // As a race leaves it: a chunk longer than the file says.
+    let mut key = vec![0x02];
+    key.extend_from_slice(&f.to_be_bytes());
+    key.extend_from_slice(&0u64.to_be_bytes());
+    let long = sealed(f, 0, 100);
+    let WriteBody::Inline(blob) = &long.body else {
+        unreachable!()
+    };
+    backend.write_key(&key, Some(blob));
+    let seq = || {
+        rt.block_on(remote.read_chunks(f, 0, 1, &[]))
+            .unwrap()
+            .chunks
+            .remove(0)
+            .seq
+    };
+
+    assert_eq!(
+        errno(rt.block_on(remote.reseal_chunks(f, &[sealed_at(f, 0, 101, Some(seq()))]))),
+        libc::EINVAL
+    );
+    rt.block_on(remote.reseal_chunks(f, &[sealed_at(f, 0, 100, Some(seq()))]))
+        .unwrap();
+}
+
+/// A block's segments must start inside the file. There is no need to upload
+/// anything to test that: the check comes before the pointer is stored.
+#[test]
+fn a_block_cannot_start_a_segment_past_the_file_size() {
+    use raft5fs_testkit::TEST_OBJECT_FROM_CHUNKS;
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, true, true);
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let f = rt
+        .block_on(tester.create(v, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    let start = TEST_OBJECT_FROM_CHUNKS;
+    let minted_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let block = |nseg| ChunkWrite {
+        index: start,
+        expected_seq: None,
+        body: WriteBody::Block(BlockRef {
+            version: 1,
+            minted_ms,
+            random: [9; BLOCK_RANDOM_LEN],
+            nseg,
+        }),
+    };
+    let chunk = TEST_CHUNK_SIZE;
+    // Two segments reach chunk `start + 1`, past a file that ends in `start`.
+    assert_eq!(
+        errno(
+            rt.block_on(
+                tester
+                    .remote()
+                    .write_chunks(f, &[block(2)], start * chunk + 1)
+            )
+        ),
+        libc::EINVAL
+    );
+    rt.block_on(
+        tester
+            .remote()
+            .write_chunks(f, &[block(1)], start * chunk + 1),
+    )
+    .unwrap();
+}
+
+/// The servers store these on every node, unable to read them, and they count
+/// towards nothing, so each has a limit.
+#[test]
+fn sealed_values_have_size_limits() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    backend.enrol("bob");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let remote = tester.remote();
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let tag = OsStr::new("t".repeat(32).as_str()).to_owned();
+
+    let ino = rt.block_on(remote.allocate_inode()).unwrap();
+    let new = |keys: usize, name: usize| NewNode {
+        ino,
+        keys: vec![1; keys],
+        sealed_name: vec![1; name],
+    };
+    assert_eq!(
+        errno(rt.block_on(remote.create(v, &tag, 0o644, &new(10, 2 << 10)))),
+        libc::ENAMETOOLONG
+    );
+    assert_eq!(
+        errno(rt.block_on(remote.create(v, &tag, 0o644, &new(2 << 20, 10)))),
+        libc::EINVAL
+    );
+
+    let grant = |key: usize, label: usize| Grant {
+        ino: v,
+        writable: false,
+        key_version: 1,
+        sealed_key: vec![1; key],
+        sealed_label: vec![1; label],
+    };
+    for bad in [grant(8 << 10, 10), grant(10, 8 << 10)] {
+        assert_eq!(
+            errno(rt.block_on(remote.grant("bob", bad, Vec::new(), 0, Vec::new()))),
+            libc::EINVAL
+        );
+    }
+    assert_eq!(
+        errno(rt.block_on(remote.grant("bob", grant(10, 10), vec![1; 2 << 20], 0, Vec::new()))),
+        libc::EINVAL
+    );
+
+    // The longest name a mount can make still fits.
+    let longest = "n".repeat(255);
+    rt.block_on(tester.create(v, OsStr::new(&longest), 0o644))
+        .unwrap();
+}
+
+/// A quota check's answer says who owns a folder, how full it is and how big
+/// something is, so nothing gets one without the right to ask.
+#[test]
+fn a_room_check_tells_nothing_to_those_with_no_right_to_ask() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    make_admin(&backend, TESTER);
+    backend.enrol("bob");
+    backend.enrol("carol");
+    let rt = &backend.runtime;
+    let tester = pinned(&backend, TESTER);
+    let bob = pinned(&backend, "bob");
+    let carol = pinned(&backend, "carol");
+    let make_file = |v: &Vault, dir: u64, name: &str, len: usize| {
+        let ino = rt
+            .block_on(v.create(dir, OsStr::new(name), 0o644))
+            .unwrap()
+            .ino;
+        rt.block_on(v.write(ino, 0, &vec![1; len])).unwrap();
+        ino
+    };
+
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    let big = make_file(&tester, v, "big", 5000);
+    rt.block_on(tester.remote().measure_usage()).unwrap();
+    rt.block_on(tester.remote().set_quota(TESTER, Some(6000)))
+        .unwrap();
+    rt.block_on(tester.remote().set_quota("carol", Some(1)))
+        .unwrap();
+
+    // A stranger's move into the full volume is refused for having no access,
+    // not with the owner's name and usage.
+    let hers = rt
+        .block_on(carol.create_volume(OsStr::new("hers"), 0o755))
+        .unwrap()
+        .ino;
+    let tag = "t".repeat(32);
+    let tag = OsStr::new(&tag);
+    let moved = |ino| SealedMove {
+        ino,
+        node_keys: Vec::new(),
+        sealed_name: vec![1; 10],
+    };
+    let refused = rt
+        .block_on(carol.remote().rename(hers, tag, v, tag, true, &moved(big)))
+        .unwrap_err();
+    assert_eq!(refused.errno, libc::EACCES, "{refused}");
+
+    // Accepting a volume nobody offered doesn't reveal if it would fit.
+    assert_eq!(
+        errno(rt.block_on(carol.remote().answer_offer(v, true))),
+        libc::ENOENT
+    );
+
+    // Someone who can write to both folders still can't size up another
+    // inode: the check is of what the name really points to.
+    let a = rt
+        .block_on(tester.mkdir(v, OsStr::new("a"), 0o755))
+        .unwrap()
+        .ino;
+    let b = rt
+        .block_on(tester.mkdir(v, OsStr::new("b"), 0o755))
+        .unwrap()
+        .ino;
+    make_file(&tester, b, "small", 10);
+    rt.block_on(tester.remote().set_quota(TESTER, None))
+        .unwrap();
+    rt.block_on(tester.remote().set_folder_limit(a, Some(100)))
+        .unwrap();
+    rt.block_on(tester.grant(v, "bob", true, OsStr::new("v")))
+        .unwrap();
+    let prefix = raft5fs_core::dirent_prefix(b);
+    let key = backend.keys_with_prefix(&prefix).remove(0);
+    let small_tag = OsStr::from_bytes(&key[prefix.len()..]);
+    let refused = rt
+        .block_on(bob.remote().rename(b, small_tag, a, tag, true, &moved(big)))
+        .unwrap_err();
+    assert_eq!(refused.errno, libc::ESTALE, "{refused}");
 }

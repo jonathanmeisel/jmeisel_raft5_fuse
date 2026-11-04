@@ -227,7 +227,22 @@ impl FsCore {
         ino: u64,
         accept: bool,
     ) -> Result<(), FsError> {
+        let offered_to_caller = |record: &VolumeInfo| {
+            let to = record.offer.as_ref().map(|(to, _)| to.as_str());
+            if to == Some(caller.user.as_str()) {
+                Ok(())
+            } else {
+                Err(FsError::new(
+                    libc::ENOENT,
+                    "this volume isn't offered to you",
+                ))
+            }
+        };
         let size = if accept {
+            // Asked first, because the room check's answer says how big the
+            // volume is. The transaction below asks again, to be sure.
+            let record = volume_of(&self.live(), ino).await??.unwrap_or_default();
+            offered_to_caller(&record)?;
             let size = self.moved_size(ino).await?;
             self.check_owner_room(&caller.user, size).await?;
             size
@@ -236,12 +251,7 @@ impl FsCore {
         };
         let old = run_txn(&self.client, move |txn| async move {
             let mut record = decide!(record_of(&txn, ino).await?);
-            if record.offer.as_ref().map(|(to, _)| to.as_str()) != Some(caller.user.as_str()) {
-                return Ok(Err(FsError::new(
-                    libc::ENOENT,
-                    "this volume isn't offered to you",
-                )));
-            }
+            decide!(offered_to_caller(&record));
             record.offer = None;
             let old = if accept {
                 if !decide!(writes_at(&txn, ino, &caller.user).await?) {

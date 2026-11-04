@@ -9,6 +9,10 @@
 //   it isn't (a first visit before it takes over, a private window, a
 //   browser that has them off), callers decrypt the whole file instead.
 
+/// How long after its last read a stream counts as still being read. A browser
+/// reads ahead in pieces, with gaps between them.
+const READING_MS = 2 * 60 * 1000;
+
 /// A token: 128 random bits, in hex.
 function newToken() {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -20,6 +24,7 @@ export function streams(fs) {
   /// The open streams, by token.
   const open = new Map();
   let controlled = !!sw?.controller;
+  let lastRead = 0;
 
   const onController = () => (controlled = !!sw.controller);
   const onMessage = async ({ data, ports: [port] }) => {
@@ -30,6 +35,7 @@ export function streams(fs) {
     } else if (data.raft5fs === "meta") {
       port.postMessage({ size: s.size, type: s.type, name: s.name, disposition: s.disposition });
     } else if (data.raft5fs === "read") {
+      lastRead = Date.now();
       try {
         const bytes = await fs.readFile(s.handle, data.offset, data.len);
         const buffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
@@ -60,6 +66,10 @@ export function streams(fs) {
 
   return {
     available: () => controlled,
+
+    /// Whether the browser has read from a stream lately. An open stream says
+    /// nothing: a finished download's stream stays open.
+    reading: () => Date.now() - lastRead < READING_MS,
 
     /// Opens file `path` as a stream of `type`; a `download` stream tells
     /// the browser to save it. Gives the token and the stream's URL.

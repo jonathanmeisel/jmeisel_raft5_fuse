@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use raft5fs_proto::types::AccountKeys;
 use serde::{Deserialize, Serialize};
 use tonic::Status;
 
@@ -37,6 +38,10 @@ struct SessionClaims {
     kind: Kind,
     /// The account name.
     sub: String,
+    /// `Signer::binding` of the account at login, so that a new password or a
+    /// new key pair ends the session. A token without it is refused, and the
+    /// client logs in again.
+    keys: String,
     exp: u64,
 }
 
@@ -70,22 +75,33 @@ impl Signer {
             .expect("HMAC signing of plain claims can't fail")
     }
 
-    /// Makes a session for account `name`, and returns it with its expiry
-    /// time (seconds since the epoch).
-    pub fn session(&self, name: &str) -> (String, u64) {
+    /// What ties a session to account `keys` as they are now (see
+    /// `raft5fs_crypto::password::session_binding`).
+    pub fn binding(&self, keys: &AccountKeys) -> String {
+        raft5fs_crypto::password::session_binding(&self.secret, &keys.verifier, &keys.public_key)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Makes a session for account `name`, tied to `binding` (see `binding`),
+    /// and returns it with its expiry time (seconds since the epoch).
+    pub fn session(&self, name: &str, binding: &str) -> (String, u64) {
         let exp = jsonwebtoken::get_current_timestamp() + self.session_ttl.as_secs();
         let token = self.sign(&SessionClaims {
             kind: Kind::Session,
             sub: name.to_string(),
+            keys: binding.to_string(),
             exp,
         });
         (token, exp)
     }
 
-    /// Returns the account that a session token is for. Any problem with
-    /// the token (forged, expired, not a session) gives `UNAUTHENTICATED`,
-    /// which tells the client to log in again.
-    pub fn verify_session(&self, token: &str) -> Result<String, Status> {
+    /// Returns the account that a session token is for, and its binding. Any
+    /// problem with the token (forged, expired, not a session, from before
+    /// bindings) gives `UNAUTHENTICATED`, which tells the client to log in
+    /// again.
+    pub fn verify_session(&self, token: &str) -> Result<(String, String), Status> {
         let refused = |why: String| Status::unauthenticated(format!("session refused: {why}"));
         // `Validation::new` fixes the algorithm and requires `exp`.
         let claims = decode::<SessionClaims>(token, &self.decoding, &Validation::new(ALGORITHM))
@@ -94,7 +110,7 @@ impl Signer {
         if claims.kind != Kind::Session {
             return Err(refused("not a session token".into()));
         }
-        Ok(claims.sub)
+        Ok((claims.sub, claims.keys))
     }
 }
 
@@ -109,13 +125,16 @@ mod tests {
     #[test]
     fn a_session_names_who_it_was_issued_to() {
         let s = signer();
-        let (token, _) = s.session("alice");
-        assert_eq!(s.verify_session(&token).unwrap(), "alice");
+        let (token, _) = s.session("alice", "b1");
+        assert_eq!(
+            s.verify_session(&token).unwrap(),
+            ("alice".to_string(), "b1".to_string())
+        );
     }
 
     #[test]
     fn another_key_or_a_tampered_token_is_refused() {
-        let (token, _) = signer().session("alice");
+        let (token, _) = signer().session("alice", "b1");
         let other = Signer::new(b"other key", DEFAULT_SESSION_TTL);
         assert!(other.verify_session(&token).is_err());
         let mut tampered = token.into_bytes();
@@ -135,7 +154,26 @@ mod tests {
         let token = s.sign(&SessionClaims {
             kind: Kind::Session,
             sub: "alice".into(),
+            keys: "b1".into(),
             exp: jsonwebtoken::get_current_timestamp() - 3600,
+        });
+        let status = s.verify_session(&token).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn a_token_from_before_bindings_is_refused() {
+        #[derive(Serialize)]
+        struct Older {
+            kind: Kind,
+            sub: String,
+            exp: u64,
+        }
+        let s = signer();
+        let token = s.sign(&Older {
+            kind: Kind::Session,
+            sub: "alice".into(),
+            exp: jsonwebtoken::get_current_timestamp() + 3600,
         });
         let status = s.verify_session(&token).unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unauthenticated);

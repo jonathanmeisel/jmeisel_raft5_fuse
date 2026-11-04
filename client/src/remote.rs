@@ -103,6 +103,11 @@ use web::WebChannel as Channel;
 /// most one maximum-size chunk (8 MiB), plus framing.
 const MAX_MESSAGE_BYTES: usize = 9 << 20;
 
+/// The largest answer that the client takes. A batch of chunks is at most
+/// about 8 MiB, but a directory listing has no such limit: this takes roughly
+/// 500,000 entries.
+const MAX_ANSWER_BYTES: usize = 64 << 20;
+
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Long on purpose: a write commits a batch of up to 8 MiB through raft,
@@ -368,7 +373,8 @@ impl Remote {
         for address in addresses {
             let channel = Timed::new(channel(address, tls.as_ref())?, address);
             let client = FsClient::with_interceptor(channel, authorize.clone())
-                .max_encoding_message_size(MAX_MESSAGE_BYTES);
+                .max_encoding_message_size(MAX_MESSAGE_BYTES)
+                .max_decoding_message_size(MAX_ANSWER_BYTES);
             servers.push((address.clone(), client));
         }
         let mut remote = Self {
