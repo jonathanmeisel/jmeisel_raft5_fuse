@@ -66,6 +66,7 @@ export function connect({ onStorageError } = {}) {
     closeFile: (handle) => call("closeFile", [handle]),
     isPinned: (user) => call("isPinned", [user]),
     userExists: (user) => call("userExists", [user]),
+    people: () => call("people", []),
     share: (path, user, writable, label, fingerprint) =>
       call("share", [path, user, writable, label, fingerprint ?? null]),
     sharedWith: (path) => call("sharedWith", [path]),

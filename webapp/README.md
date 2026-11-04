@@ -63,6 +63,14 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   (`TransferDialog.svelte`) offers it to someone with read-write access,
   who sees a banner to accept or decline it. **Shared with…** names the
   owner, who can't be revoked.
+- Safety codes: what the command line calls a fingerprint, in words people can
+  read to each other. `Fingerprint.svelte` shows one and `CodeInput.svelte`
+  takes one, checking each word as it's typed. A folder's **Sharing…**
+  (`SharedWith.svelte`) lists who has it and leads to sharing further
+  (`ShareDialog.svelte`) and public links. **People** (`People.svelte`) lists
+  whose code this account has checked, and **Shared with me**
+  (`Pending.svelte`) lists what others have shared. The app looks for new
+  shares every minute, and when the tab comes back into view.
 - Public links: `#link=<…>` logs in as the link's own account, in a
   Worker that stores nothing (no IndexedDB, no prune), and shows its one
   folder read-only. The fragment leaves the address bar at once. Whoever

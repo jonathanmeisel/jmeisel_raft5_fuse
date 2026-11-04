@@ -374,7 +374,7 @@ impl KnownKeys {
 
     /// Every pinned key, including those that another process pinned in
     /// the store since this one loaded it.
-    pub(crate) fn all(&self) -> HashMap<String, [u8; PUBLIC_KEY_LEN]> {
+    pub fn all(&self) -> HashMap<String, [u8; PUBLIC_KEY_LEN]> {
         let mut keys = self.keys.lock().unwrap();
         if let Ok(stored) = read_pins(self.store.as_ref(), &self.name) {
             for (other, key) in stored {

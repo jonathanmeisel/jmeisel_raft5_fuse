@@ -16,6 +16,7 @@
   import SharingBar from "./SharingBar.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
+  import People from "./People.svelte";
   import TransferDialog from "./TransferDialog.svelte";
   import LimitDialog from "./LimitDialog.svelte";
   import { sizeText } from "../lib/sizes.js";
@@ -445,11 +446,7 @@
     return [
       ...options,
       { comp: "separator" },
-      { id: "share", text: "Share…", icon: "wxi-account", handler: () => (dialog = { kind: "share", path: item.id }) },
-      { id: "shared-with", text: "Shared with…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
-      ...(account.caps.includes("links")
-        ? [{ id: "share-link", text: "Share publicly…", icon: "wxi-link", handler: () => (dialog = { kind: "link", path: item.id }) }]
-        : []),
+      { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
       { id: "size-limit", text: "Size limit…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "limit", path: item.id }) },
       ...(parentOf(item.id) === "/"
         ? [{ id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) }]
@@ -479,6 +476,7 @@
   /// The account menu: what the account does besides files.
   const menuItems = $derived([
     { id: "pending", text: "Shared with me", icon: "wxi-file-multiple-outline", badge: pendingCount || 0 },
+    { id: "people", text: "People", icon: "wxi-account" },
     ...(account.caps.includes("admin") ? [{ id: "users", text: "Users", icon: "wxi-account" }] : []),
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
     { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
@@ -614,7 +612,15 @@
 {:else if dialog?.kind === "share"}
   <ShareDialog {fs} path={dialog.path} mine={me.fingerprint} onclose={closeSharing} />
 {:else if dialog?.kind === "shared-with"}
-  <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={closeSharing} />
+  <SharedWith
+    {fs}
+    path={dialog.path}
+    me={me.user}
+    links={account.caps.includes("links")}
+    onshare={() => (dialog = { kind: "share", path: dialog.path })}
+    onlink={() => (dialog = { kind: "link", path: dialog.path })}
+    onclose={closeSharing}
+  />
 {:else if dialog?.kind === "transfer"}
   <TransferDialog {fs} path={dialog.path} me={me.user} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "limit"}
@@ -634,6 +640,15 @@
   <LinksDialog {fs} onclose={closeSharing} />
 {:else if dialog?.kind === "users"}
   <UsersDialog {fs} me={me.user} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "people"}
+  <People
+    {fs}
+    mine={me.fingerprint}
+    onclose={() => {
+      dialog = null;
+      refreshPending();
+    }}
+  />
 {:else if dialog?.kind === "pending"}
   <Pending
     {fs}

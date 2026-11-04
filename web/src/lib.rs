@@ -1757,6 +1757,40 @@ impl Fs {
         })
     }
 
+    /// Whose key this account has pinned, in name order: `[{user, fingerprint,
+    /// keyChanged}]`, where `keyChanged` says the servers now give another key
+    /// for them. Public links are pinned to share with them, but aren't people.
+    pub fn people(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Person {
+                user: String,
+                fingerprint: Fingerprint,
+                key_changed: bool,
+            }
+            let mut pins: Vec<_> = inner
+                .vault()
+                .known_keys()
+                .all()
+                .into_iter()
+                .filter(|(user, _)| !user.starts_with(raft5fs_proto::types::LINK_PREFIX))
+                .collect();
+            pins.sort();
+            let mut people = Vec::with_capacity(pins.len());
+            for (user, key) in pins {
+                let key_changed = inner.vault().key_changed(&user).await.unwrap_or(false);
+                people.push(Person {
+                    user,
+                    fingerprint: Fingerprint::of(&key),
+                    key_changed,
+                });
+            }
+            Ok(people)
+        })
+    }
+
     /// Whether there is an account called `user`, so a mistyped name can say
     /// so before anyone goes to ask a person who doesn't exist for their code.
     #[wasm_bindgen(js_name = userExists)]

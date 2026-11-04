@@ -1,5 +1,5 @@
 <script>
-  // Who a folder is shared with, and revoking. A revoke queues the folder
+  // Who a folder is shared with, sharing it further, and revoking. A revoke queues the folder
   // for pruning: until that finishes, what was written there before is
   // still sealed under keys the revoked user had.
   //
@@ -14,7 +14,7 @@
   import Dialog from "./Dialog.svelte";
   import LinkField from "./LinkField.svelte";
 
-  let { fs, path, me, links = false, onclose } = $props();
+  let { fs, path, me, links = false, onshare, onlink, onclose } = $props();
   /// This account's own links, by name, for their expiry.
   let mine = $state(new Map());
   const isLink = (user) => user.startsWith("link-");
@@ -155,7 +155,11 @@
         </tbody>
       </table>
     {/if}
-    <p><button onclick={onclose}>Close</button></p>
+    <p>
+      <button class="primary" onclick={onshare}>Share with someone</button>
+      {#if links}<button onclick={onlink}>Share publicly</button>{/if}
+      <button onclick={onclose}>Close</button>
+    </p>
   {/if}
   {#if error}<p class="error">{error}</p>{/if}
 </Dialog>
