@@ -24,9 +24,15 @@
     busy = true;
     error = "";
     try {
-      if (!needWords && !(await fs.isPinned(user.trim()))) {
-        needWords = true;
-        return;
+      if (!needWords) {
+        if (!(await fs.userExists(user.trim()))) {
+          error = `There's nobody called ${user.trim()} here. Check the spelling.`;
+          return;
+        }
+        if (!(await fs.isPinned(user.trim()))) {
+          needWords = true;
+          return;
+        }
       }
       if (keyChanged) await fs.replaceKey(user.trim(), words.trim());
       const fingerprint = needWords && !keyChanged ? words.trim() : null;
@@ -49,7 +55,19 @@
   {:else}
     <form onsubmit={submit}>
       <label for="share-user">User</label>
-      <input id="share-user" bind:value={user} required disabled={needWords} />
+      <input id="share-user" bind:value={user} required disabled={needWords} autocapitalize="none" autocomplete="off" />
+      {#if needWords}
+        <button
+          type="button"
+          onclick={() => {
+            needWords = keyChanged = false;
+            words = "";
+            error = "";
+          }}
+        >
+          Change
+        </button>
+      {/if}
       <label for="share-label">What this folder will show up to shared user as</label>
       <input id="share-label" bind:value={label} required />
       <label><input type="checkbox" bind:checked={readOnly} style="width:auto" /> Read-only</label>

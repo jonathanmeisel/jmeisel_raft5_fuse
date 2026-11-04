@@ -892,7 +892,14 @@ test("new shares and files show up without a reload", async ({ browser }) => {
   await login(nils, "nils");
   await addFolder(mona, "gift");
   await menu(mona, "gift", "Share…");
+  // A mistyped name says so at once, and can be put right.
+  await mona.getByLabel("User", { exact: true }).fill("nilz");
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(mona.getByText("There's nobody called nilz here")).toBeVisible(SLOW);
   await mona.getByLabel("User", { exact: true }).fill("nils");
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await mona.getByRole("button", { name: "Change" }).click();
+  await expect(mona.getByLabel("User", { exact: true })).toBeEnabled();
   await mona.getByRole("button", { name: "Share", exact: true }).click();
   await mona.getByLabel("nils's fingerprint").fill(nilsWords);
   await mona.getByRole("button", { name: "Share", exact: true }).click();

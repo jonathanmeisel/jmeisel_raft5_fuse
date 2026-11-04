@@ -1732,6 +1732,20 @@ impl Fs {
         })
     }
 
+    /// Whether there is an account called `user`, so a mistyped name can say
+    /// so before anyone goes to ask a person who doesn't exist for their code.
+    #[wasm_bindgen(js_name = userExists)]
+    pub fn user_exists(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            match inner.vault().served_key(&user).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.errno == errno::ENOENT || e.errno == errno::EINVAL => Ok(false),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
     /// Pins `user`'s key if its fingerprint is `words`, as they read it
     /// out. What they share becomes writable.
     pub fn trust(&self, user: String, words: String) -> Promise {

@@ -467,6 +467,7 @@ const methods = {
   },
 
   isPinned: (user) => session().isPinned(user),
+  userExists: (user) => session().userExists(user),
   share: (path, user, writable, label, fingerprint) =>
     session().share(path, user, writable, label, fingerprint || undefined),
   sharedWith: (path) => session().sharedWith(path),
