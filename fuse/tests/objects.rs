@@ -402,7 +402,12 @@ fn commits_are_checked() {
         );
     }
     assert_eq!(stored(&h, file, K), None, "nothing landed");
-    write(block_write(K, block)).unwrap();
+    // A commit with the block's own end of the file goes through, but not
+    // one that leaves the block past the end.
+    assert_fs_errno(write(block_write(K, block)), libc::EINVAL);
+    h.runtime
+        .block_on(remote.write_chunks(file, &[block_write(K, block)], K * C + 10))
+        .unwrap();
 }
 
 #[test]

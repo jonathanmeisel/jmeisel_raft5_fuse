@@ -2476,22 +2476,31 @@ impl Vault {
 
     /// Applies `changes` to `ino` (see `Remote::setattr`). When the file
     /// gets shorter, the client first seals the chunk at the new end again,
-    /// cut short, because the server cannot open the chunk to do this.
+    /// cut short, because the server cannot open the chunk to do this. If
+    /// another write fills that chunk again before the server applies the
+    /// change, the server refuses it (`EAGAIN`), so this does it again.
     pub async fn setattr(&self, ino: u64, changes: SetAttr) -> Result<Attr, FsError> {
-        if let Some(size) = changes.size {
-            self.truncate(ino, size).await?;
+        let mut retries = 0;
+        loop {
+            if let Some(size) = changes.size {
+                self.truncate(ino, size).await?;
+            }
+            let applied = self.remote.setattr(ino, changes).await;
+            if let Some(size) = changes.size {
+                // The chunks after the new end are gone, whatever the result
+                // was.
+                let chunk_size = self.remote.chunk_size();
+                self.cache.lock().unwrap().invalidate(
+                    self.space,
+                    ino,
+                    size / chunk_size..=u64::MAX,
+                );
+            }
+            match applied {
+                Err(e) if changed(&e) && retries < CHANGE_RETRIES => retries += 1,
+                other => return other,
+            }
         }
-        let changed = self.remote.setattr(ino, changes).await;
-        if let Some(size) = changes.size {
-            // The chunks after the new end are gone, whatever the result
-            // was.
-            let chunk_size = self.remote.chunk_size();
-            self.cache
-                .lock()
-                .unwrap()
-                .invalidate(self.space, ino, size / chunk_size..=u64::MAX);
-        }
-        changed
     }
 
     /// Seals the chunk that `new_size` falls in again, without the bytes
