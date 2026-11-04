@@ -303,6 +303,11 @@ the servers' addresses and CA, as `user add`'s do, serve with the same
 --invite-server and --invite-ca options. Without them she gets only a
 code. `raft5fs whoami` shows what she may do, and how much she stores.
 
+Failed logins are throttled: after 5 different wrong passwords for a name,
+or 20 from one address, a server refuses attempts for a second, doubling up
+to a minute. Sessions already open carry on. New passwords must also not be
+ones that guessers try early, such as a common word with numbers after it.
+
 Each top-level folder has an owner, whoever made it, and everything in
 it counts against the owner, whoever writes it. An admin can cap that:
 

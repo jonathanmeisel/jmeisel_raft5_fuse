@@ -28,12 +28,68 @@ pub const AUTH_LEN: usize = 32;
 /// on the password.
 pub const MIN_PASSWORD_LEN: usize = 12;
 
-/// Fails if `password` is shorter than `MIN_PASSWORD_LEN` characters.
+/// Words that guessers try first, with a number or symbols on the end.
+const COMMON_PASSWORD_WORDS: &[&str] = &[
+    "admin",
+    "administrator",
+    "baseball",
+    "changeme",
+    "dragon",
+    "football",
+    "iloveyou",
+    "letmein",
+    "login",
+    "master",
+    "monkey",
+    "passw0rd",
+    "password",
+    "princess",
+    "qwerty",
+    "qwertyuiop",
+    "secret",
+    "shadow",
+    "sunshine",
+    "superman",
+    "trustno1",
+    "welcome",
+];
+
+/// Keyboard runs, which pass a length check without being any harder to guess.
+const KEYBOARD_RUNS: &[&str] = &[
+    "qwertyuiopasdfghjklzxcvbnm",
+    "1234567890qwertyuiop",
+    "abcdefghijklmnopqrstuvwxyz",
+    "12345678901234567890",
+];
+
+/// Whether `password` is one that guessers try early, whatever its length:
+/// mostly one short pattern repeated, a run of keys or letters, or a common
+/// word with something on the end. It can't catch everything, but these are
+/// what a list of guesses starts with.
+fn is_common_password(password: &str) -> bool {
+    let lower = password.to_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    let repeats = (1..=chars.len() / 2).any(|period| {
+        chars.len().is_multiple_of(period)
+            && chars.chunks(period).all(|chunk| chunk == &chars[..period])
+    });
+    let run = KEYBOARD_RUNS.iter().any(|keys| {
+        keys.contains(&lower) || keys.chars().rev().collect::<String>().contains(&lower)
+    });
+    let word = lower.trim_end_matches(|c: char| !c.is_alphabetic());
+    repeats || run || COMMON_PASSWORD_WORDS.contains(&word)
+}
+
+/// Fails if `password` is shorter than `MIN_PASSWORD_LEN` characters, or is
+/// one that guessers try early.
 pub fn check_new_password(password: &str) -> Result<(), String> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "a password must be at least {MIN_PASSWORD_LEN} characters long"
         ));
+    }
+    if is_common_password(password) {
+        return Err("that password is too easy to guess: choose another".to_string());
     }
     Ok(())
 }
@@ -380,6 +436,23 @@ mod tests {
         assert!(check_new_password("short").is_err());
         assert!(check_new_password("elevenchars").is_err());
         check_new_password("twelve chars").unwrap();
+        check_new_password("correct horse battery staple").unwrap();
+        for common in [
+            "password1234",
+            "Password123!",
+            "PASSWORD12345",
+            "letmein12345",
+            "iloveyou2024",
+            "qwertyuiop12",
+            "123456789012",
+            "abcdefghijkl",
+            "aaaaaaaaaaaa",
+            "abcabcabcabc",
+            "passwordpassword",
+            "lkjhgfdsapoiuy",
+        ] {
+            assert!(check_new_password(common).is_err(), "{common} got through");
+        }
         // The limit counts characters, not bytes.
         assert!(check_new_password("ééééééééééé").is_err());
     }

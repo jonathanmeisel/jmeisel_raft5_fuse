@@ -707,6 +707,19 @@ raft5fs admin unreachable --delete 4711   # delete one, for good
   way down to it.
 - Backups, restores and snapshots stay with `fsadmin.sh`.
 
+**Failed logins are throttled.** Each server counts failed password guesses
+for each name and each address. After 5 different wrong passwords for a name,
+or 20 from one address, attempts are refused for a second, doubling up to a
+minute: "too many failed logins". The right password waits too, because
+checking it would tell a guesser it was right. Sessions already open carry on.
+
+- Anyone can use up a name's failures, which can keep its owner out for up to a
+  minute at a time while it goes on. A restart clears the counts.
+- The counts are per server, so a guesser can try each server in turn. That
+  still leaves about 1,500 guesses a day per name, per server.
+- Repeating one wrong password counts once, so a mount left running after a
+  password change doesn't lock its owner out.
+
 **Owners, quotas and folder limits.** Each top-level folder (volume) has
 an owner: whoever made it. Everything in it counts against the owner,
 whoever writes it; what is shared with someone costs them nothing. The

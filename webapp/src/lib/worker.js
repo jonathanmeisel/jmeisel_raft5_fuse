@@ -302,7 +302,11 @@ const methods = {
       fs = await wasm.resume(config, user, keys, blobs, persister(db, prefix, tabs.channel));
     } catch (e) {
       tabs.channel.close();
-      if (e.code !== "EHOSTUNREACH") await putRecord(db, "unlock", config.fsId, undefined);
+      // The keys are still good if the servers can't be reached, or are holding
+      // back logins for a moment.
+      if (e.code !== "EHOSTUNREACH" && e.code !== "EBUSY") {
+        await putRecord(db, "unlock", config.fsId, undefined);
+      }
       throw e;
     } finally {
       keys.fill(0);

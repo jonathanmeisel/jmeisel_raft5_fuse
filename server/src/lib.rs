@@ -7,7 +7,8 @@
 //!   for at most `identity_ttl`;
 //! - the core's paths up to grants, which only say what to read, and are
 //!   checked against the store every time (see `raft5fs_core`'s
-//!   `grants::Paths`).
+//!   `grants::Paths`);
+//! - the count of failed logins (see `throttle`).
 //!
 //! Write buffering and the chunk cache are in the client. Sessions are
 //! signed tokens that the client holds (see `auth`).
@@ -16,11 +17,13 @@
 //! browsers gRPC-Web on a second port (`serve_web`), with the same service.
 
 pub mod auth;
+mod throttle;
 pub mod timing;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
+use std::net::IpAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -52,6 +55,7 @@ use raft5fs_proto::pb::{
     StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
+use throttle::LoginThrottle;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::http::{HeaderName, HeaderValue, Method, header};
@@ -108,6 +112,7 @@ pub struct FsService {
     /// tied to then (`Signer::binding`).
     enrolled: Mutex<HashMap<String, (Instant, String)>>,
     identity_ttl: Duration,
+    logins: LoginThrottle,
     /// Whether responses say where their time went (see `timing`).
     timing_header: bool,
     /// Without them, an invitation that a user issues is only a code.
@@ -143,6 +148,7 @@ impl FsService {
             signer,
             enrolled: Mutex::new(HashMap::new()),
             identity_ttl,
+            logins: LoginThrottle::default(),
             timing_header: false,
             invites: None,
         }
@@ -205,6 +211,22 @@ impl FsService {
                 )))
             }
             Err(e) => Err(store_unavailable(e)),
+        }
+    }
+
+    /// Refuses (`EBUSY`) an attempt at a password that has to wait (see
+    /// `throttle`). Not `EACCES`, which says the password was wrong: clients
+    /// forget a remembered login on that.
+    fn check_throttle(&self, name: &str, address: Option<IpAddr>) -> Result<(), FsError> {
+        match self.logins.wait(name, address, Instant::now()) {
+            None => Ok(()),
+            Some(wait) => Err(FsError::new(
+                libc::EBUSY,
+                format!(
+                    "too many failed logins: try again in {} seconds",
+                    wait.as_secs().max(1)
+                ),
+            )),
         }
     }
 
@@ -409,9 +431,14 @@ impl Fs for FsService {
     /// wrapped private key. A wrong `auth` and an unknown account give the
     /// same error.
     async fn login(&self, r: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
+        let address = r.remote_addr().map(|a| a.ip());
         let r = r.into_inner();
+        if let Err(e) = self.check_throttle(&r.username, address) {
+            return Ok(Response::new(Err::<Session, _>(e).into()));
+        }
         let session = match accounts::check_login(self.core.client(), &r.username, &r.auth).await {
             Ok(Some(keys)) => {
+                self.logins.succeeded(&r.username);
                 let binding = self.signer.binding(&keys);
                 self.remember(&r.username, binding.clone());
                 let (token, expires_at) = self.signer.session(&r.username, &binding);
@@ -421,10 +448,14 @@ impl Fs for FsService {
                     wrapped_private_key: keys.wrapped_private_key,
                 })
             }
-            Ok(None) => Err(FsError::new(
-                libc::EACCES,
-                "login refused: the username or password was wrong",
-            )),
+            Ok(None) => {
+                self.logins
+                    .failed(&r.username, address, &r.auth, Instant::now());
+                Err(FsError::new(
+                    libc::EACCES,
+                    "login refused: the username or password was wrong",
+                ))
+            }
             Err(e) => return Err(store_unavailable(e)),
         };
         Ok(Response::new(session.into()))
@@ -445,7 +476,13 @@ impl Fs for FsService {
         &self,
         r: Request<ChangePasswordRequest>,
     ) -> Result<Response<EmptyResponse>, Status> {
+        let address = r.remote_addr().map(|a| a.ip());
         let r = r.into_inner();
+        // It takes the old password, with no session, so it can test guesses
+        // as a login can.
+        if let Err(e) = self.check_throttle(&r.username, address) {
+            return Ok(Response::new(Err::<(), _>(e).into()));
+        }
         let changed = match r.keys {
             None => Err(FsError::new(libc::EINVAL, "a password change needs keys")),
             Some(keys) => {
@@ -458,6 +495,14 @@ impl Fs for FsService {
                 .await
             }
         };
+        match &changed {
+            Ok(()) => self.logins.succeeded(&r.username),
+            Err(e) if e.errno == libc::EACCES => {
+                self.logins
+                    .failed(&r.username, address, &r.old_auth, Instant::now());
+            }
+            Err(_) => {}
+        }
         Ok(Response::new(changed.into()))
     }
 

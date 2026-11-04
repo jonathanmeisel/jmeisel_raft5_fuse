@@ -930,3 +930,79 @@ fn a_new_password_or_a_new_enrollment_ends_earlier_sessions() {
     enrol_again("dave");
     assert_eq!(errno(rt.block_on(old.list_grants())), libc::EACCES);
 }
+
+/// Anyone who can reach a server can try passwords, so each server slows that
+/// down, for a name and for an address.
+#[test]
+fn failed_logins_are_throttled_without_saying_who_exists() {
+    use raft5fs_proto::errno::EBUSY;
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    backend.enrol("bob");
+    // One server, because each keeps its own counts.
+    let one = &backend.addresses()[..1];
+    let try_login = |user: &str, password: &str| {
+        rt.block_on(Remote::connect(
+            one,
+            credentials_with(user, password),
+            Some(fs_tls()),
+        ))
+    };
+    let refused = |user: &str, password: &str| {
+        try_login(user, password)
+            .err()
+            .expect("the login should fail")
+    };
+
+    // One old password, over and over, as a stale mount sends it, is one guess.
+    for _ in 0..10 {
+        assert!(refused("bob", "an old password here").contains("login refused"));
+    }
+
+    // Different ones are refused, and then not even looked at. The right
+    // password gets the same answer until the wait is over.
+    let here = rt
+        .block_on(Remote::connect(one, credentials("bob"), Some(fs_tls())))
+        .unwrap();
+    for i in 0..5 {
+        assert!(refused("bob", &format!("guess number {i}")).contains("login refused"));
+    }
+    let wait = refused("bob", "guess number 5");
+    assert!(wait.contains("too many failed logins"), "{wait}");
+    assert!(
+        refused("bob", &raft5fs_testkit::password("bob")).contains("too many failed logins"),
+        "the right password waits too"
+    );
+    assert!(refused(TESTER, "guess number 5").contains("login refused"));
+
+    // Changing a password takes the old one, so it waits too. A session in use
+    // goes on working.
+    rt.block_on(here.list_grants()).unwrap();
+    assert_eq!(
+        errno(rt.block_on(here.change_password("a brand new password", KdfParams::TESTING))),
+        EBUSY
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let remote = rt
+        .block_on(Remote::connect(one, credentials("bob"), Some(fs_tls())))
+        .expect("the right password works once the wait is over");
+    drop(remote);
+
+    // A success cleared the count, so a typo isn't refused.
+    assert!(refused("bob", "one more typo").contains("login refused"));
+    drop(here);
+
+    // A name that doesn't exist fails the same way.
+    for i in 0..5 {
+        assert!(refused("nobody", &format!("guess number {i}")).contains("login refused"));
+    }
+    assert!(refused("nobody", "guess number 5").contains("too many failed logins"));
+
+    // Guessing at many names from one address adds up too, which also shows
+    // that the servers can see the address.
+    let blocked = (0..20)
+        .find(|i| refused(&format!("name{i}"), "a guess").contains("too many failed logins"));
+    assert!(blocked.is_some(), "an address was never blocked");
+}
