@@ -868,6 +868,7 @@ impl FsCore {
     /// needs the number before it can make the record.
     pub async fn reserve_inode(&self, caller: &Caller) -> Result<u64, FsError> {
         let user = caller.user.as_str();
+        crate::accounts::refuse_link(user)?;
         let ino = allocate_inode(&self.client).await?;
         let key = reservation_key(ino);
         let value = grants::reservation_value(user, unix_secs(SystemTime::now()));
@@ -1702,11 +1703,38 @@ impl FsCore {
 
     /// `user`'s public key, for sealing grants to them. Returns `ENOENT`
     /// for an account that has not enrolled.
-    pub async fn public_key(&self, user: &str) -> Result<Vec<u8>, FsError> {
+    ///
+    /// A public link needs only the key of who sealed its grant, to open it.
+    /// Its holders are strangers, so for any other name they get one refusal,
+    /// which doesn't say whether the account exists.
+    pub async fn public_key(&self, caller: &Caller, user: &str) -> Result<Vec<u8>, FsError> {
+        if caller.user.starts_with(raft5fs_proto::types::LINK_PREFIX)
+            && !self.sealed_a_grant_to(caller, user).await?
+        {
+            return Err(FsError::new(
+                libc::EACCES,
+                "a public link can only ask for the key of who shared its folder",
+            ));
+        }
         crate::accounts::get(&self.client, user)
             .await?
             .map(|keys| keys.public_key)
             .ok_or_else(|| FsError::new(libc::ENOENT, format!("{user} hasn't enrolled")))
+    }
+
+    /// Whether `sender` sealed one of `caller`'s grants, now or in a snapshot,
+    /// which keeps the grants as they were then.
+    async fn sealed_a_grant_to(&self, caller: &Caller, sender: &str) -> Result<bool, FsError> {
+        if grants::has_sender(&self.live(), &caller.user, sender).await? {
+            return Ok(true);
+        }
+        for snapshot in self.client.list_snapshots().await? {
+            let view = View::at(&self.client, &snapshot.id);
+            if grants::has_sender(&view, &caller.user, sender).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Grants directory `grant.ino` to `grantee`, and replaces any grant of
@@ -2389,7 +2417,7 @@ fn operations_are_send(
     send(core.key_path(caller, 1, None));
     send(core.grants(caller, None));
     send(core.snapshots());
-    send(core.public_key("u"));
+    send(core.public_key(caller, "u"));
     send(core.read_chunks(caller, 1, 0, 1, &[], true, None));
     send(core.write_chunks(caller, 1, &[], 0));
     send(core.prepare_uploads(caller, 1, &[]));

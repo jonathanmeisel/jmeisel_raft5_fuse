@@ -617,9 +617,9 @@ impl Fs for FsService {
         &self,
         r: Request<PublicKeyRequest>,
     ) -> Result<Response<PublicKeyResponse>, Status> {
-        let (_, r) = self.caller(r).await?;
+        let (caller, r) = self.caller(r).await?;
         Ok(Response::new(
-            self.core.public_key(&r.username).await.into(),
+            self.core.public_key(&caller, &r.username).await.into(),
         ))
     }
 

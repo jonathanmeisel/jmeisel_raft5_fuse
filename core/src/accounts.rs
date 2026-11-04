@@ -28,7 +28,9 @@
 //! A public link is an account too (`create_link`), whose password only the
 //! link holds. Its name starts with `LINK_PREFIX`, which nothing else may
 //! use. It can only read the one folder its maker grants it, and it lasts
-//! only as long as that grant (`drop_unused_link`) and until it expires.
+//! only as long as that grant (`drop_unused_link`) and until it expires. Its
+//! holders share one secret, so nothing lets one of them change the account
+//! or store anything under it (`refuse_link`).
 
 use raft5_client::{Client, Consistency, Error as KvError, Transaction};
 use raft5fs_crypto::identity::PUBLIC_KEY_LEN;
@@ -90,6 +92,16 @@ pub async fn pins(client: &Client, user: &str) -> Result<(u64, Vec<u8>), FsError
     })
 }
 
+/// Refuses (`EACCES`) what only a person may do. Everyone who has a public
+/// link has its secret, so one of them could otherwise end it for the rest,
+/// or use it to store things.
+pub(crate) fn refuse_link(user: &str) -> Result<(), FsError> {
+    if user.starts_with(LINK_PREFIX) {
+        return Err(FsError::new(libc::EACCES, "a public link can only read"));
+    }
+    Ok(())
+}
+
 /// Replaces `user`'s sealed trusted keys with `sealed` if they are still at
 /// `expected`, the version that the caller read. Returns the new version.
 /// `EAGAIN` if another device changed them since: read, merge, try again.
@@ -99,6 +111,7 @@ pub async fn put_pins(
     expected: u64,
     sealed: &[u8],
 ) -> Result<u64, FsError> {
+    refuse_link(user)?;
     if sealed.len() > MAX_PINS_BYTES {
         return Err(FsError::new(libc::EINVAL, "too many trusted keys"));
     }
@@ -913,6 +926,7 @@ pub async fn change_password(
     old_auth: &[u8],
     keys: &AccountKeys,
 ) -> Result<(), FsError> {
+    refuse_link(user)?;
     validate(keys)?;
     let encoded = encode(keys);
     run_txn(client, |txn| {

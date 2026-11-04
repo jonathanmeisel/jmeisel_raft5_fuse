@@ -43,6 +43,7 @@ use std::future::Future;
 use std::sync::Mutex;
 
 use raft5_client::{Client, Consistency, Error as KvError, Transaction};
+use raft5fs_crypto::identity::grant_sender;
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 
@@ -691,6 +692,14 @@ pub(crate) async fn list(view: &View<'_>, user: &str) -> Result<Vec<Grant>, FsEr
         }
     }
     Ok(grants)
+}
+
+/// Whether one of `user`'s grants, as `view` has them, says `sender` sealed it.
+pub(crate) async fn has_sender(view: &View<'_>, user: &str, sender: &str) -> Result<bool, FsError> {
+    Ok(list(view, user)
+        .await?
+        .iter()
+        .any(|grant| grant_sender(&grant.sealed_key) == Ok(sender)))
 }
 
 /// Writes `grant` of its inode to `user`, with its index entry.

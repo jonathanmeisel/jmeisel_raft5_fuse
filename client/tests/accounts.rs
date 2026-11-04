@@ -762,3 +762,113 @@ fn a_share_inside_a_share_shows_once_and_the_widest_access_wins() {
         libc::EROFS
     );
 }
+
+/// Everyone who has a link has its secret, so nothing lets one holder change
+/// the account, store things under it, or learn who has an account.
+#[test]
+fn a_public_link_can_only_read() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    accounts_allow_links(&backend, TESTER);
+    let bob_key = backend.enrol("bob");
+    let carol_key = backend.enrol("carol");
+    let dave_key = backend.enrol("dave");
+    let tester = vault(&backend, TESTER);
+    let docs = rt
+        .block_on(tester.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    tester.known_keys().check("carol", &carol_key).unwrap();
+    tester.known_keys().check("dave", &dave_key).unwrap();
+    rt.block_on(tester.grant(docs, "bob", true, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(tester.grant(docs, "carol", false, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(tester.grant(docs, "dave", false, OsStr::new("docs")))
+        .unwrap();
+    let (link, secret) = rt
+        .block_on(tester.create_link(docs, "/docs", OsStr::new("docs"), None))
+        .unwrap();
+
+    let visitor = visit(&backend, &link, &secret).unwrap();
+    let remote = visitor.remote();
+
+    // It changes nothing about the account, and stores nothing.
+    assert_eq!(
+        errno(rt.block_on(remote.change_password("a new password here", KdfParams::TESTING))),
+        libc::EACCES
+    );
+    assert_eq!(errno(rt.block_on(remote.allocate_inode())), libc::EACCES);
+    assert_eq!(
+        errno(rt.block_on(remote.put_pins(0, vec![1; 64]))),
+        libc::EACCES
+    );
+    assert!(
+        visit(&backend, &link, &secret).is_ok(),
+        "the secret still works"
+    );
+
+    // It gets the key of who sealed its grant, and can't tell whether anyone
+    // else has an account.
+    assert_eq!(
+        rt.block_on(remote.public_key(TESTER)).unwrap(),
+        backend.tester_key
+    );
+    let real = rt.block_on(remote.public_key("bob")).unwrap_err();
+    let made_up = rt.block_on(remote.public_key("nobody")).unwrap_err();
+    assert_eq!(real.errno, libc::EACCES);
+    assert_eq!(real, made_up);
+
+    // A person still can tell, as they must to share.
+    let person = tester.remote();
+    assert_eq!(rt.block_on(person.public_key("bob")).unwrap(), bob_key);
+    assert_eq!(
+        errno(rt.block_on(person.public_key("nobody"))),
+        libc::ENOENT
+    );
+
+    // When a writer revokes someone, they seal the link's grant again, so it
+    // opens with their key, and no longer needs the tester's.
+    let bob = vault(&backend, "bob");
+    bob.known_keys().check(TESTER, &backend.tester_key).unwrap();
+    bob.known_keys().check("carol", &carol_key).unwrap();
+    bob.known_keys().check("dave", &dave_key).unwrap();
+    bob.known_keys()
+        .check(&link, &rt.block_on(person.public_key(&link)).unwrap())
+        .unwrap();
+    rt.block_on(bob.revoke(docs, "carol")).unwrap();
+    let again = visit(&backend, &link, &secret).unwrap();
+    rt.block_on(again.readdir(docs))
+        .expect("the link opens under the new sender");
+    assert_eq!(rt.block_on(remote.public_key("bob")).unwrap(), bob_key);
+    assert_eq!(errno(rt.block_on(remote.public_key(TESTER))), libc::EACCES);
+
+    // A snapshot keeps the grant as it was, so its sender stays open to the
+    // link for as long as the snapshot lasts.
+    backend.snapshot("before");
+    rt.block_on(tester.revoke(docs, "dave")).unwrap();
+    assert_eq!(
+        rt.block_on(remote.public_key(TESTER)).unwrap(),
+        backend.tester_key,
+        "the tester sealed the grant now"
+    );
+    assert_eq!(
+        rt.block_on(remote.public_key("bob")).unwrap(),
+        bob_key,
+        "bob sealed the grant in the snapshot"
+    );
+    backend.drop_snapshot("before");
+    assert_eq!(errno(rt.block_on(remote.public_key("bob"))), libc::EACCES);
+}
+
+fn accounts_allow_links(backend: &Backend, user: &str) {
+    backend
+        .runtime
+        .block_on(accounts::set_caps(
+            &backend.client,
+            user,
+            Caps::LINKS,
+            Caps::NONE,
+        ))
+        .unwrap();
+}
