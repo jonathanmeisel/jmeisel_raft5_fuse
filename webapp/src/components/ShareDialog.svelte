@@ -8,7 +8,10 @@
   import Fingerprint from "./Fingerprint.svelte";
   import CodeInput from "./CodeInput.svelte";
 
-  let { fs, path, onclose } = $props();
+  // That check goes both ways: to change what is shared, the other person
+  // needs this account's code too. So it shows here while the two are in
+  // touch, and again at the end.
+  let { fs, path, mine, onclose } = $props();
   let user = $state("");
   let readOnly = $state(false);
   // svelte-ignore state_referenced_locally
@@ -19,7 +22,10 @@
   let keyChanged = $state(false);
   let busy = $state(false);
   let error = $state("");
-  let sealedTo = $state(null);
+  let shared = $state(false);
+  /// Whether this was the first share with them, so they need this account's
+  /// code next.
+  let first = $state(false);
 
   async function submit(event) {
     event.preventDefault();
@@ -38,7 +44,9 @@
       }
       if (keyChanged) await fs.replaceKey(user.trim(), words.trim());
       const fingerprint = needWords && !keyChanged ? words.trim() : null;
-      sealedTo = await fs.share(path, user.trim(), !readOnly, label.trim(), fingerprint);
+      first = needWords;
+      await fs.share(path, user.trim(), !readOnly, label.trim(), fingerprint);
+      shared = true;
     } catch (e) {
       if (e.code === "EFINGERPRINT") needWords = true;
       else if (e.code === "EKEYCHANGED") needWords = keyChanged = true;
@@ -49,10 +57,13 @@
   }
 </script>
 
-<Dialog title={`Share ${path}`} {onclose}>
-  {#if sealedTo}
-    <p>Shared with <strong>{user}</strong> {readOnly ? "read-only" : "read-write"} as “{label}”, sealed to the key with this safety code:</p>
-    <Fingerprint fingerprint={sealedTo} />
+<Dialog title={`Share ${path}`} keep={needWords && !shared} {onclose}>
+  {#if shared}
+    <p>Shared with <strong>{user}</strong> {readOnly ? "read-only" : "read-write"} as “{label}”.</p>
+    {#if first}
+      <p>{user} now needs your safety code, to know it's really from you:</p>
+      <Fingerprint fingerprint={mine} />
+    {/if}
     <p><button class="primary" onclick={onclose}>Done</button></p>
   {:else}
     <form onsubmit={submit}>
@@ -87,6 +98,8 @@
             words.
           </p>
         {/if}
+        <p>They'll need yours too. Your safety code:</p>
+        <Fingerprint fingerprint={mine} />
       {/if}
       {#if error}<p class="error">{error}</p>{/if}
       <p>

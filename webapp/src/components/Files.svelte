@@ -612,7 +612,7 @@
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "share"}
-  <ShareDialog {fs} path={dialog.path} onclose={closeSharing} />
+  <ShareDialog {fs} path={dialog.path} mine={me.fingerprint} onclose={closeSharing} />
 {:else if dialog?.kind === "shared-with"}
   <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={closeSharing} />
 {:else if dialog?.kind === "transfer"}
