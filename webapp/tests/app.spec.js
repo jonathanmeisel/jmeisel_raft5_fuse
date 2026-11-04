@@ -311,7 +311,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.getByRole("button", { name: "Share", exact: true }).click();
     await alice.getByLabel("bob's fingerprint").fill(aliceWords);
     await alice.getByRole("button", { name: "Share", exact: true }).click();
-    await expect(alice.getByText(/not the one given/)).toBeVisible(SLOW);
+    await expect(alice.getByText(/don't match the key/)).toBeVisible(SLOW);
     await alice.getByLabel("bob's fingerprint").fill(bobWords);
     await alice.getByRole("button", { name: "Share", exact: true }).click();
     await expect(alice.getByText(/Shared with bob/)).toBeVisible(SLOW);
@@ -684,7 +684,7 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     // Her old fingerprint doesn't match her new key.
     await hank.getByLabel("iris's fingerprint").fill(irisWords);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
-    await expect(hank.getByText(/not the one given/)).toBeVisible(SLOW);
+    await expect(hank.getByText(/don't match the key/)).toBeVisible(SLOW);
     await hank.getByLabel("iris's fingerprint").fill(newIris);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/Shared with iris/)).toBeVisible(SLOW);
@@ -704,7 +704,7 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     await iris.getByRole("button", { name: "Check new fingerprint…" }).click();
     await iris.getByLabel("fingerprint").fill(hankWords);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByText(/not the one given/)).toBeVisible(SLOW);
+    await expect(iris.getByText(/don't match the key/)).toBeVisible(SLOW);
     await iris.getByLabel("fingerprint").fill(newHank);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
     await expect(iris.getByRole("button", { name: "Check new fingerprint…" })).toHaveCount(0, SLOW);

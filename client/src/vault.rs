@@ -1936,13 +1936,15 @@ impl Vault {
         let served = self.served_key(user).await?;
         let matches = fingerprint_matches(&served, expected)
             .map_err(|e| FsError::new(errno::EINVAL, format!("{expected:?}: {e}")))?;
+        // It doesn't say what the server's key is: someone shown the answer
+        // could copy it, and then the check would check nothing.
         if !matches {
             return Err(FsError::new(
                 errno::EPERM,
                 format!(
-                    "the server's key for {user} has fingerprint\n  {}\nnot the one given: \
-                     not pinning it",
-                    fingerprint_words(&served)
+                    "those words don't match the key the servers have for {user}. Check them \
+                     with {user}, one by one. If they still don't match, don't trust this key, \
+                     and tell your admin."
                 ),
             ));
         }

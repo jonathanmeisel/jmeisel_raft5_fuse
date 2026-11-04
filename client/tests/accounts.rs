@@ -1006,3 +1006,23 @@ fn failed_logins_are_throttled_without_saying_who_exists() {
         .find(|i| refused(&format!("name{i}"), "a guess").contains("too many failed logins"));
     assert!(blocked.is_some(), "an address was never blocked");
 }
+
+/// A check that shows the answer checks nothing: someone could copy it.
+#[test]
+fn a_wrong_fingerprint_does_not_show_the_right_one() {
+    use raft5fs_crypto::identity::{fingerprint_matches, fingerprint_words};
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let carol_key = backend.enrol("carol");
+    let tester = vault(&backend, TESTER);
+    let wrong = fingerprint_words(&carol_key);
+    assert!(!fingerprint_matches(&bob_key, &wrong).unwrap());
+    let refused = rt.block_on(tester.trust("bob", &wrong)).unwrap_err();
+    assert_eq!(refused.errno, libc::EPERM);
+    let right = fingerprint_words(&bob_key);
+    let first_word = right.split(' ').next().unwrap();
+    assert!(!refused.message.contains(&right), "{}", refused.message);
+    assert!(!refused.message.contains(first_word), "{}", refused.message);
+}

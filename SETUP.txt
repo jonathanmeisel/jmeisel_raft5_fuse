@@ -552,10 +552,13 @@ look, but nothing he writes could end up sealed under a key the server
 made.
 
   raft5fs pending                what is shared with you by someone not
-                                 trusted yet, with their fingerprint as
-                                 the server has it
+                                 trusted yet
   raft5fs trust alice <her twelve words>
-                                 pin her key, if she reads you the same
+                                 pin her key, if they match it
+
+Nothing here shows you what the fingerprint should be. The words have to
+come from alice, or the check would only compare the server's key with
+itself.
 
 A running mount takes the new pin the next time it writes there. If
 someone really did enrol again, check their new fingerprint with them,
