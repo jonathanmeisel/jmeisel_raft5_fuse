@@ -5,6 +5,7 @@
   import Dialog from "./Dialog.svelte";
   import CodeInput from "./CodeInput.svelte";
   import Fingerprint from "./Fingerprint.svelte";
+  import ErrorText from "./ErrorText.svelte";
 
   let { fs, mine, onclose } = $props();
   let people = $state(null);
@@ -27,7 +28,12 @@
       people = [];
     }
   }
-  load();
+
+  // Each login merges with the account's other devices, but only logs a failure.
+  // This is where someone looks at whom they trust, so it says so here.
+  fs.syncPins()
+    .catch((e) => (error = e.message))
+    .then(load);
 
   async function run(work) {
     busy = true;
@@ -129,7 +135,7 @@
       <button onclick={onclose}>Close</button>
     </p>
   {/if}
-  {#if error}<p class="error">{error}</p>{/if}
+  {#if error}<div class="error"><ErrorText {fs} message={error} /></div>{/if}
 </Dialog>
 
 <style>

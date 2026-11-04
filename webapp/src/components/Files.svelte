@@ -5,6 +5,7 @@
   // servers have. SVAR never gets a URL, so it fetches nothing itself.
   import { Filemanager, WillowDark, getMenuOptions } from "@svar-ui/svelte-filemanager";
   import Fingerprint from "./Fingerprint.svelte";
+  import ErrorText from "./ErrorText.svelte";
   import Dialog from "./Dialog.svelte";
   import ShareDialog from "./ShareDialog.svelte";
   import SharedWith from "./SharedWith.svelte";
@@ -552,7 +553,7 @@
   {/if}
   {#if error}
     <div class="banner error-banner">
-      {error}
+      <ErrorText {fs} message={error} />
       <button onclick={() => (error = "")}>Dismiss</button>
     </div>
   {/if}

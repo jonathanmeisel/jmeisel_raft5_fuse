@@ -577,11 +577,26 @@ same keys and she checks each fingerprint once. It is sealed under a key
 that only her key pair gives: the servers can't read it, or add or
 change a pin. Every login merges this machine's pins with that copy, and
 every trust, new key or forget-key updates it; where two devices
-disagree, the latest change wins. A server could hand back an older
-copy, which can only take pins away: she would be asked for a
-fingerprint again, never shown a key she didn't check. Enrolling again
-drops the copy, since a new key pair can't open it. (Servers older than
-protocol 3 keep no copy; then each device pins on its own.)
+disagree, the latest change wins. Enrolling again drops the copy, since
+a new key pair can't open it. (Servers older than protocol 3 keep no
+copy; then each device pins on its own.)
+
+A server could hand back an older copy, or an older key record for a
+folder. An older copy could bring back a key that alice has since
+replaced, and an older key record could make her seal new files under a
+key that a revoked user still has. So each device remembers the newest
+it has seen, in files next to known_keys, and refuses anything older.
+A device that has seen nothing yet has nothing to compare with.
+
+A real restore from a backup looks just the same: every device says the
+servers handed back something older. After a restore, and only then, run
+this on each device, and restart any mount:
+
+  raft5fs reset-versions
+
+(In the web app, a button beside the message does the same.) That device
+then accepts what the servers give, and its own pins replace any older
+ones in the restored copy.
 
 
 -------------------------------------------------------------------------

@@ -6,8 +6,10 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 use raft5fs_client::remote::Remote;
-use raft5fs_client::vault::Vault;
+use raft5fs_client::store::{MemoryStore, Store};
+use raft5fs_client::vault::{KnownKeys, Vault};
 use raft5fs_core::accounts;
+use raft5fs_crypto::identity::fingerprint_words;
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
@@ -414,7 +416,6 @@ fn public_links_read_one_folder_until_any_writer_revokes() {
 
 #[test]
 fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
-    use raft5fs_crypto::identity::fingerprint_words;
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let old = backend.enrol("bob");
@@ -458,7 +459,6 @@ fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
 
 #[test]
 fn trusted_keys_follow_the_account_to_its_other_devices() {
-    use raft5fs_crypto::identity::fingerprint_words;
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let bob = backend.enrol("bob");
@@ -1025,4 +1025,132 @@ fn a_wrong_fingerprint_does_not_show_the_right_one() {
     let first_word = right.split(' ').next().unwrap();
     assert!(!refused.message.contains(&right), "{}", refused.message);
     assert!(!refused.message.contains(first_word), "{}", refused.message);
+}
+
+/// One device's pins, kept in `store` as they are across its restarts.
+fn device(backend: &Backend, user: &str, store: &Arc<MemoryStore>) -> Vault {
+    let store: Arc<dyn Store> = store.clone();
+    vault(backend, user).with_known_keys(KnownKeys::open(store, "pins").unwrap())
+}
+
+#[test]
+fn a_device_refuses_a_key_record_older_than_it_saw() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let store = Arc::new(MemoryStore::new());
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let docs = rt
+        .block_on(a.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = rt
+        .block_on(a.mkdir(docs, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    let key = [&[0x08], &sub.to_be_bytes()[..]].concat();
+    let old = backend.read_key(&key).unwrap();
+
+    // Revoking gives the folder a new key, which this device then sees.
+    rt.block_on(a.grant(sub, "bob", false, OsStr::new("sub")))
+        .unwrap();
+    rt.block_on(a.revoke(sub, "bob")).unwrap();
+    rt.block_on(a.readdir(sub)).unwrap();
+    assert!(rt.block_on(a.node(sub)).unwrap().record.version >= 2);
+    drop(a);
+
+    // The servers hand back the old record to a restarted device.
+    backend.write_key(&key, Some(&old));
+    let restarted = device(&backend, TESTER, &store);
+    let e = rt.block_on(restarted.readdir(sub)).unwrap_err();
+    assert_eq!(e.errno, libc::EIO);
+    assert!(e.message.contains("restored from a backup"), "{e:?}");
+    assert!(e.message.contains("raft5fs reset-versions"), "{e:?}");
+
+    // A new device has nothing to compare with.
+    rt.block_on(vault(&backend, TESTER).readdir(sub)).unwrap();
+
+    // After a real restore, a person resets the device.
+    rt.block_on(restarted.reset_versions()).unwrap();
+    rt.block_on(restarted.readdir(sub)).unwrap();
+    assert_eq!(
+        rt.block_on(restarted.node(sub)).unwrap().record.version,
+        1,
+        "it took the restored record"
+    );
+}
+
+#[test]
+fn a_device_refuses_pins_older_than_it_saw() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let carol = backend.enrol("carol");
+    let store = Arc::new(MemoryStore::new());
+    let key = [b"\x06p/", TESTER.as_bytes()].concat();
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let old = backend.read_key(&key).unwrap();
+    rt.block_on(a.trust("carol", &fingerprint_words(&carol)))
+        .unwrap();
+    let newest = backend.read_key(&key).unwrap();
+
+    // Refused at once, and after a restart. This device keeps its pins.
+    backend.write_key(&key, Some(&old));
+    for device in [&a, &device(&backend, TESTER, &store)] {
+        let e = rt.block_on(device.sync_pins()).unwrap_err();
+        assert_eq!(e.errno, libc::EIO);
+        assert!(e.message.contains("restored from a backup"), "{e:?}");
+        assert_eq!(device.known_keys().pinned("carol"), Some(carol));
+    }
+    // Having no copy at all is older too.
+    backend.write_key(&key, None);
+    assert_eq!(
+        rt.block_on(a.sync_pins()).unwrap_err().errno,
+        libc::EIO,
+        "the copy was deleted"
+    );
+
+    // A new device takes what it is given: it has nothing to compare with.
+    backend.write_key(&key, Some(&old));
+    let new = vault(&backend, TESTER);
+    rt.block_on(new.sync_pins()).unwrap();
+    assert_eq!(new.known_keys().pinned("bob"), Some(bob));
+    assert_eq!(new.known_keys().pinned("carol"), None);
+
+    // After a reset, this device's pins win over the restored copy, and the
+    // counter goes on from there.
+    rt.block_on(a.reset_versions()).unwrap();
+    rt.block_on(a.sync_pins()).unwrap();
+    assert_eq!(a.known_keys().pinned("carol"), Some(carol));
+    rt.block_on(new.sync_pins()).unwrap();
+    assert_eq!(new.known_keys().pinned("carol"), Some(carol));
+    assert_ne!(backend.read_key(&key).unwrap(), newest);
+}
+
+/// A key trusted while the servers can't be told stays trusted after a
+/// restart: the servers' copy doesn't simply replace it.
+#[test]
+fn a_change_made_offline_survives_a_restart() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let store = Arc::new(MemoryStore::new());
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    // Only here, without a merge: the new key isn't on the servers.
+    a.known_keys().forget("bob").unwrap();
+    a.known_keys().check("bob", &[9; 32]).unwrap();
+    drop(a);
+
+    let restarted = device(&backend, TESTER, &store);
+    rt.block_on(restarted.sync_pins()).unwrap();
+    assert_eq!(restarted.known_keys().pinned("bob"), Some([9; 32]));
 }

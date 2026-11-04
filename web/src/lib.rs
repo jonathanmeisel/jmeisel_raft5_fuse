@@ -1834,6 +1834,23 @@ impl Fs {
         promise(async move { inner.vault().forget_key(&user).await })
     }
 
+    /// Merges this browser's pins with the account's copy, and reports a
+    /// failure, which a login only logs.
+    #[wasm_bindgen(js_name = syncPins)]
+    pub fn sync_pins(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().sync_pins().await })
+    }
+
+    /// After a real restore: forgets the key versions and pin counter that
+    /// this browser remembers. The app reloads after this, because the
+    /// background prune has its own view of them.
+    #[wasm_bindgen(js_name = resetVersions)]
+    pub fn reset_versions(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().reset_versions().await })
+    }
+
     /// What waits to be pruned, with each entry's latest status.
     #[wasm_bindgen(js_name = pruneStatus)]
     pub fn prune_status(&self) -> Result<JsValue, JsValue> {

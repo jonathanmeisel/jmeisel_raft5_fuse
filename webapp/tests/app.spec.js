@@ -971,6 +971,65 @@ test("new shares and files show up without a reload", async ({ browser }) => {
   expect(problems.flat()).toEqual([]);
 });
 
+test("a device that saw newer keys says so, and a person can reset it", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "olga");
+  await login(page, "olga");
+  await addFolder(page, "kept");
+
+  // Stands in for a rollback, or a restore: this browser remembers more than
+  // the servers now have.
+  const remember = (names) =>
+    page.evaluate(
+      ({ names }) =>
+        new Promise((resolve, reject) => {
+          const opening = indexedDB.open("raft5fs");
+          opening.onerror = () => reject(opening.error);
+          opening.onsuccess = () => {
+            const transaction = opening.result.transaction("blobs", "readwrite");
+            const blobs = transaction.objectStore("blobs");
+            const keys = blobs.getAllKeys();
+            keys.onsuccess = () => {
+              const encode = (text) => new TextEncoder().encode(text).buffer;
+              const mine = keys.result.filter((key) => key.includes("/olga/"));
+              const pins = mine.find((key) => key.includes(".sync."));
+              if (!pins) return reject(new Error(`no merge remembered: ${mine}`));
+              blobs.put(encode(names.pins), pins);
+              const versions = pins.slice(0, pins.indexOf(".sync.")) + ".versions";
+              blobs.put(encode(names.versions), versions);
+            };
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error);
+          };
+        }),
+      { names },
+    );
+  const inodes = Array.from({ length: 5000 }, (_, ino) => `${ino} 99\n`).join("");
+  await expect(async () => remember({ pins: "counter 999\n", versions: inodes })).toPass(SLOW);
+
+  await page.reload();
+  await login(page, "olga");
+  await open(page, "kept");
+  const message = /older than[^]*restored from a backup/;
+  await expect(page.getByText(message).first()).toBeVisible(SLOW);
+  await expect(page.getByText("raft5fs reset-versions")).toHaveCount(0);
+
+  // The sealed list is older too, and People is where that shows.
+  await accountMenu(page, "People");
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(/trusted keys is change \d+, older than change 999/)).toBeVisible(SLOW);
+
+  await dialog.getByRole("button", { name: "It was restored: reset this device" }).click();
+  await login(page, "olga");
+  await expect(item(page, "kept")).toBeVisible(SLOW);
+  await open(page, "kept");
+  await accountMenu(page, "People");
+  await expect(page.getByRole("dialog").getByText("You haven't checked anyone yet.")).toBeVisible(SLOW);
+  await expect(page.getByRole("dialog").getByText(/older than/)).toHaveCount(0);
+
+  expect(problems).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

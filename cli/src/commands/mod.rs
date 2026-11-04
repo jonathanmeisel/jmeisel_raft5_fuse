@@ -133,6 +133,10 @@ pub enum Command {
     Trust(share::TrustArgs),
     /// Forget a user's pinned key (for example, after they enrolled again).
     ForgetKey(share::UserArg),
+    /// After a real restore from a backup: forget the key versions and the
+    /// trusted-key counter that this device remembers. Do not use this for
+    /// any other reason: the servers could be rolling them back.
+    ResetVersions,
     /// Show what users that are not trusted yet share with this account.
     Pending,
     /// Prune old key versions: what is queued, or the given directories.
@@ -161,6 +165,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Grants(args) => share::grants(&cli.connect, args),
         Command::Trust(args) => share::trust(&cli.connect, args),
         Command::ForgetKey(args) => share::forget_key(&cli.connect, args),
+        Command::ResetVersions => share::reset_versions(&cli.connect),
         Command::Pending => share::pending(&cli.connect),
         Command::Prune(args) => prune::run(&cli.connect, args),
         Command::Profile(command) => profile::run(command),

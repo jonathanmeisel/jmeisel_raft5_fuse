@@ -218,6 +218,19 @@ pub fn forget_key(connect: &ConnectArgs, args: UserArg) -> Outcome {
     Ok(0)
 }
 
+pub fn reset_versions(connect: &ConnectArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    runtime
+        .block_on(vault.reset_versions())
+        .map_err(|e| format!("cannot reset this device's memory: {e}"))?;
+    println!(
+        "this device now accepts the versions the servers give; restart any mount of this account"
+    );
+    Ok(0)
+}
+
 pub fn pending(connect: &ConnectArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();

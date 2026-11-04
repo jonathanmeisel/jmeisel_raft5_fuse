@@ -47,7 +47,7 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
-use raft5fs_crypto::pins::{PinEntry, open_pins, seal_pins};
+use raft5fs_crypto::pins::{PinEntry, PinList, open_pins, seal_pins};
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
@@ -61,6 +61,7 @@ use blocks::{BlockEdit, Rewritten};
 
 mod blocks;
 mod prune;
+mod rollback;
 pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
@@ -521,14 +522,10 @@ pub struct Vault {
     remote: Arc<Remote>,
     identity: Arc<Identity>,
     known: KnownKeys,
-    /// This device's pins as of its last merge with the account's copy on
-    /// the servers (`sync_pins`); `None` before the first.
-    pins_synced: Mutex<Option<HashMap<String, [u8; PUBLIC_KEY_LEN]>>>,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
-    /// The newest key version seen for each inode in this session. Clearing
-    /// `nodes` does not clear it. It stops the server from returning an
-    /// older key record, under a key that a revoked user still has.
-    seen: Mutex<HashMap<u64, u32>>,
+    /// The newest key version seen for each inode, kept beside the pins.
+    /// Clearing `nodes` does not clear it. See `rollback`.
+    versions: Mutex<rollback::Versions>,
     /// Public keys that the server gave for grant senders, by user name.
     senders: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
     /// If true (`with_untrusted_warnings`), print a message once for each
@@ -544,6 +541,12 @@ pub struct Vault {
     space: u64,
     /// Each file's layout, kept after the first request (see `layout`).
     layouts: Mutex<HashMap<u64, Layout>>,
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.save_versions(true);
+    }
 }
 
 /// How much decrypted file data a vault caches by default.
@@ -565,9 +568,8 @@ impl Vault {
             remote,
             identity,
             known: KnownKeys::in_memory(),
-            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
+            versions: Mutex::default(),
             senders: Mutex::new(HashMap::new()),
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
@@ -595,9 +597,8 @@ impl Vault {
             remote: Arc::new(self.remote.at(name)),
             identity: Arc::clone(&self.identity),
             known: KnownKeys::in_memory(),
-            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
+            versions: Mutex::default(),
             senders: Mutex::new(HashMap::new()),
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
@@ -619,7 +620,7 @@ impl Vault {
     /// Pins public keys in `known`, not only in memory.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.known = known;
-        self.pins_synced = Mutex::new(None);
+        self.load_versions();
         self
     }
 
@@ -628,11 +629,14 @@ impl Vault {
     ///
     /// - What changed here since the last merge (a key trusted, replaced or
     ///   forgotten) goes to the servers, unless another device changed the
-    ///   same user later.
-    /// - On the first merge, keys trusted only here go to the servers too.
-    ///   Where the two differ, the servers' copy wins: it is the latest
-    ///   that one of the account's devices checked.
+    ///   same user later. The last merge is kept beside the pins, so this
+    ///   holds after a restart too.
+    /// - On this device's first merge, keys trusted only here go to the
+    ///   servers too. Where the two differ, the servers' copy wins: it is
+    ///   the latest that one of the account's devices checked.
     /// - Then this device trusts what the merged list says.
+    /// - Returns `EIO` and changes nothing if the servers' copy is older
+    ///   than one this device has seen (`rollback`).
     ///
     /// The servers can't read or change the list (raft5fs-crypto's
     /// `pins`). Does nothing on servers older than protocol 3.
@@ -642,7 +646,7 @@ impl Vault {
         }
         let me = self.remote.username().to_string();
         let local = self.known.all();
-        let base = self.pins_synced.lock().unwrap().clone();
+        let rollback::PinMemory { floor, base } = self.load_pin_memory();
         let now = raft5fs_proto::clock::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -665,13 +669,17 @@ impl Vault {
         for _ in 0..CHANGE_RETRIES {
             let (version, sealed) = self.remote.get_pins().await?;
             let stored = if sealed.is_empty() {
-                Vec::new()
+                PinList::default()
             } else {
                 open_pins(&self.identity, &me, &sealed)
                     .map_err(|e| FsError::new(errno::EIO, format!("the servers' copy: {e}")))?
             };
-            let before: BTreeMap<String, PinEntry> =
-                stored.into_iter().map(|e| (e.user.clone(), e)).collect();
+            self.check_pin_counter(stored.counter, floor)?;
+            let before: BTreeMap<String, PinEntry> = stored
+                .entries
+                .into_iter()
+                .map(|e| (e.user.clone(), e))
+                .collect();
             let mut merged = before.clone();
             for change in &changes {
                 if merged.get(&change.user).is_none_or(|e| e.at <= change.at) {
@@ -698,11 +706,19 @@ impl Vault {
             for user in &dead {
                 merged.remove(user);
             }
-            if merged != before {
-                let entries: Vec<PinEntry> = merged.values().cloned().collect();
+            // A list from before counters has nothing to protect it until
+            // it has one.
+            let uncounted = stored.counter == 0 && !sealed.is_empty();
+            let mut counter = stored.counter;
+            if merged != before || uncounted {
+                counter = stored.counter.max(floor) + 1;
+                let list = PinList {
+                    counter,
+                    entries: merged.values().cloned().collect(),
+                };
                 match self
                     .remote
-                    .put_pins(version, seal_pins(&self.identity, &me, &entries))
+                    .put_pins(version, seal_pins(&self.identity, &me, &list))
                     .await
                 {
                     // Another device changed them: merge with theirs.
@@ -728,7 +744,11 @@ impl Vault {
                     _ => {}
                 }
             }
-            *self.pins_synced.lock().unwrap() = Some(self.known.all());
+            self.save_pin_memory(&rollback::PinMemory {
+                floor: counter,
+                base: Some(self.known.all()),
+            })
+            .map_err(io)?;
             // Grants from users trusted now open as trusted.
             if changed_here {
                 self.forget_all();
@@ -1288,28 +1308,8 @@ impl Vault {
         Ok(parent.1)
     }
 
-    /// Returns `EIO` if `record` is older than a record seen before for
-    /// `ino`. A server could send an old record so that the client seals
-    /// new data under a key that a revoked user still has.
-    fn check_not_older(&self, ino: u64, record: &NodeKeys) -> Result<(), FsError> {
-        match self.seen.lock().unwrap().get(&ino) {
-            Some(&seen) if record.version < seen => Err(FsError::new(
-                errno::EIO,
-                format!(
-                    "inode {ino}: the server handed back key version {}, older than \
-                     version {seen} seen before",
-                    record.version
-                ),
-            )),
-            _ => Ok(()),
-        }
-    }
-
     fn keep(&self, ino: u64, node: Node) -> Arc<Node> {
-        let mut seen = self.seen.lock().unwrap();
-        let newest = seen.entry(ino).or_insert(node.record.version);
-        *newest = (*newest).max(node.record.version);
-        drop(seen);
+        self.saw_version(ino, node.record.version);
         let node = Arc::new(node);
         self.nodes.lock().unwrap().insert(ino, Arc::clone(&node));
         node
