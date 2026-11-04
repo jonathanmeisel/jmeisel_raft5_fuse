@@ -1711,8 +1711,9 @@ impl Fs {
         })
     }
 
-    /// Shares from people whose keys aren't pinned here: read-only until
-    /// trusted (`trust`), or not opening at all.
+    /// Everything shared with this account, with who shared it. Shares from
+    /// people whose keys aren't pinned here are read-only until trusted
+    /// (`trust`), or don't open at all.
     pub fn pending(&self) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
@@ -1721,9 +1722,11 @@ impl Fs {
             struct Pending {
                 label: String,
                 sender: String,
-                /// `untrusted` or `unreadable`.
+                /// `trusted`, `untrusted` or `unreadable`.
                 state: &'static str,
                 message: String,
+                /// Whether the share lets this account change things.
+                writable: bool,
                 /// The sender's key differs from the one pinned here, so
                 /// trusting them means replacing it (`replaceKey`).
                 key_changed: bool,
@@ -1731,20 +1734,22 @@ impl Fs {
             let mut pending = Vec::new();
             for share in inner.vault().shares().await? {
                 let (state, message) = match share.trust {
-                    ShareTrust::Trusted => continue,
+                    ShareTrust::Trusted => ("trusted", String::new()),
                     ShareTrust::Untrusted { .. } => ("untrusted", String::new()),
                     ShareTrust::Unreadable(e) => ("unreadable", e.message),
                 };
-                let key_changed = inner
-                    .vault()
-                    .key_changed(&share.sender)
-                    .await
-                    .unwrap_or(false);
+                let key_changed = state != "trusted"
+                    && inner
+                        .vault()
+                        .key_changed(&share.sender)
+                        .await
+                        .unwrap_or(false);
                 pending.push(Pending {
                     label: share.label.to_string_lossy().into_owned(),
                     sender: share.sender,
                     state,
                     message,
+                    writable: share.writable,
                     key_changed,
                 });
             }

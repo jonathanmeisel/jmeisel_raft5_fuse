@@ -198,7 +198,7 @@
 
   async function refreshPending() {
     try {
-      pendingCount = (await fs.pending()).length;
+      pendingCount = (await fs.pending()).filter((p) => p.state !== "trusted").length;
     } catch {}
   }
 
@@ -530,8 +530,8 @@
 
   {#if pendingCount && !visitor}
     <div class="banner">
-      {pendingCount === 1 ? "A share is" : `${pendingCount} shares are`} waiting for you to check who
-      sent {pendingCount === 1 ? "it" : "them"}.
+      {pendingCount === 1 ? "A share needs" : `${pendingCount} shares need`} checking. You can already
+      open {pendingCount === 1 ? "it" : "them"}, but check who sent {pendingCount === 1 ? "it" : "them"} to be sure.
       <button onclick={() => (dialog = { kind: "pending" })}>Review</button>
     </div>
   {/if}
@@ -637,6 +637,8 @@
 {:else if dialog?.kind === "pending"}
   <Pending
     {fs}
+    me={me.user}
+    mine={me.fingerprint}
     onclose={() => {
       dialog = null;
       refreshPending();

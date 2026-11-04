@@ -348,13 +348,13 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await bob.reload();
     await login(bob, "bob");
     // A share from someone not trusted yet shows as a banner.
-    await expect(bob.getByText("A share is waiting for you to check who sent it.")).toBeVisible(SLOW);
+    await expect(bob.getByText(/A share needs checking/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Review" }).click();
     await expect(bob.getByText(/docs.*from alice/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Trust…" }).click();
     await bob.getByLabel("Their safety code").fill(aliceWords);
     await bob.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(bob.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await expect(bob.getByText(/You and alice are verified/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Close" }).click();
     await open(bob, "docs");
     await expect(bob.locator(".sharing-bar")).toContainText("Shared with alice", SLOW);
@@ -656,7 +656,7 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     await iris.getByRole("button", { name: "Trust…" }).click();
     await iris.getByLabel("Their safety code").fill(hankWords);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await expect(iris.getByText(/You and hank are verified/)).toBeVisible(SLOW);
     await iris.getByRole("button", { name: "Close" }).click();
   });
 
@@ -886,7 +886,7 @@ test("new shares and files show up without a reload", async ({ browser }) => {
   /// What the browser does when someone comes back to the tab.
   const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
 
-  await enrol(mona, "mona");
+  const monaWords = await enrol(mona, "mona");
   const nilsWords = await enrol(nils, "nils");
   await login(mona, "mona");
   await login(nils, "nils");
@@ -906,14 +906,33 @@ test("new shares and files show up without a reload", async ({ browser }) => {
   await expect(mona.getByText(/isn't one of the words/)).toBeVisible();
   await expect(mona.getByRole("button", { name: "Share", exact: true })).toBeDisabled();
   await mona.getByLabel("nils's safety code").fill(nilsWords);
+  // While the two are in touch, mona has her own code to hand, and an Esc
+  // doesn't lose what she typed.
+  await expect(mona.getByRole("dialog").locator(".words")).toHaveText(monaWords);
+  await mona.keyboard.press("Escape");
+  await expect(mona.getByLabel("nils's safety code")).toHaveValue(nilsWords);
   await mona.getByRole("button", { name: "Share", exact: true }).click();
   await expect(mona.getByText(/Shared with nils/)).toBeVisible(SLOW);
+  // What nils needs next is mona's code, not his own.
+  await expect(mona.getByText(/nils now needs your safety code/)).toBeVisible();
+  await expect(mona.getByRole("dialog").locator(".words")).toHaveText(monaWords);
   await mona.getByRole("button", { name: "Done" }).click();
 
   // nils is already logged in, and hasn't reloaded.
   await comeBack(nils);
   await expect(nils.getByRole("button", { name: "Review" })).toBeVisible(SLOW);
   await expect(item(nils, "gift")).toBeVisible(SLOW);
+
+  // "Shared with me" lists it, says what it allows, and stays useful after.
+  await nils.getByRole("button", { name: "Review" }).click();
+  await expect(nils.getByText(/You can already open it/)).toBeVisible(SLOW);
+  await nils.getByRole("button", { name: "Trust…" }).click();
+  await expect(nils.getByRole("dialog").locator(".words")).toHaveText(nilsWords);
+  await nils.getByLabel("Their safety code").fill(monaWords);
+  await nils.getByRole("button", { name: "Trust", exact: true }).click();
+  await expect(nils.getByText(/You and mona are verified. gift is in My files/)).toBeVisible(SLOW);
+  await expect(nils.getByText(/You can add, change and delete files here/)).toBeVisible();
+  await nils.getByRole("button", { name: "Close" }).click();
 
   // A file added while nils has the folder open appears there too, and the
   // folder stays open.
