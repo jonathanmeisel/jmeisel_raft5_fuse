@@ -353,13 +353,16 @@ pub async fn check_login(
     Ok(Some(keys))
 }
 
-/// Whether `user` can still use a session: they have keys, and are not a
-/// link that has expired.
-pub async fn active(client: &Client, user: &str) -> Result<bool, FsError> {
-    if get(client, user).await?.is_none() {
-        return Ok(false);
+/// `user`'s keys if they can still use a session: they have keys, and are not
+/// a link that has expired.
+pub async fn active_keys(client: &Client, user: &str) -> Result<Option<AccountKeys>, FsError> {
+    let Some(keys) = get(client, user).await? else {
+        return Ok(None);
+    };
+    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs()) {
+        return Ok(None);
     }
-    Ok(!(user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs())))
+    Ok(Some(keys))
 }
 
 /// Makes a new one-time code that `user` can enrol with, and replaces any

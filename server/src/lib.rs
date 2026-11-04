@@ -104,8 +104,9 @@ pub struct InviteSettings {
 pub struct FsService {
     core: Arc<FsCore>,
     signer: Signer,
-    /// When each account was last seen enrolled.
-    enrolled: Mutex<HashMap<String, Instant>>,
+    /// When each account was last seen enrolled, and what sessions must be
+    /// tied to then (`Signer::binding`).
+    enrolled: Mutex<HashMap<String, (Instant, String)>>,
     identity_ttl: Duration,
     /// Whether responses say where their time went (see `timing`).
     timing_header: bool,
@@ -166,28 +167,38 @@ impl FsService {
     async fn caller<T>(&self, request: Request<T>) -> Result<(Caller, T), Status> {
         let token = session_from_metadata(request.metadata())
             .ok_or_else(|| Status::unauthenticated("the request carries no session"))?;
-        let name = self.signer.verify_session(token)?;
-        self.check_enrolled(&name).await?;
+        let (name, binding) = self.signer.verify_session(token)?;
+        self.check_enrolled(&name, &binding).await?;
         Ok((Caller::new(name), request.into_inner()))
     }
 
     /// Checks that account `name` is still enrolled (and, for a public
-    /// link, not expired), within `identity_ttl`. A removed account gives
+    /// link, not expired), with the password and key that session `binding`
+    /// was made for, within `identity_ttl`. A removed account gives
     /// `UNAUTHENTICATED`. The client then logs in
     /// again, which fails, so removing an account cuts off a mounted user
     /// without waiting for their session to expire.
-    async fn check_enrolled(&self, name: &str) -> Result<(), Status> {
-        if let Some(seen) = self.enrolled.lock().unwrap().get(name)
+    async fn check_enrolled(&self, name: &str, binding: &str) -> Result<(), Status> {
+        if let Some((seen, known)) = self.enrolled.lock().unwrap().get(name)
             && seen.elapsed() < self.identity_ttl
+            && known == binding
         {
             return Ok(());
         }
-        match accounts::active(self.core.client(), name).await {
-            Ok(true) => {
-                self.remember(name);
-                Ok(())
+        match accounts::active_keys(self.core.client(), name).await {
+            Ok(Some(keys)) => {
+                let current = self.signer.binding(&keys);
+                let same = current == binding;
+                self.remember(name, current);
+                if same {
+                    Ok(())
+                } else {
+                    Err(Status::unauthenticated(format!(
+                        "{name}'s password or key has changed since this login"
+                    )))
+                }
             }
-            Ok(false) => {
+            Ok(None) => {
                 self.enrolled.lock().unwrap().remove(name);
                 Err(Status::unauthenticated(format!(
                     "{name} no longer has an account"
@@ -197,11 +208,11 @@ impl FsService {
         }
     }
 
-    fn remember(&self, name: &str) {
+    fn remember(&self, name: &str, binding: String) {
         self.enrolled
             .lock()
             .unwrap()
-            .insert(name.to_string(), Instant::now());
+            .insert(name.to_string(), (Instant::now(), binding));
     }
 }
 
@@ -401,8 +412,9 @@ impl Fs for FsService {
         let r = r.into_inner();
         let session = match accounts::check_login(self.core.client(), &r.username, &r.auth).await {
             Ok(Some(keys)) => {
-                self.remember(&r.username);
-                let (token, expires_at) = self.signer.session(&r.username);
+                let binding = self.signer.binding(&keys);
+                self.remember(&r.username, binding.clone());
+                let (token, expires_at) = self.signer.session(&r.username, &binding);
                 Ok(Session {
                     token,
                     expires_at,

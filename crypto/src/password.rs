@@ -215,6 +215,21 @@ pub fn decoy_salt(server_secret: &[u8], user: &str) -> [u8; SALT_LEN] {
     digest[..SALT_LEN].try_into().unwrap()
 }
 
+/// What ties a session to the account as it was at login: made from a server
+/// secret, an account's password verifier and its public key. A new password
+/// or a new key pair changes it, which ends earlier sessions. The secret keeps
+/// it from helping anyone who gets a session token to test password guesses.
+pub fn session_binding(server_secret: &[u8], verifier: &[u8], public_key: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(server_secret).expect("HMAC takes any key length");
+    mac.update(b"raft5fs/session-binding/");
+    mac.update(&(verifier.len() as u64).to_be_bytes());
+    mac.update(verifier);
+    mac.update(public_key);
+    mac.finalize().into_bytes().into()
+}
+
 /// A one-time enrolment code: 128 random bits, as 32 hex digits.
 pub fn new_enrolment_code() -> String {
     let mut bytes = [0; 16];
@@ -256,6 +271,17 @@ mod tests {
         assert_eq!(decoy_salt(b"s", "eve"), decoy_salt(b"s", "eve"));
         assert_ne!(decoy_salt(b"s", "eve"), decoy_salt(b"s", "mallory"));
         assert_ne!(decoy_salt(b"s", "eve"), decoy_salt(b"t", "eve"));
+    }
+
+    #[test]
+    fn a_session_binding_changes_with_the_secret_the_verifier_and_the_key() {
+        let base = session_binding(b"s", b"verifier", b"key");
+        assert_eq!(base, session_binding(b"s", b"verifier", b"key"));
+        assert_ne!(base, session_binding(b"t", b"verifier", b"key"));
+        assert_ne!(base, session_binding(b"s", b"other", b"key"));
+        assert_ne!(base, session_binding(b"s", b"verifier", b"other"));
+        // The two parts can't trade bytes.
+        assert_ne!(base, session_binding(b"s", b"verifierk", b"ey"));
     }
 
     #[test]

@@ -872,3 +872,61 @@ fn accounts_allow_links(backend: &Backend, user: &str) {
         ))
         .unwrap();
 }
+
+/// A session lasts only as long as the password and key it was made with. A
+/// new login works, but one with the old password doesn't, so a stolen device
+/// is locked out by changing the password.
+#[test]
+fn a_new_password_or_a_new_enrollment_ends_earlier_sessions() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    backend.enrol("bob");
+    const NEW_PASSWORD: &str = "a brand new password for this";
+    let connect_with = |user: &str, password: &str| {
+        rt.block_on(Remote::connect(
+            &backend.addresses(),
+            credentials_with(user, password),
+            Some(fs_tls()),
+        ))
+    };
+    let enrol_again = |user: &str| {
+        let code = rt
+            .block_on(accounts::issue_code(&backend.client, user))
+            .unwrap();
+        rt.block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials_with(user, NEW_PASSWORD),
+            &code,
+            KdfParams::TESTING,
+        ))
+        .unwrap();
+    };
+
+    // A new password: this device carries on, and the other is locked out.
+    let here = connect(&backend, "bob");
+    let stolen = connect(&backend, "bob");
+    rt.block_on(here.list_grants()).unwrap();
+    rt.block_on(stolen.list_grants()).unwrap();
+    rt.block_on(here.change_password(NEW_PASSWORD, KdfParams::TESTING))
+        .unwrap();
+    rt.block_on(here.list_grants()).unwrap();
+    assert_eq!(errno(rt.block_on(stolen.list_grants())), libc::EACCES);
+    assert!(connect_with("bob", NEW_PASSWORD).is_ok());
+
+    // A new enrollment ends the sessions of the key pair before it.
+    backend.enrol("carol");
+    let old = connect(&backend, "carol");
+    rt.block_on(old.list_grants()).unwrap();
+    enrol_again("carol");
+    assert_eq!(errno(rt.block_on(old.list_grants())), libc::EACCES);
+
+    // So does removing the account, even if someone takes the name again.
+    backend.enrol("dave");
+    let old = connect(&backend, "dave");
+    rt.block_on(old.list_grants()).unwrap();
+    rt.block_on(accounts::remove(&backend.client, "dave"))
+        .unwrap();
+    enrol_again("dave");
+    assert_eq!(errno(rt.block_on(old.list_grants())), libc::EACCES);
+}
