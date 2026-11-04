@@ -879,6 +879,46 @@ test("an idle logout waits for playing media, but not for ever", async ({ browse
   expect(problems).toEqual([]);
 });
 
+test("new shares and files show up without a reload", async ({ browser }) => {
+  const mona = await (await browser.newContext()).newPage();
+  const nils = await (await browser.newContext()).newPage();
+  const problems = [mona, nils].map(watch);
+  /// What the browser does when someone comes back to the tab.
+  const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  await enrol(mona, "mona");
+  const nilsWords = await enrol(nils, "nils");
+  await login(mona, "mona");
+  await login(nils, "nils");
+  await addFolder(mona, "gift");
+  await menu(mona, "gift", "Share…");
+  await mona.getByLabel("User", { exact: true }).fill("nils");
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await mona.getByLabel("nils's fingerprint").fill(nilsWords);
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(mona.getByText(/Shared with nils/)).toBeVisible(SLOW);
+  await mona.getByRole("button", { name: "Done" }).click();
+
+  // nils is already logged in, and hasn't reloaded.
+  await comeBack(nils);
+  await expect(nils.getByRole("button", { name: "Review" })).toBeVisible(SLOW);
+  await expect(item(nils, "gift")).toBeVisible(SLOW);
+
+  // A file added while nils has the folder open appears there too, and the
+  // folder stays open.
+  await open(nils, "gift");
+  await open(mona, "gift");
+  await mona.locator("input[type=file]").setInputFiles([
+    { name: "card.txt", mimeType: "text/plain", buffer: Buffer.from("hello") },
+  ]);
+  await expect(item(mona, "card.txt")).toBeVisible(SLOW);
+  await comeBack(nils);
+  await expect(item(nils, "card.txt")).toBeVisible(SLOW);
+  expect(new URL(nils.url()).hash).toBe("#/gift");
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

@@ -88,7 +88,9 @@
 
   async function load() {
     try {
-      initial = entries("/", await fs.readdir("/"));
+      const list = await fs.readdir("/");
+      shown.set("/", JSON.stringify(list));
+      initial = entries("/", list);
     } catch (e) {
       error = e.message;
       initial = [];
@@ -135,6 +137,65 @@
       : "",
   );
 
+  // ---------------------------------------------------------- staying current
+  // Others share things and change files while this tab is open, and a reload
+  // means logging in again. So the app looks every minute while the tab is in
+  // view, and as soon as it comes back into view.
+
+  const POLL_MS = 60_000;
+  let polling = false;
+  /// The folder last listed, to show a new listing only if it differs:
+  /// showing one disturbs what is on screen.
+  let shown = new Map();
+
+  async function poll() {
+    if (visitor || polling || document.hidden || !api) return;
+    polling = true;
+    try {
+      await Promise.all([refreshPending(), refreshOffers()]);
+      account = await fs.account();
+      const root = await listIfChanged("/");
+      // Listing a folder makes SVAR forget what was in those inside it, so a
+      // change in the root lists again down to the open one.
+      if (root && current !== "/") await relistDown("/", current);
+      else if (current !== "/") await listIfChanged(current);
+    } catch {
+    } finally {
+      polling = false;
+    }
+  }
+
+  /// Lists `dir`, and shows it if it changed. Says if it did.
+  async function listIfChanged(dir) {
+    const list = await fs.readdir(dir);
+    const seen = JSON.stringify(list);
+    if (shown.get(dir) === seen) return false;
+    shown.set(dir, seen);
+    await api.exec("provide-data", { id: dir, data: entries(dir, list) });
+    return true;
+  }
+
+  /// Lists again the folders below `top`, down to `open`.
+  async function relistDown(top, open) {
+    const inside = top === "/" ? "/" : top + "/";
+    if (open === top || !open.startsWith(inside)) return;
+    let folder = top;
+    for (const name of open.slice(inside.length).split("/").filter(Boolean)) {
+      folder = join(folder, name);
+      await reload(folder);
+    }
+  }
+
+  const onVisible = () => poll();
+  const pollTimer = setInterval(poll, POLL_MS);
+  addEventListener("focus", onVisible);
+  document.addEventListener("visibilitychange", onVisible);
+  onDestroy(() => {
+    clearInterval(pollTimer);
+    removeEventListener("focus", onVisible);
+    document.removeEventListener("visibilitychange", onVisible);
+  });
+
   async function refreshPending() {
     try {
       pendingCount = (await fs.pending()).length;
@@ -145,6 +206,7 @@
   async function reload(dir) {
     try {
       const list = await fs.readdir(dir);
+      shown.set(dir, JSON.stringify(list));
       await api.exec("provide-data", { id: dir, data: entries(dir, list) });
     } catch (e) {
       if (e.code !== "ENOENT") fail(e);
@@ -434,14 +496,7 @@
     const open = state?.panels[state.activePanel]?.path ?? current;
     const top = path ? parentOf(path) : open;
     await reload(top);
-    const inside = top === "/" ? "/" : top + "/";
-    if (open !== top && open.startsWith(inside)) {
-      let folder = top;
-      for (const name of open.slice(inside.length).split("/").filter(Boolean)) {
-        folder = join(folder, name);
-        await reload(folder);
-      }
-    }
+    await relistDown(top, open);
     showSharing(current);
   }
 
