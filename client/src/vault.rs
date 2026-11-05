@@ -15,8 +15,9 @@
 //!   refuses writes under them (`EKEYEXPIRED`), and `freshen` rotates them.
 //!   A revocation also rotates the path down to every grant below, because
 //!   those grantees cannot rotate keys above their grant.
-//! - **Public keys.** The vault pins each user's key the first time it sees
-//!   it (`KnownKeys`), and refuses a different key later.
+//! - **Public keys.** The vault pins a user's key once a person has checked
+//!   its fingerprint with them (`KnownKeys`), and refuses a different key
+//!   later.
 //! - **The root.** A mount shows a virtual root, with one entry for each
 //!   grant to this account. Making a directory there makes a new volume.
 //!
@@ -43,8 +44,8 @@ use raft5fs_crypto::data::{
 };
 use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
 use raft5fs_crypto::identity::{
-    Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, fingerprint_words, grant_sender,
-    label_signer, seal_grant, seal_label, seal_signed_label,
+    Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, grant_sender, label_signer,
+    seal_grant, seal_label, seal_signed_label,
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
@@ -164,12 +165,9 @@ impl Node {
                 format!(
                     "inode {ino} is shared with this account by {}, whose key isn't pinned \
                      here: the server could have made the share up, so nothing is written \
-                     under it. If {} really shared it, check their key's fingerprint ({}) \
-                     with them, then: raft5fs-share trust {} <fingerprint>",
-                    u.sender,
-                    u.sender,
-                    fingerprint_words(&u.key),
-                    u.sender
+                     under it. If {} really shared it, ask them for their key's fingerprint, \
+                     then: raft5fs trust {} <fingerprint>",
+                    u.sender, u.sender, u.sender
                 ),
             )),
         }
@@ -225,11 +223,11 @@ fn changed(e: &FsError) -> bool {
     e.errno == errno::EAGAIN
 }
 
-/// Public keys that this account sealed to, by user. The server could give
-/// its own key in place of a user's key, so the vault trusts the first key
-/// it sees for a user and refuses a different key later. It keeps the keys
-/// in memory and in a blob of a `Store` (one `user hex-key` line for each
-/// user; natively, a file readable only by its owner).
+/// Public keys that this account checked, by user. The server could give its
+/// own key in place of a user's key, so a person checks a key's fingerprint
+/// before the vault pins it, and the vault refuses a different key later. It
+/// keeps the keys in memory and in a blob of a `Store` (one `user hex-key`
+/// line for each user; natively, a file readable only by its owner).
 ///
 /// The names come from the server, so the vault checks each one
 /// (`check_username`) before it writes it to the blob. A name with a line
@@ -373,8 +371,7 @@ impl KnownKeys {
         entries
     }
 
-    /// Removes `user`'s pinned key, so the vault trusts the next key it
-    /// sees for them.
+    /// Removes `user`'s pinned key, so that their next key needs checking.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
         self.rewrite(user, None)
     }
@@ -1867,7 +1864,7 @@ impl Vault {
     ///
     /// Returns the public key that the grant was sealed to. If it was not
     /// pinned before, compare it with the fingerprint that the user saw
-    /// when they enrolled (`raft5fs-share` calls `trust` first to require
+    /// when they enrolled (`raft5fs grant` calls `trust` first to require
     /// this). A pin is trust in both directions: shares from `user` are
     /// trusted after this.
     pub async fn grant(
