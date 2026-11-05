@@ -1,21 +1,28 @@
 <script>
-  // Shares from people whose keys aren't pinned here. They're read-only
-  // until trusted, by the fingerprint the sender reads out. A sender whose
-  // key changed (they enrolled again) is trusted the same way: their new
-  // key replaces the old one only if it matches.
+  // Everything shared with this account, from whom, and what it allows.
+  // Shares from people whose keys aren't pinned here can be opened, but stay
+  // read-only until checked, by the safety code the sender reads out. A sender
+  // whose key changed (they enrolled again) is checked the same way: their new
+  // key replaces the old one only if it matches. This account's own folders
+  // aren't shares, so they don't show.
   import Dialog from "./Dialog.svelte";
+  import CodeInput from "./CodeInput.svelte";
+  import Fingerprint from "./Fingerprint.svelte";
 
-  let { fs, onclose } = $props();
+  let { fs, me, mine, onclose } = $props();
   let pending = $state(null);
-  /// {sender, keyChanged} being trusted.
+  /// {sender, label, keyChanged} being checked.
   let trusting = $state(null);
   let words = $state("");
+  let wordsComplete = $state(false);
   let error = $state("");
   let busy = $state(false);
+  /// What was just checked, to say so.
+  let verified = $state(null);
 
   async function load() {
     try {
-      pending = await fs.pending();
+      pending = (await fs.pending()).filter((p) => p.sender !== me);
     } catch (e) {
       error = e.message;
       pending = [];
@@ -30,6 +37,7 @@
     try {
       if (trusting.keyChanged) await fs.replaceKey(trusting.sender, words.trim());
       else await fs.trust(trusting.sender, words.trim());
+      verified = trusting;
       trusting = null;
       words = "";
       await load();
@@ -41,7 +49,7 @@
   }
 </script>
 
-<Dialog title="Shared with me" {onclose}>
+<Dialog title="Shared with me" keep={!!trusting} {onclose}>
   {#if pending === null}
     <p class="note">Loading…</p>
   {:else if trusting}
@@ -49,31 +57,44 @@
       {#if trusting.keyChanged}
         <p>
           <strong>{trusting.sender}</strong>'s key has changed: they may have enrolled again. Ask them
-          to read you their new fingerprint, in person or on a call, and type it here.
+          to read you their new safety code, in person or on a call, and type it here. If they didn't
+          reset anything, tell your admin first.
         </p>
       {:else}
-        <p>Ask <strong>{trusting.sender}</strong> to read you their fingerprint, in person or on a call, and type it here.</p>
+        <p>Ask <strong>{trusting.sender}</strong> to read you their safety code, in person or on a call, and type it here.</p>
       {/if}
-      <textarea rows="3" bind:value={words} required aria-label="fingerprint"></textarea>
+      <CodeInput {fs} id="trust-words" label="Their safety code" bind:value={words} bind:complete={wordsComplete} />
+      <p>They may need yours too. Your safety code:</p>
+      <Fingerprint fingerprint={mine} />
       <p>
-        <button class="primary" type="submit" disabled={busy}>Trust</button>
+        <button class="primary" type="submit" disabled={busy || !wordsComplete}>Trust</button>
         <button type="button" onclick={() => (trusting = null)}>Cancel</button>
       </p>
     </form>
-  {:else if pending.length === 0}
-    <p>No shares from untrusted users</p>
   {:else}
+    {#if verified}
+      <p class="note">You and {verified.sender} are verified. {verified.label} is in My files.</p>
+    {/if}
+    {#if pending.length === 0}
+      <p>Nothing has been shared with you yet.</p>
+    {/if}
     {#each pending as p}
       <div class="item">
-        <strong>{p.label}</strong>, from {p.sender}:
-        {#if p.state === "untrusted" && p.keyChanged}
-          {p.sender}'s key has changed, so it is read-only until you check their new fingerprint.
-          <button onclick={() => (trusting = { sender: p.sender, keyChanged: true })}>Check new fingerprint…</button>
+        <strong>{p.label}</strong>, from {p.sender}.
+        {#if p.state === "trusted"}
+          <span class="note">{p.writable ? "You can add, change and delete files here." : "You can open files here."}</span>
+        {:else if p.state === "untrusted" && p.keyChanged}
+          {p.sender}'s key has changed, so this is read-only until you check their new safety code.
+          <button onclick={() => (trusting = { sender: p.sender, label: p.label, keyChanged: true })}>Check new safety code…</button>
         {:else if p.state === "untrusted"}
-          read-only until you trust {p.sender}.
-          <button onclick={() => (trusting = { sender: p.sender, keyChanged: false })}>Trust…</button>
+          {#if p.writable}
+            You can already open it. To add or change files, check {p.sender}'s safety code.
+          {:else}
+            You can open it. Check {p.sender}'s safety code, so you know it's really from them.
+          {/if}
+          <button onclick={() => (trusting = { sender: p.sender, label: p.label, keyChanged: false })}>Trust…</button>
         {:else}
-          <span class="error">doesn't open: {p.message}</span>
+          <span class="error">It doesn't open: {p.message}</span>
         {/if}
       </div>
     {/each}

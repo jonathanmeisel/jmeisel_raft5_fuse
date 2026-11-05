@@ -1938,6 +1938,34 @@ impl FsCore {
         .await?
     }
 
+    /// Replaces the label of `caller`'s own grant of `ino`, which only they
+    /// read. Their key and their access stay as they are. A public link's label
+    /// is its creator's, and the link only reads.
+    pub async fn set_grant_label(
+        &self,
+        caller: &Caller,
+        ino: u64,
+        sealed_label: &[u8],
+    ) -> Result<(), FsError> {
+        crate::accounts::refuse_link(&caller.user)?;
+        check_sealed_size("a grant's label", sealed_label, MAX_SEALED_GRANT)?;
+        run_txn(&self.client, move |txn| async move {
+            let Some(row) = txn
+                .read_one(&grants::grant_key(ino, &caller.user))
+                .await?
+                .value
+            else {
+                return Ok(Err(FsError::errno(libc::ENOENT)));
+            };
+            let mut grant = decide!(grants::decode_grant(ino, &row));
+            grant.sealed_label = sealed_label.to_vec();
+            grants::put_grant(&txn, &caller.user, &grant).await?;
+            txn.commit().await?;
+            Ok(Ok(()))
+        })
+        .await?
+    }
+
     /// Makes a new volume: a directory under the real root, at `new`'s
     /// reserved inode, granted read-write to `caller` with `sealed_key`
     /// (its key, version 1) and `sealed_label`. Its name is its inode

@@ -6,8 +6,10 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 use raft5fs_client::remote::Remote;
-use raft5fs_client::vault::Vault;
+use raft5fs_client::store::{MemoryStore, Store};
+use raft5fs_client::vault::{KnownKeys, Vault};
 use raft5fs_core::accounts;
+use raft5fs_crypto::identity::{fingerprint_words, label_signer, seal_label, seal_signed_label};
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
@@ -414,7 +416,6 @@ fn public_links_read_one_folder_until_any_writer_revokes() {
 
 #[test]
 fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
-    use raft5fs_crypto::identity::fingerprint_words;
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let old = backend.enrol("bob");
@@ -458,7 +459,6 @@ fn a_changed_key_replaces_the_pin_only_when_its_fingerprint_matches() {
 
 #[test]
 fn trusted_keys_follow_the_account_to_its_other_devices() {
-    use raft5fs_crypto::identity::fingerprint_words;
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let bob = backend.enrol("bob");
@@ -1005,4 +1005,499 @@ fn failed_logins_are_throttled_without_saying_who_exists() {
     let blocked = (0..20)
         .find(|i| refused(&format!("name{i}"), "a guess").contains("too many failed logins"));
     assert!(blocked.is_some(), "an address was never blocked");
+}
+
+/// A check that shows the answer checks nothing: someone could copy it.
+#[test]
+fn a_wrong_fingerprint_does_not_show_the_right_one() {
+    use raft5fs_crypto::identity::{fingerprint_matches, fingerprint_words};
+
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let carol_key = backend.enrol("carol");
+    let tester = vault(&backend, TESTER);
+    let wrong = fingerprint_words(&carol_key);
+    assert!(!fingerprint_matches(&bob_key, &wrong).unwrap());
+    let refused = rt.block_on(tester.trust("bob", &wrong)).unwrap_err();
+    assert_eq!(refused.errno, libc::EPERM);
+    let right = fingerprint_words(&bob_key);
+    let first_word = right.split(' ').next().unwrap();
+    assert!(!refused.message.contains(&right), "{}", refused.message);
+    assert!(!refused.message.contains(first_word), "{}", refused.message);
+}
+
+/// One device's pins, kept in `store` as they are across its restarts.
+fn device(backend: &Backend, user: &str, store: &Arc<MemoryStore>) -> Vault {
+    let store: Arc<dyn Store> = store.clone();
+    vault(backend, user).with_known_keys(KnownKeys::open(store, "pins").unwrap())
+}
+
+#[test]
+fn a_device_refuses_a_key_record_older_than_it_saw() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let store = Arc::new(MemoryStore::new());
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let docs = rt
+        .block_on(a.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = rt
+        .block_on(a.mkdir(docs, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    let key = [&[0x08], &sub.to_be_bytes()[..]].concat();
+    let old = backend.read_key(&key).unwrap();
+
+    // Revoking gives the folder a new key, which this device then sees.
+    rt.block_on(a.grant(sub, "bob", false, OsStr::new("sub")))
+        .unwrap();
+    rt.block_on(a.revoke(sub, "bob")).unwrap();
+    rt.block_on(a.readdir(sub)).unwrap();
+    assert!(rt.block_on(a.node(sub)).unwrap().record.version >= 2);
+    drop(a);
+
+    // The servers hand back the old record to a restarted device.
+    backend.write_key(&key, Some(&old));
+    let restarted = device(&backend, TESTER, &store);
+    let e = rt.block_on(restarted.readdir(sub)).unwrap_err();
+    assert_eq!(e.errno, libc::EIO);
+    assert!(e.message.contains("restored from a backup"), "{e:?}");
+    assert!(e.message.contains("raft5fs reset-versions"), "{e:?}");
+
+    // A new device has nothing to compare with.
+    rt.block_on(vault(&backend, TESTER).readdir(sub)).unwrap();
+
+    // After a real restore, a person resets the device.
+    rt.block_on(restarted.reset_versions()).unwrap();
+    rt.block_on(restarted.readdir(sub)).unwrap();
+    assert_eq!(
+        rt.block_on(restarted.node(sub)).unwrap().record.version,
+        1,
+        "it took the restored record"
+    );
+}
+
+#[test]
+fn a_device_refuses_pins_older_than_it_saw() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let carol = backend.enrol("carol");
+    let store = Arc::new(MemoryStore::new());
+    let key = [b"\x06p/", TESTER.as_bytes()].concat();
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let old = backend.read_key(&key).unwrap();
+    rt.block_on(a.trust("carol", &fingerprint_words(&carol)))
+        .unwrap();
+    let newest = backend.read_key(&key).unwrap();
+
+    // Refused at once, and after a restart. This device keeps its pins.
+    backend.write_key(&key, Some(&old));
+    for device in [&a, &device(&backend, TESTER, &store)] {
+        let e = rt.block_on(device.sync_pins()).unwrap_err();
+        assert_eq!(e.errno, libc::EIO);
+        assert!(e.message.contains("restored from a backup"), "{e:?}");
+        assert_eq!(device.known_keys().pinned("carol"), Some(carol));
+    }
+    // Having no copy at all is older too.
+    backend.write_key(&key, None);
+    assert_eq!(
+        rt.block_on(a.sync_pins()).unwrap_err().errno,
+        libc::EIO,
+        "the copy was deleted"
+    );
+
+    // A new device takes what it is given: it has nothing to compare with.
+    backend.write_key(&key, Some(&old));
+    let new = vault(&backend, TESTER);
+    rt.block_on(new.sync_pins()).unwrap();
+    assert_eq!(new.known_keys().pinned("bob"), Some(bob));
+    assert_eq!(new.known_keys().pinned("carol"), None);
+
+    // After a reset, this device's pins win over the restored copy, and the
+    // counter goes on from there.
+    rt.block_on(a.reset_versions()).unwrap();
+    rt.block_on(a.sync_pins()).unwrap();
+    assert_eq!(a.known_keys().pinned("carol"), Some(carol));
+    rt.block_on(new.sync_pins()).unwrap();
+    assert_eq!(new.known_keys().pinned("carol"), Some(carol));
+    assert_ne!(backend.read_key(&key).unwrap(), newest);
+}
+
+/// A key trusted while the servers can't be told stays trusted after a
+/// restart: the servers' copy doesn't simply replace it.
+#[test]
+fn a_change_made_offline_survives_a_restart() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    let store = Arc::new(MemoryStore::new());
+    let a = device(&backend, TESTER, &store);
+    rt.block_on(a.sync_pins()).unwrap();
+    rt.block_on(a.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    // Only here, without a merge: the new key isn't on the servers.
+    a.known_keys().forget("bob").unwrap();
+    a.known_keys().check("bob", &[9; 32]).unwrap();
+    drop(a);
+
+    let restarted = device(&backend, TESTER, &store);
+    rt.block_on(restarted.sync_pins()).unwrap();
+    assert_eq!(restarted.known_keys().pinned("bob"), Some([9; 32]));
+}
+
+/// The name `ino` shows as in the root of `vault`.
+fn shown_as(backend: &Backend, vault: &Vault, ino: u64) -> String {
+    let entries = backend.runtime.block_on(vault.root_entries()).unwrap();
+    let (name, _) = entries.iter().find(|(_, i)| *i == ino).unwrap();
+    name.to_string_lossy().into_owned()
+}
+
+fn label_of(backend: &Backend, vault: &Vault, ino: u64) -> Vec<u8> {
+    let grants = backend.runtime.block_on(vault.remote().list_grants());
+    let grants = grants.unwrap();
+    let grant = grants.iter().find(|g| g.ino == ino).unwrap();
+    grant.sealed_label.clone()
+}
+
+/// Each account signs what it sees once. After that, the servers can't pass
+/// a share off as something else without it saying so.
+#[test]
+fn grant_labels_are_signed_once_and_then_checked() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob = backend.enrol("bob");
+    backend.enrol("eve");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.sync_pins()).unwrap();
+    let own = connect(&backend, TESTER).identity().unwrap();
+    let mine = own.public_key();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), Some(TESTER));
+
+    // A label from before signing shows as it is, and gets signed.
+    let old = seal_label(&mine, docs, b"older");
+    rt.block_on(me.remote().set_grant_label(docs, old)).unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "older");
+    rt.block_on(me.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "older");
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), Some(TESTER));
+
+    // After that, a label nobody vouches for says so. Another device learns
+    // that from the sealed pins, and doesn't sign it either.
+    let forged = seal_label(&mine, docs, b"forged");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "forged (unverified)");
+    let other = vault(&backend, TESTER);
+    rt.block_on(other.sync_pins()).unwrap();
+    rt.block_on(other.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &other, docs), "forged (unverified)");
+    assert_eq!(label_signer(&label_of(&backend, &me, docs)), None);
+
+    // So does one signed by someone this account hasn't checked, or by
+    // someone claiming to be this account.
+    let eves = connect(&backend, "eve").identity().unwrap();
+    let forged = seal_signed_label(&eves, "eve", &mine, docs, b"from eve");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), "from eve (unverified)");
+    let forged = seal_signed_label(&eves, TESTER, &mine, docs, b"from me");
+    rt.block_on(me.remote().set_grant_label(docs, forged))
+        .unwrap();
+    assert!(shown_as(&backend, &me, docs).starts_with("unreadable-"));
+
+    // Its sender's label: plain while the whole share says it needs checking,
+    // and once checked, it becomes this account's own and stays so. A forgery
+    // of it says so.
+    let bobs = vault(&backend, "bob");
+    rt.block_on(bobs.trust(TESTER, &fingerprint_words(&mine)))
+        .unwrap();
+    let photos = rt
+        .block_on(bobs.create_volume(OsStr::new("photos"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(bobs.grant(photos, TESTER, false, OsStr::new("holiday")))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "holiday");
+    let forged = seal_signed_label(&eves, "eve", &mine, photos, b"bills");
+    rt.block_on(me.remote().set_grant_label(photos, forged))
+        .unwrap();
+    assert_eq!(
+        shown_as(&backend, &me, photos),
+        "bills",
+        "needs checking anyway"
+    );
+    let label = seal_signed_label(
+        &connect(&backend, "bob").identity().unwrap(),
+        "bob",
+        &mine,
+        photos,
+        b"holiday",
+    );
+    rt.block_on(me.remote().set_grant_label(photos, label))
+        .unwrap();
+    rt.block_on(me.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "holiday");
+    assert_eq!(label_signer(&label_of(&backend, &me, photos)), Some("bob"));
+    rt.block_on(me.sign_labels()).unwrap();
+    assert_eq!(label_signer(&label_of(&backend, &me, photos)), Some(TESTER));
+    let forged = seal_signed_label(&eves, "eve", &mine, photos, b"bills");
+    rt.block_on(me.remote().set_grant_label(photos, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, photos), "bills (unverified)");
+}
+
+/// A label is the holder's own: nobody changes another's, and a link only
+/// reads.
+#[test]
+fn only_the_grantee_sets_a_grants_label() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let bob = backend.enrol("bob");
+    backend.enrol("eve");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.trust("bob", &fingerprint_words(&bob)))
+        .unwrap();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(
+        errno(
+            rt.block_on(
+                vault(&backend, "eve")
+                    .remote()
+                    .set_grant_label(docs, vec![1])
+            )
+        ),
+        libc::ENOENT
+    );
+    assert_eq!(
+        errno(rt.block_on(me.remote().set_grant_label(docs, vec![1; 8192]))),
+        libc::EINVAL
+    );
+    let (link, secret) = rt
+        .block_on(me.create_link(docs, "/docs", OsStr::new("docs"), None))
+        .unwrap();
+    let visitor = visit(&backend, &link, &secret).unwrap();
+    assert_eq!(
+        errno(rt.block_on(visitor.remote().set_grant_label(docs, vec![1]))),
+        libc::EACCES
+    );
+    // A link shows its signed label, and signs nothing.
+    rt.block_on(visitor.sign_labels()).unwrap();
+    assert_eq!(shown_as(&backend, &visitor, docs), "docs");
+}
+
+/// A writer seals what names they like. One that a path can't say stays out
+/// of listings, and nobody can make one through this client.
+#[test]
+fn names_a_path_cant_say_stay_out_of_listings() {
+    use raft5fs_client::vault::Node;
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    backend.enrol("bob");
+    let me = vault(&backend, TESTER);
+    rt.block_on(me.sync_pins()).unwrap();
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let real = rt
+        .block_on(me.create(docs, OsStr::new("real"), 0o644))
+        .unwrap()
+        .ino;
+    let dir: Arc<Node> = rt.block_on(me.node(docs)).unwrap();
+    let forge = |name: &str| {
+        let name = OsStr::new(name);
+        let tag = dir.tag(name);
+        let key = [&[0x03], &docs.to_be_bytes()[..], tag.as_encoded_bytes()].concat();
+        let value = [
+            &real.to_be_bytes()[..],
+            &dir.seal(docs, real, &tag, name)[..],
+        ]
+        .concat();
+        backend.write_key(&key, Some(&value));
+    };
+    forge("fine");
+    for bad in ["a/b", "..", ".", "../up", "", "with\0nul"] {
+        forge(bad);
+    }
+    let mut names: Vec<String> = rt
+        .block_on(me.readdir(docs))
+        .unwrap()
+        .into_iter()
+        .map(|item| item.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".", "..", "fine", "real"]);
+
+    // A label is a name too.
+    let own = connect(&backend, TESTER).identity().unwrap();
+    let label = seal_signed_label(&own, TESTER, &own.public_key(), docs, b"a/b");
+    rt.block_on(me.remote().set_grant_label(docs, label))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &me, docs), format!("unreadable-{docs}"));
+
+    for bad in ["a/b", "..", ".", ""] {
+        let bad = OsStr::new(bad);
+        for result in [
+            rt.block_on(me.mkdir(docs, bad, 0o755)).map(drop),
+            rt.block_on(me.create(docs, bad, 0o644)).map(drop),
+            rt.block_on(me.create_volume(bad, 0o755)).map(drop),
+            rt.block_on(me.grant(docs, "bob", false, bad)).map(drop),
+            rt.block_on(me.rename(docs, OsStr::new("real"), docs, bad, false))
+                .map(drop),
+        ] {
+            assert_eq!(errno(result), libc::EINVAL, "{bad:?}");
+        }
+    }
+}
+
+#[test]
+fn an_invitation_works_for_two_weeks() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let key = [b"\x06e/", "dave".as_bytes()].concat();
+    let code = rt
+        .block_on(accounts::add(
+            &backend.client,
+            "dave",
+            Caps::NONE,
+            Caps::NONE,
+        ))
+        .unwrap();
+    let pending = |user: &str| {
+        let users = rt.block_on(accounts::list(&backend.client)).unwrap();
+        users
+            .into_iter()
+            .find(|u| u.user == user)
+            .unwrap()
+            .code_expires
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let end = pending("dave").unwrap();
+    assert!(
+        (now + 13 * 86400..=now + 15 * 86400).contains(&end),
+        "{end}"
+    );
+
+    // Fifteen days on, it's refused. The right code says why; a wrong one says
+    // nothing more than it ever did.
+    let stored = backend.read_key(&key).unwrap();
+    let old = [&stored[..32], &(now - 15 * 86400).to_be_bytes()[..]].concat();
+    backend.write_key(&key, Some(&old));
+    assert!(pending("dave").unwrap() < now);
+    let refused = rt
+        .block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials("dave"),
+            &code,
+            KdfParams::TESTING,
+        ))
+        .unwrap_err();
+    assert!(refused.message.contains("expired"), "{refused}");
+    let refused = rt
+        .block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials("dave"),
+            "not-the-code",
+            KdfParams::TESTING,
+        ))
+        .unwrap_err();
+    assert!(!refused.message.contains("expired"), "{refused}");
+
+    // A code from before they had an end still works.
+    backend.write_key(&key, Some(&stored[..32]));
+    assert_eq!(pending("dave"), Some(0));
+    enrol_with(&backend, "dave", &code);
+    assert_eq!(pending("dave"), None);
+}
+
+/// A name can come back as someone else. They get nothing the name had.
+#[test]
+fn a_name_that_comes_back_gets_nothing_it_had() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let erin_key = backend.enrol("erin");
+    let bob = vault(&backend, "bob");
+    rt.block_on(bob.trust("erin", &fingerprint_words(&erin_key)))
+        .unwrap();
+    let docs = rt
+        .block_on(bob.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(bob.grant(docs, "erin", true, OsStr::new("docs")))
+        .unwrap();
+    rt.block_on(bob.remote().offer_volume(docs, "erin"))
+        .unwrap();
+    let erin = vault(&backend, "erin");
+    assert_eq!(rt.block_on(erin.remote().offers()).unwrap().len(), 1);
+
+    // Removing takes every grant, whenever it was made.
+    let tester = vault(&backend, TESTER);
+    rt.block_on(tester.trust("bob", &fingerprint_words(&bob_key)))
+        .unwrap();
+    let theirs = rt
+        .block_on(tester.create_volume(OsStr::new("theirs"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(tester.grant(theirs, "bob", true, OsStr::new("theirs")))
+        .unwrap();
+    let grant = [&[0x07], &theirs.to_be_bytes()[..], b"bob"].concat();
+    let index = [b"\x09bob\x00", &theirs.to_be_bytes()[..]].concat();
+    let row = backend.read_key(&grant).unwrap();
+    drop(bob);
+    assert!(
+        rt.block_on(accounts::remove(&backend.client, "bob"))
+            .unwrap()
+    );
+    assert!(backend.keys_with_prefix(b"\x09bob\x00").is_empty());
+
+    // The offer of a removed owner doesn't stand.
+    assert!(rt.block_on(erin.remote().offers()).unwrap().is_empty());
+
+    // A grant that outlived the name goes when it is next enrolled.
+    backend.write_key(&grant, Some(&row));
+    backend.write_key(&index, Some(&[]));
+    let code = rt
+        .block_on(accounts::add(
+            &backend.client,
+            "bob",
+            Caps::NONE,
+            Caps::NONE,
+        ))
+        .unwrap();
+    enrol_with(&backend, "bob", &code);
+    assert!(backend.keys_with_prefix(b"\x09bob\x00").is_empty());
+    assert!(backend.read_key(&grant).is_none());
+
+    // The volume's record still names bob, but this bob can't give it away.
+    let new_bob = connect(&backend, "bob");
+    assert_eq!(
+        errno(rt.block_on(new_bob.offer_volume(docs, "erin"))),
+        libc::EPERM
+    );
+    assert!(rt.block_on(new_bob.offers()).unwrap().is_empty());
 }

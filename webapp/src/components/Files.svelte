@@ -5,6 +5,7 @@
   // servers have. SVAR never gets a URL, so it fetches nothing itself.
   import { Filemanager, WillowDark, getMenuOptions } from "@svar-ui/svelte-filemanager";
   import Fingerprint from "./Fingerprint.svelte";
+  import ErrorText from "./ErrorText.svelte";
   import Dialog from "./Dialog.svelte";
   import ShareDialog from "./ShareDialog.svelte";
   import SharedWith from "./SharedWith.svelte";
@@ -16,6 +17,7 @@
   import SharingBar from "./SharingBar.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
+  import People from "./People.svelte";
   import TransferDialog from "./TransferDialog.svelte";
   import LimitDialog from "./LimitDialog.svelte";
   import { sizeText } from "../lib/sizes.js";
@@ -88,7 +90,9 @@
 
   async function load() {
     try {
-      initial = entries("/", await fs.readdir("/"));
+      const list = await fs.readdir("/");
+      shown.set("/", JSON.stringify(list));
+      initial = entries("/", list);
     } catch (e) {
       error = e.message;
       initial = [];
@@ -135,9 +139,68 @@
       : "",
   );
 
+  // ---------------------------------------------------------- staying current
+  // Others share things and change files while this tab is open, and a reload
+  // means logging in again. So the app looks every minute while the tab is in
+  // view, and as soon as it comes back into view.
+
+  const POLL_MS = 60_000;
+  let polling = false;
+  /// The folder last listed, to show a new listing only if it differs:
+  /// showing one disturbs what is on screen.
+  let shown = new Map();
+
+  async function poll() {
+    if (visitor || polling || document.hidden || !api) return;
+    polling = true;
+    try {
+      await Promise.all([refreshPending(), refreshOffers()]);
+      account = await fs.account();
+      const root = await listIfChanged("/");
+      // Listing a folder makes SVAR forget what was in those inside it, so a
+      // change in the root lists again down to the open one.
+      if (root && current !== "/") await relistDown("/", current);
+      else if (current !== "/") await listIfChanged(current);
+    } catch {
+    } finally {
+      polling = false;
+    }
+  }
+
+  /// Lists `dir`, and shows it if it changed. Says if it did.
+  async function listIfChanged(dir) {
+    const list = await fs.readdir(dir);
+    const seen = JSON.stringify(list);
+    if (shown.get(dir) === seen) return false;
+    shown.set(dir, seen);
+    await api.exec("provide-data", { id: dir, data: entries(dir, list) });
+    return true;
+  }
+
+  /// Lists again the folders below `top`, down to `open`.
+  async function relistDown(top, open) {
+    const inside = top === "/" ? "/" : top + "/";
+    if (open === top || !open.startsWith(inside)) return;
+    let folder = top;
+    for (const name of open.slice(inside.length).split("/").filter(Boolean)) {
+      folder = join(folder, name);
+      await reload(folder);
+    }
+  }
+
+  const onVisible = () => poll();
+  const pollTimer = setInterval(poll, POLL_MS);
+  addEventListener("focus", onVisible);
+  document.addEventListener("visibilitychange", onVisible);
+  onDestroy(() => {
+    clearInterval(pollTimer);
+    removeEventListener("focus", onVisible);
+    document.removeEventListener("visibilitychange", onVisible);
+  });
+
   async function refreshPending() {
     try {
-      pendingCount = (await fs.pending()).length;
+      pendingCount = (await fs.pending()).filter((p) => p.state !== "trusted").length;
     } catch {}
   }
 
@@ -145,6 +208,7 @@
   async function reload(dir) {
     try {
       const list = await fs.readdir(dir);
+      shown.set(dir, JSON.stringify(list));
       await api.exec("provide-data", { id: dir, data: entries(dir, list) });
     } catch (e) {
       if (e.code !== "ENOENT") fail(e);
@@ -383,11 +447,7 @@
     return [
       ...options,
       { comp: "separator" },
-      { id: "share", text: "Share…", icon: "wxi-account", handler: () => (dialog = { kind: "share", path: item.id }) },
-      { id: "shared-with", text: "Shared with…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
-      ...(account.caps.includes("links")
-        ? [{ id: "share-link", text: "Share publicly…", icon: "wxi-link", handler: () => (dialog = { kind: "link", path: item.id }) }]
-        : []),
+      { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
       { id: "size-limit", text: "Size limit…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "limit", path: item.id }) },
       ...(parentOf(item.id) === "/"
         ? [{ id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) }]
@@ -417,9 +477,10 @@
   /// The account menu: what the account does besides files.
   const menuItems = $derived([
     { id: "pending", text: "Shared with me", icon: "wxi-file-multiple-outline", badge: pendingCount || 0 },
+    { id: "people", text: "People", icon: "wxi-account" },
     ...(account.caps.includes("admin") ? [{ id: "users", text: "Users", icon: "wxi-account" }] : []),
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
-    { id: "fingerprint", text: "My fingerprint", icon: "wxi-information-outline" },
+    { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
 
@@ -434,14 +495,7 @@
     const open = state?.panels[state.activePanel]?.path ?? current;
     const top = path ? parentOf(path) : open;
     await reload(top);
-    const inside = top === "/" ? "/" : top + "/";
-    if (open !== top && open.startsWith(inside)) {
-      let folder = top;
-      for (const name of open.slice(inside.length).split("/").filter(Boolean)) {
-        folder = join(folder, name);
-        await reload(folder);
-      }
-    }
+    await relistDown(top, open);
     showSharing(current);
   }
 
@@ -475,8 +529,8 @@
 
   {#if pendingCount && !visitor}
     <div class="banner">
-      {pendingCount === 1 ? "A share is" : `${pendingCount} shares are`} waiting for you to check who
-      sent {pendingCount === 1 ? "it" : "them"}.
+      {pendingCount === 1 ? "A share needs" : `${pendingCount} shares need`} checking. You can already
+      open {pendingCount === 1 ? "it" : "them"}, but check who sent {pendingCount === 1 ? "it" : "them"} to be sure.
       <button onclick={() => (dialog = { kind: "pending" })}>Review</button>
     </div>
   {/if}
@@ -499,7 +553,7 @@
   {/if}
   {#if error}
     <div class="banner error-banner">
-      {error}
+      <ErrorText {fs} message={error} />
       <button onclick={() => (error = "")}>Dismiss</button>
     </div>
   {/if}
@@ -539,8 +593,12 @@
 </WillowDark>
 
 {#if dialog?.kind === "fingerprint"}
-  <Dialog title="My fingerprint" onclose={() => (dialog = null)}>
-    <p>Your key's fingerprint</p>
+  <Dialog title="My safety code" onclose={() => (dialog = null)}>
+    <p class="note">
+      These 12 words are your safety code. The first time you share with someone, you'll each
+      read yours to the other, so you know you've really reached each other. No need to save it: it's
+      always under your name, in My safety code.
+    </p>
     <Fingerprint fingerprint={me.fingerprint} />
   </Dialog>
 {:else if dialog?.kind === "view"}
@@ -553,9 +611,17 @@
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "share"}
-  <ShareDialog {fs} path={dialog.path} onclose={closeSharing} />
+  <ShareDialog {fs} path={dialog.path} mine={me.fingerprint} onclose={closeSharing} />
 {:else if dialog?.kind === "shared-with"}
-  <SharedWith {fs} path={dialog.path} me={me.user} links={account.caps.includes("links")} onclose={closeSharing} />
+  <SharedWith
+    {fs}
+    path={dialog.path}
+    me={me.user}
+    links={account.caps.includes("links")}
+    onshare={() => (dialog = { kind: "share", path: dialog.path })}
+    onlink={() => (dialog = { kind: "link", path: dialog.path })}
+    onclose={closeSharing}
+  />
 {:else if dialog?.kind === "transfer"}
   <TransferDialog {fs} path={dialog.path} me={me.user} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "limit"}
@@ -575,9 +641,20 @@
   <LinksDialog {fs} onclose={closeSharing} />
 {:else if dialog?.kind === "users"}
   <UsersDialog {fs} me={me.user} onclose={() => (dialog = null)} />
+{:else if dialog?.kind === "people"}
+  <People
+    {fs}
+    mine={me.fingerprint}
+    onclose={() => {
+      dialog = null;
+      refreshPending();
+    }}
+  />
 {:else if dialog?.kind === "pending"}
   <Pending
     {fs}
+    me={me.user}
+    mine={me.fingerprint}
     onclose={() => {
       dialog = null;
       refreshPending();

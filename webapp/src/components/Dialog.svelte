@@ -1,10 +1,12 @@
 <script>
-  let { title, wide = false, onclose, children } = $props();
+  // `keep` holds it open against Esc and clicks outside it, while closing it
+  // would lose something typed.
+  let { title, wide = false, keep = false, onclose, children } = $props();
 </script>
 
-<svelte:window onkeydown={(e) => e.key === "Escape" && onclose()} />
+<svelte:window onkeydown={(e) => e.key === "Escape" && !keep && onclose()} />
 
-<div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && onclose()}>
+<div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && !keep && onclose()}>
   <div class="dialog" class:wide role="dialog" aria-modal="true" aria-label={title}>
     <h2>{title}</h2>
     {@render children()}

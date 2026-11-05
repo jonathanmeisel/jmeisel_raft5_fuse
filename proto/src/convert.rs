@@ -810,6 +810,7 @@ impl From<Result<Vec<UserEntry>, FsError>> for pb::UserListResponse {
                             enrolled: u.enrolled,
                             account: Some(u.info.into()),
                             used: u.used,
+                            code_expires: u.code_expires,
                         })
                         .collect(),
                 }),
@@ -832,6 +833,7 @@ impl pb::UserListResponse {
                         enrolled: u.enrolled,
                         info: u.account.ok_or_else(|| malformed("account"))?.into(),
                         used: u.used,
+                        code_expires: u.code_expires,
                     })
                 })
                 .collect(),

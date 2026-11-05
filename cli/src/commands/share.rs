@@ -87,14 +87,15 @@ pub fn grant(connect: &ConnectArgs, args: GrantArgs) -> Outcome {
             // fingerprint matches, never only because the server says so.
             if vault.known_keys().pinned(&args.grantee).is_none() {
                 let Some(expected) = &args.fingerprint else {
-                    let served = vault.served_key(&args.grantee).await?;
+                    // Asked here so that a mistyped name says so. It doesn't
+                    // show the key: the fingerprint must come from them.
+                    vault.served_key(&args.grantee).await?;
                     return Err(raft5fs_proto::types::FsError::new(
                         libc::EPERM,
                         format!(
-                            "{user}'s key isn't pinned yet. The server says its fingerprint is\n\
-                             {}\ncheck that with {user} (`raft5fs whoami` shows it to them), \
-                             then share again with --fingerprint",
-                            show_fingerprint(&served),
+                            "{user}'s key isn't pinned yet. Ask {user} to read you their \
+                             fingerprint (`raft5fs whoami` shows it to them), then share again \
+                             with --fingerprint",
                             user = args.grantee,
                         ),
                     ));
@@ -217,6 +218,19 @@ pub fn forget_key(connect: &ConnectArgs, args: UserArg) -> Outcome {
     Ok(0)
 }
 
+pub fn reset_versions(connect: &ConnectArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    runtime
+        .block_on(vault.reset_versions())
+        .map_err(|e| format!("cannot reset this device's memory: {e}"))?;
+    println!(
+        "this device now accepts the versions the servers give; restart any mount of this account"
+    );
+    Ok(0)
+}
+
 pub fn pending(connect: &ConnectArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
@@ -229,18 +243,12 @@ pub fn pending(connect: &ConnectArgs) -> Outcome {
         let label = share.label.to_string_lossy();
         match share.trust {
             ShareTrust::Trusted => continue,
-            ShareTrust::Untrusted { key } => {
+            ShareTrust::Untrusted { .. } => {
                 println!(
-                    "{label}: shared by {}, whose key isn't pinned, so it is read-only. \
-                     The server says their fingerprint is",
-                    share.sender
-                );
-                println!("{}", show_fingerprint(&key));
-                println!(
-                    "  if {} reads you the same, run: raft5fs trust {} {}",
-                    share.sender,
-                    share.sender,
-                    fingerprint_words(&key)
+                    "{label}: shared by {sender}, whose key isn't pinned, so it is read-only.\n  \
+                     Ask {sender} to read you their fingerprint (`raft5fs whoami` shows it to \
+                     them), then run: raft5fs trust {sender} <their twelve words>",
+                    sender = share.sender,
                 );
             }
             ShareTrust::Unreadable(e) => {

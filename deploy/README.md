@@ -511,6 +511,11 @@ What it trusts that the native client doesn't:
   registrar can serve a changed app that captures passwords. Use
   two-factor login on all three, and keep write access to the repo to
   yourself.
+- **The first visit isn't protected.** GitHub Pages doesn't tell browsers
+  to insist on HTTPS (HSTS) for a custom domain. Someone on the network
+  could answer a visit that starts at `http://` with a changed app. This
+  is accepted, to stay on GitHub Pages. Bookmark the `https://` address,
+  and use that.
 - **The web port's identity is the public web PKI,** not `fs-ca`. A CAA
   record limits who may issue certificates for the domain.
 - **Port 80 is open on the nodes,** for Let's Encrypt to check each
@@ -770,10 +775,11 @@ never send to a server. So:
   with…** list shows it as "Public link"), as for a person: the folder is
   re-encrypted and the servers delete the link's account. Deleting the
   folder ends its links too.
-- Anyone who can change the folder and make links can also copy its links
-  again (**Show link**). The link's secret is kept in the folder's list of
+- Anyone who can change the folder can also copy its links again. The app
+  offers **Show link** only to those who may make links, but nothing else
+  holds the others back: the link's secret is kept in the folder's list of
   who it is shared with, which is sealed under the folder's key, and which
-  the servers give only to those who can change the folder. So a writer
+  the servers give to anyone who can change the folder. So a writer
   you later remove from the folder may still have its links: revoke them
   too if that matters. Clients from before this change can't share or
   revoke on a folder that has a link: update them.

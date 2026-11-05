@@ -16,8 +16,9 @@
 // - With "stay unlocked", it also keeps the account's unlock keys (what a
 //   password gives a login), for one account per filesystem and for
 //   REMEMBER_MS. They are encrypted (AES-GCM) under a key that WebCrypto
-//   made non-extractable: scripts on this origin can use it, but nothing
-//   can read it out of the browser. Logging out deletes them.
+//   made non-extractable. That stops someone copying the browser's files to
+//   another machine. It doesn't stop a script on this origin, which can ask
+//   the browser to decrypt them. Logging out deletes them.
 import init, * as wasm from "../wasm/raft5fs_web.js";
 
 const filesystems = __RAFT5FS_FILESYSTEMS__;
@@ -336,6 +337,7 @@ const methods = {
   },
 
   checkNewPassword: (password) => wasm.checkNewPassword(password),
+  checkSafetyCode: (text) => wasm.checkSafetyCode(text),
   whoami: () => session().whoami(),
   readdir: (path) => session().readdir(path),
   stat: (path) => session().stat(path),
@@ -467,6 +469,8 @@ const methods = {
   },
 
   isPinned: (user) => session().isPinned(user),
+  userExists: (user) => session().userExists(user),
+  people: () => session().people(),
   share: (path, user, writable, label, fingerprint) =>
     session().share(path, user, writable, label, fingerprint || undefined),
   sharedWith: (path) => session().sharedWith(path),
@@ -474,6 +478,8 @@ const methods = {
   pending: () => session().pending(),
   trust: (user, words) => session().trust(user, words),
   forgetKey: (user) => session().forgetKey(user),
+  syncPins: () => session().syncPins(),
+  resetVersions: () => session().resetVersions(),
   replaceKey: (user, words) => session().replaceKey(user, words),
   account: () => session().account(),
   issueInvite: (user, caps) => session().issueInvite(user, caps),

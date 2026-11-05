@@ -15,8 +15,9 @@
 //!   refuses writes under them (`EKEYEXPIRED`), and `freshen` rotates them.
 //!   A revocation also rotates the path down to every grant below, because
 //!   those grantees cannot rotate keys above their grant.
-//! - **Public keys.** The vault pins each user's key the first time it sees
-//!   it (`KnownKeys`), and refuses a different key later.
+//! - **Public keys.** The vault pins a user's key once a person has checked
+//!   its fingerprint with them (`KnownKeys`), and refuses a different key
+//!   later.
 //! - **The root.** A mount shows a virtual root, with one entry for each
 //!   grant to this account. Making a directory there makes a new volume.
 //!
@@ -29,6 +30,7 @@
 //! - It checks that a looked-up name names the inode that the server
 //!   returned.
 //! - It refuses key records older than ones it already saw.
+//! - It leaves out a name that a writer sealed but no folder could hold.
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,12 +44,12 @@ use raft5fs_crypto::data::{
 };
 use raft5fs_crypto::grantees::{GranteeEntry, open_grantees, seal_grantees};
 use raft5fs_crypto::identity::{
-    Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, fingerprint_words, grant_sender,
-    seal_grant, seal_label,
+    Identity, PUBLIC_KEY_LEN, fingerprint, fingerprint_matches, grant_sender, label_signer,
+    seal_grant, seal_label, seal_signed_label,
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
-use raft5fs_crypto::pins::{PinEntry, open_pins, seal_pins};
+use raft5fs_crypto::pins::{PinEntry, PinList, open_pins, seal_pins};
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
@@ -61,6 +63,7 @@ use blocks::{BlockEdit, Rewritten};
 
 mod blocks;
 mod prune;
+mod rollback;
 pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
@@ -100,6 +103,18 @@ pub struct Share {
     /// The sender that the grant claims.
     pub sender: String,
     pub trust: ShareTrust,
+}
+
+/// Who vouches for a share's label.
+enum LabelSource {
+    /// This account sealed it.
+    Me,
+    /// Someone whose key this account checked.
+    Checked,
+    /// It's signed, by a key that only the servers vouch for.
+    Unchecked,
+    /// Nobody: anyone could have sealed it.
+    Unsigned,
 }
 
 /// Whether this account trusts a share's sender.
@@ -150,12 +165,9 @@ impl Node {
                 format!(
                     "inode {ino} is shared with this account by {}, whose key isn't pinned \
                      here: the server could have made the share up, so nothing is written \
-                     under it. If {} really shared it, check their key's fingerprint ({}) \
-                     with them, then: raft5fs-share trust {} <fingerprint>",
-                    u.sender,
-                    u.sender,
-                    fingerprint_words(&u.key),
-                    u.sender
+                     under it. If {} really shared it, ask them for their key's fingerprint, \
+                     then: raft5fs trust {} <fingerprint>",
+                    u.sender, u.sender, u.sender
                 ),
             )),
         }
@@ -211,11 +223,11 @@ fn changed(e: &FsError) -> bool {
     e.errno == errno::EAGAIN
 }
 
-/// Public keys that this account sealed to, by user. The server could give
-/// its own key in place of a user's key, so the vault trusts the first key
-/// it sees for a user and refuses a different key later. It keeps the keys
-/// in memory and in a blob of a `Store` (one `user hex-key` line for each
-/// user; natively, a file readable only by its owner).
+/// Public keys that this account checked, by user. The server could give its
+/// own key in place of a user's key, so a person checks a key's fingerprint
+/// before the vault pins it, and the vault refuses a different key later. It
+/// keeps the keys in memory and in a blob of a `Store` (one `user hex-key`
+/// line for each user; natively, a file readable only by its owner).
 ///
 /// The names come from the server, so the vault checks each one
 /// (`check_username`) before it writes it to the blob. A name with a line
@@ -359,8 +371,7 @@ impl KnownKeys {
         entries
     }
 
-    /// Removes `user`'s pinned key, so the vault trusts the next key it
-    /// sees for them.
+    /// Removes `user`'s pinned key, so that their next key needs checking.
     pub fn forget(&self, user: &str) -> std::io::Result<()> {
         self.rewrite(user, None)
     }
@@ -374,7 +385,7 @@ impl KnownKeys {
 
     /// Every pinned key, including those that another process pinned in
     /// the store since this one loaded it.
-    pub(crate) fn all(&self) -> HashMap<String, [u8; PUBLIC_KEY_LEN]> {
+    pub fn all(&self) -> HashMap<String, [u8; PUBLIC_KEY_LEN]> {
         let mut keys = self.keys.lock().unwrap();
         if let Ok(stored) = read_pins(self.store.as_ref(), &self.name) {
             for (other, key) in stored {
@@ -506,6 +517,23 @@ fn sealed_blob(ino: u64, body: &ChunkBody) -> Result<Option<&[u8]>, FsError> {
     }
 }
 
+/// Whether a name can be one thing in one folder. A writer seals what names
+/// they like, and a `/` or a `..` would make a listing say something a path
+/// can't, or point somewhere else.
+fn good_name(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+}
+
+fn check_new_name(name: &OsStr) -> Result<(), FsError> {
+    if good_name(os_bytes::bytes(name)) {
+        return Ok(());
+    }
+    Err(FsError::new(
+        errno::EINVAL,
+        format!("{name:?} can't be a name: it can't be empty, . or .., or hold a / or a NUL"),
+    ))
+}
+
 fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
     FsError::new(errno::EIO, format!("inode {ino}: {e}"))
 }
@@ -521,14 +549,10 @@ pub struct Vault {
     remote: Arc<Remote>,
     identity: Arc<Identity>,
     known: KnownKeys,
-    /// This device's pins as of its last merge with the account's copy on
-    /// the servers (`sync_pins`); `None` before the first.
-    pins_synced: Mutex<Option<HashMap<String, [u8; PUBLIC_KEY_LEN]>>>,
     nodes: Mutex<HashMap<u64, Arc<Node>>>,
-    /// The newest key version seen for each inode in this session. Clearing
-    /// `nodes` does not clear it. It stops the server from returning an
-    /// older key record, under a key that a revoked user still has.
-    seen: Mutex<HashMap<u64, u32>>,
+    /// The newest key version seen for each inode, kept beside the pins.
+    /// Clearing `nodes` does not clear it. See `rollback`.
+    versions: Mutex<rollback::Versions>,
     /// Public keys that the server gave for grant senders, by user name.
     senders: Mutex<HashMap<String, [u8; PUBLIC_KEY_LEN]>>,
     /// If true (`with_untrusted_warnings`), print a message once for each
@@ -544,6 +568,12 @@ pub struct Vault {
     space: u64,
     /// Each file's layout, kept after the first request (see `layout`).
     layouts: Mutex<HashMap<u64, Layout>>,
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.save_versions(true);
+    }
 }
 
 /// How much decrypted file data a vault caches by default.
@@ -565,9 +595,8 @@ impl Vault {
             remote,
             identity,
             known: KnownKeys::in_memory(),
-            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
+            versions: Mutex::default(),
             senders: Mutex::new(HashMap::new()),
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
@@ -595,9 +624,8 @@ impl Vault {
             remote: Arc::new(self.remote.at(name)),
             identity: Arc::clone(&self.identity),
             known: KnownKeys::in_memory(),
-            pins_synced: Mutex::new(None),
             nodes: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashMap::new()),
+            versions: Mutex::default(),
             senders: Mutex::new(HashMap::new()),
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
@@ -619,7 +647,7 @@ impl Vault {
     /// Pins public keys in `known`, not only in memory.
     pub fn with_known_keys(mut self, known: KnownKeys) -> Self {
         self.known = known;
-        self.pins_synced = Mutex::new(None);
+        self.load_versions();
         self
     }
 
@@ -628,21 +656,30 @@ impl Vault {
     ///
     /// - What changed here since the last merge (a key trusted, replaced or
     ///   forgotten) goes to the servers, unless another device changed the
-    ///   same user later.
-    /// - On the first merge, keys trusted only here go to the servers too.
-    ///   Where the two differ, the servers' copy wins: it is the latest
-    ///   that one of the account's devices checked.
+    ///   same user later. The last merge is kept beside the pins, so this
+    ///   holds after a restart too.
+    /// - On this device's first merge, keys trusted only here go to the
+    ///   servers too. Where the two differ, the servers' copy wins: it is
+    ///   the latest that one of the account's devices checked.
     /// - Then this device trusts what the merged list says.
+    /// - Returns `EIO` and changes nothing if the servers' copy is older
+    ///   than one this device has seen (`rollback`).
     ///
     /// The servers can't read or change the list (raft5fs-crypto's
     /// `pins`). Does nothing on servers older than protocol 3.
     pub async fn sync_pins(&self) -> Result<(), FsError> {
+        self.merge_pins(false).await
+    }
+
+    /// `sync_pins`, and with `labels_signed`, records that this account has
+    /// signed its old labels.
+    async fn merge_pins(&self, labels_signed: bool) -> Result<(), FsError> {
         if self.remote.protocol() < 3 {
             return Ok(());
         }
         let me = self.remote.username().to_string();
         let local = self.known.all();
-        let base = self.pins_synced.lock().unwrap().clone();
+        let rollback::PinMemory { floor, base, .. } = self.load_pin_memory();
         let now = raft5fs_proto::clock::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -665,13 +702,17 @@ impl Vault {
         for _ in 0..CHANGE_RETRIES {
             let (version, sealed) = self.remote.get_pins().await?;
             let stored = if sealed.is_empty() {
-                Vec::new()
+                PinList::default()
             } else {
                 open_pins(&self.identity, &me, &sealed)
                     .map_err(|e| FsError::new(errno::EIO, format!("the servers' copy: {e}")))?
             };
-            let before: BTreeMap<String, PinEntry> =
-                stored.into_iter().map(|e| (e.user.clone(), e)).collect();
+            self.check_pin_counter(stored.counter, floor)?;
+            let before: BTreeMap<String, PinEntry> = stored
+                .entries
+                .into_iter()
+                .map(|e| (e.user.clone(), e))
+                .collect();
             let mut merged = before.clone();
             for change in &changes {
                 if merged.get(&change.user).is_none_or(|e| e.at <= change.at) {
@@ -698,11 +739,21 @@ impl Vault {
             for user in &dead {
                 merged.remove(user);
             }
-            if merged != before {
-                let entries: Vec<PinEntry> = merged.values().cloned().collect();
+            // A list from before counters has nothing to protect it until
+            // it has one.
+            let uncounted = stored.counter == 0 && !sealed.is_empty();
+            let signed = stored.labels_signed || labels_signed;
+            let mut counter = stored.counter;
+            if merged != before || uncounted || signed != stored.labels_signed {
+                counter = stored.counter.max(floor) + 1;
+                let list = PinList {
+                    counter,
+                    labels_signed: signed,
+                    entries: merged.values().cloned().collect(),
+                };
                 match self
                     .remote
-                    .put_pins(version, seal_pins(&self.identity, &me, &entries))
+                    .put_pins(version, seal_pins(&self.identity, &me, &list))
                     .await
                 {
                     // Another device changed them: merge with theirs.
@@ -728,7 +779,12 @@ impl Vault {
                     _ => {}
                 }
             }
-            *self.pins_synced.lock().unwrap() = Some(self.known.all());
+            self.save_pin_memory(&rollback::PinMemory {
+                floor: counter,
+                labels_signed: signed,
+                base: Some(self.known.all()),
+            })
+            .map_err(io)?;
             // Grants from users trusted now open as trusted.
             if changed_here {
                 self.forget_all();
@@ -1288,28 +1344,8 @@ impl Vault {
         Ok(parent.1)
     }
 
-    /// Returns `EIO` if `record` is older than a record seen before for
-    /// `ino`. A server could send an old record so that the client seals
-    /// new data under a key that a revoked user still has.
-    fn check_not_older(&self, ino: u64, record: &NodeKeys) -> Result<(), FsError> {
-        match self.seen.lock().unwrap().get(&ino) {
-            Some(&seen) if record.version < seen => Err(FsError::new(
-                errno::EIO,
-                format!(
-                    "inode {ino}: the server handed back key version {}, older than \
-                     version {seen} seen before",
-                    record.version
-                ),
-            )),
-            _ => Ok(()),
-        }
-    }
-
     fn keep(&self, ino: u64, node: Node) -> Arc<Node> {
-        let mut seen = self.seen.lock().unwrap();
-        let newest = seen.entry(ino).or_insert(node.record.version);
-        *newest = (*newest).max(node.record.version);
-        drop(seen);
+        self.saw_version(ino, node.record.version);
         let node = Arc::new(node);
         self.nodes.lock().unwrap().insert(ino, Arc::clone(&node));
         node
@@ -1325,11 +1361,7 @@ impl Vault {
         grants.sort_by_key(|g| g.ino);
         let mut roots = Roots::default();
         for grant in grants {
-            let label = self
-                .identity
-                .open_label(grant.ino, &grant.sealed_label)
-                .map(os_bytes::into_name)
-                .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
+            let label = self.root_label(&grant).await;
             let mut name = label.clone();
             let mut n = 2;
             while roots.by_name.contains_key(&name) || name.is_empty() || self.reserved(&name) {
@@ -1348,6 +1380,106 @@ impl Vault {
             .collect();
         *self.roots.lock().unwrap() = roots;
         Ok(entries)
+    }
+
+    /// Opens `grant`'s label, and says who vouches for it.
+    async fn read_label(&self, grant: &Grant) -> Option<(Vec<u8>, LabelSource)> {
+        let (ino, sealed) = (grant.ino, &grant.sealed_label);
+        if let Some(signer) = label_signer(sealed)
+            && check_username(signer).is_ok()
+        {
+            if signer == self.remote.username() {
+                let me = self.identity.public_key();
+                if let Ok(text) = self.identity.open_signed_label(&me, ino, sealed) {
+                    return Some((text, LabelSource::Me));
+                }
+            }
+            if let Some(pinned) = self.known.pinned(signer)
+                && let Ok(text) = self.identity.open_signed_label(&pinned, ino, sealed)
+            {
+                return Some((text, LabelSource::Checked));
+            }
+            if let Ok(served) = self.sender_key(signer).await
+                && let Ok(text) = self.identity.open_signed_label(&served, ino, sealed)
+            {
+                return Some((text, LabelSource::Unchecked));
+            }
+        }
+        let text = self.identity.open_label(ino, sealed).ok()?;
+        Some((text, LabelSource::Unsigned))
+    }
+
+    /// The name that `grant` shows as in the root.
+    ///
+    /// The servers could replace a label, to pass a share off as something
+    /// else. So once this account has signed its old labels, a label that
+    /// nobody it checked vouches for says so. Not for a share from someone it
+    /// hasn't checked: the whole share already says that it needs checking,
+    /// and its name shouldn't change when they check.
+    async fn root_label(&self, grant: &Grant) -> OsString {
+        let unreadable = || OsString::from(format!("unreadable-{}", grant.ino));
+        let Some((text, source)) = self.read_label(grant).await else {
+            return unreadable();
+        };
+        if !good_name(&text) {
+            return unreadable();
+        }
+        let mut label = os_bytes::into_name(text);
+        let vouched = matches!(source, LabelSource::Me | LabelSource::Checked);
+        if !vouched && self.load_pin_memory().labels_signed && self.sender_checked(grant) {
+            label.push(" (unverified)");
+        }
+        label
+    }
+
+    /// Whether this account checked the sender that `grant` names.
+    fn sender_checked(&self, grant: &Grant) -> bool {
+        grant_sender(&grant.sealed_key).is_ok_and(|sender| {
+            sender == self.remote.username() || self.known.pinned(sender).is_some()
+        })
+    }
+
+    /// Seals this account's labels under its own key, where it can vouch for
+    /// them. They then hold whatever the sharer does later, like enrolling
+    /// again.
+    ///
+    /// - A label from someone this account checked: every time.
+    /// - An unsigned label: only the first time, trusting what it sees then.
+    ///   After that, this records in the sealed pins that it is done, so
+    ///   that an unsigned label means someone else wrote it.
+    ///
+    /// A failure leaves the rest for the next login. Does nothing for a public
+    /// link, which only reads, or on servers older than protocol 8.
+    pub async fn sign_labels(&self) -> Result<(), FsError> {
+        let me = self.remote.username();
+        if self.remote.protocol() < 8 || me.starts_with(LINK_PREFIX) {
+            return Ok(());
+        }
+        let done = self.load_pin_memory().labels_signed;
+        let own = self.identity.public_key();
+        for grant in self.remote.list_grants().await? {
+            let Some((text, source)) = self.read_label(&grant).await else {
+                continue;
+            };
+            let sign = match source {
+                LabelSource::Checked => true,
+                LabelSource::Unsigned => !done,
+                LabelSource::Me | LabelSource::Unchecked => false,
+            };
+            if !sign {
+                continue;
+            }
+            let sealed = seal_signed_label(&self.identity, me, &own, grant.ino, &text);
+            match self.remote.set_grant_label(grant.ino, sealed).await {
+                // Revoked in the meantime.
+                Err(e) if e.errno == errno::ENOENT => {}
+                other => other?,
+            }
+        }
+        if !done {
+            self.merge_pins(true).await?;
+        }
+        Ok(())
     }
 
     /// Whether `name` is reserved in the root. Only the live root's
@@ -1383,6 +1515,7 @@ impl Vault {
         parent: u64,
         name: &OsStr,
     ) -> Result<(NewNode, Node, OsString), FsError> {
+        check_new_name(name)?;
         let parent_node = self.fresh_node(parent).await?;
         let ino = self.remote.allocate_inode().await?;
         let (record, key) =
@@ -1506,6 +1639,9 @@ impl Vault {
                     .map_err(|e| corrupt(ino, e))
                 });
             match opened {
+                Ok(name) if !good_name(&name) => {
+                    eprintln!("inode {ino}: a bad name for inode {}; left out", item.ino)
+                }
                 Ok(name) => {
                     item.name = os_bytes::into_name(name);
                     item.sealed_name = Vec::new();
@@ -1574,6 +1710,7 @@ impl Vault {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<Option<u64>, FsError> {
+        check_new_name(new_name)?;
         if parent != new_parent {
             self.rotate_moving(parent, name).await?;
         }
@@ -1663,6 +1800,7 @@ impl Vault {
 
     /// Makes a new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
+        check_new_name(label)?;
         if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
             return Err(FsError::errno(errno::EEXIST));
         }
@@ -1671,7 +1809,8 @@ impl Vault {
         let me = self.identity.public_key();
         let username = self.remote.username();
         let sealed_key = seal_grant(&self.identity, username, &me, ino, record.version, &key);
-        let sealed_label = seal_label(&me, ino, os_bytes::bytes(label));
+        let sealed_label =
+            seal_signed_label(&self.identity, username, &me, ino, os_bytes::bytes(label));
         let sealed_grantees = seal_grantees(
             &key,
             record.version,
@@ -1725,7 +1864,7 @@ impl Vault {
     ///
     /// Returns the public key that the grant was sealed to. If it was not
     /// pinned before, compare it with the fingerprint that the user saw
-    /// when they enrolled (`raft5fs-share` calls `trust` first to require
+    /// when they enrolled (`raft5fs grant` calls `trust` first to require
     /// this). A pin is trust in both directions: shares from `user` are
     /// trusted after this.
     pub async fn grant(
@@ -1749,6 +1888,7 @@ impl Vault {
         link_secret: Option<&str>,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
+        check_new_name(label)?;
         // Check this before pinning `user`'s key. A pin also makes shares
         // from `user` trusted, and sharing from an untrusted share must not
         // cause that.
@@ -1796,7 +1936,13 @@ impl Vault {
                     version,
                     &node.key,
                 ),
-                sealed_label: seal_label(&public_key, ino, os_bytes::bytes(label)),
+                sealed_label: seal_signed_label(
+                    &self.identity,
+                    self.remote.username(),
+                    &public_key,
+                    ino,
+                    os_bytes::bytes(label),
+                ),
             };
             let sealed_grantees = seal_grantees(&node.key, version, ino, &entries);
             let listed = entries.iter().map(|e| e.user.clone()).collect();
@@ -1936,13 +2082,15 @@ impl Vault {
         let served = self.served_key(user).await?;
         let matches = fingerprint_matches(&served, expected)
             .map_err(|e| FsError::new(errno::EINVAL, format!("{expected:?}: {e}")))?;
+        // It doesn't say what the server's key is: someone shown the answer
+        // could copy it, and then the check would check nothing.
         if !matches {
             return Err(FsError::new(
                 errno::EPERM,
                 format!(
-                    "the server's key for {user} has fingerprint\n  {}\nnot the one given: \
-                     not pinning it",
-                    fingerprint_words(&served)
+                    "those words don't match the key the servers have for {user}. Check them \
+                     with {user}, one by one. If they still don't match, don't trust this key, \
+                     and tell your admin."
                 ),
             ));
         }
@@ -1967,11 +2115,7 @@ impl Vault {
         grants.sort_by_key(|g| g.ino);
         let mut shares = Vec::with_capacity(grants.len());
         for grant in grants {
-            let label = self
-                .identity
-                .open_label(grant.ino, &grant.sealed_label)
-                .map(os_bytes::into_name)
-                .unwrap_or_else(|_| OsString::from(format!("unreadable-{}", grant.ino)));
+            let label = self.root_label(&grant).await;
             let sender = grant_sender(&grant.sealed_key).unwrap_or("?").to_string();
             let trust = match self.open_grant(grant.ino, &grant).await {
                 Ok((_, _, None)) => ShareTrust::Trusted,

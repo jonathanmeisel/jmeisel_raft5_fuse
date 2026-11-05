@@ -31,7 +31,9 @@ use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault};
-use raft5fs_crypto::identity::{PUBLIC_KEY_LEN, fingerprint, fingerprint_words, grant_sender};
+use raft5fs_crypto::identity::{
+    PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
+};
 use raft5fs_crypto::password::{AUTH_LEN, KdfParams, check_new_password};
 use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
@@ -233,6 +235,24 @@ fn invalid_invitation() -> JsValue {
 #[wasm_bindgen(js_name = checkNewPassword)]
 pub fn check_password(password: &str) -> Result<(), JsValue> {
     check_new_password(password).map_err(|why| failure("EINVAL", &why))
+}
+
+/// How far along someone is in typing a safety code: `{words, unknown,
+/// complete}`, with the words that aren't in the word list.
+#[wasm_bindgen(js_name = checkSafetyCode)]
+pub fn check_safety_code(written: &str) -> Result<JsValue, JsValue> {
+    #[derive(Serialize)]
+    struct Progress {
+        words: usize,
+        unknown: Vec<String>,
+        complete: bool,
+    }
+    let progress = fingerprint_progress(written);
+    to_js(&Progress {
+        words: progress.words,
+        unknown: progress.unknown,
+        complete: progress.complete,
+    })
 }
 
 /// Enrols with `invitation` (from `raft5fs-server user add`), choosing
@@ -1258,8 +1278,9 @@ impl Fs {
     /// Every account, for an admin, as `[{user, enrolled, caps, kind,
     /// invitedBy, owner, used, quota}]`: `enrolled` is false for an
     /// invitation nobody used yet, `kind` is `person` or `link` (made by
-    /// `owner`), and `used` and `quota` are bytes (`quota` null for no
-    /// limit).
+    /// `owner`), `used` and `quota` are bytes (`quota` null for no limit),
+    /// and `codeExpires` is when an unused invitation stops working (seconds
+    /// since the epoch; 0 never; null for none).
     #[wasm_bindgen(js_name = listUsers)]
     pub fn list_users(&self) -> Promise {
         let inner = Rc::clone(&self.0);
@@ -1275,6 +1296,7 @@ impl Fs {
                 owner: String,
                 used: u64,
                 quota: Option<u64>,
+                code_expires: Option<u64>,
             }
             let mut users = inner.vault().remote().list_users().await?;
             users.sort_by(|a, b| a.user.cmp(&b.user));
@@ -1292,6 +1314,7 @@ impl Fs {
                     owner: u.info.owner,
                     used: u.used,
                     quota: u.info.quota,
+                    code_expires: u.code_expires,
                 })
                 .collect::<Vec<_>>())
         })
@@ -1691,8 +1714,9 @@ impl Fs {
         })
     }
 
-    /// Shares from people whose keys aren't pinned here: read-only until
-    /// trusted (`trust`), or not opening at all.
+    /// Everything shared with this account, with who shared it. Shares from
+    /// people whose keys aren't pinned here are read-only until trusted
+    /// (`trust`), or don't open at all.
     pub fn pending(&self) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
@@ -1701,9 +1725,11 @@ impl Fs {
             struct Pending {
                 label: String,
                 sender: String,
-                /// `untrusted` or `unreadable`.
+                /// `trusted`, `untrusted` or `unreadable`.
                 state: &'static str,
                 message: String,
+                /// Whether the share lets this account change things.
+                writable: bool,
                 /// The sender's key differs from the one pinned here, so
                 /// trusting them means replacing it (`replaceKey`).
                 key_changed: bool,
@@ -1711,24 +1737,74 @@ impl Fs {
             let mut pending = Vec::new();
             for share in inner.vault().shares().await? {
                 let (state, message) = match share.trust {
-                    ShareTrust::Trusted => continue,
+                    ShareTrust::Trusted => ("trusted", String::new()),
                     ShareTrust::Untrusted { .. } => ("untrusted", String::new()),
                     ShareTrust::Unreadable(e) => ("unreadable", e.message),
                 };
-                let key_changed = inner
-                    .vault()
-                    .key_changed(&share.sender)
-                    .await
-                    .unwrap_or(false);
+                let key_changed = state != "trusted"
+                    && inner
+                        .vault()
+                        .key_changed(&share.sender)
+                        .await
+                        .unwrap_or(false);
                 pending.push(Pending {
                     label: share.label.to_string_lossy().into_owned(),
                     sender: share.sender,
                     state,
                     message,
+                    writable: share.writable,
                     key_changed,
                 });
             }
             Ok(pending)
+        })
+    }
+
+    /// Whose key this account has pinned, in name order: `[{user, fingerprint,
+    /// keyChanged}]`, where `keyChanged` says the servers now give another key
+    /// for them. Public links are pinned to share with them, but aren't people.
+    pub fn people(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Person {
+                user: String,
+                fingerprint: Fingerprint,
+                key_changed: bool,
+            }
+            let mut pins: Vec<_> = inner
+                .vault()
+                .known_keys()
+                .all()
+                .into_iter()
+                .filter(|(user, _)| !user.starts_with(raft5fs_proto::types::LINK_PREFIX))
+                .collect();
+            pins.sort();
+            let mut people = Vec::with_capacity(pins.len());
+            for (user, key) in pins {
+                let key_changed = inner.vault().key_changed(&user).await.unwrap_or(false);
+                people.push(Person {
+                    user,
+                    fingerprint: Fingerprint::of(&key),
+                    key_changed,
+                });
+            }
+            Ok(people)
+        })
+    }
+
+    /// Whether there is an account called `user`, so a mistyped name can say
+    /// so before anyone goes to ask a person who doesn't exist for their code.
+    #[wasm_bindgen(js_name = userExists)]
+    pub fn user_exists(&self, user: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            match inner.vault().served_key(&user).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.errno == errno::ENOENT || e.errno == errno::EINVAL => Ok(false),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -1759,6 +1835,23 @@ impl Fs {
     pub fn forget_key(&self, user: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move { inner.vault().forget_key(&user).await })
+    }
+
+    /// Merges this browser's pins with the account's copy, and reports a
+    /// failure, which a login only logs.
+    #[wasm_bindgen(js_name = syncPins)]
+    pub fn sync_pins(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().sync_pins().await })
+    }
+
+    /// After a real restore: forgets the key versions and pin counter that
+    /// this browser remembers. The app reloads after this, because the
+    /// background prune has its own view of them.
+    #[wasm_bindgen(js_name = resetVersions)]
+    pub fn reset_versions(&self) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().reset_versions().await })
     }
 
     /// What waits to be pruned, with each entry's latest status.

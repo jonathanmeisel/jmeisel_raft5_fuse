@@ -183,7 +183,13 @@
     bytes: items.reduce((n, u) => n + u.bytes, 0),
   });
 
-  const what = (u) => (u.kind === "link" ? `public link made by ${u.owner}` : u.enrolled ? "" : "invited");
+  function what(u) {
+    if (u.kind === "link") return `public link made by ${u.owner}`;
+    const end = u.codeExpires ?? null;
+    if (end && end < Date.now() / 1000) return "invitation expired";
+    if (!u.enrolled) return "invited";
+    return end === null ? "" : "new invitation waiting";
+  }
 </script>
 
 {#snippet heirs(o)}
@@ -241,7 +247,7 @@
     <p class="note">
       They get a new invitation, which replaces any earlier one. Enrolling with it gives them a new
       key: everything shared with them, their own folders included, is unshared and has to be shared
-      with them again, and the people who share with them are asked to check their new fingerprint.
+      with them again, and the people who share with them are asked to check their new safety code.
     </p>
     {#if step.impact === null}
       <p class="note">Checking what only {step.user} can reach…</p>

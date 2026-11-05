@@ -224,6 +224,7 @@ Adding a user issues an invitation (with the store options from section
 The invitation is one line: alice's one-time enrolment code, the servers'
 addresses and the CA certificate to trust for them. It is as secret as
 the code -- whoever has it can enrol as alice -- so hand it to her alone.
+It works for 14 days.
 She runs, on her own machine:
 
   raft5fs enrol 'raft5fs-invite:1:...'
@@ -552,10 +553,14 @@ look, but nothing he writes could end up sealed under a key the server
 made.
 
   raft5fs pending                what is shared with you by someone not
-                                 trusted yet, with their fingerprint as
-                                 the server has it
+                                 trusted yet
   raft5fs trust alice <her twelve words>
-                                 pin her key, if she reads you the same
+                                 pin her key, if they match it
+
+Nothing here shows you what the fingerprint should be. The words have to
+come from alice, or the check would only compare the server's key with
+itself. (The web app calls a fingerprint a "safety code". They are the
+same words.)
 
 A running mount takes the new pin the next time it writes there. If
 someone really did enrol again, check their new fingerprint with them,
@@ -574,11 +579,26 @@ same keys and she checks each fingerprint once. It is sealed under a key
 that only her key pair gives: the servers can't read it, or add or
 change a pin. Every login merges this machine's pins with that copy, and
 every trust, new key or forget-key updates it; where two devices
-disagree, the latest change wins. A server could hand back an older
-copy, which can only take pins away: she would be asked for a
-fingerprint again, never shown a key she didn't check. Enrolling again
-drops the copy, since a new key pair can't open it. (Servers older than
-protocol 3 keep no copy; then each device pins on its own.)
+disagree, the latest change wins. Enrolling again drops the copy, since
+a new key pair can't open it. (Servers older than protocol 3 keep no
+copy; then each device pins on its own.)
+
+A server could hand back an older copy, or an older key record for a
+folder. An older copy could bring back a key that alice has since
+replaced, and an older key record could make her seal new files under a
+key that a revoked user still has. So each device remembers the newest
+it has seen, in files next to known_keys, and refuses anything older.
+A device that has seen nothing yet has nothing to compare with.
+
+A real restore from a backup looks just the same: every device says the
+servers handed back something older. After a restore, and only then, run
+this on each device, and restart any mount:
+
+  raft5fs reset-versions
+
+(In the web app, a button beside the message does the same.) That device
+then accepts what the servers give, and its own pins replace any older
+ones in the restored copy.
 
 
 -------------------------------------------------------------------------
@@ -621,13 +641,23 @@ with every change. The store holds at most 32 at once.
 9. WHAT THE SERVERS CAN AND CAN'T DO
 -------------------------------------------------------------------------
 
-They can't read file contents, names (of files, directories, or what a
-grant is called), or passwords; nor forge or alter what is sealed
-without the change being detected when it is read. A server can't get a
-key sealed to anyone the people sharing it didn't share it with: who
-each directory is shared with is kept sealed under its key too, and a
-mount re-seals keys only to who is on that list. Nor can it point a name
-at another file: every name is sealed bound to the inode it names.
+They can't read file contents or names (of files, directories, or what a
+grant is called); nor forge or alter what is sealed without the change
+being detected when it is read. One exception: a public link's note, which
+reminds its maker which folder the link is for, is sealed so that only its
+maker can read it, but anyone could have sealed it. A server could show its
+maker a wrong one.
+
+They never see a password. They do hold what a login checks and what the
+private key is wrapped under, so whoever has the store can test guesses at
+a password offline, at the cost of Argon2 for each one. A long password is
+what makes that hopeless.
+
+A server can't get a key sealed to anyone the people sharing it didn't
+share it with: who each directory is shared with is kept sealed under its
+key too, and a mount re-seals keys only to who is on that list. Nor can it
+point a name at another file: every name is sealed bound to the inode it
+names.
 
 They can see:
 
@@ -637,8 +667,9 @@ They can see:
     are read and written, and when. Whoever runs the bucket sees as
     much of that as the objects show: each object's size, the inode it
     belongs to, and when it is read or written -- sealed contents only;
-  - who is granted what, read-only or not, and who reads and writes
-    which inodes, and when;
+  - who is granted what, read-only or not, who made each grant (it names
+    its sender in the clear), and who reads and writes which inodes, and
+    when;
   - the names of snapshots, which are chosen in the clear;
   - the tag each name is filed under. The tag of a name doesn't change
     when the directory's key does, so someone revoked who also got hold
@@ -653,13 +684,26 @@ latest). In particular:
 
   - a chunk withheld reads as zeros, like a hole, and a size changed
     makes a file shorter or longer;
-  - a mount refuses a directory's key older than one it has already seen
-    while it runs, but a newly started one can't tell: a server
-    colluding with someone revoked could hand it the old one, and have
-    what it then writes sealed under a key they had;
+  - a device refuses a directory's key older than one it has already
+    seen, and trusted keys older than it has seen (7.3), but a device
+    that has seen nothing can't tell: a server colluding with someone
+    revoked could hand a new device the old key, and have what it then
+    writes sealed under a key they had;
   - a server could show a user a share it made up, from a user it made
     up -- which stays read-only (7.3). The pinned keys are what stop it
-    reading what users share with each other, so check fingerprints.
+    reading what users share with each other, so check fingerprints;
+  - a server could swap what a share is called. The name is signed by
+    whoever shared it, and then by the account itself, so a name that no
+    one checked vouches for shows as "name (unverified)". (Clients from
+    before protocol 8 can't read signed names: they show unreadable-<ino>.
+    Update them. The first login of an updated client signs the names it
+    sees then, trusting them.)
+
+A pin is trust in a person, not only in a key. A grant is believed because
+the person you pinned sealed it, whatever it is a grant of. So someone you
+pinned, working with a server, could give you a grant of any folder with a
+key of their choosing, and read what you then write there. Pin only people
+you would share with.
 
 And anyone with a key -- read-only or not -- can write a directory's
 sealed list of who it is shared with. Read-only is the servers' rule,
@@ -720,6 +764,10 @@ as seeds.
   "no such enrolment code"
       The code is wrong, was issued to someone else, or was used: codes
       work once. `user add` issues another.
+
+  "<user>'s invitation has expired"
+      Invitations work for 14 days. `user add` issues another. `raft5fs
+      admin users` shows who has one waiting, and who has one expired.
 
   "Operation not permitted" making a file at the top of a mount
       Only volumes go there: `mkdir` one, and put files in it.

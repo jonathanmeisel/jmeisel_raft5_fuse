@@ -179,6 +179,12 @@ async function download(page, name) {
   return readFileSync(await file.path());
 }
 
+/// Opens folder `name`'s Sharing dialog, and chooses `action` in it, if any.
+async function sharing(page, name, action) {
+  await menu(page, name, "Sharing…");
+  if (action) await page.getByRole("button", { name: action, exact: true }).click();
+}
+
 async function menu(page, name, option) {
   // The first match is the option; a hotkey label can repeat its text.
   const choice = page.getByText(option, { exact: true }).first();
@@ -306,13 +312,13 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
 
   await test.step("a share needs the right fingerprint", async () => {
     await alice.getByText("My files").first().click();
-    await menu(alice, "docs", "Share…");
+    await sharing(alice, "docs", "Share with someone");
     await alice.getByLabel("User", { exact: true }).fill("bob");
     await alice.getByRole("button", { name: "Share", exact: true }).click();
-    await alice.getByLabel("bob's fingerprint").fill(aliceWords);
+    await alice.getByLabel("bob's safety code").fill(aliceWords);
     await alice.getByRole("button", { name: "Share", exact: true }).click();
-    await expect(alice.getByText(/not the one given/)).toBeVisible(SLOW);
-    await alice.getByLabel("bob's fingerprint").fill(bobWords);
+    await expect(alice.getByText(/don't match the key/)).toBeVisible(SLOW);
+    await alice.getByLabel("bob's safety code").fill(bobWords);
     await alice.getByRole("button", { name: "Share", exact: true }).click();
     await expect(alice.getByText(/Shared with bob/)).toBeVisible(SLOW);
     await alice.getByRole("button", { name: "Done" }).click();
@@ -336,7 +342,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.getByRole("button", { name: "Close" }).click();
     await alice.goBack();
     await expect(item(alice, "sub")).toBeVisible(SLOW);
-    await menu(alice, "sub", "Shared with…");
+    await sharing(alice, "sub");
     const row = alice.getByRole("row").filter({ hasText: "bob" });
     await expect(row).toContainText("via docs", SLOW);
     await expect(row.getByRole("button")).toHaveCount(0);
@@ -348,13 +354,13 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await bob.reload();
     await login(bob, "bob");
     // A share from someone not trusted yet shows as a banner.
-    await expect(bob.getByText("A share is waiting for you to check who sent it.")).toBeVisible(SLOW);
+    await expect(bob.getByText(/A share needs checking/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Review" }).click();
     await expect(bob.getByText(/docs.*from alice/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Trust…" }).click();
-    await bob.getByLabel("fingerprint").fill(aliceWords);
+    await bob.getByLabel("Their safety code").fill(aliceWords);
     await bob.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(bob.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await expect(bob.getByText(/You and alice are verified/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Close" }).click();
     await open(bob, "docs");
     await expect(bob.locator(".sharing-bar")).toContainText("Shared with alice", SLOW);
@@ -362,7 +368,7 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   });
 
   await test.step("alice revokes, and the app re-seals the folder", async () => {
-    await menu(alice, "docs", "Shared with…");
+    await sharing(alice, "docs");
     const bobRow = alice.getByRole("row").filter({ hasText: "bob" });
     await expect(bobRow).toContainText("read-write", SLOW);
     await expect(alice.getByRole("row").filter({ hasText: "alice (you)" }).getByRole("button")).toHaveCount(0);
@@ -540,23 +546,23 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     ]);
     await expect(item(frank, "note.txt")).toBeVisible(SLOW);
     await frank.getByText("My files").first().click();
-    await menu(frank, "public", "Share…");
+    await sharing(frank, "public", "Share with someone");
     await frank.getByLabel("User", { exact: true }).fill("gina");
     await frank.getByRole("button", { name: "Share", exact: true }).click();
-    await frank.getByLabel("gina's fingerprint").fill(ginaWords);
+    await frank.getByLabel("gina's safety code").fill(ginaWords);
     await frank.getByRole("button", { name: "Share", exact: true }).click();
     await frank.getByRole("button", { name: "Done" }).click();
     await gina.reload();
     await login(gina, "gina");
     await accountMenu(gina, "Shared with me");
     await gina.getByRole("button", { name: "Trust…" }).click();
-    await gina.getByLabel("fingerprint").fill(frankWords);
+    await gina.getByLabel("Their safety code").fill(frankWords);
     await gina.getByRole("button", { name: "Trust", exact: true }).click();
     await gina.getByRole("button", { name: "Close" }).click();
   });
 
   await test.step("frank makes a public link", async () => {
-    await menu(frank, "public", "Share publicly…");
+    await sharing(frank, "public", "Share publicly");
     await frank.getByRole("button", { name: "Make link" }).click();
     link = await frank.getByLabel("Public link").inputValue();
     expect(link).toMatch(/^http:\/\/localhost:4173\/#link=[\w-]+$/);
@@ -581,7 +587,7 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
   });
 
   await test.step("gina, who can change the folder, copies it, then revokes it", async () => {
-    await menu(gina, "public", "Shared with…");
+    await sharing(gina, "public");
     const row = gina.getByRole("row").filter({ hasText: "Public link" });
     await row.getByRole("button", { name: "Show link" }).click();
     expect(await gina.locator("#shared-link").inputValue()).toBe(link);
@@ -632,11 +638,11 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
   let hankWords, irisWords;
 
   async function share(page, folder, user, words) {
-    await menu(page, folder, "Share…");
+    await sharing(page, folder, "Share with someone");
     await page.getByLabel("User", { exact: true }).fill(user);
     await page.getByRole("button", { name: "Share", exact: true }).click();
     if (words) {
-      await page.getByLabel(`${user}'s fingerprint`).fill(words);
+      await page.getByLabel(`${user}'s safety code`).fill(words);
       await page.getByRole("button", { name: "Share", exact: true }).click();
     }
     await expect(page.getByText(new RegExp(`Shared with ${user}`))).toBeVisible(SLOW);
@@ -654,9 +660,9 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     await login(iris, "iris");
     await iris.getByRole("button", { name: "Review" }).click();
     await iris.getByRole("button", { name: "Trust…" }).click();
-    await iris.getByLabel("fingerprint").fill(hankWords);
+    await iris.getByLabel("Their safety code").fill(hankWords);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByText(/No shares from untrusted users/)).toBeVisible(SLOW);
+    await expect(iris.getByText(/You and hank are verified/)).toBeVisible(SLOW);
     await iris.getByRole("button", { name: "Close" }).click();
   });
 
@@ -677,15 +683,15 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     const newIris = await enrolAgain(iris, "iris", await reissue("iris"));
     await hank.reload();
     await login(hank, "hank");
-    await menu(hank, "team", "Share…");
+    await sharing(hank, "team", "Share with someone");
     await hank.getByLabel("User", { exact: true }).fill("iris");
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/iris's key has changed/)).toBeVisible(SLOW);
     // Her old fingerprint doesn't match her new key.
-    await hank.getByLabel("iris's fingerprint").fill(irisWords);
+    await hank.getByLabel("iris's safety code").fill(irisWords);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
-    await expect(hank.getByText(/not the one given/)).toBeVisible(SLOW);
-    await hank.getByLabel("iris's fingerprint").fill(newIris);
+    await expect(hank.getByText(/don't match the key/)).toBeVisible(SLOW);
+    await hank.getByLabel("iris's safety code").fill(newIris);
     await hank.getByRole("button", { name: "Share", exact: true }).click();
     await expect(hank.getByText(/Shared with iris/)).toBeVisible(SLOW);
     await hank.getByRole("button", { name: "Done" }).click();
@@ -701,13 +707,13 @@ test("trusted keys follow an account, and a changed key needs its new fingerprin
     await login(iris, "iris");
     await iris.getByRole("button", { name: "Review" }).click();
     await expect(iris.getByText(/hank's key has changed/)).toBeVisible(SLOW);
-    await iris.getByRole("button", { name: "Check new fingerprint…" }).click();
-    await iris.getByLabel("fingerprint").fill(hankWords);
+    await iris.getByRole("button", { name: "Check new safety code…" }).click();
+    await iris.getByLabel("Their safety code").fill(hankWords);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByText(/not the one given/)).toBeVisible(SLOW);
-    await iris.getByLabel("fingerprint").fill(newHank);
+    await expect(iris.getByText(/don't match the key/)).toBeVisible(SLOW);
+    await iris.getByLabel("Their safety code").fill(newHank);
     await iris.getByRole("button", { name: "Trust", exact: true }).click();
-    await expect(iris.getByRole("button", { name: "Check new fingerprint…" })).toHaveCount(0, SLOW);
+    await expect(iris.getByRole("button", { name: "Check new safety code…" })).toHaveCount(0, SLOW);
     await iris.getByRole("button", { name: "Close" }).click();
     await expect(item(iris, "fresh")).toBeVisible(SLOW);
   });
@@ -772,10 +778,10 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await menu(jack, "proj", "Transfer ownership…");
     await expect(jack.getByText("Share it with them read-write first", { exact: false })).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Close" }).click();
-    await menu(jack, "proj", "Share…");
+    await sharing(jack, "proj", "Share with someone");
     await jack.getByLabel("User", { exact: true }).fill("kim");
     await jack.getByRole("button", { name: "Share", exact: true }).click();
-    await jack.getByLabel("kim's fingerprint").fill(kimWords);
+    await jack.getByLabel("kim's safety code").fill(kimWords);
     await jack.getByRole("button", { name: "Share", exact: true }).click();
     await expect(jack.getByText(/Shared with kim/)).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Done" }).click();
@@ -793,7 +799,7 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await expect.poll(() => storageLine(kim), SLOW).toBe("2.0 KB used");
 
     // jack sees kim as the owner, whose access nobody can take away.
-    await menu(jack, "proj", "Shared with…");
+    await sharing(jack, "proj");
     const kimRow = jack.getByRole("row").filter({ hasText: "kim" });
     await expect(kimRow).toContainText("owner", SLOW);
     await expect(kimRow.getByRole("button", { name: "Revoke…" })).toHaveCount(0);
@@ -875,6 +881,151 @@ test("an idle logout waits for playing media, but not for ever", async ({ browse
     await lena.clock.fastForward("01:01:00");
     await expect(loggedOut).toBeVisible(SLOW);
   });
+
+  expect(problems).toEqual([]);
+});
+
+test("new shares and files show up without a reload", async ({ browser }) => {
+  const mona = await (await browser.newContext()).newPage();
+  const nils = await (await browser.newContext()).newPage();
+  const problems = [mona, nils].map(watch);
+  /// What the browser does when someone comes back to the tab.
+  const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  const monaWords = await enrol(mona, "mona");
+  const nilsWords = await enrol(nils, "nils");
+  await login(mona, "mona");
+  await login(nils, "nils");
+  await addFolder(mona, "gift");
+  await sharing(mona, "gift", "Share with someone");
+  // A mistyped name says so at once, and can be put right.
+  await mona.getByLabel("User", { exact: true }).fill("nilz");
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(mona.getByText("There's nobody called nilz here")).toBeVisible(SLOW);
+  await mona.getByLabel("User", { exact: true }).fill("nils");
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await mona.getByRole("button", { name: "Change" }).click();
+  await expect(mona.getByLabel("User", { exact: true })).toBeEnabled();
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  // A word that isn't one of the code's words says so, and can't go further.
+  await mona.getByLabel("nils's safety code").fill("notaword ");
+  await expect(mona.getByText(/isn't one of the words/)).toBeVisible();
+  await expect(mona.getByRole("button", { name: "Share", exact: true })).toBeDisabled();
+  await mona.getByLabel("nils's safety code").fill(nilsWords);
+  // While the two are in touch, mona has her own code to hand, and an Esc
+  // doesn't lose what she typed.
+  await expect(mona.getByRole("dialog").locator(".words")).toHaveText(monaWords);
+  await mona.keyboard.press("Escape");
+  await expect(mona.getByLabel("nils's safety code")).toHaveValue(nilsWords);
+  await mona.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(mona.getByText(/Shared with nils/)).toBeVisible(SLOW);
+  // What nils needs next is mona's code, not his own.
+  await expect(mona.getByText(/nils now needs your safety code/)).toBeVisible();
+  await expect(mona.getByRole("dialog").locator(".words")).toHaveText(monaWords);
+  await mona.getByRole("button", { name: "Done" }).click();
+
+  // nils is already logged in, and hasn't reloaded.
+  await comeBack(nils);
+  await expect(nils.getByRole("button", { name: "Review" })).toBeVisible(SLOW);
+  await expect(item(nils, "gift")).toBeVisible(SLOW);
+
+  // "Shared with me" lists it, says what it allows, and stays useful after.
+  await nils.getByRole("button", { name: "Review" }).click();
+  await expect(nils.getByText(/You can already open it/)).toBeVisible(SLOW);
+  await nils.getByRole("button", { name: "Trust…" }).click();
+  await expect(nils.getByRole("dialog").locator(".words")).toHaveText(nilsWords);
+  await nils.getByLabel("Their safety code").fill(monaWords);
+  await nils.getByRole("button", { name: "Trust", exact: true }).click();
+  await expect(nils.getByText(/You and mona are verified. gift is in My files/)).toBeVisible(SLOW);
+  await expect(nils.getByText(/You can add, change and delete files here/)).toBeVisible();
+  await nils.getByRole("button", { name: "Close" }).click();
+
+  // People lists who has been checked, and shows their code on request.
+  await accountMenu(nils, "People");
+  await expect(nils.getByRole("dialog").getByText("mona", { exact: true })).toBeVisible(SLOW);
+  await nils.getByRole("button", { name: "Show code" }).click();
+  await expect(nils.getByRole("dialog").locator(".words")).toHaveText(monaWords);
+  // Forgetting makes her shares read-only again, and checking her again undoes it.
+  await nils.getByRole("button", { name: "Forget…" }).click();
+  await nils.getByRole("button", { name: "Forget", exact: true }).click();
+  await expect(nils.getByText("You haven't checked anyone yet.")).toBeVisible(SLOW);
+  await nils.getByRole("button", { name: "Check someone's safety code" }).click();
+  await nils.getByLabel("Their account name").fill("mona");
+  await nils.getByLabel("Their safety code").fill(monaWords);
+  await nils.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(nils.getByRole("dialog").getByText("mona", { exact: true })).toBeVisible(SLOW);
+  await nils.getByRole("button", { name: "Close" }).click();
+
+  // A file added while nils has the folder open appears there too, and the
+  // folder stays open.
+  await open(nils, "gift");
+  await open(mona, "gift");
+  await mona.locator("input[type=file]").setInputFiles([
+    { name: "card.txt", mimeType: "text/plain", buffer: Buffer.from("hello") },
+  ]);
+  await expect(item(mona, "card.txt")).toBeVisible(SLOW);
+  await comeBack(nils);
+  await expect(item(nils, "card.txt")).toBeVisible(SLOW);
+  expect(new URL(nils.url()).hash).toBe("#/gift");
+
+  expect(problems.flat()).toEqual([]);
+});
+
+test("a device that saw newer keys says so, and a person can reset it", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "olga");
+  await login(page, "olga");
+  await addFolder(page, "kept");
+
+  // Stands in for a rollback, or a restore: this browser remembers more than
+  // the servers now have.
+  const remember = (names) =>
+    page.evaluate(
+      ({ names }) =>
+        new Promise((resolve, reject) => {
+          const opening = indexedDB.open("raft5fs");
+          opening.onerror = () => reject(opening.error);
+          opening.onsuccess = () => {
+            const transaction = opening.result.transaction("blobs", "readwrite");
+            const blobs = transaction.objectStore("blobs");
+            const keys = blobs.getAllKeys();
+            keys.onsuccess = () => {
+              const encode = (text) => new TextEncoder().encode(text).buffer;
+              const mine = keys.result.filter((key) => key.includes("/olga/"));
+              const pins = mine.find((key) => key.includes(".sync."));
+              if (!pins) return reject(new Error(`no merge remembered: ${mine}`));
+              blobs.put(encode(names.pins), pins);
+              const versions = pins.slice(0, pins.indexOf(".sync.")) + ".versions";
+              blobs.put(encode(names.versions), versions);
+            };
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error);
+          };
+        }),
+      { names },
+    );
+  const inodes = Array.from({ length: 5000 }, (_, ino) => `${ino} 99\n`).join("");
+  await expect(async () => remember({ pins: "counter 999\n", versions: inodes })).toPass(SLOW);
+
+  await page.reload();
+  await login(page, "olga");
+  await open(page, "kept");
+  const message = /older than[^]*restored from a backup/;
+  await expect(page.getByText(message).first()).toBeVisible(SLOW);
+  await expect(page.getByText("raft5fs reset-versions")).toHaveCount(0);
+
+  // The sealed list is older too, and People is where that shows.
+  await accountMenu(page, "People");
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText(/trusted keys is change \d+, older than change 999/)).toBeVisible(SLOW);
+
+  await dialog.getByRole("button", { name: "It was restored: reset this device" }).click();
+  await login(page, "olga");
+  await expect(item(page, "kept")).toBeVisible(SLOW);
+  await open(page, "kept");
+  await accountMenu(page, "People");
+  await expect(page.getByRole("dialog").getByText("You haven't checked anyone yet.")).toBeVisible(SLOW);
+  await expect(page.getByRole("dialog").getByText(/older than/)).toHaveCount(0);
 
   expect(problems).toEqual([]);
 });

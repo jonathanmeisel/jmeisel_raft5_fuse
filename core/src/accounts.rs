@@ -226,6 +226,28 @@ fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
     })
 }
 
+/// How long an enrollment code works. Whoever finds an old invitation, in a
+/// mailbox or a chat, can enroll as that person.
+const CODE_LIFETIME_SECS: u64 = 14 * 24 * 3600;
+
+/// How a code is kept: its hash, then when it was issued.
+fn stored_code(code: &str) -> Vec<u8> {
+    let mut stored = enrolment_code_hash(code).to_vec();
+    stored.extend_from_slice(&now_secs().to_be_bytes());
+    stored
+}
+
+/// When a stored code stops working, in seconds since the epoch. 0 for a code
+/// from before they had an end, which is the hash alone.
+fn code_expires(stored: &[u8]) -> u64 {
+    stored
+        .get(32..)
+        .and_then(|issued| <[u8; 8]>::try_from(issued).ok())
+        .map_or(0, |issued| {
+            u64::from_be_bytes(issued).saturating_add(CODE_LIFETIME_SECS)
+        })
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -371,7 +393,7 @@ pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> 
     crate::grants::check_username(user)?;
     let code = new_enrolment_code();
     client
-        .write(&code_key(user), Some(&enrolment_code_hash(&code)))
+        .write(&code_key(user), Some(&stored_code(&code)))
         .await?;
     Ok(code)
 }
@@ -584,16 +606,16 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
     crate::grants::check_username(user)?;
     refuse_link_name(user)?;
     let code = new_enrolment_code();
-    let hash = enrolment_code_hash(&code);
+    let stored = stored_code(&code);
     run_txn(client, |txn| {
-        let hash = &hash;
+        let stored = &stored;
         async move {
             let mut info = decide!(info_in(&txn, user).await?).unwrap_or_else(|| AccountInfo {
                 created: now_secs(),
                 ..AccountInfo::default()
             });
             info.caps = (info.caps | on).with(off, false);
-            txn.write(&code_key(user), Some(hash)).await?;
+            txn.write(&code_key(user), Some(stored)).await?;
             txn.write(&info_key(user), Some(&encode_info(&info)))
                 .await?;
             txn.commit().await?;
@@ -717,9 +739,9 @@ pub async fn issue_invite(
     crate::grants::check_username(user)?;
     refuse_link_name(user)?;
     let code = new_enrolment_code();
-    let hash = enrolment_code_hash(&code);
+    let stored = stored_code(&code);
     run_txn(client, |txn| {
-        let hash = &hash;
+        let stored = &stored;
         async move {
             decide!(require_admin(&txn, caller).await?);
             let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
@@ -738,7 +760,7 @@ pub async fn issue_invite(
                 created: now_secs(),
                 ..AccountInfo::default()
             };
-            txn.write(&code_key(user), Some(hash)).await?;
+            txn.write(&code_key(user), Some(stored)).await?;
             txn.write(&info_key(user), Some(&encode_info(&info)))
                 .await?;
             txn.commit().await?;
@@ -758,9 +780,9 @@ pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result
     crate::grants::check_username(user)?;
     refuse_link_name(user)?;
     let code = new_enrolment_code();
-    let hash = enrolment_code_hash(&code);
+    let stored = stored_code(&code);
     run_txn(client, |txn| {
-        let hash = &hash;
+        let stored = &stored;
         async move {
             decide!(require_admin(&txn, caller).await?);
             let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
@@ -771,7 +793,7 @@ pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result
                     format!("there is no user {user}"),
                 )));
             }
-            txn.write(&code_key(user), Some(hash)).await?;
+            txn.write(&code_key(user), Some(stored)).await?;
             txn.commit().await?;
             Ok(Ok(()))
         }
@@ -881,19 +903,26 @@ pub async fn enrol(
         let (hash, encoded) = (&hash, &encoded);
         async move {
             let issued = txn.read_one(&code_key(user)).await?.value;
-            if issued.as_deref() != Some(hash.as_slice()) {
+            let Some(issued) = issued.filter(|i| i.get(..32) == Some(hash.as_slice())) else {
                 return Ok(Err(FsError::new(
                     libc::EACCES,
                     format!("no such enrolment code for {user}"),
                 )));
+            };
+            let expires = code_expires(&issued);
+            if expires != 0 && expires < now_secs() {
+                return Ok(Err(FsError::new(
+                    libc::EACCES,
+                    format!("{user}'s invitation has expired: ask an admin for a new one"),
+                )));
             }
-            if txn.read_one(&keys_key(user)).await?.value.is_some() {
-                for ino in granted_in(&txn, user).await? {
-                    crate::grants::remove_grant(&txn, user, ino).await?;
-                }
-                // Sealed to the old key pair, so no use to the new one.
-                txn.write(&pins_key(user), None).await?;
+            // Whatever this name had was sealed to another key pair, so it is
+            // no use to the new one. Not only for a name with keys now: a
+            // grant made as a user was removed can outlive them.
+            for ino in granted_in(&txn, user).await? {
+                crate::grants::remove_grant(&txn, user, ino).await?;
             }
+            txn.write(&pins_key(user), None).await?;
             txn.write(&code_key(user), None).await?;
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.commit().await?;
@@ -967,8 +996,9 @@ pub async fn change_password(
 /// already issued to them stops working when the servers see that the keys
 /// are gone (their identity cache).
 pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
-    let granted = &list_granted(client, user).await?;
     run_txn(client, |txn| async move {
+        // In the transaction: a grant made meanwhile doesn't stay behind.
+        let granted = granted_in(&txn, user).await?;
         let existed = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some()
             || txn.read_one(&info_key(user)).await?.value.is_some()
@@ -978,7 +1008,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&info_key(user), None).await?;
         txn.write(&pins_key(user), None).await?;
         txn.write(&usage_key(user), None).await?;
-        for &ino in granted {
+        for ino in granted {
             crate::grants::remove_grant(&txn, user, ino).await?;
         }
         txn.commit().await?;
@@ -1007,11 +1037,14 @@ pub async fn list(client: &Client) -> Result<Vec<UserEntry>, FsError> {
     let records = client.read_many(&keys).await?;
     let keys: Vec<Vec<u8>> = names.iter().map(|name| usage_key(name)).collect();
     let usage = client.read_many(&keys).await?;
+    let keys: Vec<Vec<u8>> = names.iter().map(|name| code_key(name)).collect();
+    let codes = client.read_many(&keys).await?;
     accounts
         .iter()
         .zip(records)
         .zip(usage)
-        .map(|(((name, &enrolled), record), usage)| {
+        .zip(codes)
+        .map(|((((name, &enrolled), record), usage), code)| {
             let info = match record.value {
                 Some(bytes) => decode_info(name, &bytes)?,
                 None => AccountInfo::default(),
@@ -1025,6 +1058,7 @@ pub async fn list(client: &Client) -> Result<Vec<UserEntry>, FsError> {
                 enrolled,
                 info,
                 used,
+                code_expires: code.value.as_deref().map(code_expires),
             })
         })
         .collect()
