@@ -3,8 +3,11 @@
 // with a fingerprint, trust, read as the other user, and revoke, which
 // queues a prune that the app works through.
 import { test, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const invites = () =>
   JSON.parse(readFileSync(new URL("../config/local/invites.json", import.meta.url)));
@@ -583,6 +586,16 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await expect(accountButton(visitor)).toHaveCount(0);
     await expect(visitor.getByText("Add New")).toHaveCount(0);
     expect((await download(visitor, "note.txt")).equals(note)).toBe(true);
+    // A whole folder too, as one ZIP.
+    const saving = visitor.waitForEvent("download");
+    await visitor.getByRole("button", { name: "Download this folder as a ZIP" }).click();
+    const zip = await saving;
+    expect(zip.suggestedFilename()).toMatch(/\.zip$/);
+    const zipPath = join(mkdtempSync(join(tmpdir(), "link-zip-")), "folder.zip");
+    await zip.saveAs(zipPath);
+    execFileSync("unzip", ["-tq", zipPath]);
+    expect(execFileSync("unzip", ["-Z1", zipPath], { encoding: "utf8" })).toContain("note.txt");
+    rmSync(dirname(zipPath), { recursive: true });
     expect(await visitor.evaluate(async () => (await indexedDB.databases()).length)).toBe(0);
   });
 
@@ -1027,6 +1040,133 @@ test("a device that saw newer keys says so, and a person can reset it", async ({
   await expect(page.getByRole("dialog").getByText("You haven't checked anyone yet.")).toBeVisible(SLOW);
   await expect(page.getByRole("dialog").getByText(/older than/)).toHaveCount(0);
 
+  expect(problems).toEqual([]);
+});
+
+test("a folder uploads with its folders, and downloads as a ZIP", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "pia");
+  await login(page, "pia");
+  await addFolder(page, "trip");
+  await open(page, "trip");
+
+  const local = mkdtempSync(join(tmpdir(), "folder-upload-"));
+  mkdirSync(join(local, "photos/day one"), { recursive: true });
+  writeFileSync(join(local, "photos/notes.txt"), "first notes");
+  writeFileSync(join(local, "photos/day one/a.txt"), "aaa");
+  writeFileSync(join(local, "photos/day one/b.txt"), "bbb");
+
+  const upload = async () => {
+    const chooser = page.waitForEvent("filechooser");
+    await page.getByText("Add New").click();
+    await page.getByText("Upload folder").click();
+    await (await chooser).setFiles(join(local, "photos"));
+  };
+  await upload();
+  await expect(page.getByText("Uploaded 3 files.")).toBeVisible(SLOW);
+  await open(page, "photos");
+  await expect(item(page, "notes.txt")).toBeVisible(SLOW);
+  await open(page, "day one");
+  await expect(item(page, "b.txt")).toBeVisible(SLOW);
+
+  // Again, into the same place: one question, for all of them.
+  const backToTrip = async () => {
+    await page.getByText("My files").first().click();
+    await open(page, "trip");
+    await expect(item(page, "photos")).toBeVisible(SLOW);
+  };
+  await backToTrip();
+  writeFileSync(join(local, "photos/notes.txt"), "second notes");
+  await upload();
+  await page.getByRole("button", { name: "Skip existing" }).click();
+  await expect(page.getByText("Uploaded 0 files, skipped 3 that already exist.")).toBeVisible(SLOW);
+  await upload();
+  await page.getByRole("button", { name: "Replace all" }).click();
+  await expect(page.getByText("Uploaded 3 files.")).toBeVisible(SLOW);
+  await upload();
+  await page.getByRole("button", { name: "Cancel upload" }).click();
+  await expect(page.getByText("then stopped, as you asked")).toBeVisible(SLOW);
+
+  // A dropped folder keeps its shape, however many it holds. The reader gives
+  // batches of 100, as Chromium's does, and the empty folder stays.
+  await page.evaluate(() => {
+    const file = (name) => ({
+      isFile: true,
+      name,
+      file: (done) => done(new File([name], name)),
+    });
+    const dir = (name, entries) => ({
+      isDirectory: true,
+      name,
+      createReader() {
+        let at = 0;
+        return {
+          readEntries(done) {
+            done(entries.slice(at, at + 100));
+            at += 100;
+          },
+        };
+      },
+    });
+    const many = Array.from({ length: 150 }, (_, n) => file(`f${n}.txt`));
+    const dropped = dir("dropped", [dir("inner", many), dir("hollow", [])]);
+    const drop = new DragEvent("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", {
+      value: { items: [{ kind: "file", webkitGetAsEntry: () => dropped }] },
+      configurable: true,
+    });
+    document.querySelector(".wx-upload-area").dispatchEvent(drop);
+  });
+  await expect(page.getByText("Uploaded 150 files.")).toBeVisible({ timeout: 90_000 });
+  await open(page, "dropped");
+  await expect(item(page, "hollow")).toBeVisible(SLOW);
+  await expect(item(page, "inner")).toBeVisible(SLOW);
+  await backToTrip();
+
+  // The folder's menu gives a ZIP of everything in it, an empty folder too.
+  const saved = page.waitForEvent("download");
+  await menu(page, "dropped", "Download as ZIP");
+  const download = await saved;
+  expect(download.suggestedFilename()).toBe("dropped.zip");
+  const zip = join(local, "dropped.zip");
+  await download.saveAs(zip);
+  execFileSync("unzip", ["-tq", zip]);
+  const names = execFileSync("unzip", ["-Z1", zip], { encoding: "utf8" }).trim().split("\n");
+  expect(names).toHaveLength(153);
+  expect(names).toContain("dropped/hollow/");
+  expect(execFileSync("unzip", ["-p", zip, "dropped/inner/f149.txt"], { encoding: "utf8" })).toBe("f149.txt");
+
+  // Several selected go in one, with the replaced file's new contents.
+  await item(page, "photos").click();
+  await item(page, "dropped").click({ modifiers: ["Control"] });
+  const savedBoth = page.waitForEvent("download");
+  await menu(page, "dropped", "Download as ZIP");
+  const both = await savedBoth;
+  expect(both.suggestedFilename()).toBe("trip.zip");
+  const trip = join(local, "trip.zip");
+  await both.saveAs(trip);
+  expect(execFileSync("unzip", ["-p", trip, "photos/notes.txt"], { encoding: "utf8" })).toBe("second notes");
+  expect(execFileSync("unzip", ["-p", trip, "photos/day one/a.txt"], { encoding: "utf8" })).toBe("aaa");
+  expect(execFileSync("unzip", ["-p", trip, "dropped/inner/f7.txt"], { encoding: "utf8" })).toBe("f7.txt");
+
+  // A new folder that wouldn't fit is refused before anything stays.
+  await addFolder(page, "tiny");
+  await menu(page, "tiny", "Size limit…");
+  await page.getByLabel(/Limit, such as/).fill("1K");
+  await page.getByRole("button", { name: "Set limit" }).click();
+  await expect(page.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
+  await page.getByRole("button", { name: "Close" }).click();
+  await open(page, "tiny");
+  mkdirSync(join(local, "large"));
+  writeFileSync(join(local, "large/big.bin"), Buffer.alloc(4096, 1));
+  const tooBig = page.waitForEvent("filechooser");
+  await page.getByText("Add New").click();
+  await page.getByText("Upload folder").click();
+  await (await tooBig).setFiles(join(local, "large"));
+  await expect(page.getByText(/reached its size limit/)).toBeVisible(SLOW);
+  await expect(item(page, "large")).toHaveCount(0);
+
+  rmSync(local, { recursive: true });
   expect(problems).toEqual([]);
 });
 

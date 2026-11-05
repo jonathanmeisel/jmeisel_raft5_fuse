@@ -26,6 +26,7 @@
   import { streams } from "../lib/streams.js";
   import { pathHash, readRoute } from "../lib/route.js";
   import { sharedIcon } from "../lib/sharedIcons.js";
+  import { treeFromEntries, treeFromPicker, uploadTree } from "../lib/folders.js";
 
   let { fs, me, storageError, onlogout } = $props();
   /// A public link's visitor: read-only, one folder, nothing of an account.
@@ -49,6 +50,8 @@
   let api = null;
   let initial = $state(null);
   let error = $state("");
+  /// What a finished folder transfer has to say, when it isn't an error.
+  let notice = $state("");
   let transfers = $state([]);
   let nextTransfer = 1;
   let dialog = $state(null);
@@ -243,12 +246,13 @@
     }
   }
 
-  /// Shows a transfer while `work(progress)` runs.
-  async function transfer(kind, name, work) {
+  /// Shows a transfer while `work(progress)` runs. `progress` can also say
+  /// how many of how many files, and `cancel` adds a button that stops it.
+  async function transfer(kind, name, work, cancel = null) {
     const id = nextTransfer++;
-    transfers = [...transfers, { id, kind, name, done: 0, total: 0 }];
-    const progress = (done, total) => {
-      transfers = transfers.map((t) => (t.id === id ? { ...t, done, total } : t));
+    transfers = [...transfers, { id, kind, name, done: 0, total: 0, cancel }];
+    const progress = (done, total, files = null, ofFiles = null) => {
+      transfers = transfers.map((t) => (t.id === id ? { ...t, done, total, files, ofFiles } : t));
     };
     try {
       return await work(progress);
@@ -298,6 +302,158 @@
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
+
+  // ---------------------------------------------------------- folders
+
+  /// What to do with files that exist already, from a person.
+  function askExisting() {
+    return new Promise((answer) => {
+      dialog = {
+        kind: "exists",
+        answer: (choice) => {
+          dialog = null;
+          answer(choice);
+        },
+      };
+    });
+  }
+
+  /// `what` a folder transfer did, for the banner: `Uploaded 3 files`.
+  const counted = (n, what) => `${n} ${what}${n === 1 ? "" : "s"}`;
+
+  /// Uploads `tree` into folder `dir`, and says what became of it.
+  async function uploadFolder(dir, tree) {
+    if (tree.files.length === 0 && tree.dirs.length === 0) return;
+    if (dir === "/" && !account.caps.includes("volumes")) {
+      error = "You can't create top-level folders here. Open a folder shared with you to add things to it.";
+      return;
+    }
+    notice = "";
+    const key = `upload-${nextTransfer}`;
+    let cancelling = false;
+    const cancelled = () => cancelling;
+    const name = tree.dirs.length ? tree.dirs[0].split("/")[0] : counted(tree.files.length, "file");
+    await act(async () => {
+      const result = await transfer(
+        "up",
+        name,
+        (progress) => uploadTree(fs, dir, tree, { key, ask: askExisting, cancelled, progress }),
+        () => {
+          cancelling = true;
+          fs.cancelUploads(key);
+        },
+      );
+      const said = [`Uploaded ${counted(result.uploaded, "file")}`];
+      if (result.skipped) said.push(`skipped ${result.skipped} that already exist`);
+      if (result.stopped === "cancelled") said.push("then stopped, as you asked");
+      if (result.failed.length) {
+        const shown = result.failed.slice(0, 5).map((f) => `${f.path}: ${f.message}`);
+        const more = result.failed.length - shown.length;
+        error = `${said.join(", ")}. ${counted(result.failed.length, "file")} failed:\n${shown.join("\n")}${more > 0 ? `\nand ${more} more` : ""}`;
+      } else {
+        notice = `${said.join(", ")}.`;
+      }
+    }, [dir, current]);
+  }
+
+  /// Asks for a folder, and uploads it to the open one.
+  function pickFolder() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.webkitdirectory = true;
+    input.onchange = () => uploadFolder(current, treeFromPicker(input.files));
+    input.click();
+  }
+
+  /// Takes a dropped folder from SVAR, which would upload all its files into
+  /// the open folder, without their folders. Plain files stay with SVAR.
+  function dropFolder(event) {
+    if (visitor) return;
+    const entries = [...(event.dataTransfer?.items ?? [])]
+      .filter((i) => i.kind === "file")
+      .map((i) => i.webkitGetAsEntry?.())
+      .filter(Boolean);
+    if (!entries.some((e) => e.isDirectory)) return;
+    // SVAR's handler still has to run, to clear its drop highlight. It reads
+    // the drop's items, so show it none.
+    Object.defineProperty(event, "dataTransfer", { value: { items: [] } });
+    const dir = current;
+    treeFromEntries(entries).then((tree) => uploadFolder(dir, tree), fail);
+  }
+
+  /// How long a download's stream can go unread before it counts as abandoned.
+  /// The browser doesn't always say that someone cancelled it.
+  const ABANDONED_MS = 5 * 60 * 1000;
+
+  /// Downloads `paths`, files or folders, as one ZIP. It goes straight to disk
+  /// where it can, and through memory where it can't, as a file does.
+  async function downloadZip(paths) {
+    const name = paths.length === 1 ? nameOf(paths[0]) : nameOf(parentOf(paths[0])) || "files";
+    const filename = `${name}.zip`;
+    await transfer("down", filename, async (progress) => {
+      const { id, bytes: total } = await fs.zipOpen(paths);
+      let sent = 0;
+      const read = async () => {
+        const bytes = await fs.zipRead(id);
+        sent += bytes.byteLength;
+        progress(Math.min(sent, total), total);
+        return bytes;
+      };
+      try {
+        if (streaming.available()) {
+          await new Promise((finished) => {
+            let last = Date.now();
+            const watching = setInterval(() => {
+              if (Date.now() - last > ABANDONED_MS) streaming.close(token);
+            }, 30_000);
+            const url = streaming.openArchive(
+              filename,
+              () => {
+                last = Date.now();
+                return read();
+              },
+              () => {
+                clearInterval(watching);
+                finished();
+              },
+            );
+            const token = url.split("/")[2];
+            const frame = document.createElement("iframe");
+            frame.hidden = true;
+            frame.src = url;
+            document.body.append(frame);
+            setTimeout(() => frame.remove(), 60_000);
+          });
+        } else {
+          if (total > 1 << 30 && !confirm(
+            `This is ${(total / (1 << 30)).toFixed(1)} GB. The browser holds all of it in memory while it downloads. Do you want to continue?`,
+          )) return;
+          const parts = [];
+          for (;;) {
+            const bytes = await read();
+            if (bytes.byteLength === 0) break;
+            parts.push(bytes);
+          }
+          const url = URL.createObjectURL(new Blob(parts, { type: "application/zip" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        }
+      } finally {
+        const errors = await fs.zipClose(id).catch(() => []);
+        if (errors.length) {
+          error = `${counted(errors.length, "item")} couldn't be read, and ${errors.length === 1 ? "is" : "are"} listed in DOWNLOAD-ERRORS.txt in the ZIP:\n${errors.slice(0, 5).join("\n")}`;
+        }
+      }
+    });
+  }
+
+  const selectedPaths = () => {
+    const { panels, activePanel } = api.getState();
+    return panels[activePanel].selected;
+  };
 
   // ---------------------------------------------------------- the URL
   // The open folder is in the URL's fragment (see route.js): browsing adds
@@ -441,10 +597,23 @@
   /// root's folders, and only folders are shared.
   function menuOptions(mode, item) {
     const options = getMenuOptions(mode);
-    if (mode !== "folder" || !item || item.id === "/" || item.id.startsWith("/.snapshot")) {
-      return options;
+    if (mode === "add") {
+      return [
+        ...options,
+        { id: "upload-folder", text: "Upload folder", icon: "mdi mdi-folder-upload-outline", handler: pickFolder },
+      ];
     }
+    if (mode === "multiselect") {
+      return [
+        { id: "download-zip", text: "Download as ZIP", icon: "wxi-download", handler: () => act(() => downloadZip(selectedPaths()), []) },
+        ...options,
+      ];
+    }
+    if (mode !== "folder" || !item || item.id === "/" || item.id === "/.snapshot") return options;
+    const zip = { id: "download-zip", text: "Download as ZIP", icon: "wxi-download", handler: () => act(() => downloadZip([item.id]), []) };
+    if (item.id.startsWith("/.snapshot")) return [zip, ...options];
     return [
+      zip,
       ...options,
       { comp: "separator" },
       { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
@@ -557,6 +726,19 @@
       <button onclick={() => (error = "")}>Dismiss</button>
     </div>
   {/if}
+  {#if notice}
+    <div class="banner">
+      {notice}
+      <button onclick={() => (notice = "")}>Dismiss</button>
+    </div>
+  {/if}
+  {#if visitor}
+    <div class="banner">
+      <button onclick={() => act(() => downloadZip([current === "/" ? "/" + me.folder : current]), [])}>
+        Download this folder as a ZIP
+      </button>
+    </div>
+  {/if}
 
   {#if !visitor}
     <PruneBar
@@ -570,14 +752,17 @@
 
   {#each transfers as t}
     <div class="transfer">
-      {t.kind === "up" ? "Uploading" : "Downloading"} {t.name}: {percent(t)}%
+      {t.kind === "up" ? "Uploading" : "Downloading"} {t.name}:
+      {#if t.ofFiles != null}{t.files} of {t.ofFiles} files,{/if}
+      {percent(t)}%
       <progress max="100" value={percent(t)}></progress>
+      {#if t.cancel}<button onclick={t.cancel}>Cancel</button>{/if}
     </div>
   {/each}
 
   <SharingBar {here} {current} {limited} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
 
-  <div class="fm">
+  <div class="fm" role="presentation" ondropcapture={dropFolder}>
     {#if initial}
         <Filemanager
           data={initial}
@@ -600,6 +785,15 @@
       always under your name, in My safety code.
     </p>
     <Fingerprint fingerprint={me.fingerprint} />
+  </Dialog>
+{:else if dialog?.kind === "exists"}
+  <Dialog title="Some files already exist" keep onclose={() => dialog.answer("cancel")}>
+    <p>Some of the files in this folder are already there. What should happen to them?</p>
+    <p>
+      <button class="primary" onclick={() => dialog.answer("skip")}>Skip existing</button>
+      <button onclick={() => dialog.answer("replace")}>Replace all</button>
+      <button onclick={() => dialog.answer("cancel")}>Cancel upload</button>
+    </p>
   </Dialog>
 {:else if dialog?.kind === "view"}
   <Viewer
