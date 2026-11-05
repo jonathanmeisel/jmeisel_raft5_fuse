@@ -1170,6 +1170,111 @@ test("a folder uploads with its folders, and downloads as a ZIP", async ({ page 
   expect(problems).toEqual([]);
 });
 
+test("shares group into one folder for each student", async ({ browser }) => {
+  const rosa = await (await browser.newContext()).newPage();
+  const quinn = await (await browser.newContext()).newPage();
+  const problems = [rosa, quinn].map(watch);
+  const rosaWords = await enrol(rosa, "rosa");
+  const quinnWords = await enrol(quinn, "quinn");
+  await login(rosa, "rosa");
+  await login(quinn, "quinn");
+  const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  // The teacher's class is one folder, and what she shares is inside it.
+  await addFolder(rosa, "class");
+  await open(rosa, "class");
+  await addFolder(rosa, "assignments");
+  await addFolder(rosa, "quinn");
+  await addFolder(rosa, "someone else");
+  await sharing(rosa, "assignments", "Share with someone");
+  await rosa.getByLabel("User", { exact: true }).fill("quinn");
+  await rosa.getByLabel("What this folder will show up to shared user as").fill("CS101/assignments");
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await rosa.getByLabel("quinn's safety code").fill(quinnWords);
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(rosa.getByText(/Shared with quinn/)).toBeVisible(SLOW);
+  await rosa.getByRole("button", { name: "Done" }).click();
+  await sharing(rosa, "quinn", "Share with someone");
+  await rosa.getByLabel("User", { exact: true }).fill("quinn");
+  await rosa.getByLabel("What this folder will show up to shared user as").fill("CS101/quinn");
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(rosa.getByText(/Shared with quinn/)).toBeVisible(SLOW);
+  await rosa.getByRole("button", { name: "Done" }).click();
+
+  // Until quinn checks who shared them, they stay out of any group.
+  await comeBack(quinn);
+  await expect(item(quinn, "CS101-assignments")).toBeVisible(SLOW);
+  await expect(item(quinn, "CS101-quinn")).toBeVisible(SLOW);
+  await accountMenu(quinn, "People");
+  await quinn.getByRole("button", { name: "Check someone's safety code" }).click();
+  await quinn.getByLabel("Their account name").fill("rosa");
+  await quinn.getByLabel("Their safety code").fill(rosaWords);
+  await quinn.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(quinn.getByRole("dialog").getByText("rosa", { exact: true })).toBeVisible(SLOW);
+  await quinn.getByRole("button", { name: "Close" }).click();
+  await comeBack(quinn);
+
+  // Then one folder, with those two, and nothing of the rest of the class.
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  await expect(item(quinn, "CS101-quinn")).toHaveCount(0);
+  await open(quinn, "CS101");
+  await expect(item(quinn, "assignments")).toBeVisible(SLOW);
+  await expect(item(quinn, "quinn")).toBeVisible(SLOW);
+  await expect(item(quinn, "someone else")).toHaveCount(0);
+  await expect(item(quinn, "class")).toHaveCount(0);
+
+  // Each share works as itself, and its address names the group.
+  await open(quinn, "quinn");
+  await expect.poll(() => new URL(quinn.url()).hash).toBe("#/CS101/quinn");
+  await quinn.locator("input[type=file]").setInputFiles([
+    { name: "essay.txt", mimeType: "text/plain", buffer: Buffer.from("my essay") },
+  ]);
+  await expect(item(quinn, "essay.txt")).toBeVisible(SLOW);
+
+  // The teacher sees it in the real folder, under its real name.
+  await open(rosa, "quinn");
+  await expect(item(rosa, "essay.txt")).toBeVisible(SLOW);
+
+  // A group is only a place: its menu has no rename or delete, and a folder
+  // made in it is a top-level folder of its own.
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  await item(quinn, "CS101").click({ button: "right" });
+  await expect(quinn.getByText("Download as ZIP", { exact: true }).first()).toBeVisible(SLOW);
+  await expect(quinn.getByText("Delete", { exact: true })).toHaveCount(0);
+  await expect(quinn.getByText("Rename", { exact: true })).toHaveCount(0);
+  await quinn.keyboard.press("Escape");
+  await open(quinn, "CS101");
+  await addFolder(quinn, "own notes");
+  await expect(item(quinn, "own notes")).toBeVisible(SLOW);
+
+  // Someone can show a share their own way. Nobody else is affected.
+  await menu(quinn, "assignments", "Show as…");
+  await quinn.getByLabel("What this folder shows up to you as").fill("Reading/CS101 work");
+  await quinn.getByRole("button", { name: "Save" }).click();
+  await expect(item(quinn, "assignments")).toHaveCount(0);
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "Reading")).toBeVisible(SLOW);
+  await open(quinn, "Reading");
+  await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
+  await rosa.getByText("My files").first().click();
+  await open(rosa, "class");
+  await expect(item(rosa, "assignments")).toBeVisible(SLOW);
+
+  // Its ZIP holds what shows in it, under the names that show.
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  const saving = quinn.waitForEvent("download");
+  await menu(quinn, "CS101", "Download as ZIP");
+  const zip = await saving;
+  const zipPath = join(mkdtempSync(join(tmpdir(), "group-zip-")), "group.zip");
+  await zip.saveAs(zipPath);
+  expect(execFileSync("unzip", ["-p", zipPath, "CS101/quinn/essay.txt"], { encoding: "utf8" })).toBe("my essay");
+  rmSync(dirname(zipPath), { recursive: true });
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

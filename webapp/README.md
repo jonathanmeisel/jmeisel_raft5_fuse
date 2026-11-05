@@ -41,6 +41,11 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   it asks the page, whose Worker decrypts. Where service workers aren't
   available (Firefox's private windows, say), files are decrypted whole
   into memory instead, with size limits.
+- Groups: a share's label can hold a `/`, and `CS101/notes` shows inside a
+  `CS101` folder that exists only in that person's view, up to 8 names deep.
+  Only a share from someone checked joins a group; until then it shows as
+  `CS101-notes`. **Show as…** (or renaming) in a share's menu changes it for
+  yourself. A group's menu only offers the ZIP.
 - `src/lib/folders.js` and `src/lib/zip.js`: folders. **Upload folder**, or
   dropping one, keeps its shape. A new folder that wouldn't fit is refused
   before anything stays, and existing files prompt one question for the whole

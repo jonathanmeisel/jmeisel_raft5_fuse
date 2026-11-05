@@ -133,6 +133,9 @@ pub enum Command {
     Trust(share::TrustArgs),
     /// Forget a user's pinned key (for example, after they enrolled again).
     ForgetKey(share::UserArg),
+    /// Show a share as something else, in your root only. A / puts it in a
+    /// group: CS101/assignments shows inside a CS101 folder.
+    Relabel(share::RelabelArgs),
     /// After a real restore from a backup: forget the key versions and the
     /// trusted-key counter that this device remembers. Do not use this for
     /// any other reason: the servers could be rolling them back.
@@ -165,6 +168,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::Grants(args) => share::grants(&cli.connect, args),
         Command::Trust(args) => share::trust(&cli.connect, args),
         Command::ForgetKey(args) => share::forget_key(&cli.connect, args),
+        Command::Relabel(args) => share::relabel(&cli.connect, args),
         Command::ResetVersions => share::reset_versions(&cli.connect),
         Command::Pending => share::pending(&cli.connect),
         Command::Prune(args) => prune::run(&cli.connect, args),

@@ -31,7 +31,7 @@ use crate::remote::ClientTlsConfig;
 use crate::remote::{Credentials, Remote};
 use crate::rt::{self, AbortHandle};
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
-use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault};
+use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault, is_group, is_virtual};
 use crate::write_buffer::WriteBuf;
 
 /// How long buffered bytes wait, not stored, after the writer's last write,
@@ -221,8 +221,13 @@ impl Session {
     /// The virtual root's attributes: a directory, as the root of a local
     /// filesystem would look to the user who opened the session.
     pub fn root_attr(&self) -> Attr {
+        self.virtual_attr(VIRTUAL_ROOT)
+    }
+
+    /// `root_attr` for the root or a group.
+    fn virtual_attr(&self, ino: u64) -> Attr {
         Attr {
-            ino: VIRTUAL_ROOT,
+            ino,
             kind: Kind::Directory,
             size: 0,
             perm: 0o755,
@@ -503,8 +508,11 @@ impl Session {
         if is_snapshot_ino(parent) {
             return self.snapshots.lookup(&self.vault, parent, name).await;
         }
-        let attr = if parent == VIRTUAL_ROOT {
-            let ino = self.vault.root_lookup(name).await?;
+        let attr = if is_virtual(parent) {
+            let ino = self.vault.group_lookup(parent, name).await?;
+            if is_group(ino) {
+                return Ok(self.virtual_attr(ino));
+            }
             self.remote().getattr(ino).await?
         } else {
             self.vault.lookup(parent, name).await?
@@ -528,8 +536,8 @@ impl Session {
     /// commit holds the buffer's lock throughout), and no other can start
     /// while this holds the lock.
     pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
-        if ino == VIRTUAL_ROOT {
-            return Ok(self.root_attr());
+        if is_virtual(ino) {
+            return Ok(self.virtual_attr(ino));
         }
         if is_snapshot_ino(ino) {
             return self.snapshots.getattr(ino).await;
@@ -553,7 +561,7 @@ impl Session {
         if is_snapshot_ino(ino) {
             return Err(read_only());
         }
-        if ino == VIRTUAL_ROOT {
+        if is_virtual(ino) {
             return Err(FsError::errno(errno::EPERM));
         }
         // Buffered bytes are older than this change, so they must be stored
@@ -568,8 +576,8 @@ impl Session {
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
-        if parent == VIRTUAL_ROOT {
-            self.vault.create_volume(name, perm).await
+        if is_virtual(parent) {
+            self.vault.create_volume_in(parent, name, perm).await
         } else {
             self.vault.mkdir(parent, name, perm).await
         }
@@ -580,8 +588,8 @@ impl Session {
         if is_snapshot_ino(parent) || (parent == VIRTUAL_ROOT && is_snapshot_dir(name)) {
             return Err(read_only());
         }
-        let removed = if parent == VIRTUAL_ROOT {
-            self.vault.delete_volume(name).await
+        let removed = if is_virtual(parent) {
+            self.vault.delete_volume_in(parent, name).await
         } else {
             self.vault.rmdir(parent, name).await.map(drop)
         };
@@ -593,7 +601,7 @@ impl Session {
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
-        if parent == VIRTUAL_ROOT {
+        if is_virtual(parent) {
             return Err(FsError::errno(errno::EPERM));
         }
         let ino = self.vault.unlink(parent, name).await;
@@ -624,7 +632,7 @@ impl Session {
             (false, false) => {}
         }
         // The virtual root's entries are grants, not names that can move.
-        if parent == VIRTUAL_ROOT || new_parent == VIRTUAL_ROOT {
+        if is_virtual(parent) || is_virtual(new_parent) {
             return Err(FsError::errno(errno::EPERM));
         }
         let renamed = self
@@ -649,7 +657,7 @@ impl Session {
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
-        if parent == VIRTUAL_ROOT {
+        if is_virtual(parent) {
             return Err(FsError::errno(errno::EPERM));
         }
         if self.hide_apple_double && is_apple_double(name) {
@@ -664,7 +672,7 @@ impl Session {
     /// access(2): whether the grant allows what `mask` asks. Anyone can
     /// list the virtual root and make volumes in it.
     pub async fn access(&self, ino: u64, mask: u32) -> Result<(), FsError> {
-        if ino == VIRTUAL_ROOT {
+        if is_virtual(ino) {
             return Ok(());
         }
         if is_snapshot_ino(ino) {
@@ -678,7 +686,7 @@ impl Session {
     /// open fails early, as it does locally. Reads and writes are checked
     /// again on their own, so nothing is kept open.
     pub async fn open_file(&self, ino: u64, mask: u32) -> Result<(), FsError> {
-        if ino == VIRTUAL_ROOT {
+        if is_virtual(ino) {
             return Err(FsError::errno(errno::EISDIR));
         }
         self.access(ino, mask).await
@@ -724,10 +732,10 @@ impl Session {
         if is_snapshot_ino(ino) {
             return self.snapshots.readdir(&self.vault, VIRTUAL_ROOT, ino).await;
         }
-        if ino == VIRTUAL_ROOT {
-            let entries = self.vault.root_entries().await?;
-            let dots = [".", ".."].map(|n| DirItem {
-                ino: VIRTUAL_ROOT,
+        if is_virtual(ino) {
+            let entries = self.vault.group_entries(ino).await?;
+            let dots = [(".", ino), ("..", self.vault.root_parent(ino))].map(|(n, ino)| DirItem {
+                ino,
                 kind: Kind::Directory,
                 name: n.into(),
                 sealed_name: Vec::new(),
@@ -743,12 +751,13 @@ impl Session {
                 .collect());
         }
         let mut items = self.vault.readdir(ino).await?;
-        // A grant's `..` is the virtual root: what is really above it is
-        // not this account's to see.
+        // A grant's `..` is where it shows: what is really above it is not
+        // this account's to see.
         if self.vault.is_grant_root(ino) {
+            let parent = self.vault.root_parent(ino);
             for item in &mut items {
                 if item.name == ".." {
-                    item.ino = VIRTUAL_ROOT;
+                    item.ino = parent;
                 }
             }
         }

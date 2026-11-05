@@ -505,6 +505,27 @@ Moving a file or directory to another directory gives it a new key, so
 that whoever could read where it was can't read what is written to it
 where it went.
 
+Grouping. Each person's root is their own view, so --name can hold a /:
+
+  raft5fs grant cs101/assignments bob --ro --name CS101/assignments
+  raft5fs grant cs101/bob bob --name CS101/bob
+
+bob's root shows one folder, CS101, holding those two. He can't see that
+anything else is in cs101, or who else has a share of it. All of it counts
+against the owner of cs101, so a size limit on each person's folder stops
+one of them filling it for everyone (raft5fs folder limit).
+
+A group isn't a real folder: it holds only shares, and goes away when the
+last one does. A mkdir in one makes a new volume with that group in its
+label. Groups go up to 8 names deep. Two shares with the same label show
+as "assignments" and "assignments (2)", and groups with the same name
+become one, whoever shared them. Only a share from someone you have
+checked (7.3) joins a group, because anyone can choose any label: until
+then it shows as CS101-bob in the root.
+
+  raft5fs relabel CS101/bob 2026/CS101/bob
+                                 show a share differently, only for you
+
 7.2 Revoking
 
   raft5fs revoke photos/2024 bob

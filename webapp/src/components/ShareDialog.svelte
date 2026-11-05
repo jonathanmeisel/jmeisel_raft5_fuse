@@ -83,6 +83,10 @@
       {/if}
       <label for="share-label">What this folder will show up to shared user as</label>
       <input id="share-label" bind:value={label} required />
+      <p class="note">
+        A / puts it in a group: shares labelled CS101/assignments and CS101/notes show together in a
+        CS101 folder.
+      </p>
       <label><input type="checkbox" bind:checked={readOnly} style="width:auto" /> Read-only</label>
       {#if needWords}
         <CodeInput {fs} id="share-words" label={`${user}'s safety code`} bind:value={words} bind:complete={wordsComplete} />

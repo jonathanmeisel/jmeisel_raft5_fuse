@@ -2,7 +2,6 @@
 //! and answer such offers. A volume's owner is who its size counts
 //! against, and always has read-write access to it.
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 
 use clap::{Args, Subcommand};
@@ -105,13 +104,10 @@ pub fn run(connect: &ConnectArgs, command: VolumeCommand) -> Outcome {
         VolumeCommand::Offers => {
             let (offers, roots) = runtime
                 .block_on(async {
-                    Ok::<_, FsError>((remote.offers().await?, vault.root_entries().await?))
+                    Ok::<_, FsError>((remote.offers().await?, vault.grant_paths().await?))
                 })
                 .map_err(|e| format!("cannot list offers: {e}"))?;
-            let names: HashMap<u64, String> = roots
-                .into_iter()
-                .map(|(name, ino)| (ino, name.to_string_lossy().into_owned()))
-                .collect();
+            let names = roots;
             if offers.is_empty() {
                 println!("no offers");
             }

@@ -87,6 +87,8 @@
       ...(e.size != null ? { size: e.size } : {}),
       date: new Date(e.modified),
       shared: e.shared ?? null,
+      group: !!e.group,
+      top: !!e.top,
       ...(e.kind === "folder" ? { lazy: true } : {}),
     }));
   }
@@ -305,6 +307,10 @@
 
   // ---------------------------------------------------------- folders
 
+  /// Whether what is made in `dir` is a new top-level folder: it is the root,
+  /// or a group in it.
+  const inRoot = (dir) => dir === "/" || !!api?.getFile(dir)?.group;
+
   /// What to do with files that exist already, from a person.
   function askExisting() {
     return new Promise((answer) => {
@@ -324,7 +330,7 @@
   /// Uploads `tree` into folder `dir`, and says what became of it.
   async function uploadFolder(dir, tree) {
     if (tree.files.length === 0 && tree.dirs.length === 0) return;
-    if (dir === "/" && !account.caps.includes("volumes")) {
+    if (inRoot(dir) && !account.caps.includes("volumes")) {
       error = "You can't create top-level folders here. Open a folder shared with you to add things to it.";
       return;
     }
@@ -533,7 +539,7 @@
       return false;
     });
     api.intercept("create-file", ({ file, parent }) => {
-      if (parent === "/" && !account.caps.includes("volumes")) {
+      if (inRoot(parent) && !account.caps.includes("volumes")) {
         error = "You can't create top-level folders here. Open a folder shared with you to add things to it.";
         return false;
       }
@@ -549,6 +555,11 @@
       return false;
     });
     api.intercept("rename-file", ({ id, name }) => {
+      // A share's name is its label here, which is this account's own.
+      if (api.getFile(id)?.top) {
+        act(() => relabel(id, join(parentOf(id), name).slice(1)), []);
+        return false;
+      }
       act(() => fs.rename(id, join(parentOf(id), name)), [parentOf(id)]);
       return false;
     });
@@ -593,6 +604,14 @@
     });
   }
 
+  /// Shows the share at `path` as `label`, and lists the root again: it may
+  /// have left a group, or joined one.
+  async function relabel(path, label) {
+    await fs.relabelShare(path, label);
+    await reload("/");
+    await goTo(current.startsWith(`${path}/`) || current === path ? "/" : parentOf(path));
+  }
+
   /// SVAR's menus, with sharing for folders. Volumes and shares are the
   /// root's folders, and only folders are shared.
   function menuOptions(mode, item) {
@@ -611,15 +630,18 @@
     }
     if (mode !== "folder" || !item || item.id === "/" || item.id === "/.snapshot") return options;
     const zip = { id: "download-zip", text: "Download as ZIP", icon: "wxi-download", handler: () => act(() => downloadZip([item.id]), []) };
-    if (item.id.startsWith("/.snapshot")) return [zip, ...options];
+    if (item.id.startsWith("/.snapshot") || item.group) return [zip, ...(item.group ? [] : options)];
     return [
       zip,
       ...options,
       { comp: "separator" },
       { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
       { id: "size-limit", text: "Size limit…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "limit", path: item.id }) },
-      ...(parentOf(item.id) === "/"
-        ? [{ id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) }]
+      ...(item.top
+        ? [
+            { id: "show-as", text: "Show as…", icon: "wxi-edit", handler: () => (dialog = { kind: "show-as", path: item.id, label: item.id.slice(1) }) },
+            { id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) },
+          ]
         : []),
       { id: "prune-again", text: "Prune again", icon: "wxi-sync", handler: () => pruneAgain(item.id) },
     ];
@@ -785,6 +807,28 @@
       always under your name, in My safety code.
     </p>
     <Fingerprint fingerprint={me.fingerprint} />
+  </Dialog>
+{:else if dialog?.kind === "show-as"}
+  <Dialog title="Show as" onclose={() => (dialog = null)}>
+    <form
+      onsubmit={(event) => {
+        event.preventDefault();
+        const { path, label } = dialog;
+        dialog = null;
+        act(() => relabel(path, label.trim()), []);
+      }}
+    >
+      <label for="show-as">What this folder shows up to you as</label>
+      <input id="show-as" bind:value={dialog.label} required />
+      <p class="note">
+        A / puts it in a group: CS101/assignments shows inside a CS101 folder. This changes it only
+        for you.
+      </p>
+      <p>
+        <button class="primary" type="submit">Save</button>
+        <button type="button" onclick={() => (dialog = null)}>Cancel</button>
+      </p>
+    </form>
   </Dialog>
 {:else if dialog?.kind === "exists"}
   <Dialog title="Some files already exist" keep onclose={() => dialog.answer("cancel")}>
