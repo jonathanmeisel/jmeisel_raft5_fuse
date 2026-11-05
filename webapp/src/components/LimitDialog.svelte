@@ -9,8 +9,6 @@
   let { fs, path, me, admin = false, onclose } = $props();
   // svelte-ignore state_referenced_locally
   const name = path.replace(/^\//, "");
-  // svelte-ignore state_referenced_locally
-  const top = "/" + path.split("/")[1];
 
   let size = $state(undefined);
   let owner = $state(null);
@@ -20,6 +18,7 @@
 
   async function load() {
     try {
+      const top = await fs.topFolder(path);
       const [measured, volume] = await Promise.all([fs.folderSize(path), fs.volume(top)]);
       size = measured;
       owner = volume?.owner ?? null;

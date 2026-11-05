@@ -5,6 +5,8 @@
 //
 // - Tokens are random and live only here, in this tab's memory. A stream
 //   ends when it is closed, at logout, or when the tab goes away.
+// - A stream can instead be a generated archive (`openArchive`), whose size
+//   nobody knows until its end, so it has no byte ranges.
 // - `available` says whether this page is under the service worker. Where
 //   it isn't (a first visit before it takes over, a private window, a
 //   browser that has them off), callers decrypt the whole file instead.
@@ -37,7 +39,9 @@ export function streams(fs) {
     } else if (data.raft5fs === "read") {
       lastRead = Date.now();
       try {
-        const bytes = await fs.readFile(s.handle, data.offset, data.len);
+        const bytes = s.read
+          ? await s.read()
+          : await fs.readFile(s.handle, data.offset, data.len);
         const buffer = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
           ? bytes.buffer
           : bytes.slice().buffer;
@@ -45,6 +49,9 @@ export function streams(fs) {
       } catch (e) {
         port.postMessage({ error: e.message });
       }
+    } else if (data.raft5fs === "cancel") {
+      close(data.token);
+      port.postMessage(null);
     }
   };
   sw?.addEventListener("controllerchange", onController);
@@ -59,7 +66,8 @@ export function streams(fs) {
     const s = open.get(token);
     if (!s) return;
     open.delete(token);
-    fs.closeFile(s.handle).catch(() => {});
+    if (s.onclose) s.onclose();
+    else fs.closeFile(s.handle).catch(() => {});
   }
 
   addEventListener("pagehide", closeAll);
@@ -86,6 +94,21 @@ export function streams(fs) {
         disposition: download ? "attachment" : "inline",
       });
       return { token, url: `/stream/${token}/${encodeURIComponent(name)}` };
+    },
+
+    /// A download of `name` whose bytes come from `read`, until it gives none.
+    /// `onclose` runs when it ends, however it ends. Gives the stream's URL.
+    openArchive(name, read, onclose) {
+      const token = newToken();
+      open.set(token, {
+        read,
+        onclose,
+        size: null,
+        type: "application/zip",
+        name,
+        disposition: "attachment",
+      });
+      return `/stream/${token}/${encodeURIComponent(name)}`;
     },
 
     close,

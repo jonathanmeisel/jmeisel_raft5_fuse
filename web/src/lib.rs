@@ -30,7 +30,7 @@ use raft5fs_client::pruner::{self, PrunerConfig};
 use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
-use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault};
+use raft5fs_client::vault::{KnownKeys, ShareTrust, VIRTUAL_ROOT, Vault, is_group, is_virtual};
 use raft5fs_crypto::identity::{
     PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
 };
@@ -428,6 +428,10 @@ struct Entry {
     /// For a folder: `link` if it has a public link, `people` if it is
     /// shared with anyone else (or with this account, by someone else).
     shared: Option<&'static str>,
+    /// A virtual folder in the root, which holds shares and nothing else.
+    group: bool,
+    /// A share in the root or a group: something this account has a grant of.
+    top: bool,
     #[serde(skip)]
     ino: u64,
 }
@@ -447,6 +451,8 @@ impl Entry {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0.0, |d| d.as_millis() as f64),
             shared: None,
+            group: is_group(attr.ino),
+            top: false,
             ino: attr.ino,
         }
     }
@@ -600,10 +606,10 @@ impl Inner {
         if names.first() == Some(&".snapshot") {
             return Ok(());
         }
-        if names.is_empty() {
+        let Some(depth) = self.top_depth(&names).await? else {
             let folders: Vec<&mut Entry> = entries
                 .iter_mut()
-                .filter(|e| e.kind == "folder" && e.name != ".snapshot")
+                .filter(|e| e.kind == "folder" && e.name != ".snapshot" && !e.group)
                 .collect();
             let known = join_all(folders.iter().map(|e| self.sharing(e.ino))).await;
             for (entry, known) in folders.into_iter().zip(known) {
@@ -613,8 +619,11 @@ impl Inner {
                 };
             }
             return Ok(());
-        }
-        let volume = self.resolve(&format!("/{}", names[0])).await?.ino;
+        };
+        let volume = self
+            .resolve(&format!("/{}", names[..depth].join("/")))
+            .await?
+            .ino;
         if let Some(known) = self.sharing(volume).await {
             for entry in entries.iter_mut().filter(|e| e.kind == "folder") {
                 entry.shared = known.get(&entry.ino).map(NodeSharing::mark);
@@ -623,14 +632,33 @@ impl Inner {
         Ok(())
     }
 
+    /// How many of `names`, a path from the root, it takes to reach a grant.
+    /// `None` if they never do: they name the root or a group.
+    async fn top_depth(&self, names: &[&str]) -> Result<Option<usize>, FsError> {
+        let mut at = VIRTUAL_ROOT;
+        for (i, name) in names.iter().enumerate() {
+            at = self.vault().group_lookup(at, OsStr::new(name)).await?;
+            if !is_group(at) {
+                return Ok(Some(i + 1));
+            }
+        }
+        Ok(None)
+    }
+
     /// How folder `path` is shared, for the bar above the files (see
     /// `Fs::sharing_here`).
     async fn sharing_here(&self, path: &str) -> Result<Option<Here>, FsError> {
         let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
-        if names.is_empty() || names[0] == ".snapshot" {
+        if names.first().is_none_or(|n| *n == ".snapshot") {
             return Ok(None);
         }
-        let top = self.resolve(&format!("/{}", names[0])).await?.ino;
+        let Some(first) = self.top_depth(&names).await? else {
+            return Ok(None);
+        };
+        let top = self
+            .resolve(&format!("/{}", names[..first].join("/")))
+            .await?
+            .ino;
         let Some(known) = self.sharing(top).await else {
             // Only shared with this account, to read: say by whom.
             let sender = self
@@ -651,9 +679,9 @@ impl Inner {
             }));
         };
         let mut sources = Vec::new();
-        for depth in 1..=names.len() {
+        for depth in first..=names.len() {
             let folder = format!("/{}", names[..depth].join("/"));
-            let ino = if depth == 1 {
+            let ino = if depth == first {
                 top
             } else {
                 self.resolve(&folder).await?.ino
@@ -691,7 +719,7 @@ impl Inner {
         }
         let folders: Vec<u64> = entries
             .iter()
-            .filter(|e| e.kind == "folder" && e.name != ".snapshot")
+            .filter(|e| e.kind == "folder" && e.name != ".snapshot" && !e.group)
             .map(|e| e.ino)
             .collect();
         if folders.is_empty() {
@@ -710,29 +738,28 @@ impl Inner {
         }
     }
 
-    /// The inode of top-level folder `path`; `EINVAL` for any other path.
+    /// The inode of top-level folder `path`, which can be in a group; `EINVAL`
+    /// for any other path.
     async fn volume_at(&self, path: &str) -> Result<u64, FsError> {
         let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
-        if names.len() != 1 || names[0] == ".snapshot" {
-            return Err(FsError::new(
-                errno::EINVAL,
-                format!("{path} isn't a top-level folder"),
-            ));
+        let is_snapshot = names.first().is_some_and(|n| *n == ".snapshot");
+        if !is_snapshot && self.top_depth(&names).await? == Some(names.len()) {
+            return Ok(self.resolve(path).await?.ino);
         }
-        Ok(self.resolve(path).await?.ino)
+        Err(FsError::new(
+            errno::EINVAL,
+            format!("{path} isn't a top-level folder"),
+        ))
     }
 
     /// Each top-level folder's path, by inode, as this account sees them.
     async fn volume_paths(&self) -> Result<HashMap<u64, String>, FsError> {
         Ok(self
             .vault()
-            .root_entries()
+            .grant_paths()
             .await?
             .into_iter()
-            .map(|(name, ino)| {
-                let name = String::from_utf8_lossy(os_bytes::bytes(&name)).into_owned();
-                (ino, format!("/{name}"))
-            })
+            .map(|(ino, path)| (ino, format!("/{path}")))
             .collect())
     }
 
@@ -905,7 +932,11 @@ impl Fs {
             let mut entries = Vec::with_capacity(items.len() + 1);
             for (item, attr) in items.iter().zip(attrs) {
                 match attr {
-                    Ok(attr) => entries.push(Entry::new(&item.name, &attr)),
+                    Ok(attr) => {
+                        let mut entry = Entry::new(&item.name, &attr);
+                        entry.top = is_virtual(dir.ino) && !entry.group;
+                        entries.push(entry);
+                    }
                     // Removed since the listing.
                     Err(e) if e.errno == errno::ENOENT => {}
                     Err(e) => return Err(e),
@@ -962,6 +993,13 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let attr = inner.resolve(&path).await?;
+            // Emptying a group would empty every share in it.
+            if is_group(attr.ino) {
+                return Err(FsError::new(
+                    errno::EPERM,
+                    "a group goes by itself, when nothing shows in it",
+                ));
+            }
             let (parent, name) = inner.session.resolve_parent(path.as_bytes()).await?;
             if attr.kind == Kind::Directory {
                 Rc::clone(&inner).empty_dir(attr.ino).await?;
@@ -1177,11 +1215,17 @@ impl Fs {
             // The folders above, from the volume down: one look at what is
             // granted under the volume says which of them to ask about.
             let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
-            if names.len() < 2 || names[0] == ".snapshot" {
+            if names.first().is_none_or(|n| *n == ".snapshot") {
+                return Ok(shared);
+            }
+            let Some(first) = inner.top_depth(&names).await? else {
+                return Ok(shared);
+            };
+            if names.len() == first {
                 return Ok(shared);
             }
             let mut above = Vec::new();
-            for depth in 1..names.len() {
+            for depth in first..names.len() {
                 let folder = format!("/{}", names[..depth].join("/"));
                 above.push((inner.resolve(&folder).await?.ino, folder));
             }
@@ -1791,6 +1835,31 @@ impl Fs {
                 });
             }
             Ok(people)
+        })
+    }
+
+    /// The top-level folder that `path` is in: the path of the grant it is
+    /// under, in any groups. `path` itself for the root or a group.
+    #[wasm_bindgen(js_name = topFolder)]
+    pub fn top_folder(&self, path: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
+            Ok(match inner.top_depth(&names).await? {
+                Some(depth) => format!("/{}", names[..depth].join("/")),
+                None => path.clone(),
+            })
+        })
+    }
+
+    /// Shows this account's share at `path` as `label`, for itself only. A
+    /// `/` in it puts it in a group.
+    #[wasm_bindgen(js_name = relabelShare)]
+    pub fn relabel_share(&self, path: String, label: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = inner.resolve(&path).await?.ino;
+            inner.vault().relabel(ino, OsStr::new(&label)).await
         })
     }
 

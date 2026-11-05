@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SnapshotInfo};
 
-use crate::vault::{SNAPSHOT_DIR, Vault};
+use crate::vault::{SNAPSHOT_DIR, VIRTUAL_ROOT, Vault, is_group};
 
 /// access(2)'s bit for writing: 2 on every system (POSIX leaves the value
 /// open, but Linux and the BSDs agree), and named here for builds without
@@ -195,6 +195,7 @@ impl SnapshotTree {
         match self.target(ino)? {
             Target::List => Ok(self.list_attr()),
             Target::Root(snap) => Ok(Self::dir_attr(snap.root, snap.created)),
+            Target::Node(snap, node) if is_group(node) => Ok(Self::dir_attr(ino, snap.created)),
             Target::Node(snap, node) => {
                 let attr = snap.vault.remote().getattr(node).await?;
                 Ok(self.node_attr(&snap, attr))
@@ -208,16 +209,49 @@ impl SnapshotTree {
                 let snap = self.open(live, name).await?;
                 Ok(Self::dir_attr(snap.root, snap.created))
             }
-            Target::Root(snap) => {
-                let node = snap.vault.root_lookup(name).await?;
-                let attr = snap.vault.remote().getattr(node).await?;
-                Ok(self.node_attr(&snap, attr))
-            }
+            Target::Root(snap) => self.entry_attr(&snap, VIRTUAL_ROOT, name).await,
+            Target::Node(snap, node) if is_group(node) => self.entry_attr(&snap, node, name).await,
             Target::Node(snap, node) => {
                 let attr = snap.vault.lookup(node, name).await?;
                 Ok(self.node_attr(&snap, attr))
             }
         }
+    }
+
+    /// The kernel's number for what `node`, a grant or group, shows in.
+    fn shown_parent(&self, snap: &Arc<Snap>, node: u64) -> u64 {
+        match snap.vault.root_parent(node) {
+            VIRTUAL_ROOT => snap.root,
+            parent => self.number(snap, parent),
+        }
+    }
+
+    /// Adds what the snapshot's root or group `dir` shows to `items`.
+    async fn add_entries(
+        &self,
+        snap: &Arc<Snap>,
+        dir: u64,
+        items: &mut Vec<DirItem>,
+    ) -> Result<(), FsError> {
+        for (name, node) in snap.vault.group_entries(dir).await? {
+            items.push(DirItem {
+                ino: self.number(snap, node),
+                kind: Kind::Directory,
+                name,
+                sealed_name: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// What `name` shows as in the snapshot's root or group `dir`.
+    async fn entry_attr(&self, snap: &Arc<Snap>, dir: u64, name: &OsStr) -> Result<Attr, FsError> {
+        let node = snap.vault.group_lookup(dir, name).await?;
+        if is_group(node) {
+            return Ok(Self::dir_attr(self.number(snap, node), snap.created));
+        }
+        let attr = snap.vault.remote().getattr(node).await?;
+        Ok(self.node_attr(snap, attr))
     }
 
     /// access(2): allows anything except writing.
@@ -227,6 +261,7 @@ impl SnapshotTree {
         }
         match self.target(ino)? {
             Target::List | Target::Root(_) => Ok(()),
+            Target::Node(_, node) if is_group(node) => Ok(()),
             Target::Node(snap, node) => snap.vault.remote().access(node, mask).await,
         }
     }
@@ -234,6 +269,7 @@ impl SnapshotTree {
     pub async fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         match self.target(ino)? {
             Target::List | Target::Root(_) => Err(FsError::errno(errno::EISDIR)),
+            Target::Node(_, node) if is_group(node) => Err(FsError::errno(errno::EISDIR)),
             Target::Node(snap, node) => snap.vault.read(node, offset, len).await,
         }
     }
@@ -269,24 +305,24 @@ impl SnapshotTree {
                     item(snap.root, Kind::Directory, "."),
                     item(SNAPSHOT_BASE, Kind::Directory, ".."),
                 ];
-                for (name, node) in snap.vault.root_entries().await? {
-                    items.push(DirItem {
-                        ino: self.number(&snap, node),
-                        kind: Kind::Directory,
-                        name,
-                        sealed_name: Vec::new(),
-                    });
-                }
+                self.add_entries(&snap, VIRTUAL_ROOT, &mut items).await?;
+                Ok(items)
+            }
+            Target::Node(snap, node) if is_group(node) => {
+                let mut items = vec![
+                    item(ino, Kind::Directory, "."),
+                    item(self.shown_parent(&snap, node), Kind::Directory, ".."),
+                ];
+                self.add_entries(&snap, node, &mut items).await?;
                 Ok(items)
             }
             Target::Node(snap, node) => {
                 let mut items = snap.vault.readdir(node).await?;
-                // A grant's `..` is the snapshot's root, as in the live
-                // filesystem.
+                // A grant's `..` is where it shows, as in the live filesystem.
                 let above_grant = snap.vault.is_grant_root(node);
                 for item in &mut items {
                     item.ino = if above_grant && item.name == ".." {
-                        snap.root
+                        self.shown_parent(&snap, node)
                     } else {
                         self.number(&snap, item.ino)
                     };

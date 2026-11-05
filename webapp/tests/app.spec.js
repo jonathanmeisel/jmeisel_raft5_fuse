@@ -3,8 +3,11 @@
 // with a fingerprint, trust, read as the other user, and revoke, which
 // queues a prune that the app works through.
 import { test, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const invites = () =>
   JSON.parse(readFileSync(new URL("../config/local/invites.json", import.meta.url)));
@@ -583,6 +586,16 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await expect(accountButton(visitor)).toHaveCount(0);
     await expect(visitor.getByText("Add New")).toHaveCount(0);
     expect((await download(visitor, "note.txt")).equals(note)).toBe(true);
+    // A whole folder too, as one ZIP.
+    const saving = visitor.waitForEvent("download");
+    await visitor.getByRole("button", { name: "Download this folder as a ZIP" }).click();
+    const zip = await saving;
+    expect(zip.suggestedFilename()).toMatch(/\.zip$/);
+    const zipPath = join(mkdtempSync(join(tmpdir(), "link-zip-")), "folder.zip");
+    await zip.saveAs(zipPath);
+    execFileSync("unzip", ["-tq", zipPath]);
+    expect(execFileSync("unzip", ["-Z1", zipPath], { encoding: "utf8" })).toContain("note.txt");
+    rmSync(dirname(zipPath), { recursive: true });
     expect(await visitor.evaluate(async () => (await indexedDB.databases()).length)).toBe(0);
   });
 
@@ -1028,6 +1041,238 @@ test("a device that saw newer keys says so, and a person can reset it", async ({
   await expect(page.getByRole("dialog").getByText(/older than/)).toHaveCount(0);
 
   expect(problems).toEqual([]);
+});
+
+test("a folder uploads with its folders, and downloads as a ZIP", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "pia");
+  await login(page, "pia");
+  await addFolder(page, "trip");
+  await open(page, "trip");
+
+  const local = mkdtempSync(join(tmpdir(), "folder-upload-"));
+  mkdirSync(join(local, "photos/day one"), { recursive: true });
+  writeFileSync(join(local, "photos/notes.txt"), "first notes");
+  writeFileSync(join(local, "photos/day one/a.txt"), "aaa");
+  writeFileSync(join(local, "photos/day one/b.txt"), "bbb");
+
+  const upload = async () => {
+    const chooser = page.waitForEvent("filechooser");
+    await page.getByText("Add New").click();
+    await page.getByText("Upload folder").click();
+    await (await chooser).setFiles(join(local, "photos"));
+  };
+  await upload();
+  await expect(page.getByText("Uploaded 3 files.")).toBeVisible(SLOW);
+  await open(page, "photos");
+  await expect(item(page, "notes.txt")).toBeVisible(SLOW);
+  await open(page, "day one");
+  await expect(item(page, "b.txt")).toBeVisible(SLOW);
+
+  // Again, into the same place: one question, for all of them.
+  const backToTrip = async () => {
+    await page.getByText("My files").first().click();
+    await open(page, "trip");
+    await expect(item(page, "photos")).toBeVisible(SLOW);
+  };
+  await backToTrip();
+  writeFileSync(join(local, "photos/notes.txt"), "second notes");
+  await upload();
+  await page.getByRole("button", { name: "Skip existing" }).click();
+  await expect(page.getByText("Uploaded 0 files, skipped 3 that already exist.")).toBeVisible(SLOW);
+  await upload();
+  await page.getByRole("button", { name: "Replace all" }).click();
+  await expect(page.getByText("Uploaded 3 files.")).toBeVisible(SLOW);
+  await upload();
+  await page.getByRole("button", { name: "Cancel upload" }).click();
+  await expect(page.getByText("then stopped, as you asked")).toBeVisible(SLOW);
+
+  // A dropped folder keeps its shape, however many it holds. The reader gives
+  // batches of 100, as Chromium's does, and the empty folder stays.
+  await page.evaluate(() => {
+    const file = (name) => ({
+      isFile: true,
+      name,
+      file: (done) => done(new File([name], name)),
+    });
+    const dir = (name, entries) => ({
+      isDirectory: true,
+      name,
+      createReader() {
+        let at = 0;
+        return {
+          readEntries(done) {
+            done(entries.slice(at, at + 100));
+            at += 100;
+          },
+        };
+      },
+    });
+    const many = Array.from({ length: 150 }, (_, n) => file(`f${n}.txt`));
+    const dropped = dir("dropped", [dir("inner", many), dir("hollow", [])]);
+    const drop = new DragEvent("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", {
+      value: { items: [{ kind: "file", webkitGetAsEntry: () => dropped }] },
+      configurable: true,
+    });
+    document.querySelector(".wx-upload-area").dispatchEvent(drop);
+  });
+  await expect(page.getByText("Uploaded 150 files.")).toBeVisible({ timeout: 90_000 });
+  await open(page, "dropped");
+  await expect(item(page, "hollow")).toBeVisible(SLOW);
+  await expect(item(page, "inner")).toBeVisible(SLOW);
+  await backToTrip();
+
+  // The folder's menu gives a ZIP of everything in it, an empty folder too.
+  const saved = page.waitForEvent("download");
+  await menu(page, "dropped", "Download as ZIP");
+  const download = await saved;
+  expect(download.suggestedFilename()).toBe("dropped.zip");
+  const zip = join(local, "dropped.zip");
+  await download.saveAs(zip);
+  execFileSync("unzip", ["-tq", zip]);
+  const names = execFileSync("unzip", ["-Z1", zip], { encoding: "utf8" }).trim().split("\n");
+  expect(names).toHaveLength(153);
+  expect(names).toContain("dropped/hollow/");
+  expect(execFileSync("unzip", ["-p", zip, "dropped/inner/f149.txt"], { encoding: "utf8" })).toBe("f149.txt");
+
+  // Several selected go in one, with the replaced file's new contents.
+  await item(page, "photos").click();
+  await item(page, "dropped").click({ modifiers: ["Control"] });
+  const savedBoth = page.waitForEvent("download");
+  await menu(page, "dropped", "Download as ZIP");
+  const both = await savedBoth;
+  expect(both.suggestedFilename()).toBe("trip.zip");
+  const trip = join(local, "trip.zip");
+  await both.saveAs(trip);
+  expect(execFileSync("unzip", ["-p", trip, "photos/notes.txt"], { encoding: "utf8" })).toBe("second notes");
+  expect(execFileSync("unzip", ["-p", trip, "photos/day one/a.txt"], { encoding: "utf8" })).toBe("aaa");
+  expect(execFileSync("unzip", ["-p", trip, "dropped/inner/f7.txt"], { encoding: "utf8" })).toBe("f7.txt");
+
+  // A new folder that wouldn't fit is refused before anything stays.
+  await addFolder(page, "tiny");
+  await menu(page, "tiny", "Size limit…");
+  await page.getByLabel(/Limit, such as/).fill("1K");
+  await page.getByRole("button", { name: "Set limit" }).click();
+  await expect(page.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
+  await page.getByRole("button", { name: "Close" }).click();
+  await open(page, "tiny");
+  mkdirSync(join(local, "large"));
+  writeFileSync(join(local, "large/big.bin"), Buffer.alloc(4096, 1));
+  const tooBig = page.waitForEvent("filechooser");
+  await page.getByText("Add New").click();
+  await page.getByText("Upload folder").click();
+  await (await tooBig).setFiles(join(local, "large"));
+  await expect(page.getByText(/reached its size limit/)).toBeVisible(SLOW);
+  await expect(item(page, "large")).toHaveCount(0);
+
+  rmSync(local, { recursive: true });
+  expect(problems).toEqual([]);
+});
+
+test("shares group into one folder for each student", async ({ browser }) => {
+  const rosa = await (await browser.newContext()).newPage();
+  const quinn = await (await browser.newContext()).newPage();
+  const problems = [rosa, quinn].map(watch);
+  const rosaWords = await enrol(rosa, "rosa");
+  const quinnWords = await enrol(quinn, "quinn");
+  await login(rosa, "rosa");
+  await login(quinn, "quinn");
+  const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  // The teacher's class is one folder, and what she shares is inside it.
+  await addFolder(rosa, "class");
+  await open(rosa, "class");
+  await addFolder(rosa, "assignments");
+  await addFolder(rosa, "quinn");
+  await addFolder(rosa, "someone else");
+  await sharing(rosa, "assignments", "Share with someone");
+  await rosa.getByLabel("User", { exact: true }).fill("quinn");
+  await rosa.getByLabel("What this folder will show up to shared user as").fill("CS101/assignments");
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await rosa.getByLabel("quinn's safety code").fill(quinnWords);
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(rosa.getByText(/Shared with quinn/)).toBeVisible(SLOW);
+  await rosa.getByRole("button", { name: "Done" }).click();
+  await sharing(rosa, "quinn", "Share with someone");
+  await rosa.getByLabel("User", { exact: true }).fill("quinn");
+  await rosa.getByLabel("What this folder will show up to shared user as").fill("CS101/quinn");
+  await rosa.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(rosa.getByText(/Shared with quinn/)).toBeVisible(SLOW);
+  await rosa.getByRole("button", { name: "Done" }).click();
+
+  // Until quinn checks who shared them, they stay out of any group.
+  await comeBack(quinn);
+  await expect(item(quinn, "CS101-assignments")).toBeVisible(SLOW);
+  await expect(item(quinn, "CS101-quinn")).toBeVisible(SLOW);
+  await accountMenu(quinn, "People");
+  await quinn.getByRole("button", { name: "Check someone's safety code" }).click();
+  await quinn.getByLabel("Their account name").fill("rosa");
+  await quinn.getByLabel("Their safety code").fill(rosaWords);
+  await quinn.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(quinn.getByRole("dialog").getByText("rosa", { exact: true })).toBeVisible(SLOW);
+  await quinn.getByRole("button", { name: "Close" }).click();
+  await comeBack(quinn);
+
+  // Then one folder, with those two, and nothing of the rest of the class.
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  await expect(item(quinn, "CS101-quinn")).toHaveCount(0);
+  await open(quinn, "CS101");
+  await expect(item(quinn, "assignments")).toBeVisible(SLOW);
+  await expect(item(quinn, "quinn")).toBeVisible(SLOW);
+  await expect(item(quinn, "someone else")).toHaveCount(0);
+  await expect(item(quinn, "class")).toHaveCount(0);
+
+  // Each share works as itself, and its address names the group.
+  await open(quinn, "quinn");
+  await expect.poll(() => new URL(quinn.url()).hash).toBe("#/CS101/quinn");
+  await quinn.locator("input[type=file]").setInputFiles([
+    { name: "essay.txt", mimeType: "text/plain", buffer: Buffer.from("my essay") },
+  ]);
+  await expect(item(quinn, "essay.txt")).toBeVisible(SLOW);
+
+  // The teacher sees it in the real folder, under its real name.
+  await open(rosa, "quinn");
+  await expect(item(rosa, "essay.txt")).toBeVisible(SLOW);
+
+  // A group is only a place: its menu has no rename or delete, and a folder
+  // made in it is a top-level folder of its own.
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  await item(quinn, "CS101").click({ button: "right" });
+  await expect(quinn.getByText("Download as ZIP", { exact: true }).first()).toBeVisible(SLOW);
+  await expect(quinn.getByText("Delete", { exact: true })).toHaveCount(0);
+  await expect(quinn.getByText("Rename", { exact: true })).toHaveCount(0);
+  await quinn.keyboard.press("Escape");
+  await open(quinn, "CS101");
+  await addFolder(quinn, "own notes");
+  await expect(item(quinn, "own notes")).toBeVisible(SLOW);
+
+  // Someone can show a share their own way. Nobody else is affected.
+  await menu(quinn, "assignments", "Show as…");
+  await quinn.getByLabel("What this folder shows up to you as").fill("Reading/CS101 work");
+  await quinn.getByRole("button", { name: "Save" }).click();
+  await expect(item(quinn, "assignments")).toHaveCount(0);
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "Reading")).toBeVisible(SLOW);
+  await open(quinn, "Reading");
+  await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
+  await rosa.getByText("My files").first().click();
+  await open(rosa, "class");
+  await expect(item(rosa, "assignments")).toBeVisible(SLOW);
+
+  // Its ZIP holds what shows in it, under the names that show.
+  await quinn.getByText("My files").first().click();
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  const saving = quinn.waitForEvent("download");
+  await menu(quinn, "CS101", "Download as ZIP");
+  const zip = await saving;
+  const zipPath = join(mkdtempSync(join(tmpdir(), "group-zip-")), "group.zip");
+  await zip.saveAs(zipPath);
+  expect(execFileSync("unzip", ["-p", zipPath, "CS101/quinn/essay.txt"], { encoding: "utf8" })).toBe("my essay");
+  rmSync(dirname(zipPath), { recursive: true });
+
+  expect(problems.flat()).toEqual([]);
 });
 
 test("the app refuses to run in a frame", async ({ page }) => {

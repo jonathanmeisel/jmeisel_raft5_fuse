@@ -319,3 +319,57 @@ fn a_removed_snapshot_is_gone_from_the_mount() {
     past_kernel_cache();
     assert_eq!(fs::read(&old).unwrap(), b"later");
 }
+
+/// Groups in a real mount: `ls` and `..` work, a group holds only shares, and
+/// a snapshot shows them the same way.
+#[test]
+fn groups_show_in_a_mount_and_in_snapshots() {
+    let h = support::setup_root();
+    h.add_user("bob");
+    let owner = vault(&h, support::TESTER);
+    let rt = &h.runtime;
+    let class = rt
+        .block_on(owner.create_volume(OsStr::new("cs101"), 0o755))
+        .unwrap()
+        .ino;
+    let notes = rt
+        .block_on(owner.mkdir(class, OsStr::new("notes"), 0o755))
+        .unwrap()
+        .ino;
+    let work = rt
+        .block_on(owner.mkdir(class, OsStr::new("work"), 0o755))
+        .unwrap()
+        .ino;
+    rt.block_on(owner.grant(notes, "bob", false, OsStr::new("CS101/notes")))
+        .unwrap();
+    rt.block_on(owner.grant(work, "bob", true, OsStr::new("CS101/work")))
+        .unwrap();
+
+    let mount = h.mount_as("bob");
+    let root = &mount.root;
+    assert_eq!(names(root), ["CS101"]);
+    let group = root.join("CS101");
+    assert!(fs::metadata(&group).unwrap().is_dir());
+    assert_eq!(names(&group), ["notes", "work"]);
+
+    // Its files work, and `..` goes back through the group.
+    fs::write(group.join("work/a.txt"), b"mine").unwrap();
+    assert_eq!(fs::read(group.join("work/../work/a.txt")).unwrap(), b"mine");
+    assert_eq!(names(&group.join("work/..")), ["notes", "work"]);
+    assert_errno(fs::write(group.join("notes/b.txt"), b"no"), libc::EROFS);
+
+    // A group holds only shares, and can't be removed or moved.
+    assert_errno(fs::write(group.join("stray.txt"), b"no"), libc::EPERM);
+    assert_errno(fs::remove_dir(&group), libc::ENOTEMPTY);
+    assert_errno(fs::rename(&group, root.join("renamed")), libc::EPERM);
+
+    // A snapshot shows the same groups, and what was in them.
+    h.snapshot("s1");
+    let then = root.join(".snapshot/s1");
+    assert_eq!(names(&then), ["CS101"]);
+    assert_eq!(names(&then.join("CS101")), ["notes", "work"]);
+    assert_eq!(fs::read(then.join("CS101/work/a.txt")).unwrap(), b"mine");
+    assert_eq!(names(&then.join("CS101/work/..")), ["notes", "work"]);
+    assert_errno(fs::write(then.join("CS101/x"), b"no"), libc::EROFS);
+    h.drop_snapshot("s1");
+}

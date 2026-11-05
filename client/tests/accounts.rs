@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use raft5fs_client::remote::Remote;
 use raft5fs_client::store::{MemoryStore, Store};
-use raft5fs_client::vault::{KnownKeys, Vault};
+use raft5fs_client::vault::{KnownKeys, VIRTUAL_ROOT, Vault, is_group};
 use raft5fs_core::accounts;
 use raft5fs_crypto::identity::{fingerprint_words, label_signer, seal_label, seal_signed_label};
 use raft5fs_crypto::password::KdfParams;
@@ -1155,11 +1155,10 @@ fn a_change_made_offline_survives_a_restart() {
     assert_eq!(restarted.known_keys().pinned("bob"), Some([9; 32]));
 }
 
-/// The name `ino` shows as in the root of `vault`.
+/// Where `ino` shows in the root of `vault`.
 fn shown_as(backend: &Backend, vault: &Vault, ino: u64) -> String {
-    let entries = backend.runtime.block_on(vault.root_entries()).unwrap();
-    let (name, _) = entries.iter().find(|(_, i)| *i == ino).unwrap();
-    name.to_string_lossy().into_owned()
+    let paths = backend.runtime.block_on(vault.grant_paths()).unwrap();
+    paths.get(&ino).cloned().unwrap()
 }
 
 fn label_of(backend: &Backend, vault: &Vault, ino: u64) -> Vec<u8> {
@@ -1347,22 +1346,37 @@ fn names_a_path_cant_say_stay_out_of_listings() {
     names.sort();
     assert_eq!(names, [".", "..", "fine", "real"]);
 
-    // A label is a name too.
+    // A label is names too, with a / between them.
     let own = connect(&backend, TESTER).identity().unwrap();
-    let label = seal_signed_label(&own, TESTER, &own.public_key(), docs, b"a/b");
-    rt.block_on(me.remote().set_grant_label(docs, label))
-        .unwrap();
-    assert_eq!(shown_as(&backend, &me, docs), format!("unreadable-{docs}"));
+    let deep = "a/".repeat(8) + "a";
+    for bad in ["a//b", "/a", "a/", "a/../b", "..", "", deep.as_str()] {
+        let label = seal_signed_label(&own, TESTER, &own.public_key(), docs, bad.as_bytes());
+        rt.block_on(me.remote().set_grant_label(docs, label))
+            .unwrap();
+        assert_eq!(
+            shown_as(&backend, &me, docs),
+            format!("unreadable-{docs}"),
+            "{bad:?}"
+        );
+    }
 
     for bad in ["a/b", "..", ".", ""] {
         let bad = OsStr::new(bad);
         for result in [
             rt.block_on(me.mkdir(docs, bad, 0o755)).map(drop),
             rt.block_on(me.create(docs, bad, 0o644)).map(drop),
-            rt.block_on(me.create_volume(bad, 0o755)).map(drop),
-            rt.block_on(me.grant(docs, "bob", false, bad)).map(drop),
             rt.block_on(me.rename(docs, OsStr::new("real"), docs, bad, false))
                 .map(drop),
+        ] {
+            assert_eq!(errno(result), libc::EINVAL, "{bad:?}");
+        }
+    }
+    for bad in ["a//b", "/a", "a/", "a/..", "..", ".", "", deep.as_str()] {
+        let bad = OsStr::new(bad);
+        for result in [
+            rt.block_on(me.create_volume(bad, 0o755)).map(drop),
+            rt.block_on(me.grant(docs, "bob", false, bad)).map(drop),
+            rt.block_on(me.relabel(docs, bad)).map(drop),
         ] {
             assert_eq!(errno(result), libc::EINVAL, "{bad:?}");
         }
@@ -1500,4 +1514,230 @@ fn a_name_that_comes_back_gets_nothing_it_had() {
         libc::EPERM
     );
     assert!(rt.block_on(new_bob.offers()).unwrap().is_empty());
+}
+
+/// What the root or group `dir` of `vault` shows, by name.
+fn names_in(backend: &Backend, vault: &Vault, dir: u64) -> Vec<String> {
+    let entries = backend.runtime.block_on(vault.group_entries(dir)).unwrap();
+    entries
+        .into_iter()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A class: one volume, its owner sees all of it, and each student sees two
+/// shares in one folder and nothing of anyone else's.
+#[test]
+fn shares_group_into_folders_in_each_persons_root() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let carol_key = backend.enrol("carol");
+    let teacher = vault(&backend, TESTER);
+    let teacher_key = connect(&backend, TESTER).identity().unwrap().public_key();
+    rt.block_on(teacher.trust("bob", &fingerprint_words(&bob_key)))
+        .unwrap();
+    rt.block_on(teacher.trust("carol", &fingerprint_words(&carol_key)))
+        .unwrap();
+    let class = rt
+        .block_on(teacher.create_volume(OsStr::new("cs101"), 0o755))
+        .unwrap()
+        .ino;
+    let mkdir = |name: &str| {
+        rt.block_on(teacher.mkdir(class, OsStr::new(name), 0o755))
+            .unwrap()
+            .ino
+    };
+    let assignments = mkdir("assignments");
+    let bobs = mkdir("bob");
+    let carols = mkdir("carol");
+    let share = |ino, user: &str, writable, label: &str| {
+        rt.block_on(teacher.grant(ino, user, writable, OsStr::new(label)))
+            .unwrap();
+    };
+    share(assignments, "bob", false, "CS101/assignments");
+    share(bobs, "bob", true, "CS101/bob");
+    share(assignments, "carol", false, "CS101/assignments");
+    share(carols, "carol", true, "CS101/carol");
+
+    // Until bob checks who shared them, they stay out of any group: anyone can
+    // choose any label.
+    let bob = vault(&backend, "bob");
+    assert_eq!(
+        names_in(&backend, &bob, VIRTUAL_ROOT),
+        ["CS101-assignments", "CS101-bob"]
+    );
+
+    // Then they go together, and nothing shows of carol's folder, or of what
+    // else the class holds.
+    rt.block_on(bob.trust(TESTER, &fingerprint_words(&teacher_key)))
+        .unwrap();
+    assert_eq!(names_in(&backend, &bob, VIRTUAL_ROOT), ["CS101"]);
+    let group = rt.block_on(bob.root_lookup(OsStr::new("CS101"))).unwrap();
+    assert!(is_group(group));
+    assert_eq!(names_in(&backend, &bob, group), ["assignments", "bob"]);
+    assert_eq!(rt.block_on(bob.resolve("CS101/bob")).unwrap(), bobs);
+    assert_eq!(bob.root_parent(bobs), group);
+    assert_eq!(bob.root_parent(group), VIRTUAL_ROOT);
+    assert!(bob.is_grant_root(bobs));
+
+    // Each share keeps its own access. His own folder can be written.
+    rt.block_on(bob.create(bobs, OsStr::new("work.txt"), 0o644))
+        .unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.create(assignments, OsStr::new("x"), 0o644))),
+        libc::EROFS
+    );
+    assert!(rt.block_on(bob.resolve("CS101/carol")).is_err());
+    assert!(rt.block_on(bob.readdir(carols)).is_err());
+
+    // The label says nothing to anyone else: the owner sees the real tree.
+    assert_eq!(names_in(&backend, &teacher, VIRTUAL_ROOT), ["cs101"]);
+
+    // The numbers stay as grants come and go, for the kernel. A group goes
+    // when nothing shows in it, and comes back as the same one.
+    rt.block_on(bob.relabel(assignments, OsStr::new("reading")))
+        .unwrap();
+    rt.block_on(bob.relabel(bobs, OsStr::new("mine"))).unwrap();
+    assert_eq!(names_in(&backend, &bob, VIRTUAL_ROOT), ["mine", "reading"]);
+    assert_eq!(errno(rt.block_on(bob.group_entries(group))), libc::ENOENT);
+    rt.block_on(bob.relabel(bobs, OsStr::new("CS101/mine")))
+        .unwrap();
+    assert_eq!(
+        rt.block_on(bob.root_lookup(OsStr::new("CS101"))).unwrap(),
+        group
+    );
+
+    // Regrouping follows the account to another device, and stops nobody else.
+    let other = vault(&backend, "bob");
+    rt.block_on(other.sync_pins()).unwrap();
+    assert_eq!(shown_as(&backend, &other, bobs), "CS101/mine");
+    assert_eq!(
+        shown_as(
+            &backend,
+            &vault_with_pin(&backend, "carol", TESTER, &teacher_key),
+            assignments
+        ),
+        "CS101/assignments"
+    );
+}
+
+/// `vault(user)`, trusting `other`.
+fn vault_with_pin(backend: &Backend, user: &str, other: &str, key: &[u8; 32]) -> Vault {
+    let v = vault(backend, user);
+    backend
+        .runtime
+        .block_on(v.trust(other, &fingerprint_words(key)))
+        .unwrap();
+    v
+}
+
+#[test]
+fn groups_merge_by_name_and_clashes_get_a_number() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let bob_key = backend.enrol("bob");
+    let erin_key = backend.enrol("erin");
+    backend.enrol("eve");
+    let tester_key = connect(&backend, TESTER).identity().unwrap().public_key();
+    let tester = vault_with_pin(&backend, TESTER, "bob", &bob_key);
+    let erin = vault_with_pin(&backend, "erin", "bob", &bob_key);
+    let bob = vault_with_pin(&backend, "bob", TESTER, &tester_key);
+    rt.block_on(bob.trust("erin", &fingerprint_words(&erin_key)))
+        .unwrap();
+    let volume = |v: &Vault, name: &str| {
+        rt.block_on(v.create_volume(OsStr::new(name), 0o755))
+            .unwrap()
+            .ino
+    };
+
+    // Two people choose the same label: both show, in one group.
+    let first = volume(&tester, "t1");
+    let second = volume(&erin, "e1");
+    rt.block_on(tester.grant(first, "bob", true, OsStr::new("CS101/same")))
+        .unwrap();
+    rt.block_on(erin.grant(second, "bob", true, OsStr::new("CS101/same")))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &bob, first), "CS101/same");
+    assert_eq!(shown_as(&backend, &bob, second), "CS101/same (2)");
+
+    // A share and a group with one name: the later gets the number, and what
+    // goes in that group stays together. Deep paths work the same way.
+    let plain = volume(&tester, "t2");
+    rt.block_on(tester.grant(plain, "bob", true, OsStr::new("Notes")))
+        .unwrap();
+    let grouped = volume(&tester, "t3");
+    rt.block_on(tester.grant(grouped, "bob", true, OsStr::new("Notes/a")))
+        .unwrap();
+    let again = volume(&tester, "t4");
+    rt.block_on(tester.grant(again, "bob", true, OsStr::new("Notes/b")))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &bob, plain), "Notes");
+    assert_eq!(shown_as(&backend, &bob, grouped), "Notes (2)/a");
+    assert_eq!(shown_as(&backend, &bob, again), "Notes (2)/b");
+    let deep = volume(&tester, "t5");
+    let label = "a/".repeat(7) + "z";
+    rt.block_on(tester.grant(deep, "bob", true, OsStr::new(&label)))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &bob, deep), label);
+
+    // A label nobody checked can't move a real share into a group: it stays
+    // in the root, and says so.
+    rt.block_on(bob.sync_pins()).unwrap();
+    rt.block_on(bob.sign_labels()).unwrap();
+    let eves = connect(&backend, "eve").identity().unwrap();
+    let mine = connect(&backend, "bob").identity().unwrap().public_key();
+    let forged = seal_signed_label(&eves, "eve", &mine, first, b"CS101/bills");
+    rt.block_on(bob.remote().set_grant_label(first, forged))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &bob, first), "CS101-bills (unverified)");
+    let old = seal_label(&mine, first, b"CS101/bills");
+    rt.block_on(bob.remote().set_grant_label(first, old))
+        .unwrap();
+    assert_eq!(shown_as(&backend, &bob, first), "CS101-bills (unverified)");
+
+    // Own volumes can sit in groups too, and can't take a name that's there.
+    let mine_new = rt
+        .block_on(bob.create_volume(OsStr::new("CS101/own"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(shown_as(&backend, &bob, mine_new), "CS101/own");
+    let group = rt.block_on(bob.root_lookup(OsStr::new("CS101"))).unwrap();
+    assert_eq!(
+        errno(rt.block_on(bob.create_volume(OsStr::new("CS101/own"), 0o755))),
+        libc::EEXIST
+    );
+    assert_eq!(
+        errno(rt.block_on(bob.create_volume(OsStr::new("CS101"), 0o755))),
+        libc::EEXIST
+    );
+    let made = rt
+        .block_on(bob.create_volume_in(group, OsStr::new("made"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(shown_as(&backend, &bob, made), "CS101/made");
+    assert_eq!(
+        errno(rt.block_on(bob.delete_volume(OsStr::new("CS101")))),
+        libc::ENOTEMPTY
+    );
+    rt.block_on(bob.delete_volume_in(group, OsStr::new("made")))
+        .unwrap();
+    assert!(!rt.block_on(bob.grant_paths()).unwrap().contains_key(&made));
+}
+
+/// A public link's visitor has checked nobody, so a link has no group.
+#[test]
+fn a_public_link_has_no_group() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let me = vault(&backend, TESTER);
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    assert_eq!(
+        errno(rt.block_on(me.create_link(docs, "/docs", OsStr::new("a/b"), None))),
+        libc::EINVAL
+    );
 }

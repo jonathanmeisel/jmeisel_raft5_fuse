@@ -20,6 +20,7 @@
 //   another machine. It doesn't stop a script on this origin, which can ask
 //   the browser to decrypt them. Logging out deletes them.
 import init, * as wasm from "../wasm/raft5fs_web.js";
+import { zipStream } from "./zip.js";
 
 const filesystems = __RAFT5FS_FILESYSTEMS__;
 /// The filesystem of the session (or the enrolment) in this Worker.
@@ -28,6 +29,11 @@ const PIECE = 4 << 20;
 const REMEMBER_MS = 7 * 24 * 60 * 60 * 1000;
 let ready = null;
 let fs = null;
+/// Uploads told to stop (see `uploadTree`), by key.
+const cancelledUploads = new Set();
+/// Archives being read (see `zipOpen`), by id.
+const zips = new Map();
+let nextZip = 1;
 
 // ---------------------------------------------------------------- storage
 
@@ -354,7 +360,9 @@ const methods = {
   /// - If a write still fails (others wrote meanwhile: quotas are soft),
   ///   a file this upload made is removed again; a replaced one stays as
   ///   far as it got.
-  async upload(path, file, overwrite) {
+  /// - `key` names the folder upload it is part of. Cancelling that stops it
+  ///   the same way, with `ECANCELED`.
+  async upload(path, file, overwrite, key) {
     const s = session();
     const existing = await s.stat(path).then(
       (entry) => entry,
@@ -374,6 +382,9 @@ const methods = {
     let closing = false;
     try {
       for (let at = 0; at < file.size; at += PIECE) {
+        if (key && cancelledUploads.has(key)) {
+          throw Object.assign(new Error("cancelled"), { code: "ECANCELED" });
+        }
         const piece = new Uint8Array(
           await file.slice(at, at + PIECE).arrayBuffer(),
         );
@@ -387,6 +398,76 @@ const methods = {
       if (!existing) await s.remove(path).catch(() => {});
       throw e;
     }
+  },
+
+  checkRoom: (path, bytes) => session().checkRoom(path, bytes),
+
+  cancelUploads(key) {
+    cancelledUploads.add(key);
+  },
+
+  /// Starts an archive of `paths`, files or folders with all they hold, under
+  /// their own names. Gives its `id`, and the `bytes` its files hold. A folder
+  /// that can't be listed is left out, and reported as `zipRead` reads.
+  async zipOpen(paths) {
+    const s = session();
+    const entries = [];
+    const errors = [];
+    async function walk(path, name, modified) {
+      entries.push({ name, modified, dir: true, path });
+      let list;
+      try {
+        list = await s.readdir(path);
+      } catch (e) {
+        errors.push(`${name}: ${e.message}`);
+        return;
+      }
+      for (const entry of list) {
+        const child = `${path}/${entry.name}`;
+        const under = `${name}/${entry.name}`;
+        if (entry.kind === "folder") await walk(child, under, entry.modified);
+        else entries.push({ name: under, modified: entry.modified, size: entry.size, path: child });
+      }
+    }
+    for (const path of paths) {
+      const name = path.slice(path.lastIndexOf("/") + 1);
+      const { kind, modified, size } = await s.stat(path);
+      if (kind === "folder") await walk(path, name, modified);
+      else entries.push({ name, modified, size, path });
+    }
+    async function* read(entry) {
+      const handle = await s.open(entry.path, false, false);
+      try {
+        // Only what the listing said: the sizes can't change once started.
+        for (let at = 0; at < entry.size; ) {
+          const len = Math.min(PIECE, entry.size - at);
+          const piece = await s.read(handle, at, len);
+          if (piece.length === 0) return;
+          at += piece.length;
+          yield piece;
+        }
+      } finally {
+        await s.close(handle);
+      }
+    }
+    const id = nextZip++;
+    zips.set(id, { stream: zipStream(entries, read, errors), errors });
+    return { id, bytes: entries.reduce((n, e) => n + (e.size ?? 0), 0) };
+  },
+
+  /// The next bytes of archive `id`, empty at its end.
+  async zipRead(id) {
+    const { value } = await zips.get(id).stream.next();
+    return value ?? new Uint8Array();
+  },
+
+  /// Ends archive `id`, finished or not. Gives what couldn't be read.
+  async zipClose(id) {
+    const zip = zips.get(id);
+    zips.delete(id);
+    if (!zip) return [];
+    await zip.stream.return();
+    return zip.errors;
   },
 
   /// Open files, for streams (see streams.js): a handle, its bytes from
@@ -479,6 +560,8 @@ const methods = {
   trust: (user, words) => session().trust(user, words),
   forgetKey: (user) => session().forgetKey(user),
   syncPins: () => session().syncPins(),
+  topFolder: (path) => session().topFolder(path),
+  relabelShare: (path, label) => session().relabelShare(path, label),
   resetVersions: () => session().resetVersions(),
   replaceKey: (user, words) => session().replaceKey(user, words),
   account: () => session().account(),

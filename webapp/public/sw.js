@@ -4,6 +4,8 @@
 //
 // - It answers only GET /stream/<token>/<name>. Every other request goes to
 //   the network untouched.
+// - An archive has no size until its end (`meta.size` is null). It streams from
+//   the start, without byte ranges, until the page has no more.
 // - It holds no keys and no state. The app's page owns each token (see
 //   src/lib/streams.js); this asks that page for the file's size and type,
 //   then for its bytes, which the page's Worker decrypts.
@@ -85,10 +87,43 @@ function range(header, size) {
   return first <= last && first < size ? [first, last] : null;
 }
 
+/// An archive, from its start to the first empty read. Cancelling the download
+/// tells the page, which stops making it.
+function streamArchive(client, token, meta) {
+  let at = 0;
+  const body = new ReadableStream({
+    async pull(controller) {
+      const reply = await ask(client, { kind: "read", token, offset: at, len: PIECE }, READ_MS);
+      if (!reply?.bytes) {
+        controller.error(new Error(reply?.error ?? "the archive couldn't be read"));
+      } else if (reply.bytes.byteLength === 0) {
+        ask(client, { kind: "cancel", token }, ASK_MS);
+        controller.close();
+      } else {
+        controller.enqueue(new Uint8Array(reply.bytes));
+        at += reply.bytes.byteLength;
+      }
+    },
+    cancel() {
+      return ask(client, { kind: "cancel", token }, ASK_MS);
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": meta.type,
+      "Content-Disposition": `${meta.disposition}; filename*=UTF-8''${encodeURIComponent(meta.name)}`,
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
 async function stream(event, token) {
   const found = await owner(event, token);
   if (!found) return new Response("This stream has ended.", { status: 404 });
   const { client, meta } = found;
+  if (meta.size === null) return streamArchive(client, token, meta);
   const header = event.request.headers.get("range");
   const wanted = meta.size === 0 ? [0, -1] : range(header, meta.size);
   if (!wanted) {

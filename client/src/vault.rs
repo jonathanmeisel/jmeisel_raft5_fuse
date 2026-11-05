@@ -19,7 +19,9 @@
 //!   its fingerprint with them (`KnownKeys`), and refuses a different key
 //!   later.
 //! - **The root.** A mount shows a virtual root, with one entry for each
-//!   grant to this account. Making a directory there makes a new volume.
+//!   grant to this account. Making a directory there makes a new volume. A
+//!   label with `/` in it puts its grant in virtual folders (groups), so that
+//!   grants from all over the filesystem can sit together (`Roots`).
 //!
 //! The vault does not trust the server:
 //!
@@ -72,6 +74,25 @@ use crate::store::{MemoryStore, Store};
 /// The inode number that the kernel uses for a mount's root. This is the
 /// virtual root, not the server's real root.
 pub const VIRTUAL_ROOT: u64 = 1;
+
+/// The first inode number of a group: a virtual folder in the root. Real
+/// inodes count up from 1 and never get here, and snapshots' numbers start at
+/// `1 << 63`.
+const GROUP_BASE: u64 = 1 << 62;
+
+/// Whether `ino` is a group.
+pub fn is_group(ino: u64) -> bool {
+    (GROUP_BASE..1 << 63).contains(&ino)
+}
+
+/// Whether `ino` is only in this client's view of the root: not on the servers.
+pub fn is_virtual(ino: u64) -> bool {
+    ino == VIRTUAL_ROOT || is_group(ino)
+}
+
+/// How many names a label can hold, with its groups. A label comes from whoever
+/// shares, so this keeps a careless or forged one from making an absurd tree.
+const MAX_LABEL_DEPTH: usize = 8;
 
 /// The root resolves this name, but does not list it.
 pub const SNAPSHOT_DIR: &str = ".snapshot";
@@ -274,6 +295,13 @@ impl KnownKeys {
         let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(bad)?;
         let dir = file.parent().ok_or_else(bad)?.to_path_buf();
         Self::open(Arc::new(crate::store::FileStore::new(dir)), name)
+    }
+
+    /// A copy of the pins as they are now, kept only in memory.
+    fn memory_copy(&self) -> Self {
+        let copy = Self::in_memory();
+        *copy.keys.lock().unwrap() = self.all();
+        copy
     }
 
     /// Another handle on the same pins and the same store. A pin that one
@@ -524,6 +552,30 @@ fn good_name(name: &[u8]) -> bool {
     !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
 }
 
+/// The names in a label, from the outermost group to the share itself, or
+/// `None` if any can't be a name, or there are too many.
+fn label_parts(label: &[u8]) -> Option<Vec<OsString>> {
+    let parts: Vec<&[u8]> = label.split(|&b| b == b'/').collect();
+    (parts.len() <= MAX_LABEL_DEPTH && parts.iter().all(|part| good_name(part))).then(|| {
+        parts
+            .into_iter()
+            .map(|part| os_bytes::into_name(part.to_vec()))
+            .collect()
+    })
+}
+
+fn check_new_label(label: &OsStr) -> Result<Vec<OsString>, FsError> {
+    label_parts(os_bytes::bytes(label)).ok_or_else(|| {
+        FsError::new(
+            errno::EINVAL,
+            format!(
+                "{label:?} can't be a label: it is up to {MAX_LABEL_DEPTH} names with a / between \
+                 them, and a name can't be empty, . or .., or hold a NUL"
+            ),
+        )
+    })
+}
+
 fn check_new_name(name: &OsStr) -> Result<(), FsError> {
     if good_name(os_bytes::bytes(name)) {
         return Ok(());
@@ -538,11 +590,69 @@ fn corrupt(ino: u64, e: impl std::fmt::Display) -> FsError {
     FsError::new(errno::EIO, format!("inode {ino}: {e}"))
 }
 
-/// The grants this account has, by the names they show in the root.
+/// The root as this account sees it: its grants, under the names they show as,
+/// in the virtual folders their labels ask for. None of this is on the servers.
+/// Each person's is their own, so that a class can show as one folder to a
+/// student who has two shares in it, and nothing of what else it holds.
 #[derive(Default)]
 struct Roots {
-    by_name: BTreeMap<OsString, u64>,
-    inos: HashSet<u64>,
+    /// The root and each group, by inode.
+    dirs: HashMap<u64, RootDir>,
+    /// The folder that each grant shows in.
+    parents: HashMap<u64, u64>,
+}
+
+#[derive(Default)]
+struct RootDir {
+    parent: u64,
+    /// The names of the groups around it, as labels say them.
+    path: Vec<OsString>,
+    /// What it shows, by name: grants and groups.
+    entries: BTreeMap<OsString, u64>,
+    /// Its groups, by the name labels use, which a clash can change for showing.
+    groups: HashMap<OsString, u64>,
+}
+
+impl Roots {
+    /// A name in folder `dir` like `wanted` that isn't taken.
+    fn free_name(&self, dir: u64, wanted: &OsStr, reserved: &impl Fn(&OsStr) -> bool) -> OsString {
+        let entries = self.dirs.get(&dir).map(|d| &d.entries);
+        let unusable = |name: &OsStr| {
+            entries.is_some_and(|e| e.contains_key(name))
+                || name.is_empty()
+                || (dir == VIRTUAL_ROOT && reserved(name))
+        };
+        let mut name = wanted.to_os_string();
+        let mut n = 2;
+        while unusable(&name) {
+            name = wanted.to_os_string();
+            name.push(format!(" ({n})"));
+            n += 1;
+        }
+        name
+    }
+
+    /// The path that `ino` shows at, from the root, with `/` between names.
+    fn shown_path(&self, ino: u64) -> Option<String> {
+        let mut names = Vec::new();
+        let mut at = ino;
+        while at != VIRTUAL_ROOT {
+            let parent = match self.parents.get(&at) {
+                Some(&parent) => parent,
+                None => self.dirs.get(&at)?.parent,
+            };
+            let (name, _) = self
+                .dirs
+                .get(&parent)?
+                .entries
+                .iter()
+                .find(|(_, i)| **i == at)?;
+            names.push(name.to_string_lossy().into_owned());
+            at = parent;
+        }
+        names.reverse();
+        Some(names.join("/"))
+    }
 }
 
 pub struct Vault {
@@ -561,6 +671,9 @@ pub struct Vault {
     warn_untrusted: bool,
     warned: Mutex<HashSet<u64>>,
     roots: Mutex<Roots>,
+    /// Each group's inode, by its names, kept for this vault's life so that
+    /// the kernel's stays right when grants come and go.
+    group_numbers: Mutex<HashMap<Vec<OsString>, u64>>,
     /// Decrypted chunks, each with the seq it was read or written at. The
     /// snapshot vaults of the same mount share this cache, and each one
     /// uses its own `space` in it.
@@ -601,6 +714,7 @@ impl Vault {
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
             roots: Mutex::new(Roots::default()),
+            group_numbers: Mutex::default(),
             cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
             space: 0,
             layouts: Mutex::new(HashMap::new()),
@@ -623,13 +737,16 @@ impl Vault {
         Self {
             remote: Arc::new(self.remote.at(name)),
             identity: Arc::clone(&self.identity),
-            known: KnownKeys::in_memory(),
+            // Who this account checked, for showing shares as it does live.
+            // Nothing can be sealed in a snapshot, so this risks nothing.
+            known: self.known.memory_copy(),
             nodes: Mutex::new(HashMap::new()),
             versions: Mutex::default(),
             senders: Mutex::new(HashMap::new()),
             warn_untrusted: false,
             warned: Mutex::new(HashSet::new()),
             roots: Mutex::new(Roots::default()),
+            group_numbers: Mutex::default(),
             cache: Arc::clone(&self.cache),
             space,
             layouts: Mutex::new(HashMap::new()),
@@ -1351,35 +1468,179 @@ impl Vault {
         node
     }
 
-    /// Reads this account's grants again and returns the root's entries:
-    /// each grant's label, made unique, and its inode. A grant of a folder
-    /// inside another grant isn't one: it is reached from there, with the
-    /// write access of the nearest read-write grant above.
-    pub async fn root_entries(&self) -> Result<Vec<(OsString, u64)>, FsError> {
+    /// Reads this account's grants again, and works out the root from them.
+    /// Each grant shows under its label, in the groups the label names, made
+    /// unique there. A grant of a folder inside another grant isn't one: it is
+    /// reached from there, with the write access of the nearest read-write
+    /// grant above.
+    async fn read_roots(&self) -> Result<(), FsError> {
         let (mut grants, covered) = self.remote.list_grants_covered().await?;
         grants.retain(|g| !covered.contains(&g.ino));
         grants.sort_by_key(|g| g.ino);
+        let reserved = |name: &OsStr| self.reserved(name);
         let mut roots = Roots::default();
+        roots.dirs.insert(VIRTUAL_ROOT, RootDir::default());
         for grant in grants {
-            let label = self.root_label(&grant).await;
-            let mut name = label.clone();
-            let mut n = 2;
-            while roots.by_name.contains_key(&name) || name.is_empty() || self.reserved(&name) {
-                let mut numbered = label.clone();
-                numbered.push(format!(" ({n})"));
-                name = numbered;
-                n += 1;
+            let (label, groupable) = self.shown_label(&grant).await;
+            let parts = label_parts(os_bytes::bytes(&label)).filter(|_| groupable);
+            let (groups, name) = match &parts {
+                Some(parts) => {
+                    let (name, groups) = parts.split_last().expect("a label has a name");
+                    (groups, name.clone())
+                }
+                // Out of any group, so that its label's `/` must go.
+                None => (
+                    &[][..],
+                    OsString::from(label.to_string_lossy().replace('/', "-")),
+                ),
+            };
+            let mut dir = VIRTUAL_ROOT;
+            for group in groups {
+                dir = self.group_in(&mut roots, dir, group);
             }
-            roots.by_name.insert(name, grant.ino);
-            roots.inos.insert(grant.ino);
+            let shown = roots.free_name(dir, &name, &reserved);
+            roots
+                .dirs
+                .get_mut(&dir)
+                .expect("the folder was just made")
+                .entries
+                .insert(shown, grant.ino);
+            roots.parents.insert(grant.ino, dir);
         }
-        let entries = roots
-            .by_name
-            .iter()
-            .map(|(name, &ino)| (name.clone(), ino))
-            .collect();
         *self.roots.lock().unwrap() = roots;
-        Ok(entries)
+        Ok(())
+    }
+
+    /// The group called `name` in folder `dir`, made if there is none.
+    fn group_in(&self, roots: &mut Roots, dir: u64, name: &OsStr) -> u64 {
+        if let Some(&group) = roots.dirs.get(&dir).and_then(|d| d.groups.get(name)) {
+            return group;
+        }
+        let mut path = roots
+            .dirs
+            .get(&dir)
+            .map(|d| d.path.clone())
+            .unwrap_or_default();
+        path.push(name.to_os_string());
+        let group = {
+            let mut numbers = self.group_numbers.lock().unwrap();
+            let next = GROUP_BASE + numbers.len() as u64;
+            *numbers.entry(path.clone()).or_insert(next)
+        };
+        let shown = roots.free_name(dir, name, &|n| self.reserved(n));
+        let parent = roots.dirs.get_mut(&dir).expect("the folder was just made");
+        parent.entries.insert(shown, group);
+        parent.groups.insert(name.to_os_string(), group);
+        roots.dirs.insert(
+            group,
+            RootDir {
+                parent: dir,
+                path,
+                ..RootDir::default()
+            },
+        );
+        group
+    }
+
+    /// Reads this account's grants again and returns the root's entries:
+    /// each grant's or group's name, and its inode.
+    pub async fn root_entries(&self) -> Result<Vec<(OsString, u64)>, FsError> {
+        self.group_entries(VIRTUAL_ROOT).await
+    }
+
+    /// `root_entries` for the root or a group. `ENOENT` if a group has gone,
+    /// because nothing is left in it.
+    pub async fn group_entries(&self, dir: u64) -> Result<Vec<(OsString, u64)>, FsError> {
+        self.read_roots().await?;
+        let roots = self.roots.lock().unwrap();
+        let dir = roots
+            .dirs
+            .get(&dir)
+            .ok_or_else(|| FsError::errno(errno::ENOENT))?;
+        Ok(dir.entries.iter().map(|(n, &i)| (n.clone(), i)).collect())
+    }
+
+    /// What `name` refers to in the root or a group. If the name is not known,
+    /// reads the grants again.
+    pub async fn group_lookup(&self, dir: u64, name: &OsStr) -> Result<u64, FsError> {
+        let known = |roots: &Roots| {
+            roots
+                .dirs
+                .get(&dir)
+                .and_then(|d| d.entries.get(name))
+                .copied()
+        };
+        if let Some(ino) = known(&self.roots.lock().unwrap()) {
+            return Ok(ino);
+        }
+        self.read_roots().await?;
+        known(&self.roots.lock().unwrap()).ok_or_else(|| FsError::errno(errno::ENOENT))
+    }
+
+    /// What `..` is for `ino`, a grant or a group: the folder it shows in.
+    pub fn root_parent(&self, ino: u64) -> u64 {
+        let roots = self.roots.lock().unwrap();
+        roots
+            .parents
+            .get(&ino)
+            .copied()
+            .or_else(|| roots.dirs.get(&ino).map(|d| d.parent))
+            .unwrap_or(VIRTUAL_ROOT)
+    }
+
+    /// The label for a new volume called `name` in the root or group `dir`.
+    fn label_in(&self, dir: u64, name: &OsStr) -> OsString {
+        let roots = self.roots.lock().unwrap();
+        let mut label = OsString::new();
+        for part in roots
+            .dirs
+            .get(&dir)
+            .map(|d| d.path.as_slice())
+            .unwrap_or_default()
+        {
+            label.push(part);
+            label.push("/");
+        }
+        label.push(name);
+        label
+    }
+
+    /// Makes a new volume called `name` in the root or group `dir`.
+    pub async fn create_volume_in(
+        &self,
+        dir: u64,
+        name: &OsStr,
+        perm: u16,
+    ) -> Result<Attr, FsError> {
+        check_new_name(name)?;
+        let label = self.label_in(dir, name);
+        self.create_volume(&label, perm).await
+    }
+
+    /// Where each of this account's grants shows, from the root, by inode.
+    pub async fn grant_paths(&self) -> Result<HashMap<u64, String>, FsError> {
+        self.read_roots().await?;
+        let roots = self.roots.lock().unwrap();
+        Ok(roots
+            .parents
+            .keys()
+            .filter_map(|&ino| Some((ino, roots.shown_path(ino)?)))
+            .collect())
+    }
+
+    /// Shows this account's grant of `ino` as `label`, on all its devices. A
+    /// `/` puts it in a group. This changes nothing for anyone else.
+    pub async fn relabel(&self, ino: u64, label: &OsStr) -> Result<(), FsError> {
+        check_new_label(label)?;
+        let sealed = seal_signed_label(
+            &self.identity,
+            self.remote.username(),
+            &self.identity.public_key(),
+            ino,
+            os_bytes::bytes(label),
+        );
+        self.remote.set_grant_label(ino, sealed).await?;
+        self.read_roots().await
     }
 
     /// Opens `grant`'s label, and says who vouches for it.
@@ -1417,19 +1678,27 @@ impl Vault {
     /// hasn't checked: the whole share already says that it needs checking,
     /// and its name shouldn't change when they check.
     async fn root_label(&self, grant: &Grant) -> OsString {
-        let unreadable = || OsString::from(format!("unreadable-{}", grant.ino));
+        self.shown_label(grant).await.0
+    }
+
+    /// `root_label`, and whether it may put the grant in a group. Only a label
+    /// from someone checked, on a share from someone checked, can: anyone can
+    /// choose any label, and a group makes what is in it look like it belongs.
+    async fn shown_label(&self, grant: &Grant) -> (OsString, bool) {
+        let unreadable = || (OsString::from(format!("unreadable-{}", grant.ino)), false);
         let Some((text, source)) = self.read_label(grant).await else {
             return unreadable();
         };
-        if !good_name(&text) {
+        if label_parts(&text).is_none() {
             return unreadable();
         }
         let mut label = os_bytes::into_name(text);
         let vouched = matches!(source, LabelSource::Me | LabelSource::Checked);
-        if !vouched && self.load_pin_memory().labels_signed && self.sender_checked(grant) {
+        let checked = self.sender_checked(grant);
+        if !vouched && checked && self.load_pin_memory().labels_signed {
             label.push(" (unverified)");
         }
-        label
+        (label, vouched && checked)
     }
 
     /// Whether this account checked the sender that `grant` names.
@@ -1488,24 +1757,16 @@ impl Vault {
         self.remote.snapshot().is_none() && name == SNAPSHOT_DIR
     }
 
-    /// Returns the grant that `name` refers to in the root. If the name is
-    /// not known, reads the grants again.
+    /// Returns the grant or group that `name` refers to in the root. If the
+    /// name is not known, reads the grants again.
     pub async fn root_lookup(&self, name: &OsStr) -> Result<u64, FsError> {
-        if let Some(&ino) = self.roots.lock().unwrap().by_name.get(name) {
-            return Ok(ino);
-        }
-        self.root_entries()
-            .await?
-            .into_iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, ino)| ino)
-            .ok_or_else(|| FsError::errno(errno::ENOENT))
+        self.group_lookup(VIRTUAL_ROOT, name).await
     }
 
     /// Whether `ino` is granted to this account. These inodes are the
     /// root's entries, and their `..` is the root.
     pub fn is_grant_root(&self, ino: u64) -> bool {
-        self.roots.lock().unwrap().inos.contains(&ino)
+        self.roots.lock().unwrap().parents.contains_key(&ino)
     }
 
     /// Reserves an inode and makes a key for a new child `name` of
@@ -1800,8 +2061,8 @@ impl Vault {
 
     /// Makes a new volume, shown in this account's root as `label`.
     pub async fn create_volume(&self, label: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        check_new_name(label)?;
-        if label == SNAPSHOT_DIR || self.root_lookup(label).await.is_ok() {
+        let parts = check_new_label(label)?;
+        if label == SNAPSHOT_DIR || self.label_taken(&parts).await? {
             return Err(FsError::errno(errno::EEXIST));
         }
         let ino = self.remote.allocate_inode().await?;
@@ -1833,21 +2094,41 @@ impl Vault {
             .create_volume(&new, perm, sealed_key, sealed_label, sealed_grantees)
             .await?;
         self.keep(ino, node);
-        let mut roots = self.roots.lock().unwrap();
-        roots.by_name.insert(label.to_os_string(), ino);
-        roots.inos.insert(ino);
+        // It is made: if this fails, the next look at the root reads them.
+        let _ = self.read_roots().await;
         Ok(attr)
+    }
+
+    /// Whether the root already shows something at the path `parts`.
+    async fn label_taken(&self, parts: &[OsString]) -> Result<bool, FsError> {
+        let mut at = VIRTUAL_ROOT;
+        for part in parts {
+            match self.group_lookup(at, part).await {
+                Ok(next) => at = next,
+                Err(e) if e.errno == errno::ENOENT => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Removes the empty volume shown as `name` in the root or group `dir`. A
+    /// group goes by itself, once nothing shows in it.
+    pub async fn delete_volume_in(&self, dir: u64, name: &OsStr) -> Result<(), FsError> {
+        let ino = self.group_lookup(dir, name).await?;
+        if is_group(ino) {
+            return Err(FsError::errno(errno::ENOTEMPTY));
+        }
+        self.remote.delete_volume(ino).await?;
+        self.forget_inode(ino);
+        // It is gone: if this fails, the next look at the root reads them.
+        let _ = self.read_roots().await;
+        Ok(())
     }
 
     /// Removes the empty volume shown in the root as `label`.
     pub async fn delete_volume(&self, label: &OsStr) -> Result<(), FsError> {
-        let ino = self.root_lookup(label).await?;
-        self.remote.delete_volume(ino).await?;
-        self.forget_inode(ino);
-        let mut roots = self.roots.lock().unwrap();
-        roots.by_name.remove(label);
-        roots.inos.remove(&ino);
-        Ok(())
+        self.delete_volume_in(VIRTUAL_ROOT, label).await
     }
 
     /// Grants directory `ino`, and everything below it, to `user`. The
@@ -1888,7 +2169,7 @@ impl Vault {
         link_secret: Option<&str>,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         check_username(user)?;
-        check_new_name(label)?;
+        check_new_label(label)?;
         // Check this before pinning `user`'s key. A pin also makes shares
         // from `user` trusted, and sharing from an untrusted share must not
         // cause that.
@@ -1993,6 +2274,8 @@ impl Vault {
         label: &OsStr,
         expires: Option<u64>,
     ) -> Result<(String, String), FsError> {
+        // A visitor has checked nobody, so a link can't show in a group.
+        check_new_name(label)?;
         // Checked first, so a refused grant leaves no account behind.
         self.remote.access(ino, 2).await?;
         let (user, secret) = new_link_credentials();
@@ -2142,7 +2425,11 @@ impl Vault {
             .ok_or_else(|| FsError::new(errno::EINVAL, "an empty path"))?;
         let mut ino = self.root_lookup(OsStr::new(first)).await?;
         for part in parts {
-            ino = self.lookup(ino, OsStr::new(part)).await?.ino;
+            ino = if is_group(ino) {
+                self.group_lookup(ino, OsStr::new(part)).await?
+            } else {
+                self.lookup(ino, OsStr::new(part)).await?.ino
+            };
         }
         Ok(ino)
     }

@@ -23,7 +23,8 @@ pub struct GrantArgs {
     /// Read-only: their writes below it fail.
     #[arg(long)]
     pub ro: bool,
-    /// Its label in their root (by default, the last part of the path).
+    /// Its label in their root (by default, the last part of the path). A /
+    /// puts it in a group: CS101/assignments shows inside a CS101 folder.
     #[arg(long)]
     pub name: Option<String>,
     /// Their key's fingerprint, as they saw it when they enrolled (`raft5fs
@@ -215,6 +216,28 @@ pub fn forget_key(connect: &ConnectArgs, args: UserArg) -> Outcome {
         .block_on(vault.forget_key(&args.who))
         .map_err(|e| format!("cannot forget {}'s key: {e}", args.who))?;
     println!("forgot {}'s pinned key", args.who);
+    Ok(0)
+}
+
+#[derive(Args)]
+pub struct RelabelArgs {
+    /// Where the share shows in your root now.
+    pub path: String,
+    /// What to show it as.
+    pub label: String,
+}
+
+pub fn relabel(connect: &ConnectArgs, args: RelabelArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    runtime
+        .block_on(async {
+            let ino = vault.resolve(&args.path).await?;
+            vault.relabel(ino, std::ffi::OsStr::new(&args.label)).await
+        })
+        .map_err(|e| format!("cannot show {} as {}: {e}", args.path, args.label))?;
+    println!("{} now shows as {}", args.path, args.label);
     Ok(0)
 }
 
