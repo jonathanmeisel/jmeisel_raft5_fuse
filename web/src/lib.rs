@@ -40,7 +40,7 @@ use raft5fs_proto::errno;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::public_link::PublicLink;
-use raft5fs_proto::types::{AccountInfo, AccountKind, Attr, Caps, FsError, Kind, SetAttr};
+use raft5fs_proto::types::{AccountInfo, AccountKind, Attr, Caps, FsError, Grant, Kind, SetAttr};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -484,8 +484,7 @@ struct Here {
     /// The folders, from the top down, whose sharing reaches it: it and
     /// those above it.
     sources: Vec<Source>,
-    /// For a folder whose top-level folder this account can only read: who
-    /// shared it.
+    /// For a folder under a share made to this account: who shared it.
     from: Option<String>,
     /// Whether this account can change the folder: a read-write share of
     /// it, or of a folder above it, inside a read-only one.
@@ -611,10 +610,20 @@ impl Inner {
                 .iter_mut()
                 .filter(|e| e.kind == "folder" && e.name != ".snapshot" && !e.group)
                 .collect();
+            let grants = self
+                .vault()
+                .remote()
+                .list_grants()
+                .await
+                .unwrap_or_default();
             let known = join_all(folders.iter().map(|e| self.sharing(e.ino))).await;
-            for (entry, known) in folders.into_iter().zip(known) {
+            let senders = join_all(folders.iter().map(|e| self.shared_by(e.ino, &grants))).await;
+            for ((entry, known), sender) in folders.into_iter().zip(known).zip(senders) {
                 entry.shared = match known {
-                    Some(known) => known.get(&entry.ino).map(NodeSharing::mark),
+                    Some(known) => known
+                        .get(&entry.ino)
+                        .map(NodeSharing::mark)
+                        .or(sender.map(|_| "people")),
                     None => Some("people"),
                 };
             }
@@ -630,6 +639,27 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Who shared folder `ino` with this account, going by `grants`, its
+    /// grants. Nobody for a folder that isn't shared with it, or that it owns: a
+    /// revocation seals every grant again, so an owner's grant can name whoever
+    /// revoked. Only for showing: it is what the grant claims.
+    async fn shared_by(&self, ino: u64, grants: &[Grant]) -> Option<String> {
+        let me = self.vault().remote().username();
+        let grant = grants.iter().find(|g| g.ino == ino)?;
+        let sender = grant_sender(&grant.sealed_key).ok()?;
+        if sender == me {
+            return None;
+        }
+        let owner = self
+            .vault()
+            .remote()
+            .get_volume(ino)
+            .await
+            .ok()
+            .and_then(|v| v.owner);
+        (owner.as_deref() != Some(me)).then(|| sender.to_string())
     }
 
     /// How many of `names`, a path from the root, it takes to reach a grant.
@@ -694,12 +724,21 @@ impl Inner {
             }
         }
         let owner = self.others_owner(top).await;
-        Ok((!sources.is_empty() || owner.is_some()).then_some(Here {
-            sources,
-            from: None,
-            writable: true,
-            owner,
-        }))
+        let grants = self
+            .vault()
+            .remote()
+            .list_grants()
+            .await
+            .unwrap_or_default();
+        let from = self.shared_by(top, &grants).await;
+        Ok(
+            (!sources.is_empty() || owner.is_some() || from.is_some()).then_some(Here {
+                sources,
+                from,
+                writable: true,
+                owner,
+            }),
+        )
     }
 
     /// Who owns volume `ino`, if someone other than this account. Only for

@@ -604,12 +604,19 @@
     });
   }
 
-  /// Shows the share at `path` as `label`, and lists the root again: it may
-  /// have left a group, or joined one.
+  /// Shows the share at `path` as `label`, and lists again where it was and
+  /// the root, where it may have made a group. Goes to the root only if the
+  /// open folder went with it, or with a group that nothing shows in now.
   async function relabel(path, label) {
     await fs.relabelShare(path, label);
     await reload("/");
-    await goTo(current.startsWith(`${path}/`) || current === path ? "/" : parentOf(path));
+    await reload(parentOf(path));
+    const open = current;
+    const gone = await fs.stat(open).then(
+      () => false,
+      (e) => e.code === "ENOENT",
+    );
+    if (gone && current === open) await goTo("/");
   }
 
   /// SVAR's menus, with sharing for folders. Volumes and shares are the

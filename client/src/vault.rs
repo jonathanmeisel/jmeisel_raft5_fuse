@@ -1560,6 +1560,15 @@ impl Vault {
         Ok(dir.entries.iter().map(|(n, &i)| (n.clone(), i)).collect())
     }
 
+    /// `ENOENT` if group `dir` has gone, after reading the grants again if it
+    /// isn't known here: another device may have made it.
+    pub async fn check_group(&self, dir: u64) -> Result<(), FsError> {
+        if self.roots.lock().unwrap().dirs.contains_key(&dir) {
+            return Ok(());
+        }
+        self.group_entries(dir).await.map(drop)
+    }
+
     /// What `name` refers to in the root or a group. If the name is not known,
     /// reads the grants again.
     pub async fn group_lookup(&self, dir: u64, name: &OsStr) -> Result<u64, FsError> {

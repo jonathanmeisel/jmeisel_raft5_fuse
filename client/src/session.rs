@@ -536,6 +536,9 @@ impl Session {
     /// commit holds the buffer's lock throughout), and no other can start
     /// while this holds the lock.
     pub async fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
+        if is_group(ino) {
+            self.vault.check_group(ino).await?;
+        }
         if is_virtual(ino) {
             return Ok(self.virtual_attr(ino));
         }
