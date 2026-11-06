@@ -12,10 +12,11 @@
 //!   `webapp/config/local`).
 //! - `--user`: a user to invite (default `alice` and `bob`).
 //!
-//! The port after the object store's answers `GET /reissue/<user>` with a
-//! new invitation for an existing user, as `raft5fs-server user add` would
-//! give an administrator: for tests where someone enrolls again. Only on
-//! this machine, and only here.
+//! The port after the object store's is for tests, on this machine only. It
+//! answers `GET /reissue/<user>` with a new invitation for an existing user,
+//! as `raft5fs-server user add` would give an administrator, for tests where
+//! someone enrolls again. `GET /snapshot/<name>` takes a snapshot, as the
+//! snapshot timer does on a cluster.
 //!
 //! It prints `ready` once everything serves, then serves until killed.
 //! Nothing is kept: each run is a new, empty filesystem.
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use raft5fs_core::{FsCore, accounts};
+use raft5fs_core::{FsCore, accounts, snapshots};
 use raft5fs_objstore::fake::FakeStore;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::Caps;
@@ -141,15 +142,16 @@ fn main() {
         let admin = TcpListener::bind(("127.0.0.1", port + 3))
             .await
             .expect("the reissue port");
-        tokio::spawn(reissue(admin, client.clone(), native_address.clone(), ca.clone()));
+        tokio::spawn(control(admin, client.clone(), native_address.clone(), ca.clone()));
         println!("ready");
         std::future::pending::<()>().await;
     });
 }
 
 /// Answers `GET /reissue/<user>` with a new invitation for `user`, whose
-/// code replaces any earlier one (see the top of this file).
-async fn reissue(listener: TcpListener, client: raft5_client::Client, server: String, ca: Vec<u8>) {
+/// code replaces any earlier one, and `GET /snapshot/<name>` by taking that
+/// snapshot (see the top of this file).
+async fn control(listener: TcpListener, client: raft5_client::Client, server: String, ca: Vec<u8>) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             continue;
@@ -157,10 +159,26 @@ async fn reissue(listener: TcpListener, client: raft5_client::Client, server: St
         let mut request = vec![0; 1024];
         let n = socket.read(&mut request).await.unwrap_or(0);
         let request = String::from_utf8_lossy(&request[..n]);
-        let user = request
-            .strip_prefix("GET /reissue/")
-            .and_then(|rest| rest.split_whitespace().next())
-            .unwrap_or("");
+        let asked = |prefix: &str| {
+            request
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        };
+        if let Some(name) = asked("GET /snapshot/") {
+            let (status, body) = match snapshots::create(&client, Some(&name)).await {
+                Ok(made) => ("200 OK", made.name),
+                Err(e) => ("400 Bad Request", e),
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            continue;
+        }
+        let user = asked("GET /reissue/").unwrap_or_default();
+        let user = user.as_str();
         let (status, body) = match accounts::issue_code(&client, user).await {
             Ok(code) => (
                 "200 OK",

@@ -12,6 +12,7 @@ mod snapshot_tree;
 pub mod store;
 mod timing;
 pub mod vault;
+pub mod versions;
 pub mod write_buffer;
 
 use sha2::{Digest, Sha256};

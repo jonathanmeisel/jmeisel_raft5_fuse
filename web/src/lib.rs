@@ -31,6 +31,7 @@ use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, VIRTUAL_ROOT, Vault, is_group, is_virtual};
+use raft5fs_client::versions;
 use raft5fs_crypto::identity::{
     PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
 };
@@ -1050,15 +1051,84 @@ impl Fs {
     }
 
     /// Moves `from` to `to`, which must not exist.
-    pub fn rename(&self, from: String, to: String) -> Promise {
+    pub fn rename(&self, from: String, to: String, replace: Option<bool>) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let (parent, name) = inner.session.resolve_parent(from.as_bytes()).await?;
             let (new_parent, new_name) = inner.session.resolve_parent(to.as_bytes()).await?;
             inner
                 .session
-                .rename(parent, &name, new_parent, &new_name, true)
+                .rename(
+                    parent,
+                    &name,
+                    new_parent,
+                    &new_name,
+                    !replace.unwrap_or(false),
+                )
                 .await
+        })
+    }
+
+    /// What `path` was in each snapshot (see raft5fs-client's `versions`):
+    /// `{now, versions, unreadable}`. `now` is the path now, or null if
+    /// nothing is there. Each version is `{snapshot, taken, modified, size,
+    /// kind, path}`, newest first, with times in milliseconds since the Unix
+    /// epoch and `path` where it is under `.snapshot`. `unreadable` counts
+    /// snapshots that couldn't be read.
+    pub fn versions(&self, path: String) -> Promise {
+        #[derive(Serialize)]
+        struct Found {
+            snapshot: String,
+            taken: f64,
+            modified: f64,
+            size: Option<u64>,
+            kind: &'static str,
+            path: String,
+        }
+        #[derive(Serialize)]
+        struct Versions {
+            now: Option<Entry>,
+            versions: Vec<Found>,
+            unreadable: usize,
+        }
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let path = format!("/{}", path.trim_matches('/'));
+            let now = match inner.resolve(&path).await {
+                Ok(attr) => Some(attr),
+                Err(e) if e.errno == errno::ENOENT => None,
+                Err(e) => return Err(e),
+            };
+            let snapshots = inner.vault().remote().list_snapshots().await?;
+            let (found, unreadable) = versions::find(snapshots, |name| {
+                let inner = Rc::clone(&inner);
+                let at = format!("/.snapshot/{name}{path}");
+                async move { inner.resolve(&at).await }
+            })
+            .await;
+            let ms = |t: std::time::SystemTime| {
+                t.duration_since(UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_millis() as f64)
+            };
+            let name = OsStr::new(path.rsplit('/').next().unwrap_or_default());
+            Ok(Versions {
+                now: now.as_ref().map(|attr| Entry::new(name, attr)),
+                versions: versions::collapse(now.as_ref(), found)
+                    .into_iter()
+                    .map(|v| {
+                        let entry = Entry::new(name, &v.attr);
+                        Found {
+                            path: format!("/.snapshot/{}{path}", v.snapshot),
+                            snapshot: v.snapshot,
+                            taken: ms(v.taken),
+                            modified: entry.modified,
+                            size: entry.size,
+                            kind: entry.kind,
+                        }
+                    })
+                    .collect(),
+                unreadable,
+            })
         })
     }
 

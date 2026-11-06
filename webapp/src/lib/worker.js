@@ -350,7 +350,8 @@ const methods = {
   sharingHere: (path) => session().sharingHere(path),
   mkdir: (path) => session().mkdir(path),
   remove: (path) => session().remove(path),
-  rename: (from, to) => session().rename(from, to),
+  rename: (from, to, replace) => session().rename(from, to, replace),
+  versions: (path) => session().versions(path),
   copy: (from, to) => session().copy(from, to),
 
   /// Writes `file` (a File) to `path`, a piece at a time.

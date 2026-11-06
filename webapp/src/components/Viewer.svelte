@@ -12,7 +12,7 @@
   import Dialog from "./Dialog.svelte";
   import { kindOf, mimeOf } from "../lib/previews.js";
 
-  let { fs, path, streams = null, ondownload, onclose, onmedia = () => {} } = $props();
+  let { fs, path, streams = null, ondownload, onversions = null, onclose, onmedia = () => {} } = $props();
   const MAX_TEXT = 1 << 20;
   const name = path.slice(path.lastIndexOf("/") + 1);
   // svelte-ignore state_referenced_locally
@@ -115,6 +115,7 @@
   {/if}
   <p>
     <button class="primary" onclick={ondownload}>Download</button>
+    {#if onversions}<button onclick={onversions}>Versions…</button>{/if}
     {#if url}<button onclick={openInTab}>Open in new tab</button>{/if}
     <button onclick={onclose}>Close</button>
   </p>

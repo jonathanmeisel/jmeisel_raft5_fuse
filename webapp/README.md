@@ -41,6 +41,11 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   it asks the page, whose Worker decrypts. Where service workers aren't
   available (Firefox's private windows, say), files are decrypted whole
   into memory instead, with size limits.
+- `src/components/Versions.svelte`: **Versions…** on a file or folder
+  lists what it was in each snapshot (the wasm `versions`, one row for each
+  distinct version), and opens, downloads or restores one: as a copy beside
+  it, or in place of the file. On a cluster, snapshots are hourly for a day
+  and daily for a week (`deploy/README.md`).
 - Groups: a share's label can hold a `/`, and `CS101/notes` shows inside a
   `CS101` folder that exists only in that person's view, up to 8 names deep.
   Only a share from someone checked joins a group; until then it shows as

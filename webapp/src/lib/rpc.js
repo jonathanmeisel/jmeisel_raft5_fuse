@@ -54,7 +54,8 @@ export function connect({ onStorageError } = {}) {
     sharingHere: (path) => call("sharingHere", [path]),
     mkdir: (path) => call("mkdir", [path]),
     remove: (path) => call("remove", [path]),
-    rename: (from, to) => call("rename", [from, to]),
+    rename: (from, to, replace) => call("rename", [from, to, !!replace]),
+    versions: (path) => call("versions", [path]),
     copy: (from, to) => call("copy", [from, to]),
     upload: (path, file, overwrite, progress, key) =>
       call("upload", [path, file, overwrite, key], progress),

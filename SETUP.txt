@@ -653,9 +653,21 @@ under that as it stood -- including volumes and files deleted since.
 What was shared with them only later isn't there; what was taken back
 since still is. Nothing in a snapshot can be changed: it is read-only.
 
+To see what one file or folder was in each snapshot:
+
+  raft5fs versions photos/cat.jpg
+
+It lists each version once (snapshots that hold the same one are one
+line), with where it is under .snapshot. It looks each snapshot up at the
+same path, so a file renamed since isn't found in older ones. The web
+app's Versions... does the same, and opens, downloads or restores one: as
+a copy beside it, or in place of the file.
+
 What it costs: until it is removed, a snapshot keeps every version of
 everything changed or deleted since it was taken, so the store grows
-with every change. The store holds at most 32 at once.
+with every change. The store holds at most 32 at once. A cluster set up
+with deploy/ takes one each hour and keeps a day of them, and one each
+day for a week (deploy/README.md, "Snapshots").
 
 
 -------------------------------------------------------------------------

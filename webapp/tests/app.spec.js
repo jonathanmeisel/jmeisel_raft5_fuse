@@ -1298,6 +1298,82 @@ test("shares group into one folder for each student", async ({ browser }) => {
   expect(problems.flat()).toEqual([]);
 });
 
+test("a file's versions come from the snapshots, and can be put back", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "sam");
+  await login(page, "sam");
+  const snapshot = async (name) => {
+    const answer = await fetch(`${REISSUE}/snapshot/${name}`);
+    expect(answer.status, await answer.text()).toBe(200);
+  };
+  // Uploading over a file asks first.
+  page.on("dialog", (d) => d.accept());
+  const put = async (name, text) => {
+    await page.locator("input[type=file]").setInputFiles([
+      { name, mimeType: "text/plain", buffer: Buffer.from(text) },
+    ]);
+    await expect(page.getByText(/Uploading/)).toHaveCount(0, SLOW);
+  };
+  await addFolder(page, "notes");
+  await open(page, "notes");
+  await addFolder(page, "drafts");
+  await put("a.txt", "one");
+  await expect(item(page, "a.txt")).toBeVisible(SLOW);
+  // Two snapshots of the same version, then a new version in each of two more.
+  await snapshot("sam-1");
+  await snapshot("sam-2");
+  await page.waitForTimeout(1100);
+  await put("a.txt", "two!");
+  await snapshot("sam-3");
+  await page.waitForTimeout(1100);
+  await put("a.txt", "three!!");
+
+  // One row for each version, newest first; the one there now is "Now".
+  await menu(page, "a.txt", "Versions…");
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Now")).toBeVisible(SLOW);
+  await expect(dialog.getByRole("button", { name: "Restore…" })).toHaveCount(2);
+  await expect(dialog.getByText("4 bytes")).toBeVisible();
+  await expect(dialog.getByText("3 bytes")).toBeVisible();
+
+  // Open shows it, and closing goes back to the list.
+  await dialog.getByRole("button", { name: "Open" }).nth(1).click();
+  await expect(page.getByText("one", { exact: true })).toBeVisible(SLOW);
+  await page.getByRole("button", { name: "Close" }).first().click();
+  await expect(page.getByRole("dialog").getByText("Now")).toBeVisible(SLOW);
+
+  // Download gives that version.
+  const [saved] = await Promise.all([
+    page.waitForEvent("download", SLOW),
+    page.getByRole("dialog").getByRole("button", { name: "Download" }).nth(1).click(),
+  ]);
+  expect(readFileSync(await saved.path(), "utf8")).toBe("one");
+
+  // As a copy, beside it, with the current file as it was.
+  await page.getByRole("dialog").getByRole("button", { name: "Restore…" }).first().click();
+  await page.getByRole("button", { name: "As a copy" }).click();
+  await expect(page.getByText(/Restored a\.txt as it was at .*, as a \(as of .*\)\.txt\./)).toBeVisible(SLOW);
+  const copy = page.locator(".wx-filemanager").getByText(/^a \(as of .*\)\.txt$/).first();
+  await expect(copy).toBeVisible(SLOW);
+  expect((await download(page, await copy.textContent())).toString()).toBe("two!");
+  expect((await download(page, "a.txt")).toString()).toBe("three!!");
+
+  // Or in place of the current file.
+  await menu(page, "a.txt", "Versions…");
+  await page.getByRole("dialog").getByRole("button", { name: "Restore…" }).nth(1).click();
+  await page.getByRole("button", { name: "Replace the current file" }).click();
+  await expect(page.getByText(/Put back a\.txt as it was at/)).toBeVisible(SLOW);
+  expect((await download(page, "a.txt")).toString()).toBe("one");
+
+  // A folder has one version for each snapshot it is in, and opens there.
+  await menu(page, "drafts", "Versions…");
+  await expect(page.getByRole("dialog").getByRole("button", { name: "Restore…" })).toHaveCount(3, SLOW);
+  await page.getByRole("dialog").getByRole("button", { name: "Open" }).first().click();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/.snapshot/sam-3/notes/drafts");
+
+  expect(problems).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

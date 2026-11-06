@@ -20,6 +20,7 @@
   import People from "./People.svelte";
   import TransferDialog from "./TransferDialog.svelte";
   import LimitDialog from "./LimitDialog.svelte";
+  import Versions from "./Versions.svelte";
   import { sizeText } from "../lib/sizes.js";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
@@ -623,6 +624,8 @@
   /// root's folders, and only folders are shared.
   function menuOptions(mode, item) {
     const options = getMenuOptions(mode);
+    const versions = { id: "versions", text: "Versions…", icon: "wxi-sync", handler: () => (dialog = { kind: "versions", path: item.id }) };
+    if (mode === "file" && item && !item.id.startsWith("/.snapshot")) return [...options, versions];
     if (mode === "add") {
       return [
         ...options,
@@ -640,6 +643,7 @@
     if (item.id.startsWith("/.snapshot") || item.group) return [zip, ...(item.group ? [] : options)];
     return [
       zip,
+      ...(item.top ? [] : [versions]),
       ...options,
       { comp: "separator" },
       { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
@@ -853,6 +857,28 @@
     streams={streaming}
     onmedia={(on) => (playing = on)}
     ondownload={() => act(() => download(dialog.path), [])}
+    onversions={visitor || dialog.path.startsWith("/.snapshot") ? null : () => (dialog = { kind: "versions", path: dialog.path })}
+    onclose={() => (dialog = dialog.back ?? null)}
+  />
+{:else if dialog?.kind === "versions"}
+  <Versions
+    {fs}
+    path={dialog.path}
+    free={freeName}
+    onopen={(version) => {
+      if (version.kind === "folder") {
+        dialog = null;
+        goTo(version.path);
+      } else {
+        dialog = { kind: "view", path: version.path, back: dialog };
+      }
+    }}
+    ondownload={(version) =>
+      act(() => (version.kind === "folder" ? downloadZip([version.path]) : download(version.path)), [])}
+    onrestored={(dir, text) => {
+      notice = text;
+      reload(dir);
+    }}
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "share"}

@@ -387,3 +387,50 @@ fn groups_show_in_a_mount_and_in_snapshots() {
     assert_errno(fs::write(then.join("CS101/x"), b"no"), libc::EROFS);
     h.drop_snapshot("s1");
 }
+
+/// Versions as the CLI finds them: each snapshot's vault looks the path up,
+/// and snapshots holding the same version count once.
+#[test]
+fn versions_come_from_the_snapshots_by_path() {
+    use raft5fs_client::versions;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let h = support::setup();
+    let file = h.path().join("a.txt");
+    fs::write(&file, b"one").unwrap();
+    h.snapshot("v1");
+    h.snapshot("v2");
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::write(&file, b"two!").unwrap();
+    h.snapshot("v3");
+    std::thread::sleep(Duration::from_millis(1100));
+    // Saved as editors do: a new file renamed over the old one.
+    fs::write(h.path().join("a.txt.new"), b"three!!").unwrap();
+    fs::rename(h.path().join("a.txt.new"), &file).unwrap();
+
+    let me = vault(&h, support::TESTER);
+    let rt = &h.runtime;
+    let path = format!("{}/a.txt", support::VOLUME);
+    let now = rt
+        .block_on(me.remote().getattr(rt.block_on(me.resolve(&path)).unwrap()))
+        .unwrap();
+    let snapshots = rt.block_on(me.remote().list_snapshots()).unwrap();
+    let space = AtomicU64::new(1);
+    let (found, unreadable) = rt.block_on(versions::find(snapshots, |name| {
+        let snap = me.at_snapshot(&name, space.fetch_add(1, Ordering::Relaxed));
+        let path = path.clone();
+        async move {
+            let ino = snap.resolve(&path).await?;
+            snap.remote().getattr(ino).await
+        }
+    }));
+    assert_eq!(unreadable, 0);
+    let shown = versions::collapse(Some(&now), found);
+    let names: Vec<(&str, u64)> = shown
+        .iter()
+        .map(|v| (v.snapshot.as_str(), v.attr.size))
+        .collect();
+    assert_eq!(names, [("v3", 4), ("v2", 3)]);
+    for name in ["v1", "v2", "v3"] {
+        h.drop_snapshot(name);
+    }
+}
