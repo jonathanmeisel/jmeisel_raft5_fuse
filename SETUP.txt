@@ -657,9 +657,9 @@ To see who changed what in a folder lately, newest first:
 
   raft5fs activity photos
 
-The servers keep this for 7 days. The web app's Activity... in a folder's
-menu shows the same, and Versions... shows a file's changes between its
-versions.
+The servers keep this for 7 days. In the web app, History in a folder's
+menu shows the same as its Activity tab, and a file's History shows its
+changes between its versions.
 
 To see what one file or folder was in each snapshot:
 
@@ -668,7 +668,7 @@ To see what one file or folder was in each snapshot:
 It lists each version once (snapshots that hold the same one are one
 line), with where it is under .snapshot. It looks each snapshot up at the
 same path, so a file renamed since isn't found in older ones. The web
-app's Versions... does the same, and opens, downloads or restores one: as
+app's History does the same, and opens, downloads or restores one: as
 a copy beside it, or in place of the file.
 
 What it costs: until it is removed, a snapshot keeps every version of
@@ -712,7 +712,7 @@ They can see:
     its sender in the clear), and who reads and writes which inodes, and
     when. They keep who created, edited, renamed or deleted what for 7
     days (raft5fs-server --activity-days), as the activity log that anyone
-    who can read a folder sees (raft5fs activity, or Activity... in the web
+    who can read a folder sees (raft5fs activity, or Activity in the web
     app). Its names are sealed as the folders' are. The servers vouch for
     who did what: nothing in it is signed;
   - the names of snapshots, which are chosen in the clear;

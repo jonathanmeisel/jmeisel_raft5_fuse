@@ -41,19 +41,25 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   it asks the page, whose Worker decrypts. Where service workers aren't
   available (Firefox's private windows, say), files are decrypted whole
   into memory instead, with size limits.
-- `src/components/Versions.svelte`: **Versions…** on a file or folder
+- The right-click menu keeps to what is used most. **History** opens a
+  file's versions, or a folder's versions and activity as two tabs
+  (`HistoryTabs.svelte`). A folder's **More** opens a panel with Size limit,
+  Show as, Transfer ownership and Prune again. It is a panel, not a submenu,
+  because SVAR's submenus open only on hover, which a phone doesn't have.
+- `src/components/Versions.svelte`: **History** on a file or folder
   lists what it was in each snapshot (the wasm `versions`, one row for each
   distinct version), and opens, downloads or restores one: as a copy beside
   it, or in place of the file. On a cluster, snapshots are hourly for a day
   and daily for a week (`deploy/README.md`).
-- `src/components/Activity.svelte`: **Activity…** on a folder lists who
+- `src/components/Activity.svelte`: the **Activity** tab of a folder's
+  History lists who
   created, edited, renamed, moved or deleted what in it, newest first (the
   wasm `activity`). The servers keep it for 7 days. A name opens its
   versions.
 - Groups: a share's label can hold a `/`, and `CS101/notes` shows inside a
   `CS101` folder that exists only in that person's view, up to 8 names deep.
   Only a share from someone checked joins a group; until then it shows as
-  `CS101-notes`. **Show as…** (or renaming) in a share's menu changes it for
+  `CS101-notes`. **More → Show as** (or renaming) in a share's menu changes it for
   yourself. A group's menu only offers the ZIP.
 - `src/lib/folders.js` and `src/lib/zip.js`: folders. **Upload folder**, or
   dropping one, keeps its shape. A new folder that wouldn't fit is refused
@@ -78,16 +84,16 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   `links`.
 - Storage: the account menu shows what the account's top-level folders
   hold, and its quota. Folders show their size, as last measured, in the
-  size column (blank until measured). A folder's **Size limit…**
+  size column (blank until measured). A folder's **More → Size limit**
   (`LimitDialog.svelte`) shows its size, and lets the owner of its
   top-level folder, or an admin, cap it; the bar above the files says how
-  full a capped folder is. A top-level folder's **Transfer ownership…**
+  full a capped folder is. A top-level folder's **More → Transfer ownership**
   (`TransferDialog.svelte`) offers it to someone with read-write access,
   who sees a banner to accept or decline it. **Shared with…** names the
   owner, who can't be revoked.
 - Safety codes: what the command line calls a fingerprint, in words people can
   read to each other. `Fingerprint.svelte` shows one and `CodeInput.svelte`
-  takes one, checking each word as it's typed. A folder's **Sharing…**
+  takes one, checking each word as it's typed. A folder's **Sharing**
   (`SharedWith.svelte`) lists who has it and leads to sharing further
   (`ShareDialog.svelte`) and public links. **People** (`People.svelte`) lists
   whose code this account has checked, and **Shared with me**

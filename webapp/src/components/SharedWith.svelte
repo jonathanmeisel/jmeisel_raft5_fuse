@@ -10,7 +10,7 @@
   // change the folder can revoke one, as for a person.
   //
   // A top-level folder's owner keeps read-write access to it, so has no
-  // Revoke: they give it away first (Transfer ownership…).
+  // Revoke: they give it away first (Transfer ownership).
   import Dialog from "./Dialog.svelte";
   import LinkField from "./LinkField.svelte";
 

@@ -622,11 +622,20 @@
   }
 
   /// SVAR's menus, with sharing for folders. Volumes and shares are the
-  /// root's folders, and only folders are shared.
+  /// root's folders, and only folders are shared. What is used less is behind
+  /// More, so the menu stays short. More opens a panel, not a submenu: SVAR's
+  /// submenus open only on hover, so a phone couldn't reach one.
   function menuOptions(mode, item) {
     const options = getMenuOptions(mode);
-    const versions = { id: "versions", text: "Versions…", icon: "wxi-sync", handler: () => (dialog = { kind: "versions", path: item.id }) };
-    if (mode === "file" && item && !item.id.startsWith("/.snapshot")) return [...options, versions];
+    // A file's history is its versions, with the changes between them. A
+    // folder's has its activity too, as a tab.
+    const history = {
+      id: "history",
+      text: "History",
+      icon: "wxi-sync",
+      handler: () => (dialog = { kind: item.type === "folder" && item.top ? "activity" : "versions", path: item.id }),
+    };
+    if (mode === "file" && item && !item.id.startsWith("/.snapshot")) return [options[0], history, ...options.slice(1)];
     if (mode === "add") {
       return [
         ...options,
@@ -642,22 +651,29 @@
     if (mode !== "folder" || !item || item.id === "/" || item.id === "/.snapshot") return options;
     const zip = { id: "download-zip", text: "Download as ZIP", icon: "wxi-download", handler: () => act(() => downloadZip([item.id]), []) };
     if (item.id.startsWith("/.snapshot") || item.group) return [zip, ...(item.group ? [] : options)];
-    const activity = { id: "activity", text: "Activity…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "activity", path: item.id }) };
-    return [
-      zip,
-      ...(item.top ? [] : [versions]),
-      activity,
-      ...options,
-      { comp: "separator" },
-      { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
-      { id: "size-limit", text: "Size limit…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "limit", path: item.id }) },
+    const more = [
+      { text: "Size limit", open: () => (dialog = { kind: "limit", path: item.id }) },
       ...(item.top
         ? [
-            { id: "show-as", text: "Show as…", icon: "wxi-edit", handler: () => (dialog = { kind: "show-as", path: item.id, label: item.id.slice(1) }) },
-            { id: "transfer", text: "Transfer ownership…", icon: "wxi-account", handler: () => (dialog = { kind: "transfer", path: item.id }) },
+            { text: "Show as", open: () => (dialog = { kind: "show-as", path: item.id, label: item.id.slice(1) }) },
+            { text: "Transfer ownership", open: () => (dialog = { kind: "transfer", path: item.id }) },
           ]
         : []),
-      { id: "prune-again", text: "Prune again", icon: "wxi-sync", handler: () => pruneAgain(item.id) },
+      {
+        text: "Prune again",
+        open: () => {
+          dialog = null;
+          pruneAgain(item.id);
+        },
+      },
+    ];
+    return [
+      zip,
+      history,
+      ...options,
+      { comp: "separator" },
+      { id: "sharing", text: "Sharing", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
+      { id: "more", text: "More", icon: "wxi-dots-v", handler: () => (dialog = { kind: "more", path: item.id, more }) },
     ];
   }
 
@@ -863,11 +879,21 @@
     onversions={visitor || dialog.path.startsWith("/.snapshot") ? null : () => (dialog = { kind: "versions", path: dialog.path })}
     onclose={() => (dialog = dialog.back ?? null)}
   />
+{:else if dialog?.kind === "more"}
+  <Dialog title={nameOf(dialog.path)} onclose={() => (dialog = null)}>
+    <div class="more">
+      {#each dialog.more as choice (choice.text)}
+        <button onclick={choice.open}>{choice.text}</button>
+      {/each}
+    </div>
+    <p><button onclick={() => (dialog = null)}>Close</button></p>
+  </Dialog>
 {:else if dialog?.kind === "activity"}
   <Activity
     {fs}
     path={dialog.path}
     onversions={(path) => (dialog = { kind: "versions", path })}
+    ontab={api?.getFile(dialog.path)?.top ? null : () => (dialog = { kind: "versions", path: dialog.path })}
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "versions"}
@@ -875,6 +901,7 @@
     {fs}
     path={dialog.path}
     free={freeName}
+    ontab={api?.getFile(dialog.path)?.type === "folder" ? () => (dialog = { kind: "activity", path: dialog.path }) : null}
     onopen={(version) => {
       if (version.kind === "folder") {
         dialog = null;
@@ -978,4 +1005,5 @@
     background: var(--panel); border-bottom: 1px solid var(--border);
   }
   .fm { flex: 1; min-height: 0; }
+  .more { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 </style>

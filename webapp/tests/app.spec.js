@@ -184,8 +184,14 @@ async function download(page, name) {
 
 /// Opens folder `name`'s Sharing dialog, and chooses `action` in it, if any.
 async function sharing(page, name, action) {
-  await menu(page, name, "Sharing…");
+  await menu(page, name, "Sharing");
   if (action) await page.getByRole("button", { name: action, exact: true }).click();
+}
+
+/// Chooses `option` from More in folder `name`'s menu.
+async function more(page, name, option) {
+  await menu(page, name, "More");
+  await page.getByRole("dialog").getByRole("button", { name: option, exact: true }).click();
 }
 
 async function menu(page, name, option) {
@@ -776,7 +782,7 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
 
   await test.step("a size limit stops what would go over it", async () => {
     await addFolder(jack, "drop");
-    await menu(jack, "drop", "Size limit…");
+    await more(jack, "drop", "Size limit");
     await jack.getByLabel(/Limit, such as/).fill("1K");
     await jack.getByRole("button", { name: "Set limit" }).click();
     await expect(jack.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
@@ -796,7 +802,7 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await jack.getByText("My files").first().click();
     await expect(item(jack, "proj")).toBeVisible(SLOW);
     // Only to someone who can change it.
-    await menu(jack, "proj", "Transfer ownership…");
+    await more(jack, "proj", "Transfer ownership");
     await expect(jack.getByText("Share it with them read-write first", { exact: false })).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Close" }).click();
     await sharing(jack, "proj", "Share with someone");
@@ -806,7 +812,7 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await jack.getByRole("button", { name: "Share", exact: true }).click();
     await expect(jack.getByText(/Shared with kim/)).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Done" }).click();
-    await menu(jack, "proj", "Transfer ownership…");
+    await more(jack, "proj", "Transfer ownership");
     await expect(jack.getByLabel("Give it to")).toHaveValue("kim", SLOW);
     await jack.getByRole("button", { name: "Offer", exact: true }).click();
     await expect(jack.getByText(/Offered to kim/)).toBeVisible(SLOW);
@@ -1159,7 +1165,7 @@ test("a folder uploads with its folders, and downloads as a ZIP", async ({ page 
 
   // A new folder that wouldn't fit is refused before anything stays.
   await addFolder(page, "tiny");
-  await menu(page, "tiny", "Size limit…");
+  await more(page, "tiny", "Size limit");
   await page.getByLabel(/Limit, such as/).fill("1K");
   await page.getByRole("button", { name: "Set limit" }).click();
   await expect(page.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
@@ -1265,7 +1271,7 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await expect(item(quinn, "own notes")).toBeVisible(SLOW);
 
   // Someone can show a share their own way. Nobody else is affected.
-  await menu(quinn, "assignments", "Show as…");
+  await more(quinn, "assignments", "Show as");
   await quinn.getByLabel("What this folder shows up to you as").fill("Reading/CS101 work");
   await quinn.getByRole("button", { name: "Save" }).click();
   await expect(item(quinn, "assignments")).toHaveCount(0);
@@ -1274,7 +1280,7 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await open(quinn, "Reading");
   await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
   // The last share leaving a group ends it, and the view goes back to the root.
-  await menu(quinn, "CS101 work", "Show as…");
+  await more(quinn, "CS101 work", "Show as");
   await quinn.getByLabel("What this folder shows up to you as").fill("CS101 work");
   await quinn.getByRole("button", { name: "Save" }).click();
   await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
@@ -1329,7 +1335,7 @@ test("a file's versions come from the snapshots, and can be put back", async ({ 
   await put("a.txt", "three!!");
 
   // One row for each version, newest first; the one there now is "Now".
-  await menu(page, "a.txt", "Versions…");
+  await menu(page, "a.txt", "History");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText("Now")).toBeVisible(SLOW);
   await expect(dialog.getByRole("button", { name: "Restore…" })).toHaveCount(2);
@@ -1359,17 +1365,27 @@ test("a file's versions come from the snapshots, and can be put back", async ({ 
   expect((await download(page, "a.txt")).toString()).toBe("three!!");
 
   // Or in place of the current file.
-  await menu(page, "a.txt", "Versions…");
+  await menu(page, "a.txt", "History");
   await page.getByRole("dialog").getByRole("button", { name: "Restore…" }).nth(1).click();
   await page.getByRole("button", { name: "Replace the current file" }).click();
   await expect(page.getByText(/Put back a\.txt as it was at/)).toBeVisible(SLOW);
   expect((await download(page, "a.txt")).toString()).toBe("one");
 
   // A folder has one version for each snapshot it is in, and opens there.
-  await menu(page, "drafts", "Versions…");
+  await menu(page, "drafts", "History");
   await expect(page.getByRole("dialog").getByRole("button", { name: "Restore…" })).toHaveCount(3, SLOW);
   await page.getByRole("dialog").getByRole("button", { name: "Open" }).first().click();
   await expect.poll(() => new URL(page.url()).hash).toBe("#/.snapshot/sam-3/notes/drafts");
+
+  // A folder's history has its activity as a tab.
+  await page.getByText("My files").first().click();
+  await open(page, "notes");
+  await menu(page, "drafts", "History");
+  await page.getByRole("tab", { name: "Activity" }).click();
+  await expect(page.getByRole("dialog").getByText("Nothing has changed here lately.")).toBeVisible(SLOW);
+  await page.getByRole("tab", { name: "Versions" }).click();
+  await expect(page.getByRole("dialog").getByRole("button", { name: "Restore…" })).toHaveCount(3, SLOW);
+  await page.getByRole("button", { name: "Close" }).last().click();
 
   expect(problems).toEqual([]);
 });
@@ -1420,7 +1436,7 @@ test("a folder's activity says who changed what", async ({ browser }) => {
 
   // tom sees who did what, newest first.
   await tom.getByText("My files").first().click();
-  await menu(tom, "plans", "Activity…");
+  await menu(tom, "plans", "History");
   const log = tom.getByRole("dialog");
   const rows = log.getByRole("listitem");
   await expect(rows).toHaveCount(3, SLOW);
@@ -1436,7 +1452,7 @@ test("a folder's activity says who changed what", async ({ browser }) => {
 
   // uma sees the same log.
   await uma.getByText("My files").first().click();
-  await menu(uma, "plans", "Activity…");
+  await menu(uma, "plans", "History");
   await expect(uma.getByRole("dialog").getByRole("listitem")).toHaveCount(3, SLOW);
   await expect(uma.getByRole("dialog").getByText(/tom\s+created/)).toBeVisible();
 

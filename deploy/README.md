@@ -802,7 +802,7 @@ never send to a server. So:
 ```
 
 Every client shows snapshots read-only at `/.snapshot/<name>`, and the web
-app's **Versions…** lists what a file or folder was in each. Until it is
+app's **History** lists what a file or folder was in each. Until it is
 removed, a snapshot keeps every old version of everything changed since,
 and the store holds at most 32.
 

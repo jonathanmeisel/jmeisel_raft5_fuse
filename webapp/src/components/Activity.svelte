@@ -4,8 +4,10 @@
   // for a few days, and vouch for who did what. A name opens its versions.
   import Dialog from "./Dialog.svelte";
   import { when } from "../lib/when.js";
+  import HistoryTabs from "./HistoryTabs.svelte";
 
-  let { fs, path, onversions, onclose } = $props();
+  /// `ontab` shows the tabs to the folder's Versions.
+  let { fs, path, onversions, ontab = null, onclose } = $props();
   // svelte-ignore state_referenced_locally
   const name = path.slice(path.lastIndexOf("/") + 1);
   const base = (p) => p.slice(path.length + 1);
@@ -40,7 +42,8 @@
   {/if}
 {/snippet}
 
-<Dialog title={`${name}: activity`} wide {onclose}>
+<Dialog title={`${name}: history`} wide {onclose}>
+  {#if ontab}<HistoryTabs current="activity" {ontab} />{/if}
   {#if !loaded}
     <p class="note">Loading…</p>
   {:else if lines.length === 0 && !error}

@@ -115,7 +115,7 @@
   {/if}
   <p>
     <button class="primary" onclick={ondownload}>Download</button>
-    {#if onversions}<button onclick={onversions}>Versions…</button>{/if}
+    {#if onversions}<button onclick={onversions}>History</button>{/if}
     {#if url}<button onclick={openInTab}>Open in new tab</button>{/if}
     <button onclick={onclose}>Close</button>
   </p>
