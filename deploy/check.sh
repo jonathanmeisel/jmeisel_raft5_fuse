@@ -12,5 +12,6 @@ shellcheck -x ./*.sh unlock
 # The templates source files that exist only on the nodes (SC1091).
 shellcheck -s sh -e SC1091 templates/remote-install.sh templates/raft5fs-admin \
     templates/raft5-shell templates/raft5fs-cert-check templates/raft5fs-nightly-backup \
+    templates/raft5fs-snapshots \
     templates/raft5fs-web-cert
 echo "every script passes shellcheck"

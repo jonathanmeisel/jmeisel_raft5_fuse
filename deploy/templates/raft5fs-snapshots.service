@@ -1,0 +1,10 @@
+# Takes and prunes the hourly and daily snapshots (see raft5fs-snapshots).
+# Fails, shown in `systemctl --failed` and the journal, if a snapshot does.
+[Unit]
+Description=raft5fs hourly and daily snapshots
+After=raft5fs-server.service wg-quick@wg0.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/raft5fs-snapshots

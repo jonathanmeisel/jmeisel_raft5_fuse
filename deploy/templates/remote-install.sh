@@ -203,7 +203,10 @@ done
 for unit in raft5fs-nightly-backup.service raft5fs-nightly-backup.timer; do
     put "systemd/$unit" "/etc/systemd/system/$unit" 0644 root:root nightly-backup
 done
-for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup; do
+for unit in raft5fs-snapshots.service raft5fs-snapshots.timer; do
+    put "systemd/$unit" "/etc/systemd/system/$unit" 0644 root:root snapshots
+done
+for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup raft5fs-snapshots; do
     put "sbin/$script" "/usr/local/sbin/$script" 0755 root:root scripts
 done
 
@@ -294,6 +297,8 @@ has() { case " $changed " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Whether the nightly backup timer should run here.
 backups_wanted() { [ "$NIGHTLY_BACKUPS" = yes ] && [ -f raft5fs/backup.env ]; }
+# Whether the hourly snapshot timer should run here.
+snapshots_wanted() { [ "$SNAPSHOTS" = yes ]; }
 
 if $dry; then
     if backups_wanted && ! systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
@@ -301,6 +306,13 @@ if $dry; then
         would=true
     elif ! backups_wanted && systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
         say "would turn nightly backups off"
+        would=true
+    fi
+    if snapshots_wanted && ! systemctl is-enabled -q raft5fs-snapshots.timer 2>/dev/null; then
+        say "would turn hourly and daily snapshots on"
+        would=true
+    elif ! snapshots_wanted && systemctl is-enabled -q raft5fs-snapshots.timer 2>/dev/null; then
+        say "would turn hourly and daily snapshots off"
         would=true
     fi
     restarts=""
@@ -380,6 +392,12 @@ if backups_wanted; then
 elif systemctl is-enabled -q raft5fs-nightly-backup.timer 2>/dev/null; then
     say "turning nightly backups off"
     systemctl disable -q --now raft5fs-nightly-backup.timer
+fi
+if snapshots_wanted; then
+    systemctl enable -q --now raft5fs-snapshots.timer
+elif systemctl is-enabled -q raft5fs-snapshots.timer 2>/dev/null; then
+    say "turning hourly and daily snapshots off"
+    systemctl disable -q --now raft5fs-snapshots.timer
 fi
 
 if has raft5-server || ! systemctl is-active -q raft5-server; then

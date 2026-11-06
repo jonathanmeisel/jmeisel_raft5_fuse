@@ -1,13 +1,22 @@
 #!/bin/sh
-# raft5fs-nightly-backup: snapshots the filesystem and backs the snapshot
-# up to the backup space, as nightly-<date>, then keeps only the newest
-# @BACKUP_KEEP@ nightly backups. raft5fs-nightly-backup.timer runs it on every
+# raft5fs-nightly-backup: backs today's snapshot up to the backup space,
+# then keeps only the newest @BACKUP_KEEP@ nightly backups. With daily
+# snapshots on (raft5fs-snapshots), that is daily-<date>, which stays; it is
+# taken here if it isn't yet. With them off, it is nightly-<date>, taken
+# for the backup and removed after it. raft5fs-nightly-backup.timer runs it on every
 # node, a little apart. The first node to start does the work; the others
 # find it done or under way, and exit successfully. A real failure fails
 # the unit (`systemctl --failed`, the journal).
 set -eu
 keep=@BACKUP_KEEP@
-name=nightly-$(date -u +%F)
+daily=@SNAPSHOTS_DAILY@
+if [ "$daily" -gt 0 ]; then
+    name=daily-$(date -u +%F)
+    temporary=no
+else
+    name=nightly-$(date -u +%F)
+    temporary=yes
+fi
 admin=/usr/local/sbin/raft5fs-admin
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
@@ -52,14 +61,16 @@ else
     fi
 fi
 
-# The backup holds everything the snapshot did, so the snapshot can go.
-if names "$("$admin" snapshot list)" "$name"; then
+# The backup holds everything the snapshot did, so a snapshot taken only for
+# it can go. A daily one stays for raft5fs-snapshots to prune.
+if [ $temporary = yes ] && names "$("$admin" snapshot list)" "$name"; then
     run snapshot del "$name"
 fi
 
-# Old nightly backups, beyond the newest $keep. Names sort by date.
+# Old nightly backups, beyond the newest $keep, oldest first: sorted by the
+# date after the first -, because daily-* sorts before nightly-* by name.
 backups=$("$admin" backup list)
-printf '%s\n' "$backups" | cut -f1 | grep '^nightly-' | sort | head -n -"$keep" |
+printf '%s\n' "$backups" | cut -f1 | grep -E '^(nightly|daily)-' | sort -t- -k2 | head -n -"$keep" |
     while read -r old; do
         if ! run backup del "$old"; then
             said "another backup job is running" || exit 1

@@ -410,10 +410,11 @@ objects, so each copies only what is new.
 
 4. **Turn on nightly backups:** `NIGHTLY_BACKUPS=yes` (and `BACKUP_KEEP`,
    default 14), then `./install.sh --all`. Every node gets a timer, 03:00
-   UTC on the first node and 20 minutes later on each next. It snapshots
-   the filesystem as `nightly-<date>`, backs the snapshot up, removes the
-   snapshot, and deletes `nightly-*` backups beyond the newest
-   `BACKUP_KEEP`. The first node to run does the work; the others find it
+   UTC on the first node and 20 minutes later on each next. It backs up
+   that day's snapshot, `daily-<date>` (see "Snapshots"), taking it if it
+   isn't there yet, and deletes backups beyond the newest `BACKUP_KEEP`.
+   With daily snapshots off, it takes `nightly-<date>` for the backup and
+   removes it after. The first node to run does the work; the others find it
    done. A failure fails the unit (`./status.sh` shows it;
    `journalctl -u raft5fs-nightly-backup` says why).
 
@@ -800,9 +801,23 @@ never send to a server. So:
 ./fsadmin.sh snapshot del before-upgrade
 ```
 
-Every client shows snapshots read-only at `/.snapshot/<name>`. Until it
-is removed, a snapshot keeps every old version of everything changed
-since, and the store holds at most 32.
+Every client shows snapshots read-only at `/.snapshot/<name>`, and the web
+app's **Versions…** lists what a file or folder was in each. Until it is
+removed, a snapshot keeps every old version of everything changed since,
+and the store holds at most 32.
+
+Every node gets a timer that keeps recent ones: `hourly-<date>T<hour>` for
+the past `SNAPSHOTS_HOURLY` hours (default 24) and `daily-<date>` for the
+past `SNAPSHOTS_DAILY` days (default 7), both UTC. It runs a few minutes
+past each hour, 4 minutes apart on each node; the first node does the work.
+It removes only `hourly-*` and `daily-*` names, so snapshots taken by hand
+stay until you remove them. Together these may use at most 31, which leaves
+one to take by hand: take another and the store is full until one goes.
+`./status.sh` says when the newest hourly snapshot is over 2 hours old.
+
+What it costs: the store keeps every version of what changed in the past
+week. A file under `OBJECT_FROM` is in the store itself, on every node; a
+larger one keeps its old blocks in the bucket.
 
 ### Reboots and updates
 

@@ -44,9 +44,12 @@ echo "memfree=$(awk "/MemAvailable/ {print int(\$2 / 1024)}" /proc/meminfo)"
 echo "swap=$(awk "/SwapTotal/ {print int(\$2 / 1024)}" /proc/meminfo)"
 echo "nightly=$(systemctl is-enabled raft5fs-nightly-backup.timer 2>/dev/null || echo off)"
 echo "nightlyresult=$(systemctl show -p Result --value raft5fs-nightly-backup.service)"
+echo "snapjob=$(systemctl is-enabled raft5fs-snapshots.timer 2>/dev/null || echo off)"
+echo "snapresult=$(systemctl show -p Result --value raft5fs-snapshots.service)"
 if [ "${1:-}" = cluster ]; then
     if snaps=$(/usr/local/sbin/raft5fs-admin snapshot list 2>/dev/null); then
         echo "snapshots=$(printf "%s\n" "$snaps" | grep -c .)"
+        echo "hourlyat=$(printf "%s\n" "$snaps" | grep "^hourly-" | cut -f2 | sort -n | tail -1)"
     else
         echo "snapshots=?"
     fi
@@ -113,6 +116,11 @@ for node in $(node_names); do
     ((f[disk] < 80)) || problem "$node: disk ${f[disk]}% full"
     ((f[memfree] >= 150)) || notes+=("low memory")
     ((f[swap] > 0)) || notes+=("no swap")
+    if ((${SNAPSHOTS_HOURLY:-24} + ${SNAPSHOTS_DAILY:-7} > 0)); then
+        [[ ${f[snapjob]} == enabled ]] || problem "$node: snapshot timer is ${f[snapjob]}"
+        [[ ${f[snapresult]} == success ]] ||
+            problem "$node: last snapshot run: ${f[snapresult]} (journalctl -u raft5fs-snapshots)"
+    fi
     if [[ ${NIGHTLY_BACKUPS:-no} == yes ]]; then
         [[ ${f[nightly]} == enabled ]] || problem "$node: nightly backup timer is ${f[nightly]}"
         [[ ${f[nightlyresult]} == success ]] ||
@@ -125,18 +133,25 @@ for node in $(node_names); do
 
     if [[ $want == cluster ]]; then
         cluster_seen=true
-        cluster=("${f[snapshots]}" "${f[backups]}" "${f[newest]:-}")
+        cluster=("${f[snapshots]}" "${f[backups]}" "${f[newest]:-}" "${f[hourlyat]:-}")
     fi
 done
 
 echo
 if $cluster_seen; then
-    snapshots=${cluster[0]} backups=${cluster[1]} newest=${cluster[2]}
+    snapshots=${cluster[0]} backups=${cluster[1]} newest=${cluster[2]} hourly_at=${cluster[3]}
     if [[ $snapshots == "?" ]]; then
         problem "can't list snapshots"
     else
         echo "snapshots: $snapshots of 32"
-        ((snapshots < 28)) || problem "$snapshots snapshots: the store holds at most 32"
+        ((snapshots < 32)) || problem "$snapshots snapshots: the store is full, so the next one fails"
+        if ((${SNAPSHOTS_HOURLY:-24} > 0)); then
+            if [[ -z $hourly_at ]]; then
+                problem "no hourly snapshots, though they are on"
+            elif ((($(date +%s) - hourly_at) > 2 * 3600)); then
+                problem "the newest hourly snapshot is $((($(date +%s) - hourly_at) / 3600))h old"
+            fi
+        fi
     fi
     case $backups in
     none) echo "backups:   no backup space set up" ;;

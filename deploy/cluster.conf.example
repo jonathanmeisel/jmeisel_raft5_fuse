@@ -61,10 +61,16 @@ BACKUP_ENDPOINT=https://s3.eu-west-1.amazonaws.com
 BACKUP_REGION=eu-west-1
 BACKUP_PATH_STYLE=no
 BACKUP_PREFIX=raft5fs-backup/
-# Take a backup every night on the nodes, as nightly-<date>, and keep the
-# newest BACKUP_KEEP of them (README "Backup and recovery").
+# Take a backup every night on the nodes, of that day's snapshot, and keep
+# the newest BACKUP_KEEP of them (README "Backup and recovery").
 NIGHTLY_BACKUPS=no
 BACKUP_KEEP=14
+
+# How many hourly and daily snapshots to keep (README "Snapshots"): the past
+# day's hours and the past week's days. 0 for none of either. The store holds
+# 32, and these may use at most 31, which leaves one to take by hand.
+SNAPSHOTS_HOURLY=24
+SNAPSHOTS_DAILY=7
 
 # Hardening (README "Creating and deploying a new cluster", step 10).
 # ADMIN_USER is a sudo user that accepts the SSH keys in the cluster's

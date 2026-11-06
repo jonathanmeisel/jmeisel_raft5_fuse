@@ -1,0 +1,61 @@
+#!/bin/sh
+# raft5fs-snapshots: keeps recent snapshots, which every client shows
+# read-only at /.snapshot and which the web app's Versions reads. Each run:
+#
+# - takes hourly-<date>T<hour> (UTC), and daily-<date> if today has none;
+# - removes hourly-* beyond the newest @SNAPSHOTS_HOURLY@, and daily-* beyond
+#   the newest @SNAPSHOTS_DAILY@. Names sort by time. No other name is
+#   touched, so snapshots taken by hand stay.
+#
+# raft5fs-snapshots.timer runs it every hour on every node, a few minutes
+# apart. The first node to start does the work; the others find it done.
+# A real failure fails the unit (`systemctl --failed`, the journal).
+set -eu
+hourly=@SNAPSHOTS_HOURLY@
+daily=@SNAPSHOTS_DAILY@
+# Both can be set to try this script out against a stand-in.
+admin=${RAFT5FS_ADMIN:-/usr/local/sbin/raft5fs-admin}
+hour=${RAFT5FS_HOUR:-$(date -u +%FT%H)}
+day=${hour%T*}
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+# Runs raft5fs-admin, showing its output and keeping it in $out to look at.
+run() {
+    status=0
+    "$admin" "$@" >"$out" 2>&1 || status=$?
+    cat "$out"
+    return $status
+}
+
+said() { grep -q "$1" "$out"; }
+
+# The snapshots' names, one per line. Failing to list is a real failure.
+names() { "$admin" snapshot list | cut -f1; }
+
+# Takes snapshot $1, unless another node took it first.
+take() {
+    if names | grep -qx "$1"; then
+        return
+    fi
+    run snapshot create "$1" || said "already exists" || exit 1
+}
+
+# Removes $1-* beyond the newest $2. One that another node removed first
+# is no longer listed.
+prune() {
+    names | grep "^$1-" | sort | head -n -"$2" | while read -r old; do
+        if ! run snapshot del "$old"; then
+            names | grep -qx "$old" && exit 1
+        fi
+    done
+}
+
+if [ "$hourly" -gt 0 ]; then
+    take "hourly-$hour"
+fi
+if [ "$daily" -gt 0 ]; then
+    take "daily-$day"
+fi
+prune hourly "$hourly"
+prune daily "$daily"

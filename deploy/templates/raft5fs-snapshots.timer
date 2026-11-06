@@ -1,0 +1,11 @@
+# Runs raft5fs-snapshots every hour. Each node's minute is a little apart,
+# so one node does the work and the others find it done.
+[Unit]
+Description=raft5fs hourly and daily snapshots
+
+[Timer]
+OnCalendar=*-*-* *:@SNAPSHOT_MINUTE@:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -53,6 +53,13 @@ ADMIN_USER=${ADMIN_USER:-}
 SSH_HARDEN=${SSH_HARDEN:-no}
 NIGHTLY_BACKUPS=${NIGHTLY_BACKUPS:-no}
 BACKUP_KEEP=${BACKUP_KEEP:-14}
+SNAPSHOTS_HOURLY=${SNAPSHOTS_HOURLY:-24}
+SNAPSHOTS_DAILY=${SNAPSHOTS_DAILY:-7}
+[[ $SNAPSHOTS_HOURLY =~ ^[0-9]+$ && $SNAPSHOTS_DAILY =~ ^[0-9]+$ ]] ||
+    die "SNAPSHOTS_HOURLY and SNAPSHOTS_DAILY must be whole numbers (0 for none)"
+# The store holds 32: leave one for a snapshot taken by hand.
+((SNAPSHOTS_HOURLY + SNAPSHOTS_DAILY <= 31)) ||
+    die "SNAPSHOTS_HOURLY + SNAPSHOTS_DAILY must be at most 31: the store holds 32 snapshots, and one is left for taking by hand"
 SWAP_SIZE=${SWAP_SIZE:-}
 [[ -z $SWAP_SIZE || $SWAP_SIZE =~ ^[1-9][0-9]*[MG]$ ]] ||
     die "SWAP_SIZE ($SWAP_SIZE) must be a size like 512M or 1G"
@@ -87,6 +94,9 @@ fill() {
         -e "s|@WEB_OPTIONS@|$(web_options)|g" \
         -e "s|@BACKUP_KEEP@|$BACKUP_KEEP|g" \
         -e "s|@BACKUP_TIME@|$(backup_time "$2")|g" \
+        -e "s|@SNAPSHOTS_HOURLY@|$SNAPSHOTS_HOURLY|g" \
+        -e "s|@SNAPSHOTS_DAILY@|$SNAPSHOTS_DAILY|g" \
+        -e "s|@SNAPSHOT_MINUTE@|$(snapshot_minute "$2")|g" \
         "$DEPLOY/templates/$1"
 }
 
@@ -96,6 +106,14 @@ backup_time() {
     local i
     i=$(node_names | grep -nx -- "$1" | cut -d: -f1)
     printf '%02d:%02d:00' $((3 + (i - 1) * 20 / 60)) $(((i - 1) * 20 % 60))
+}
+
+# The minute of each hour when node $1 takes snapshots: 5 for the first
+# node, then 4 minutes later for each one after.
+snapshot_minute() {
+    local i
+    i=$(node_names | grep -nx -- "$1" | cut -d: -f1)
+    printf '%02d' $(((5 + (i - 1) * 4) % 60))
 }
 
 render() {
@@ -167,10 +185,12 @@ render() {
 
     for unit in raft5-server.service raft5fs-server.service \
         raft5fs-cert-check.service raft5fs-cert-check.timer \
-        raft5fs-nightly-backup.service raft5fs-nightly-backup.timer; do
+        raft5fs-nightly-backup.service raft5fs-nightly-backup.timer \
+        raft5fs-snapshots.service raft5fs-snapshots.timer; do
         fill "$unit" "$node" >"$dir/systemd/$unit"
     done
-    for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup; do
+    for script in raft5fs-admin raft5-shell raft5fs-cert-check raft5fs-nightly-backup \
+        raft5fs-snapshots; do
         fill "$script" "$node" >"$dir/sbin/$script"
     done
     fill remote-install.sh "$node" >"$dir/remote-install.sh"
@@ -202,6 +222,7 @@ render() {
         echo "ADMIN_USER=$ADMIN_USER"
         echo "SSH_HARDEN=$SSH_HARDEN"
         echo "NIGHTLY_BACKUPS=$NIGHTLY_BACKUPS"
+        echo "SNAPSHOTS=$( ((SNAPSHOTS_HOURLY + SNAPSHOTS_DAILY > 0)) && echo yes || echo no)"
         echo "SWAP_SIZE=$SWAP_SIZE"
         echo "WEB=$(web_enabled && echo yes || echo no)"
         echo "WEB_PORT=$WEB_PORT"
