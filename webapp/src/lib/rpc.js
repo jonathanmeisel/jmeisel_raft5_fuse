@@ -56,6 +56,7 @@ export function connect({ onStorageError } = {}) {
     remove: (path) => call("remove", [path]),
     rename: (from, to, replace) => call("rename", [from, to, !!replace]),
     versions: (path) => call("versions", [path]),
+    activity: (path, after) => call("activity", [path, after ?? null]),
     copy: (from, to) => call("copy", [from, to]),
     upload: (path, file, overwrite, progress, key) =>
       call("upload", [path, file, overwrite, key], progress),

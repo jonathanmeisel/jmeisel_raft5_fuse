@@ -49,11 +49,11 @@ use raft5fs_proto::pb::{
     Session, SetAttrRequest, SnapshotListResponse, WriteChunksRequest, WriteChunksResponse,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, FolderLimitRequest,
-    FolderSizesRequest, FolderSizesResponse, GrantLabelRequest, OfferListResponse,
-    OfferVolumeRequest, OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
-    SetQuotaRequest, StorageResponse, UnreachableListResponse, UserListResponse, UsernameRequest,
-    VolumeResponse,
+    ActivityRequest, ActivityResponse, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest,
+    FolderLimitRequest, FolderSizesRequest, FolderSizesResponse, GrantLabelRequest,
+    OfferListResponse, OfferVolumeRequest, OrphanListResponse, PinsResponse, PutPinsRequest,
+    SetCapabilitiesRequest, SetQuotaRequest, StorageResponse, UnreachableListResponse,
+    UserListResponse, UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use throttle::LoginThrottle;
@@ -824,6 +824,18 @@ impl Fs for FsService {
         let (caller, r) = self.caller(r).await?;
         let checked = self.core.check_room_for(&caller, r.ino, r.bytes).await;
         Ok(Response::new(checked.into()))
+    }
+
+    async fn list_activity(
+        &self,
+        r: Request<ActivityRequest>,
+    ) -> Result<Response<ActivityResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let page = self
+            .core
+            .activity(&caller, r.folder, &r.after, r.limit as usize)
+            .await;
+        Ok(Response::new(page.into()))
     }
 
     async fn set_grant_label(

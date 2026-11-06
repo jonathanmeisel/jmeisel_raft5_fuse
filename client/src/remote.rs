@@ -70,9 +70,9 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, CreateLinkAccountRequest,
-    FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest, PutPinsRequest,
-    SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    ActivityRequest, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest,
+    CreateLinkAccountRequest, FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest,
+    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
@@ -80,7 +80,8 @@ use raft5fs_proto::types::{
     SnapshotInfo,
 };
 use raft5fs_proto::types::{
-    FolderSize, LinkAccount, Offer, Orphan, Storage, Unreachable, UserEntry, VolumeInfo,
+    ActivityPage, FolderSize, LinkAccount, Offer, Orphan, Storage, Unreachable, UserEntry,
+    VolumeInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -1033,6 +1034,28 @@ impl Remote {
         self.call(Retry::Once, |mut c| {
             let req = req.clone();
             async move { c.create_volume(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// What changed in folder `ino` and below it, newest first, from where
+    /// `after` (a page's `next`) says.
+    pub async fn list_activity(
+        &self,
+        ino: u64,
+        after: &[u8],
+        limit: u32,
+    ) -> Result<ActivityPage, FsError> {
+        self.needs_protocol(9, "the activity log")?;
+        let req = ActivityRequest {
+            folder: ino,
+            after: after.to_vec(),
+            limit,
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.list_activity(req).await }
         })
         .await?
         .into_result()

@@ -46,6 +46,10 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   distinct version), and opens, downloads or restores one: as a copy beside
   it, or in place of the file. On a cluster, snapshots are hourly for a day
   and daily for a week (`deploy/README.md`).
+- `src/components/Activity.svelte`: **Activity…** on a folder lists who
+  created, edited, renamed, moved or deleted what in it, newest first (the
+  wasm `activity`). The servers keep it for 7 days. A name opens its
+  versions.
 - Groups: a share's label can hold a `/`, and `CS101/notes` shows inside a
   `CS101` folder that exists only in that person's view, up to 8 names deep.
   Only a share from someone checked joins a group; until then it shows as

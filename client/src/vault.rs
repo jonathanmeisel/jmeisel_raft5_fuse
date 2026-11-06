@@ -63,9 +63,11 @@ use raft5fs_proto::types::{
 use crate::chunk_cache::{ChunkCache, Lookup};
 use blocks::{BlockEdit, Rewritten};
 
+mod activity;
 mod blocks;
 mod prune;
 mod rollback;
+pub use activity::{ActivityLine, ActivityLines, Change};
 pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
@@ -210,6 +212,20 @@ impl Node {
             os_bytes::bytes(tag),
             os_bytes::bytes(name),
         )
+    }
+
+    /// Opens the name of `child` in this directory, `ino`, sealed as it is
+    /// filed under `tag`. It must name `child`.
+    fn open_entry(
+        &self,
+        ino: u64,
+        child: u64,
+        tag: &[u8],
+        sealed: &[u8],
+    ) -> Result<Vec<u8>, FsError> {
+        let version = sealed_version(sealed).map_err(|e| corrupt(ino, e))?;
+        let key = self.key_at(ino, version)?;
+        open_name(&key, &self.name_key, ino, child, tag, sealed).map_err(|e| corrupt(ino, e))
     }
 
     /// This node's key at `version`: the current key, or an older key from
@@ -1894,20 +1910,12 @@ impl Vault {
                 }
                 continue;
             }
-            let opened = sealed_version(&item.sealed_name)
-                .map_err(|e| corrupt(ino, e))
-                .and_then(|version| dir.key_at(ino, version))
-                .and_then(|key| {
-                    open_name(
-                        &key,
-                        &dir.name_key,
-                        ino,
-                        item.ino,
-                        os_bytes::bytes(&item.name),
-                        &item.sealed_name,
-                    )
-                    .map_err(|e| corrupt(ino, e))
-                });
+            let opened = dir.open_entry(
+                ino,
+                item.ino,
+                os_bytes::bytes(&item.name),
+                &item.sealed_name,
+            );
             match opened {
                 Ok(name) if !good_name(&name) => {
                     eprintln!("inode {ino}: a bad name for inode {}; left out", item.ino)

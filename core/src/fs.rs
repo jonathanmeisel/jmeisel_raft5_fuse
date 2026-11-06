@@ -14,9 +14,10 @@ use raft5fs_crypto::data::{CHUNK_OVERHEAD, TAG_LEN, sealed_version};
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_objstore::ObjectName;
 use raft5fs_proto::types::{
-    Attr, BlockRef, BlockUpload, BlockUrl, Caller, ChunkBody, ChunkWrite, Chunks, DirItem, FsError,
-    Grant, GrantedNode, KeyPath, Kind, Layout, NewNode, ObjectGrid, PreparedUpload,
-    RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr, WriteBody,
+    ActivityOp, Attr, BlockRef, BlockUpload, BlockUrl, Caller, ChunkBody, ChunkWrite, Chunks,
+    DirItem, FsError, Grant, GrantedNode, KeyPath, Kind, Layout, NewNode, ObjectGrid,
+    PreparedUpload, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedEntryName,
+    SealedMove, SetAttr, WriteBody,
 };
 
 use crate::entry::{Entry, decode_entry, encode_entry};
@@ -132,6 +133,7 @@ macro_rules! decide {
 }
 
 // After `decide!`, which they use.
+mod activity;
 mod unreachable;
 pub mod usage;
 pub(crate) mod volumes;
@@ -489,6 +491,8 @@ pub struct FsCore {
     paths: grants::Paths,
     /// This server's part of measuring usage (see `usage`).
     usage: usage::Usage,
+    /// This server's part of the activity log (see `activity`).
+    activity: activity::ActivityLog,
 }
 
 impl FsCore {
@@ -532,6 +536,7 @@ impl FsCore {
             objects: objects.map(Objects::new),
             paths: grants::Paths::default(),
             usage: usage::Usage::default(),
+            activity: activity::ActivityLog::default(),
         };
         core.ensure_root()
             .await
@@ -921,6 +926,9 @@ impl FsCore {
         .await??;
         if attr.kind == Kind::File {
             self.count(parent, change).await;
+            if changes.size.is_some() {
+                self.note_edit(caller, ino, parent).await;
+            }
         }
         Ok(attr)
     }
@@ -1037,7 +1045,20 @@ impl FsCore {
             Ok(Ok(entry.attr))
         })
         .await?;
-        self.release_if_failed(caller, new.ino, made).await
+        let made = self.release_if_failed(caller, new.ino, made).await;
+        if made.is_ok() {
+            let name = SealedEntryName {
+                parent,
+                tag: name.as_bytes().to_vec(),
+                sealed: new.sealed_name.clone(),
+            };
+            self.note(
+                caller,
+                activity::change(ActivityOp::Created, kind, new.ino, parent, Some(name)),
+            )
+            .await;
+        }
+        made
     }
 
     /// Passes `made` through. When a create failed for good (the name is
@@ -1209,10 +1230,13 @@ impl FsCore {
         guarded: u64,
     ) -> Result<(), FsError> {
         let dirent = &dirent_key(parent, name);
-        run_txn(&self.client, move |txn| async move {
+        let sealed = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, guarded, true).await?);
             let mut dir = decide!(modifiable_dir(&txn, parent).await?);
-            if named(&txn, dirent).await? != Some(ino) {
+            let Some(value) = txn.read_one(dirent).await?.value else {
+                return Ok(Err(enoent()));
+            };
+            if dirent_ino(&value) != ino {
                 return Ok(Err(enoent()));
             }
             let mut entry = decide!(live_entry(&txn, ino).await?);
@@ -1230,9 +1254,19 @@ impl FsCore {
             txn.write(&tombstone_key(ino), Some(&[1])).await?;
             touch_dir(&txn, &mut dir, now).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(Ok(dirent_sealed_name(&value).to_vec()))
         })
         .await??;
+        let gone = SealedEntryName {
+            parent,
+            tag: name.as_bytes().to_vec(),
+            sealed,
+        };
+        self.note(
+            caller,
+            activity::change(ActivityOp::Deleted, kind, ino, parent, Some(gone)),
+        )
+        .await;
         self.finish_removal(ino).await
     }
 
@@ -1261,7 +1295,7 @@ impl FsCore {
         check_sealed_size("a key record", &sealed.node_keys, MAX_SEALED_RECORD)?;
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
-        let replaced = run_txn(&self.client, move |txn| async move {
+        let (replaced, moved) = run_txn(&self.client, move |txn| async move {
             decide!(self.guard(&txn, caller, parent, true).await?);
             if new_parent != parent {
                 decide!(self.guard(&txn, caller, new_parent, true).await?);
@@ -1284,7 +1318,7 @@ impl FsCore {
                 None
             };
 
-            let Some(ino) = from_value.map(|b| dirent_ino(&b)) else {
+            let Some(ino) = from_value.as_deref().map(dirent_ino) else {
                 return Ok(Err(enoent()));
             };
             let target = to_value.map(|b| dirent_ino(&b));
@@ -1297,8 +1331,13 @@ impl FsCore {
             if target == Some(ino) {
                 // Two names for one inode: POSIX says to do nothing. With
                 // no hard links, only `rename(a, a)` gets here.
-                return Ok(Ok(None));
+                return Ok(Ok((None, None)));
             }
+            let old_sealed = from_value
+                .as_deref()
+                .map(dirent_sealed_name)
+                .unwrap_or_default()
+                .to_vec();
 
             let now = SystemTime::now();
             if let Some(victim_ino) = victim_ino {
@@ -1385,9 +1424,29 @@ impl FsCore {
                 touch_dir(&txn, dst_dir, now).await?;
             }
             txn.commit().await?;
-            Ok(Ok(target))
+            Ok(Ok((target, Some((old_sealed, moved.attr.kind)))))
         })
         .await??;
+        if let Some((old_sealed, kind)) = moved {
+            let mut renamed = activity::change(
+                ActivityOp::Renamed,
+                kind,
+                sealed.ino,
+                new_parent,
+                Some(SealedEntryName {
+                    parent: new_parent,
+                    tag: new_name.as_bytes().to_vec(),
+                    sealed: sealed.sealed_name.clone(),
+                }),
+            );
+            renamed.from = Some(SealedEntryName {
+                parent,
+                tag: name.as_bytes().to_vec(),
+                sealed: old_sealed,
+            });
+            renamed.replaced = replaced.is_some();
+            self.note(caller, renamed).await;
+        }
 
         if let Some(victim) = replaced {
             // The rename is done, whatever this returns. A failure here
@@ -1783,6 +1842,7 @@ impl FsCore {
         .await??;
         self.discard(dropped);
         self.count(parent, grown as i64).await;
+        self.note_edit(caller, ino, parent).await;
         Ok(attr)
     }
 
@@ -2455,10 +2515,13 @@ impl FsCore {
         })
         .await?;
         self.discard(dropped);
-        if let Some(entry) = entry
+        if let Some(entry) = &entry
             && entry.attr.kind == Kind::File
         {
             self.count(entry.parent, -(entry.attr.size as i64)).await;
+        }
+        if entry.is_some_and(|e| e.parent == ROOT_INO) {
+            self.forget_activity(ino).await;
         }
         Ok(())
     }

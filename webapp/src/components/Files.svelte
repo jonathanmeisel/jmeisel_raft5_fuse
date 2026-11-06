@@ -21,6 +21,7 @@
   import TransferDialog from "./TransferDialog.svelte";
   import LimitDialog from "./LimitDialog.svelte";
   import Versions from "./Versions.svelte";
+  import Activity from "./Activity.svelte";
   import { sizeText } from "../lib/sizes.js";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
@@ -641,9 +642,11 @@
     if (mode !== "folder" || !item || item.id === "/" || item.id === "/.snapshot") return options;
     const zip = { id: "download-zip", text: "Download as ZIP", icon: "wxi-download", handler: () => act(() => downloadZip([item.id]), []) };
     if (item.id.startsWith("/.snapshot") || item.group) return [zip, ...(item.group ? [] : options)];
+    const activity = { id: "activity", text: "Activity…", icon: "wxi-information-outline", handler: () => (dialog = { kind: "activity", path: item.id }) };
     return [
       zip,
       ...(item.top ? [] : [versions]),
+      activity,
       ...options,
       { comp: "separator" },
       { id: "sharing", text: "Sharing…", icon: "wxi-account", handler: () => (dialog = { kind: "shared-with", path: item.id }) },
@@ -859,6 +862,13 @@
     ondownload={() => act(() => download(dialog.path), [])}
     onversions={visitor || dialog.path.startsWith("/.snapshot") ? null : () => (dialog = { kind: "versions", path: dialog.path })}
     onclose={() => (dialog = dialog.back ?? null)}
+  />
+{:else if dialog?.kind === "activity"}
+  <Activity
+    {fs}
+    path={dialog.path}
+    onversions={(path) => (dialog = { kind: "versions", path })}
+    onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "versions"}
   <Versions

@@ -815,6 +815,12 @@ stay until you remove them. Together these may use at most 31, which leaves
 one to take by hand: take another and the store is full until one goes.
 `./status.sh` says when the newest hourly snapshot is over 2 hours old.
 
+Alongside them, the servers keep an activity log, who created, edited,
+renamed or deleted what, for 7 days (`raft5fs-server --activity-days`). The
+server that measures folder sizes removes older entries. It is small: a
+line for each change, and at most one every 10 minutes for each person
+editing a file.
+
 What it costs: the store keeps every version of what changed in the past
 week. A file under `OBJECT_FROM` is in the store itself, on every node; a
 larger one keeps its old blocks in the bucket.

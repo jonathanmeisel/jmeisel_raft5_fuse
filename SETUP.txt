@@ -653,6 +653,14 @@ under that as it stood -- including volumes and files deleted since.
 What was shared with them only later isn't there; what was taken back
 since still is. Nothing in a snapshot can be changed: it is read-only.
 
+To see who changed what in a folder lately, newest first:
+
+  raft5fs activity photos
+
+The servers keep this for 7 days. The web app's Activity... in a folder's
+menu shows the same, and Versions... shows a file's changes between its
+versions.
+
 To see what one file or folder was in each snapshot:
 
   raft5fs versions photos/cat.jpg
@@ -702,7 +710,11 @@ They can see:
     belongs to, and when it is read or written -- sealed contents only;
   - who is granted what, read-only or not, who made each grant (it names
     its sender in the clear), and who reads and writes which inodes, and
-    when;
+    when. They keep who created, edited, renamed or deleted what for 7
+    days (raft5fs-server --activity-days), as the activity log that anyone
+    who can read a folder sees (raft5fs activity, or Activity... in the web
+    app). Its names are sealed as the folders' are. The servers vouch for
+    who did what: nothing in it is signed;
   - the names of snapshots, which are chosen in the clear;
   - the tag each name is filed under. The tag of a name doesn't change
     when the directory's key does, so someone revoked who also got hold

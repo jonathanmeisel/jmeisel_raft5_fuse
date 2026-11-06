@@ -1374,6 +1374,75 @@ test("a file's versions come from the snapshots, and can be put back", async ({ 
   expect(problems).toEqual([]);
 });
 
+test("a folder's activity says who changed what", async ({ browser }) => {
+  const tom = await (await browser.newContext()).newPage();
+  const uma = await (await browser.newContext()).newPage();
+  const problems = [tom, uma].map(watch);
+  const tomWords = await enrol(tom, "tom");
+  const umaWords = await enrol(uma, "uma");
+  await login(tom, "tom");
+  await login(uma, "uma");
+  const comeBack = (page) => page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  // tom shares a folder with uma, who checks him back so she can write.
+  await addFolder(tom, "plans");
+  await sharing(tom, "plans", "Share with someone");
+  await tom.getByLabel("User", { exact: true }).fill("uma");
+  await tom.getByRole("button", { name: "Share", exact: true }).click();
+  await tom.getByLabel("uma's safety code").fill(umaWords);
+  await tom.getByRole("button", { name: "Share", exact: true }).click();
+  await expect(tom.getByText(/Shared with uma/)).toBeVisible(SLOW);
+  await tom.getByRole("button", { name: "Done" }).click();
+  await accountMenu(uma, "People");
+  await uma.getByRole("button", { name: "Check someone's safety code" }).click();
+  await uma.getByLabel("Their account name").fill("tom");
+  await uma.getByLabel("Their safety code").fill(tomWords);
+  await uma.getByRole("button", { name: "Check", exact: true }).click();
+  await expect(uma.getByRole("dialog").getByText("tom", { exact: true })).toBeVisible(SLOW);
+  await uma.getByRole("button", { name: "Close" }).click();
+  await comeBack(uma);
+
+  // Each changes something in it.
+  await open(tom, "plans");
+  await tom.locator("input[type=file]").setInputFiles([
+    { name: "list.txt", mimeType: "text/plain", buffer: Buffer.from("eggs") },
+  ]);
+  await expect(item(tom, "list.txt")).toBeVisible(SLOW);
+  await expect(item(uma, "plans")).toBeVisible(SLOW);
+  await open(uma, "plans");
+  await uma.locator("input[type=file]").setInputFiles([
+    { name: "trip.txt", mimeType: "text/plain", buffer: Buffer.from("beach") },
+  ]);
+  await expect(item(uma, "trip.txt")).toBeVisible(SLOW);
+  await menu(uma, "list.txt", "Delete");
+  await uma.locator(".wx-modal").getByRole("button", { name: "OK" }).click();
+  await expect(item(uma, "list.txt")).toHaveCount(0, SLOW);
+
+  // tom sees who did what, newest first.
+  await tom.getByText("My files").first().click();
+  await menu(tom, "plans", "Activity…");
+  const log = tom.getByRole("dialog");
+  const rows = log.getByRole("listitem");
+  await expect(rows).toHaveCount(3, SLOW);
+  await expect(rows.nth(0)).toContainText("uma deleted list.txt");
+  await expect(rows.nth(1)).toContainText("uma created trip.txt");
+  await expect(rows.nth(2)).toContainText("tom created list.txt");
+
+  // A name opens its versions, which show the change too.
+  await log.getByRole("button", { name: "trip.txt" }).click();
+  await expect(tom.getByRole("dialog").getByText("Now")).toBeVisible(SLOW);
+  await expect(tom.getByRole("dialog").getByText(/uma\s+created it/)).toBeVisible(SLOW);
+  await tom.getByRole("button", { name: "Close" }).last().click();
+
+  // uma sees the same log.
+  await uma.getByText("My files").first().click();
+  await menu(uma, "plans", "Activity…");
+  await expect(uma.getByRole("dialog").getByRole("listitem")).toHaveCount(3, SLOW);
+  await expect(uma.getByRole("dialog").getByText(/tom\s+created/)).toBeVisible();
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

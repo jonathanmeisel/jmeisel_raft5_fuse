@@ -4,6 +4,7 @@
   // week on a cluster that keeps them, so this is only as fine as they are.
   import Dialog from "./Dialog.svelte";
   import { sizeText } from "../lib/sizes.js";
+  import { when } from "../lib/when.js";
 
   let { fs, path, free, onopen, ondownload, onrestored, onclose } = $props();
   // svelte-ignore state_referenced_locally
@@ -17,27 +18,35 @@
   /// The version whose restore choices show.
   let restoring = $state(null);
 
+  /// The log's lines about this path, from its folder's log: who changed it.
+  let changes = $state([]);
+
   async function load() {
     try {
       found = await fs.versions(path);
     } catch (e) {
       error = e.message;
     }
+    if (dir === "/" || dir.startsWith("/.snapshot")) return;
+    try {
+      const page = await fs.activity(dir, null);
+      changes = page.lines.filter((l) => l.path === path || l.from === path);
+    } catch {
+      // No log (older servers), or none to see: the versions still show.
+    }
   }
   load();
 
+  /// The versions, and the changes between them, newest first.
+  const rows = $derived(
+    [
+      ...(found?.versions ?? []).map((version) => ({ at: version.taken, version })),
+      ...changes.map((change) => ({ at: change.at, change })),
+    ].sort((a, b) => b.at - a.at),
+  );
+
   const isFolder = $derived((found?.now?.kind ?? found?.versions[0]?.kind) === "folder");
 
-  /// "14:00" today, "yesterday 14:00", else "Nov 4 14:00".
-  function when(ms) {
-    const at = new Date(ms);
-    const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const day = new Date(at).setHours(0, 0, 0, 0);
-    const today = new Date().setHours(0, 0, 0, 0);
-    if (day === today) return time;
-    if (today - day === 24 * 3600 * 1000) return `yesterday ${time}`;
-    return `${at.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
-  }
 
   /// `report (as of Nov 4 14.00).docx`, from `report.docx`. No `:`, which some
   /// systems can't have in a name.
@@ -87,7 +96,18 @@
           {/if}
           <td></td>
         </tr>
-        {#each found.versions as version (version.snapshot)}
+        {#each rows as row (row.version?.snapshot ?? `change-${row.at}-${row.change.change}`)}
+          {#if row.change}
+            <tr class="change">
+              <td colspan="4">
+                {when(row.change.at)}: <strong>{row.change.user}</strong>
+                {row.change.change}{row.change.change === "renamed" || row.change.change === "moved"
+                  ? row.change.from === path ? " it away" : " it here"
+                  : " it"}
+              </td>
+            </tr>
+          {:else}
+          {@const version = row.version}
           <tr>
             <td>As of {when(version.taken)}</td>
             <td>{version.kind === "file" ? `edited ${when(version.modified)}` : ""}</td>
@@ -109,6 +129,7 @@
               </td>
             </tr>
           {/if}
+          {/if}
         {/each}
       </tbody>
     </table>
@@ -129,6 +150,7 @@
   table { width: 100%; border-collapse: collapse; }
   td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
   .now td { font-weight: 600; }
+  .change td { font-size: 0.9em; opacity: 0.8; }
   .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
   .restore { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 </style>

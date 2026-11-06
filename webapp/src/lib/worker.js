@@ -352,6 +352,7 @@ const methods = {
   remove: (path) => session().remove(path),
   rename: (from, to, replace) => session().rename(from, to, replace),
   versions: (path) => session().versions(path),
+  activity: (path, after) => session().activity(path, after ?? undefined),
   copy: (from, to) => session().copy(from, to),
 
   /// Writes `file` (a File) to `path`, a piece at a time.

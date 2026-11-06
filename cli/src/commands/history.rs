@@ -1,4 +1,5 @@
-//! What files were: `versions`, from the snapshots.
+//! What files were, and who changed them: `versions`, from the snapshots,
+//! and `activity`, from the servers' log.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,6 +44,58 @@ fn described(attr: &Attr) -> String {
         Kind::File => format!("edited {}, {} bytes", utc(attr.mtime), attr.size),
         Kind::Directory => format!("a folder, changed {}", utc(attr.mtime)),
     }
+}
+
+#[derive(Args)]
+pub struct ActivityArgs {
+    /// A folder, from the root, as a mount shows it.
+    pub path: String,
+    /// Every line the servers keep, not only the newest page.
+    #[arg(long)]
+    pub all: bool,
+}
+
+pub fn activity(connect: &ConnectArgs, args: ActivityArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    let failed = |e: FsError| format!("cannot read the activity in {}: {e}", args.path);
+    let ino = runtime
+        .block_on(vault.resolve(&args.path))
+        .map_err(failed)?;
+    let mut after = Vec::new();
+    let mut any = false;
+    loop {
+        let page = runtime
+            .block_on(vault.activity(ino, &after, 0))
+            .map_err(failed)?;
+        for line in &page.lines {
+            any = true;
+            let name = |n: &Option<String>| n.clone().unwrap_or_else(|| "(can't be named)".into());
+            let what = match &line.from {
+                Some(from) => format!("{from} -> {}", name(&line.name)),
+                None => name(&line.name),
+            };
+            println!(
+                "{}\t{}\t{}\t{what}",
+                utc(UNIX_EPOCH + std::time::Duration::from_millis(line.at_ms)),
+                line.user,
+                line.change.as_str()
+            );
+        }
+        if page.next.is_empty() {
+            break;
+        }
+        if !args.all {
+            println!("(more: --all)");
+            break;
+        }
+        after = page.next;
+    }
+    if !any {
+        println!("nothing has changed there lately");
+    }
+    Ok(0)
 }
 
 pub fn versions(connect: &ConnectArgs, args: PathArgs) -> Outcome {

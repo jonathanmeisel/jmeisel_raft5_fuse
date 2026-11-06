@@ -89,6 +89,10 @@ service Fs {
   // Replaces the sealed label of the caller's own grant of a directory. The
   // caller's key and access stay as they are.
   rpc SetGrantLabel(GrantLabelRequest) returns (EmptyResponse);
+  // What changed in a folder and below it, newest first, for the past few
+  // days: who created, edited, renamed or deleted what. Needs read access to
+  // the folder. Not for a public link.
+  rpc ListActivity(ActivityRequest) returns (ActivityResponse);
   // Makes a new top-level directory, granted read-write to its creator.
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume and every grant of it.
@@ -1015,6 +1019,53 @@ message OfferListResponse {
 message CheckRoomRequest {
   uint64 ino = 1;
   uint64 bytes = 2;
+}
+
+message ActivityRequest {
+  uint64 folder = 1;
+  // Where the page starts: a page's `next`, or empty for the newest.
+  bytes after = 2;
+  // How many entries at most.
+  uint32 limit = 3;
+}
+
+enum ActivityOp {
+  ACTIVITY_CREATED = 0;
+  ACTIVITY_EDITED = 1;
+  ACTIVITY_RENAMED = 2;
+  ACTIVITY_DELETED = 3;
+}
+
+message SealedEntryName {
+  uint64 parent = 1;
+  bytes tag = 2;
+  bytes sealed = 3;
+}
+
+message ActivityEntry {
+  uint64 at_ms = 1;
+  string user = 2;
+  ActivityOp op = 3;
+  Kind kind = 4;
+  uint64 ino = 5;
+  uint64 parent = 6;
+  SealedEntryName name = 7;
+  SealedEntryName from = 8;
+  bool replaced = 9;
+  bool moved_out = 10;
+  repeated uint64 path = 11;
+}
+
+message ActivityPage {
+  repeated ActivityEntry entries = 1;
+  bytes next = 2;
+}
+
+message ActivityResponse {
+  oneof result {
+    ActivityPage page = 1;
+    Error error = 2;
+  }
 }
 
 message GrantLabelRequest {

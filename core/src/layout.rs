@@ -125,6 +125,9 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x0D ++ ino(BE8)                    -> a folder's size, as last measured (`fs::usage`)
 //   0x0E ++ ino(BE8)                    -> a folder's size limit (`fs::usage`)
 //   0x06 ++ "q/" ++ username            -> how much the user's volumes hold (`fs::usage`)
+//   0x0F ++ volume(BE8) ++ (u64::MAX - time in ms)(BE8) ++ ino(BE8) ++ op(1)
+//                                       -> one change in that volume, newest first
+//                                          (`fs::activity`)
 //
 // **Deleting an inode** takes several transactions, because its chunks
 // cannot all fit in one. So the deletion is announced first:
@@ -187,6 +190,9 @@ pub(crate) const GRANT_INDEX_PREFIX: &[u8] = &[0x09];
 pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
 /// The prefix of every sealed grantee list; see `grants`.
 pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
+
+/// The prefix of the activity log; see `fs::activity`.
+pub(crate) const ACTIVITY_PREFIX: &[u8] = &[0x0F];
 
 /// The prefix of every volume record; see `fs::volumes`.
 pub(crate) const VOLUME_PREFIX: &[u8] = &[0x0C];

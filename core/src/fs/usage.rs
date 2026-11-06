@@ -231,7 +231,7 @@ impl FsCore {
     /// Folder `dir` and the folders above it, up to its volume; empty for
     /// the root or a folder no longer in the tree. Read again every
     /// `OWNER_TTL`, or after a move here.
-    async fn path_of(&self, dir: u64) -> Result<Arc<[u64]>, FsError> {
+    pub(super) async fn path_of(&self, dir: u64) -> Result<Arc<[u64]>, FsError> {
         if let Some((seen, path)) = self.usage.paths.lock().unwrap().get(&dir)
             && seen.elapsed() < OWNER_TTL
         {
@@ -713,6 +713,12 @@ impl FsCore {
             return Ok(None);
         }
         let measured = self.measure_held().await;
+        // The same lease keeps one server at trimming the activity log.
+        match self.trim_activity().await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("removed {n} activity log entries older than it keeps"),
+            Err(e) => eprintln!("trimming the activity log failed: {e}"),
+        }
         if let Err(e) = release_lease(&self.client, USAGE_LEASE_KEY, holder).await {
             eprintln!("{e}");
         }

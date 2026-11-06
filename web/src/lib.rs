@@ -415,6 +415,17 @@ struct Inner {
 }
 
 /// One entry of a listing.
+/// The bytes that `hex` spells, or `None` if it doesn't.
+fn from_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
@@ -1066,6 +1077,67 @@ impl Fs {
                     !replace.unwrap_or(false),
                 )
                 .await
+        })
+    }
+
+    /// What changed in folder `path` and below it, newest first, from where
+    /// `after` (a page's `next`) says: `{lines, next}`. Each line is `{at,
+    /// user, change, kind, path, from, replaced}`, with `at` in milliseconds
+    /// since the Unix epoch, and `path` and `from` from the root (null when a
+    /// name can't be opened). `next` is null at the end.
+    pub fn activity(&self, path: String, after: Option<String>) -> Promise {
+        #[derive(Serialize)]
+        struct Line {
+            at: f64,
+            user: String,
+            change: &'static str,
+            kind: &'static str,
+            path: Option<String>,
+            from: Option<String>,
+            replaced: bool,
+        }
+        #[derive(Serialize)]
+        struct Page {
+            lines: Vec<Line>,
+            next: Option<String>,
+        }
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let base = path.trim_end_matches('/').to_string();
+            if base.is_empty() || base.trim_start_matches('/').starts_with(".snapshot") {
+                return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
+            }
+            let ino = inner.resolve(&base).await?.ino;
+            if is_virtual(ino) {
+                return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
+            }
+            let after = match after {
+                Some(hex) => from_hex(&hex)
+                    .ok_or_else(|| FsError::new(errno::EINVAL, "that page can't be read"))?,
+                None => Vec::new(),
+            };
+            let page = inner.vault().activity(ino, &after, 0).await?;
+            let full = |name: Option<String>| name.map(|n| format!("{base}/{n}"));
+            Ok(Page {
+                lines: page
+                    .lines
+                    .into_iter()
+                    .map(|l| Line {
+                        at: l.at_ms as f64,
+                        user: l.user,
+                        change: l.change.as_str(),
+                        kind: match l.kind {
+                            Kind::File => "file",
+                            Kind::Directory => "folder",
+                        },
+                        path: full(l.name),
+                        from: full(l.from),
+                        replaced: l.replaced,
+                    })
+                    .collect(),
+                next: (!page.next.is_empty())
+                    .then(|| page.next.iter().map(|b| format!("{b:02x}")).collect()),
+            })
         })
     }
 

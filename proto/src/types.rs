@@ -603,6 +603,59 @@ pub struct FolderSize {
     pub limit: Option<u64>,
 }
 
+/// What a change in the activity log did (see `Activity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityOp {
+    Created,
+    Edited,
+    Renamed,
+    Deleted,
+}
+
+/// A name as a folder holds it: the tag it is filed under, and the name
+/// sealed under the folder's key. Only someone who can read the folder can
+/// open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedEntryName {
+    pub parent: u64,
+    pub tag: Vec<u8>,
+    pub sealed: Vec<u8>,
+}
+
+/// One change to a file or folder, as the servers saw it. The servers vouch
+/// for who and when: nothing here is signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    /// Milliseconds since the Unix epoch, by the server's clock.
+    pub at_ms: u64,
+    pub user: String,
+    pub op: ActivityOp,
+    pub kind: Kind,
+    pub ino: u64,
+    /// The folder it is in after the change.
+    pub parent: u64,
+    /// Its name there, for all but an edit.
+    pub name: Option<SealedEntryName>,
+    /// For a rename: where it was before.
+    pub from: Option<SealedEntryName>,
+    /// For a rename: whether it replaced something with that name.
+    pub replaced: bool,
+    /// For a rename: whether it went out of the folder asked about. `path`
+    /// is then to where it was.
+    pub moved_out: bool,
+    /// The folders from the one asked about down to where the change was,
+    /// not counting the one asked about: empty for a change in it.
+    pub path: Vec<u64>,
+}
+
+/// A page of the activity log, newest first, and where the next page
+/// starts: empty when there is no more.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActivityPage {
+    pub entries: Vec<Activity>,
+    pub next: Vec<u8>,
+}
+
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.
 pub const LINK_PREFIX: &str = "link-";

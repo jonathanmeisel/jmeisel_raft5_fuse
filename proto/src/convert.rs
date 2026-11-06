@@ -8,11 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::pb;
 use crate::types::{
-    AccountInfo, AccountKeys, AccountKind, Attr, BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl,
-    Caps, ChunkBody, ChunkWrite, Chunks, DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee,
-    KeyPath, Kind, Layout, LinkAccount, ObjectGrid, Offer, Orphan, PreparedUpload, ResealedName,
-    Rotation, SealedChunk, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry,
-    VolumeInfo, WriteBody,
+    AccountInfo, AccountKeys, AccountKind, Activity, ActivityOp, ActivityPage, Attr,
+    BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl, Caps, ChunkBody, ChunkWrite, Chunks,
+    DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind, Layout, LinkAccount,
+    ObjectGrid, Offer, Orphan, PreparedUpload, ResealedName, Rotation, SealedChunk,
+    SealedEntryName, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry, VolumeInfo,
+    WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -582,6 +583,107 @@ impl pb::StorageResponse {
             }),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("storage")),
+        }
+    }
+}
+
+impl From<ActivityOp> for pb::ActivityOp {
+    fn from(op: ActivityOp) -> Self {
+        match op {
+            ActivityOp::Created => Self::ActivityCreated,
+            ActivityOp::Edited => Self::ActivityEdited,
+            ActivityOp::Renamed => Self::ActivityRenamed,
+            ActivityOp::Deleted => Self::ActivityDeleted,
+        }
+    }
+}
+
+fn activity_op(raw: i32) -> ActivityOp {
+    match pb::ActivityOp::try_from(raw) {
+        Ok(pb::ActivityOp::ActivityEdited) => ActivityOp::Edited,
+        Ok(pb::ActivityOp::ActivityRenamed) => ActivityOp::Renamed,
+        Ok(pb::ActivityOp::ActivityDeleted) => ActivityOp::Deleted,
+        _ => ActivityOp::Created,
+    }
+}
+
+impl From<SealedEntryName> for pb::SealedEntryName {
+    fn from(n: SealedEntryName) -> Self {
+        Self {
+            parent: n.parent,
+            tag: n.tag,
+            sealed: n.sealed,
+        }
+    }
+}
+
+impl From<pb::SealedEntryName> for SealedEntryName {
+    fn from(n: pb::SealedEntryName) -> Self {
+        Self {
+            parent: n.parent,
+            tag: n.tag,
+            sealed: n.sealed,
+        }
+    }
+}
+
+impl From<Result<ActivityPage, FsError>> for pb::ActivityResponse {
+    fn from(r: Result<ActivityPage, FsError>) -> Self {
+        use pb::activity_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(page) => R::Page(pb::ActivityPage {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|a| pb::ActivityEntry {
+                            at_ms: a.at_ms,
+                            user: a.user,
+                            op: pb::ActivityOp::from(a.op).into(),
+                            kind: pb::Kind::from(a.kind).into(),
+                            ino: a.ino,
+                            parent: a.parent,
+                            name: a.name.map(Into::into),
+                            from: a.from.map(Into::into),
+                            replaced: a.replaced,
+                            moved_out: a.moved_out,
+                            path: a.path,
+                        })
+                        .collect(),
+                    next: page.next,
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::ActivityResponse {
+    pub fn into_result(self) -> Result<ActivityPage, FsError> {
+        use pb::activity_response::Result as R;
+        match self.result {
+            Some(R::Page(p)) => Ok(ActivityPage {
+                entries: p
+                    .entries
+                    .into_iter()
+                    .map(|a| Activity {
+                        at_ms: a.at_ms,
+                        user: a.user,
+                        op: activity_op(a.op),
+                        kind: kind(a.kind),
+                        ino: a.ino,
+                        parent: a.parent,
+                        name: a.name.map(Into::into),
+                        from: a.from.map(Into::into),
+                        replaced: a.replaced,
+                        moved_out: a.moved_out,
+                        path: a.path,
+                    })
+                    .collect(),
+                next: p.next,
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("activity")),
         }
     }
 }

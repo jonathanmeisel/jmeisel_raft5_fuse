@@ -77,6 +77,11 @@ Serving:
                        owner's usage (default 600; 0 never). One server
                        measures at a time; writes and deletions count
                        within a second anyway.
+  --activity-days <DAYS>
+                       how long to keep the log of who created, edited,
+                       renamed or deleted what (default 7; 0 keeps none).
+                       The measuring server (--usage-interval) removes
+                       older entries.
   --chunk-size <SIZE>  size of each stored file chunk, as a byte count or
                        with a K/M suffix (default 1M). Only applies when
                        creating a new filesystem: an existing one keeps
@@ -313,6 +318,7 @@ struct Args {
     object_ca: Option<String>,
     gc_interval: Option<Duration>,
     usage_interval: Option<Duration>,
+    activity_days: Option<u64>,
     no_prompt_delete: bool,
     backup_endpoint: Option<String>,
     backup_bucket: Option<String>,
@@ -417,6 +423,10 @@ fn parse_args() -> Args {
                     raft5fs_proto::types::parse_limit(&value("--quota"))
                         .unwrap_or_else(|why| usage(&why)),
                 );
+            }
+            "--activity-days" => {
+                a.activity_days =
+                    Some(parse_number("--activity-days", &value("--activity-days")).into());
             }
             "--usage-interval" => {
                 let secs = parse_number("--usage-interval", &value("--usage-interval"));
@@ -1031,7 +1041,7 @@ async fn serve_command(a: Args) {
 
     let objects = object_settings(&a);
     let client = store_client(&a, a.positional.clone()).await;
-    let core = FsCore::connect(client, chunk_size, objects)
+    let mut core = FsCore::connect(client, chunk_size, objects)
         .await
         .unwrap_or_else(|why| fail(format!("cannot open the filesystem: {why}")));
     if core.chunk_size() != chunk_size {
@@ -1058,6 +1068,9 @@ async fn serve_command(a: Args) {
         .unwrap_or_else(|e| usage(&format!("cannot listen on {listen}: {e}")));
     eprintln!("serving on {}", listener.local_addr().unwrap());
     let web = web_port(&a).await;
+    if let Some(days) = a.activity_days {
+        core.set_activity_days(days);
+    }
     let core = Arc::new(core);
     let gc_interval = a.gc_interval.unwrap_or(DEFAULT_GC_INTERVAL);
     if core.object_grid().is_some() && !gc_interval.is_zero() {

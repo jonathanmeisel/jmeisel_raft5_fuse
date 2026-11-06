@@ -137,6 +137,9 @@ pub enum Command {
     /// List what a file or folder was in each snapshot: where to find each
     /// version under .snapshot, and when it was edited.
     Versions(history::PathArgs),
+    /// What changed in a folder and below it lately, and who changed it,
+    /// newest first, as the servers keep it (a few days).
+    Activity(history::ActivityArgs),
     /// Show a share as something else, in your root only. A / puts it in a
     /// group: CS101/assignments shows inside a CS101 folder.
     Relabel(share::RelabelArgs),
@@ -174,6 +177,7 @@ pub fn run(cli: Cli) -> i32 {
         Command::ForgetKey(args) => share::forget_key(&cli.connect, args),
         Command::Relabel(args) => share::relabel(&cli.connect, args),
         Command::Versions(args) => history::versions(&cli.connect, args),
+        Command::Activity(args) => history::activity(&cli.connect, args),
         Command::ResetVersions => share::reset_versions(&cli.connect),
         Command::Pending => share::pending(&cli.connect),
         Command::Prune(args) => prune::run(&cli.connect, args),
