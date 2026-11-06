@@ -363,6 +363,20 @@ fn groups_show_in_a_mount_and_in_snapshots() {
     assert_errno(fs::remove_dir(&group), libc::ENOTEMPTY);
     assert_errno(fs::rename(&group, root.join("renamed")), libc::EPERM);
 
+    // A group goes when nothing shows in it, and a mount stops seeing it.
+    let bob = vault(&h, "bob");
+    rt.block_on(bob.relabel(notes, OsStr::new("alone")))
+        .unwrap();
+    rt.block_on(bob.relabel(work, OsStr::new("alone too")))
+        .unwrap();
+    assert_eq!(names(root), ["alone", "alone too"]);
+    assert_errno(fs::metadata(&group), libc::ENOENT);
+    rt.block_on(bob.relabel(notes, OsStr::new("CS101/notes")))
+        .unwrap();
+    rt.block_on(bob.relabel(work, OsStr::new("CS101/work")))
+        .unwrap();
+    assert_eq!(names(&group), ["notes", "work"]);
+
     // A snapshot shows the same groups, and what was in them.
     h.snapshot("s1");
     let then = root.join(".snapshot/s1");

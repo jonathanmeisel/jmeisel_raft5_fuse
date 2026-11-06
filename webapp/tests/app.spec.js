@@ -616,6 +616,14 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await expect(again.getByText("This link no longer works.")).toBeVisible(SLOW);
     await accountMenu(frank, "Public links");
     await expect(frank.getByText(/haven't made any public links/)).toBeVisible(SLOW);
+    await frank.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("gina's revoke sealed frank's grant again, but the folder stays his", async () => {
+    await frank.getByText("My files").first().click();
+    await open(frank, "public");
+    await expect(item(frank, "note.txt")).toBeVisible(SLOW);
+    await expect(frank.getByText(/Shared with you by/)).toHaveCount(0);
   });
 
   expect(problems.flat()).toEqual([]);
@@ -1189,6 +1197,7 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await sharing(rosa, "assignments", "Share with someone");
   await rosa.getByLabel("User", { exact: true }).fill("quinn");
   await rosa.getByLabel("What this folder will show up to shared user as").fill("CS101/assignments");
+  await rosa.getByLabel("Read-only").check();
   await rosa.getByRole("button", { name: "Share", exact: true }).click();
   await rosa.getByLabel("quinn's safety code").fill(quinnWords);
   await rosa.getByRole("button", { name: "Share", exact: true }).click();
@@ -1226,6 +1235,8 @@ test("shares group into one folder for each student", async ({ browser }) => {
   // Each share works as itself, and its address names the group.
   await open(quinn, "quinn");
   await expect.poll(() => new URL(quinn.url()).hash).toBe("#/CS101/quinn");
+  // Read-write or not, it says who shared it.
+  await expect(quinn.getByText("Shared with you by rosa.")).toBeVisible(SLOW);
   await quinn.locator("input[type=file]").setInputFiles([
     { name: "essay.txt", mimeType: "text/plain", buffer: Buffer.from("my essay") },
   ]);
@@ -1234,6 +1245,11 @@ test("shares group into one folder for each student", async ({ browser }) => {
   // The teacher sees it in the real folder, under its real name.
   await open(rosa, "quinn");
   await expect(item(rosa, "essay.txt")).toBeVisible(SLOW);
+
+  await quinn.getByText("CS101", { exact: true }).first().click();
+  await expect.poll(() => sharedMark(quinn, "quinn"), SLOW).toBe("people");
+  await open(quinn, "assignments");
+  await expect(quinn.getByText("Shared with you by rosa, read-only.")).toBeVisible(SLOW);
 
   // A group is only a place: its menu has no rename or delete, and a folder
   // made in it is a top-level folder of its own.
@@ -1257,6 +1273,13 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await expect(item(quinn, "Reading")).toBeVisible(SLOW);
   await open(quinn, "Reading");
   await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
+  // The last share leaving a group ends it, and the view goes back to the root.
+  await menu(quinn, "CS101 work", "Show as…");
+  await quinn.getByLabel("What this folder shows up to you as").fill("CS101 work");
+  await quinn.getByRole("button", { name: "Save" }).click();
+  await expect(item(quinn, "CS101 work")).toBeVisible(SLOW);
+  await expect(item(quinn, "CS101")).toBeVisible(SLOW);
+  await expect(item(quinn, "Reading")).toHaveCount(0);
   await rosa.getByText("My files").first().click();
   await open(rosa, "class");
   await expect(item(rosa, "assignments")).toBeVisible(SLOW);

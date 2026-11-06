@@ -1,10 +1,9 @@
 <script>
   // A line above the files saying how the open folder is shared: with
   // whom, whether by public link, and through which folder, when the
-  // sharing was set up on a folder above it. For a folder in a top-level
-  // folder that this account can only read, who shared it, and whether
-  // this account can still change it (a read-write share inside a
-  // read-only one). `here` is the Worker's `sharingHere`. It
+  // sharing was set up on a folder above it. For a folder under a share made
+  // to this account, who shared it, and whether this account can change it.
+  // `here` is the Worker's `sharingHere`. It
   // also names the top-level folder's owner, if someone else, and, for a
   // folder with a size limit (`limited`, the Worker's `folderSize`), how
   // full it is.
@@ -35,18 +34,15 @@
   <div class="sharing-bar">
     {#if here}<img src={markUrl(link ? "link" : "people")} alt="" width="22" height="22" />{/if}
     <div class="text">
-      {#if !here}
-        <!-- Only a size limit to show. -->
-      {:else if here.from}
+      {#if here?.from}
         <p class="source">Shared with you by <strong>{here.from}</strong>{here.writable ? "" : ", read-only"}.</p>
-      {:else}
-        {#each here.sources as source}
-          <p class="source">
-            {what(source)}{#if source.path !== current}{" "}through <strong>{folder(source.path)}</strong>{/if}.
-            <button class="details" onclick={() => ondetails(source.path)}>Details</button>
-          </p>
-        {/each}
       {/if}
+      {#each here?.sources ?? [] as source}
+        <p class="source">
+          {what(source)}{#if source.path !== current}{" "}through <strong>{folder(source.path)}</strong>{/if}.
+          <button class="details" onclick={() => ondetails(source.path)}>Details</button>
+        </p>
+      {/each}
       {#if here?.owner}<p class="source">Owned by <strong>{here.owner}</strong>.</p>{/if}
       {#if limited}
         <p class="source">
