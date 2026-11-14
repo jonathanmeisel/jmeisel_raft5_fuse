@@ -389,3 +389,158 @@ fn looking_at_a_file_being_written_uploads_each_block_once() {
     );
     assert_eq!(rt.block_on(session.read(ino, 0, data.len())).unwrap(), data);
 }
+
+/// The servers' count of requests from `session`, snapshots included.
+fn requests(session: &Session) -> u64 {
+    session.vault().remote().requests()
+}
+
+#[test]
+fn a_listed_folder_resolves_with_no_round_trip() {
+    let s = Setup::with(|c| c.path_ttl = std::time::Duration::from_secs(60));
+    let d = s
+        .block(s.session.mkdir(s.volume, OsStr::new("d"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = s
+        .block(s.session.mkdir(d, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    // As the web app does: each folder is listed before it is opened.
+    for dir in [VIRTUAL_ROOT, s.volume, d] {
+        s.block(s.session.readdir(dir)).unwrap();
+    }
+    let before = requests(&s.session);
+    assert_eq!(s.block(s.session.resolve_ino(b"/v/d/sub")).unwrap(), sub);
+    assert_eq!(requests(&s.session), before);
+}
+
+#[test]
+fn a_stale_inode_resolves_fresh() {
+    let s = Setup::with(|c| c.path_ttl = std::time::Duration::from_secs(60));
+    let d = s
+        .block(s.session.mkdir(s.volume, OsStr::new("d"), 0o755))
+        .unwrap()
+        .ino;
+    let keep = s
+        .block(s.session.mkdir(s.volume, OsStr::new("keep"), 0o755))
+        .unwrap()
+        .ino;
+    s.block(s.session.readdir(s.volume)).unwrap();
+
+    // Another client replaces `d`, under the name that this client
+    // remembers.
+    let other = open(&s.backend, |_| {});
+    s.block(other.rmdir(s.volume, OsStr::new("d"))).unwrap();
+    let new_d = s
+        .block(other.mkdir(s.volume, OsStr::new("d"), 0o755))
+        .unwrap()
+        .ino;
+
+    // The remembered inode is the old one, and using it finds it gone.
+    let stale = s.block(s.session.resolve_ino(b"/v/d")).unwrap();
+    assert_eq!(stale, d);
+    assert_eq!(errno(s.block(s.session.readdir(stale))), libc::ENOENT);
+    assert_eq!(
+        s.block(s.session.resolve_ino_fresh(b"/v/d")).unwrap(),
+        new_d
+    );
+    // Only that path was looked up again.
+    let before = requests(&s.session);
+    assert_eq!(s.block(s.session.resolve_ino(b"/v/keep")).unwrap(), keep);
+    assert_eq!(requests(&s.session), before);
+}
+
+/// Writes `data` over the start of file `ino` and stores it.
+fn write_now(s: &Setup, ino: u64, data: &[u8]) {
+    s.block(s.session.write(ino, 0, data)).unwrap();
+    s.block(s.session.release(ino)).unwrap();
+}
+
+#[test]
+fn versions_come_from_the_same_folder_in_each_snapshot() {
+    let s = Setup::new();
+    let d = s
+        .block(s.session.mkdir(s.volume, OsStr::new("d"), 0o755))
+        .unwrap()
+        .ino;
+    let f = s
+        .block(s.session.create(d, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    write_now(&s, f, b"one");
+    s.backend.snapshot("s1");
+    write_now(&s, f, b"two!");
+    s.backend.snapshot("s2");
+    write_now(&s, f, b"three");
+    // The folder is renamed since: its versions are still found.
+    s.block(
+        s.session
+            .rename(s.volume, OsStr::new("d"), s.volume, OsStr::new("e"), true),
+    )
+    .unwrap();
+
+    let before = requests(&s.session);
+    let found = s.block(s.session.versions(b"/v/e/f")).unwrap();
+    let sent = requests(&s.session) - before;
+    assert_eq!(found.now.unwrap().size, 5);
+    let sizes: Vec<u64> = found.versions.iter().map(|v| v.attr.size).collect();
+    let names: Vec<&str> = found.versions.iter().map(|v| v.snapshot.as_str()).collect();
+    assert_eq!(names, ["s2", "s1"]);
+    assert_eq!(sizes, [4, 3]);
+    assert_eq!(found.unreadable, 0);
+    // One for each name on the path and one for the snapshots, at once;
+    // at most one for the folder's key; then one lookup in each snapshot.
+    assert!(sent <= 3 + 1 + 1 + 2, "versions sent {sent} requests");
+
+    // What a version's number names reads as it was.
+    let s1 = &found.versions[1];
+    assert_eq!(s.block(s.session.read(s1.attr.ino, 0, 10)).unwrap(), b"one");
+
+    // A file made after every snapshot has no versions, and that isn't a
+    // failure to read them.
+    s.block(s.session.create(d, OsStr::new("new"), 0o644))
+        .unwrap();
+    let found = s.block(s.session.versions(b"/v/e/new")).unwrap();
+    assert!(found.versions.is_empty());
+    assert_eq!(found.unreadable, 0);
+}
+
+#[test]
+fn a_volumes_versions_are_found_by_path() {
+    let s = Setup::new();
+    s.backend.snapshot("s1");
+    s.backend.snapshot("s2");
+    let found = s.block(s.session.versions(b"/v")).unwrap();
+    assert_eq!(found.versions.len(), 2);
+    assert_eq!(found.unreadable, 0);
+    assert_eq!(errno(s.block(s.session.versions(b"/"))), libc::EINVAL);
+}
+
+#[test]
+fn versions_open_under_a_folder_key_rotated_since() {
+    let s = Setup::new();
+    s.backend.enrol("bob");
+    let f = s
+        .block(s.session.create(s.volume, OsStr::new("f"), 0o644))
+        .unwrap()
+        .ino;
+    write_now(&s, f, b"old");
+    s.block(
+        s.session
+            .vault()
+            .grant(s.volume, "bob", true, OsStr::new("v")),
+    )
+    .unwrap();
+    s.backend.snapshot("s1");
+    // Revoking rotates the volume's key, so the snapshot's names are
+    // sealed under a key older than the one this session holds.
+    s.block(s.session.vault().revoke(s.volume, "bob")).unwrap();
+    write_now(&s, f, b"newer");
+
+    let found = s.block(s.session.versions(b"/v/f")).unwrap();
+    assert_eq!(found.unreadable, 0);
+    let names: Vec<&str> = found.versions.iter().map(|v| v.snapshot.as_str()).collect();
+    assert_eq!(names, ["s1"]);
+    assert_eq!(found.versions[0].attr.size, 3);
+}

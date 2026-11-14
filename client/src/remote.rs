@@ -208,6 +208,9 @@ pub struct Remote {
     /// How many chunks were asked for. Tests of the client's cache check
     /// that the cache keeps this low.
     chunk_reads: AtomicU64,
+    /// How many requests were sent, each attempt counted. Shared with the
+    /// clients that `at` makes, so tests can count what a view costs.
+    requests: Arc<AtomicU64>,
     session: Session,
     /// Where to start: the last server that answered.
     current: AtomicUsize,
@@ -388,6 +391,7 @@ impl Remote {
             min_kdf: credentials.min_kdf,
             identity: RwLock::new(None),
             chunk_reads: AtomicU64::new(0),
+            requests: Arc::default(),
             session,
             current: AtomicUsize::new(0),
             chunk_size: 0,
@@ -503,6 +507,7 @@ impl Remote {
             min_kdf: self.min_kdf,
             identity: RwLock::new(self.identity()),
             chunk_reads: AtomicU64::new(0),
+            requests: Arc::clone(&self.requests),
             session: Arc::clone(&self.session),
             current: AtomicUsize::new(self.current.load(Ordering::Relaxed)),
             chunk_size: self.chunk_size,
@@ -535,6 +540,12 @@ impl Remote {
     /// unchanged ones.
     pub fn chunk_reads(&self) -> u64 {
         self.chunk_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many requests went through `call`, here and in the clients
+    /// that `at` made from this one. Each attempt counts once.
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// Logs in on whichever server answers, and keeps the session for every
@@ -698,6 +709,7 @@ impl Remote {
         for attempt in 0..n {
             let i = (start + attempt) % n;
             let (address, client) = &self.servers[i];
+            self.requests.fetch_add(1, Ordering::Relaxed);
             let mut outcome = request(client.clone()).await;
             // The only status about the request and not the server: the
             // session is not valid. Renew it once for each call (a request
@@ -711,6 +723,7 @@ impl Remote {
             {
                 renewed = true;
                 self.login().await?;
+                self.requests.fetch_add(1, Ordering::Relaxed);
                 outcome = request(client.clone()).await;
             }
             match outcome {

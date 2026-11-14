@@ -1363,6 +1363,15 @@ impl Vault {
 
     /// Returns `ino`'s key. If it is not known yet, unwraps it from this
     /// account's grant.
+    /// Takes `node`, the live key of directory `ino`, as this snapshot
+    /// vault's key for it, unless it has one. The live key opens every
+    /// older version of the directory's names too, and its name key never
+    /// changes, so names sealed at the snapshot still open. A name sealed
+    /// under a key newer than `node` makes `lookup` fetch the snapshot's own.
+    pub(crate) fn adopt(&self, ino: u64, node: Arc<Node>) {
+        self.nodes.lock().unwrap().entry(ino).or_insert(node);
+    }
+
     pub async fn node(&self, ino: u64) -> Result<Arc<Node>, FsError> {
         if let Some(node) = self.nodes.lock().unwrap().get(&ino) {
             return Ok(Arc::clone(node));
@@ -1887,8 +1896,9 @@ impl Vault {
     ///   open or does not match its tag. The directory's key holders did
     ///   not make that entry.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
-        let items = self.remote.readdir(ino).await?;
-        let mut dir = self.node(ino).await?;
+        // Neither needs the other, so they share one round trip.
+        let (items, mut dir) =
+            futures_util::future::try_join(self.remote.readdir(ino), self.node(ino)).await?;
         // A name sealed under a newer key than the one known here means
         // that another client rotated the key.
         let newest = items

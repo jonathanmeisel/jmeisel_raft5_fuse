@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
-use crate::paths::Dentries;
+use crate::paths::{DEFAULT_PATH_TTL, Dentries};
 use crate::prune_queue::PruneQueue;
 use crate::pruner::{self, PrunerConfig};
 use crate::remote::ClientTlsConfig;
@@ -76,6 +76,9 @@ pub struct SessionConfig {
     /// it. Otherwise each one is one more node sealed and stored next to
     /// every file that its user only looks at.
     pub hide_apple_double: bool,
+    /// How long a name resolved by path is trusted (see `paths`). Longer
+    /// saves round trips; shorter shows other clients' renames sooner.
+    pub path_ttl: Duration,
 }
 
 impl SessionConfig {
@@ -89,6 +92,7 @@ impl SessionConfig {
             prune_queue: None,
             write_buffering: true,
             hide_apple_double: false,
+            path_ttl: DEFAULT_PATH_TTL,
         }
     }
 }
@@ -143,7 +147,7 @@ pub struct Session {
     write_buffering: bool,
     hide_apple_double: bool,
     /// `/.snapshot` and everything below it.
-    snapshots: SnapshotTree,
+    pub(crate) snapshots: SnapshotTree,
     /// Names resolved by path, for front ends that use paths.
     pub(crate) dentries: Dentries,
 }
@@ -206,7 +210,7 @@ impl Session {
             write_buffering: config.write_buffering,
             hide_apple_double: config.hide_apple_double,
             snapshots: SnapshotTree::new(opened_at),
-            dentries: Dentries::default(),
+            dentries: Dentries::new(config.path_ttl),
         }))
     }
 
@@ -730,8 +734,20 @@ impl Session {
         self.vault.batch_at(ino, offset).await
     }
 
-    /// A directory's entries, including `.` and `..`.
+    /// A directory's entries, including `.` and `..`. The names are kept
+    /// for resolving paths (see `paths`), so opening one of them by path
+    /// needs no round trip.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        let items = self.list(ino).await?;
+        for item in &items {
+            if item.name != "." && item.name != ".." {
+                self.dentries.put(ino, &item.name, item.ino);
+            }
+        }
+        Ok(items)
+    }
+
+    async fn list(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         if is_snapshot_ino(ino) {
             return self.snapshots.readdir(&self.vault, VIRTUAL_ROOT, ino).await;
         }

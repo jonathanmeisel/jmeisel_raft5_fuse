@@ -415,8 +415,8 @@ fn versions_come_from_the_snapshots_by_path() {
         .unwrap();
     let snapshots = rt.block_on(me.remote().list_snapshots()).unwrap();
     let space = AtomicU64::new(1);
-    let (found, unreadable) = rt.block_on(versions::find(snapshots, |name| {
-        let snap = me.at_snapshot(&name, space.fetch_add(1, Ordering::Relaxed));
+    let (found, unreadable) = rt.block_on(versions::find(snapshots, |info| {
+        let snap = me.at_snapshot(&info.name, space.fetch_add(1, Ordering::Relaxed));
         let path = path.clone();
         async move {
             let ino = snap.resolve(&path).await?;

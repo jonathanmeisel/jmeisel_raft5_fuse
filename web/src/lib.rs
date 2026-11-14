@@ -31,7 +31,6 @@ use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
 use raft5fs_client::vault::{KnownKeys, ShareTrust, VIRTUAL_ROOT, Vault, is_group, is_virtual};
-use raft5fs_client::versions;
 use raft5fs_crypto::identity::{
     PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
 };
@@ -366,6 +365,10 @@ async fn open(
     let mut session_config = SessionConfig::new(config.servers.clone(), credentials);
     session_config.tls = config.tls();
     session_config.known_keys = Some(known);
+    // Every listing renews the names it shows, and the app lists the open
+    // folder again each minute, so a remembered name is no older than the
+    // screen. Each name not looked up again saves a round trip.
+    session_config.path_ttl = PATH_TTL;
     let session = Session::open(session_config).await.map_err(fs_failure)?;
     let protocol = session.vault().remote().protocol();
     if protocol < MIN_SERVER_PROTOCOL {
@@ -389,6 +392,8 @@ async fn open(
         handles: RefCell::new(HashMap::new()),
         next_handle: Cell::new(1),
         sharing: RefCell::new(HashMap::new()),
+        grants: RefCell::new(None),
+        version_paths: RefCell::new(HashMap::new()),
     })))
 }
 
@@ -412,6 +417,11 @@ struct Inner {
     /// Each volume's sharing, by inode, and when it was read (see
     /// `sharing`). Any share or revoke here empties it.
     sharing: RefCell<HashMap<u64, (f64, Option<Sharing>)>>,
+    /// This account's grants, and when they were read (see `grants`).
+    grants: RefCell<Option<(f64, Rc<Vec<Grant>>)>>,
+    /// The session's inode for each version path that `versions` gave, so
+    /// that a version opens even if its folder had another name then.
+    version_paths: RefCell<HashMap<String, u64>>,
 }
 
 /// One entry of a listing.
@@ -432,7 +442,7 @@ struct Entry {
     name: String,
     /// `file` or `folder`.
     kind: &'static str,
-    /// A file's size; a folder's, as last measured (see `mark_sizes`), or
+    /// A file's size; a folder's, as last measured (see `folder_sizes`), or
     /// none.
     size: Option<u64>,
     /// Milliseconds since the Unix epoch.
@@ -560,7 +570,15 @@ fn caps_named(names: &[String]) -> Result<Caps, FsError> {
 }
 
 /// How long a volume's sharing, as `Inner::sharing` reads it, is reused.
+/// This account's grants (`Inner::grants`) are reused as long.
 const SHARING_TTL_MS: f64 = 30_000.0;
+
+/// How long a name resolved by path is trusted (see `SessionConfig`).
+const PATH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many version paths `Inner::version_paths` keeps before it starts
+/// again.
+const MAX_VERSION_PATHS: usize = 1000;
 
 /// Whom a node with `grantees` is shared with besides `me`, if anyone.
 fn sharing_of(grantees: &[raft5fs_proto::types::Grantee], me: &str) -> Option<NodeSharing> {
@@ -609,48 +627,66 @@ impl Inner {
         known
     }
 
-    /// Marks the folders among `entries` (of directory `path`) that are
-    /// shared. A top-level folder that this account can't list the grants
-    /// of was shared with it by someone else.
-    async fn mark_shared(&self, path: &str, entries: &mut [Entry]) -> Result<(), FsError> {
+    /// This account's grants, with one for each of `inos`. They are read
+    /// again once they are `SHARING_TTL_MS` old, or if one of `inos` has
+    /// none: each is a grant this account has, so the list is older than
+    /// that grant. None if the servers can't say. Only for showing.
+    async fn grants(&self, inos: &[u64]) -> Rc<Vec<Grant>> {
+        let now = js_sys::Date::now();
+        if let Some((at, grants)) = &*self.grants.borrow()
+            && now - at < SHARING_TTL_MS
+            && inos.iter().all(|ino| grants.iter().any(|g| g.ino == *ino))
+        {
+            return Rc::clone(grants);
+        }
+        match self.vault().remote().list_grants().await {
+            Ok(grants) => {
+                let grants = Rc::new(grants);
+                *self.grants.borrow_mut() = Some((now, Rc::clone(&grants)));
+                grants
+            }
+            Err(_) => Rc::default(),
+        }
+    }
+
+    /// How each of `folders` (inodes in directory `path`) is shown shared
+    /// (see `Entry::shared`), by inode. A top-level folder that this
+    /// account can't list the grants of was shared with it by someone else.
+    async fn shared_marks(
+        &self,
+        path: &str,
+        folders: &[u64],
+    ) -> Result<HashMap<u64, &'static str>, FsError> {
         let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
         if names.first() == Some(&".snapshot") {
-            return Ok(());
+            return Ok(HashMap::new());
         }
-        let Some(depth) = self.top_depth(&names).await? else {
-            let folders: Vec<&mut Entry> = entries
-                .iter_mut()
-                .filter(|e| e.kind == "folder" && e.name != ".snapshot" && !e.group)
-                .collect();
-            let grants = self
-                .vault()
-                .remote()
-                .list_grants()
-                .await
-                .unwrap_or_default();
-            let known = join_all(folders.iter().map(|e| self.sharing(e.ino))).await;
-            let senders = join_all(folders.iter().map(|e| self.shared_by(e.ino, &grants))).await;
-            for ((entry, known), sender) in folders.into_iter().zip(known).zip(senders) {
-                entry.shared = match known {
+        let Some((_, volume)) = self.top(&names).await? else {
+            let grants = self.grants(folders).await;
+            let known = join_all(folders.iter().map(|&ino| self.sharing(ino))).await;
+            let senders = join_all(folders.iter().map(|&ino| self.shared_by(ino, &grants))).await;
+            let mut marks = HashMap::new();
+            for ((&ino, known), sender) in folders.iter().zip(known).zip(senders) {
+                let mark = match known {
                     Some(known) => known
-                        .get(&entry.ino)
+                        .get(&ino)
                         .map(NodeSharing::mark)
                         .or(sender.map(|_| "people")),
                     None => Some("people"),
                 };
+                if let Some(mark) = mark {
+                    marks.insert(ino, mark);
+                }
             }
-            return Ok(());
+            return Ok(marks);
         };
-        let volume = self
-            .resolve(&format!("/{}", names[..depth].join("/")))
-            .await?
-            .ino;
-        if let Some(known) = self.sharing(volume).await {
-            for entry in entries.iter_mut().filter(|e| e.kind == "folder") {
-                entry.shared = known.get(&entry.ino).map(NodeSharing::mark);
-            }
-        }
-        Ok(())
+        let Some(known) = self.sharing(volume).await else {
+            return Ok(HashMap::new());
+        };
+        Ok(folders
+            .iter()
+            .filter_map(|ino| Some((*ino, known.get(ino)?.mark())))
+            .collect())
     }
 
     /// Who shared folder `ino` with this account, going by `grants`, its
@@ -671,17 +707,31 @@ impl Inner {
             .await
             .ok()
             .and_then(|v| v.owner);
-        (owner.as_deref() != Some(me)).then(|| sender.to_string())
+        self.sender_of(ino, grants, owner.as_deref())
+    }
+
+    /// `shared_by`, with the volume's owner already known.
+    fn sender_of(&self, ino: u64, grants: &[Grant], owner: Option<&str>) -> Option<String> {
+        let me = self.vault().remote().username();
+        let grant = grants.iter().find(|g| g.ino == ino)?;
+        let sender = grant_sender(&grant.sealed_key).ok()?;
+        (sender != me && owner != Some(me)).then(|| sender.to_string())
     }
 
     /// How many of `names`, a path from the root, it takes to reach a grant.
     /// `None` if they never do: they name the root or a group.
     async fn top_depth(&self, names: &[&str]) -> Result<Option<usize>, FsError> {
+        Ok(self.top(names).await?.map(|(depth, _)| depth))
+    }
+
+    /// `top_depth`, and the inode of the grant it reaches. Asks the servers
+    /// only for a name not known here.
+    async fn top(&self, names: &[&str]) -> Result<Option<(usize, u64)>, FsError> {
         let mut at = VIRTUAL_ROOT;
         for (i, name) in names.iter().enumerate() {
             at = self.vault().group_lookup(at, OsStr::new(name)).await?;
             if !is_group(at) {
-                return Ok(Some(i + 1));
+                return Ok(Some((i + 1, at)));
             }
         }
         Ok(None)
@@ -689,103 +739,112 @@ impl Inner {
 
     /// How folder `path` is shared, for the bar above the files (see
     /// `Fs::sharing_here`).
+    ///
+    /// - Finds each folder from the top-level one down, from remembered
+    ///   names: no round trip once they are listed.
+    /// - Then asks for everything else at once: the volume's sharing, its
+    ///   owner, this account's grants, and whether it can write `path`
+    ///   (needed only when it can't list the volume's sharing).
     async fn sharing_here(&self, path: &str) -> Result<Option<Here>, FsError> {
         let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
         if names.first().is_none_or(|n| *n == ".snapshot") {
             return Ok(None);
         }
-        let Some(first) = self.top_depth(&names).await? else {
+        let Some((first, top)) = self.top(&names).await? else {
             return Ok(None);
         };
-        let top = self
-            .resolve(&format!("/{}", names[..first].join("/")))
-            .await?
-            .ino;
-        let Some(known) = self.sharing(top).await else {
+        let below: Vec<String> = (first + 1..=names.len())
+            .map(|depth| format!("/{}", names[..depth].join("/")))
+            .collect();
+        let below_inos =
+            join_all(below.iter().map(|f| self.session.resolve_ino(f.as_bytes()))).await;
+        let mut folders = vec![(format!("/{}", names[..first].join("/")), top)];
+        for (folder, ino) in below.into_iter().zip(below_inos) {
+            folders.push((folder, ino?));
+        }
+        let here = folders.last().expect("the top folder is first").1;
+        const W_OK: u32 = 2;
+        let tops = [top];
+        let (known, volume, grants, writable) = futures_util::join!(
+            self.sharing(top),
+            self.vault().remote().get_volume(top),
+            self.grants(&tops),
+            self.vault().remote().access(here, W_OK),
+        );
+        let me = self.vault().remote().username();
+        let owner = volume.ok().and_then(|v| v.owner);
+        let others_owner = owner.clone().filter(|o| o != me);
+        let Some(known) = known else {
             // Only shared with this account, to read: say by whom.
-            let sender = self
-                .vault()
-                .remote()
-                .list_grants()
-                .await?
-                .into_iter()
+            let sender = grants
+                .iter()
                 .find(|g| g.ino == top)
                 .and_then(|g| grant_sender(&g.sealed_key).ok().map(str::to_string));
-            let here = self.resolve(path).await?.ino;
-            const W_OK: u32 = 2;
             return Ok(Some(Here {
                 sources: Vec::new(),
                 from: sender,
-                writable: self.vault().remote().access(here, W_OK).await.is_ok(),
-                owner: self.others_owner(top).await,
+                writable: writable.is_ok(),
+                owner: others_owner,
             }));
         };
-        let mut sources = Vec::new();
-        for depth in first..=names.len() {
-            let folder = format!("/{}", names[..depth].join("/"));
-            let ino = if depth == first {
-                top
-            } else {
-                self.resolve(&folder).await?.ino
-            };
-            if let Some(shared) = known.get(&ino) {
-                sources.push(Source {
-                    path: folder,
-                    sharing: shared.clone(),
-                });
-            }
-        }
-        let owner = self.others_owner(top).await;
-        let grants = self
-            .vault()
-            .remote()
-            .list_grants()
-            .await
-            .unwrap_or_default();
-        let from = self.shared_by(top, &grants).await;
+        let sources: Vec<Source> = folders
+            .into_iter()
+            .filter_map(|(path, ino)| {
+                Some(Source {
+                    path,
+                    sharing: known.get(&ino)?.clone(),
+                })
+            })
+            .collect();
+        let from = self.sender_of(top, &grants, owner.as_deref());
         Ok(
-            (!sources.is_empty() || owner.is_some() || from.is_some()).then_some(Here {
+            (!sources.is_empty() || others_owner.is_some() || from.is_some()).then_some(Here {
                 sources,
                 from,
                 writable: true,
-                owner,
+                owner: others_owner,
             }),
         )
     }
 
-    /// Who owns volume `ino`, if someone other than this account. Only for
-    /// showing: none if the servers can't say.
-    async fn others_owner(&self, ino: u64) -> Option<String> {
-        let me = self.vault().remote().username();
-        let owner = self.vault().remote().get_volume(ino).await.ok()?.owner?;
-        (owner != me).then_some(owner)
-    }
-
-    /// Gives the folders among `entries` (of directory `path`) their size
-    /// as last measured. Folders not measured yet, or on servers too old
-    /// to say, have none.
-    async fn mark_sizes(&self, path: &str, entries: &mut [Entry]) {
-        if path.trim_start_matches('/').starts_with(".snapshot") {
-            return;
+    /// The last measured size of each of `folders`, by inode. Folders not
+    /// measured yet, or on servers too old to say, have none.
+    async fn folder_sizes(&self, path: &str, folders: &[u64]) -> HashMap<u64, u64> {
+        if folders.is_empty() || path.trim_start_matches('/').starts_with(".snapshot") {
+            return HashMap::new();
         }
-        let folders: Vec<u64> = entries
-            .iter()
-            .filter(|e| e.kind == "folder" && e.name != ".snapshot" && !e.group)
-            .map(|e| e.ino)
-            .collect();
-        if folders.is_empty() {
-            return;
-        }
-        let Ok(sizes) = self.vault().remote().folder_sizes(&folders).await else {
-            return;
+        let Ok(sizes) = self.vault().remote().folder_sizes(folders).await else {
+            return HashMap::new();
         };
-        let sizes: HashMap<u64, u64> = sizes
+        sizes
             .into_iter()
             .filter(|s| s.measured_at > 0)
             .map(|s| (s.ino, s.bytes))
-            .collect();
-        for entry in entries.iter_mut().filter(|e| e.kind == "folder") {
-            entry.size = sizes.get(&entry.ino).copied();
+            .collect()
+    }
+
+    /// Runs `op` on the inode at `path`, found from remembered names (see
+    /// `Session::resolve_ino`). If `op` finds that inode gone, the path is
+    /// looked up again and `op` runs once more.
+    async fn at_path<T, F, Fut>(&self, path: &str, op: F) -> Result<T, FsError>
+    where
+        F: Fn(u64) -> Fut,
+        Fut: Future<Output = Result<T, FsError>>,
+    {
+        let version = self.version_paths.borrow().get(path).copied();
+        let ino = match version {
+            Some(ino) => ino,
+            None => self.session.resolve_ino(path.as_bytes()).await?,
+        };
+        match op(ino).await {
+            Err(e) if e.errno == errno::ENOENT => {
+                let fresh = self.session.resolve_ino_fresh(path.as_bytes()).await?;
+                if fresh == ino {
+                    return Err(e);
+                }
+                op(fresh).await
+            }
+            other => other,
         }
     }
 
@@ -794,8 +853,11 @@ impl Inner {
     async fn volume_at(&self, path: &str) -> Result<u64, FsError> {
         let names: Vec<&str> = path.split('/').filter(|n| !n.is_empty()).collect();
         let is_snapshot = names.first().is_some_and(|n| *n == ".snapshot");
-        if !is_snapshot && self.top_depth(&names).await? == Some(names.len()) {
-            return Ok(self.resolve(path).await?.ino);
+        if !is_snapshot
+            && let Some((depth, ino)) = self.top(&names).await?
+            && depth == names.len()
+        {
+            return Ok(ino);
         }
         Err(FsError::new(
             errno::EINVAL,
@@ -842,7 +904,23 @@ impl Inner {
         self.sharing.borrow_mut().clear();
     }
 
+    /// Keeps version path `path` (see `Fs::versions`) as the session's
+    /// inode `ino`. Snapshots don't change, so it stays true.
+    fn remember_version(&self, path: &str, ino: u64) {
+        let mut paths = self.version_paths.borrow_mut();
+        if paths.len() >= MAX_VERSION_PATHS {
+            paths.clear();
+        }
+        paths.insert(path.to_string(), ino);
+    }
+
     async fn resolve(&self, path: &str) -> Result<Attr, FsError> {
+        let version = self.version_paths.borrow().get(path).copied();
+        if let Some(ino) = version
+            && let Ok(attr) = self.session.getattr(ino).await
+        {
+            return Ok(attr);
+        }
         self.session.resolve(path.as_bytes()).await
     }
 
@@ -963,29 +1041,44 @@ impl Fs {
 
     /// The entries of directory `path`, without `.` and `..`. The root also
     /// lists `.snapshot`, the read-only snapshots.
+    ///
+    /// - Lists the folder, found from remembered names.
+    /// - Then asks at once for each entry's attributes, how its folders are
+    ///   shared, and their sizes.
     pub fn readdir(&self, path: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
-            let dir = inner.resolve(&path).await?;
-            let items: Vec<_> = inner
-                .session
-                .readdir(dir.ino)
-                .await?
+            let session = &inner.session;
+            let (dir, items) = inner
+                .at_path(&path, |ino| async move {
+                    Ok((ino, session.readdir(ino).await?))
+                })
+                .await?;
+            let items: Vec<_> = items
                 .into_iter()
                 .filter(|i| i.name != "." && i.name != "..")
                 .collect();
-            let attrs = join_all(
-                items
-                    .iter()
-                    .map(|item| inner.session.lookup(dir.ino, &item.name)),
-            )
-            .await;
+            let folders: Vec<u64> = items
+                .iter()
+                .filter(|i| i.kind == Kind::Directory && !is_group(i.ino))
+                .map(|i| i.ino)
+                .collect();
+            let (attrs, marks, sizes) = futures_util::join!(
+                join_all(items.iter().map(|item| session.lookup(dir, &item.name))),
+                inner.shared_marks(&path, &folders),
+                inner.folder_sizes(&path, &folders),
+            );
+            let marks = marks?;
             let mut entries = Vec::with_capacity(items.len() + 1);
             for (item, attr) in items.iter().zip(attrs) {
                 match attr {
                     Ok(attr) => {
                         let mut entry = Entry::new(&item.name, &attr);
-                        entry.top = is_virtual(dir.ino) && !entry.group;
+                        entry.top = is_virtual(dir) && !entry.group;
+                        if entry.kind == "folder" {
+                            entry.shared = marks.get(&entry.ino).copied();
+                            entry.size = sizes.get(&entry.ino).copied();
+                        }
                         entries.push(entry);
                     }
                     // Removed since the listing.
@@ -994,14 +1087,9 @@ impl Fs {
                 }
             }
             if path.trim_matches('/').is_empty() {
-                let snapshots = inner
-                    .session
-                    .lookup(dir.ino, OsStr::new(".snapshot"))
-                    .await?;
+                let snapshots = session.lookup(dir, OsStr::new(".snapshot")).await?;
                 entries.push(Entry::new(OsStr::new(".snapshot"), &snapshots));
             }
-            inner.mark_shared(&path, &mut entries).await?;
-            inner.mark_sizes(&path, &mut entries).await;
             Ok(entries)
         })
     }
@@ -1107,16 +1195,21 @@ impl Fs {
             if base.is_empty() || base.trim_start_matches('/').starts_with(".snapshot") {
                 return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
             }
-            let ino = inner.resolve(&base).await?.ino;
-            if is_virtual(ino) {
-                return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
-            }
             let after = match after {
                 Some(hex) => from_hex(&hex)
                     .ok_or_else(|| FsError::new(errno::EINVAL, "that page can't be read"))?,
                 None => Vec::new(),
             };
-            let page = inner.vault().activity(ino, &after, 0).await?;
+            let vault = inner.vault();
+            let after = &after;
+            let page = inner
+                .at_path(&base, |ino| async move {
+                    if is_virtual(ino) {
+                        return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
+                    }
+                    vault.activity(ino, after, 0).await
+                })
+                .await?;
             let full = |name: Option<String>| name.map(|n| format!("{base}/{n}"));
             Ok(Page {
                 lines: page
@@ -1166,40 +1259,33 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let path = format!("/{}", path.trim_matches('/'));
-            let now = match inner.resolve(&path).await {
-                Ok(attr) => Some(attr),
-                Err(e) if e.errno == errno::ENOENT => None,
-                Err(e) => return Err(e),
-            };
-            let snapshots = inner.vault().remote().list_snapshots().await?;
-            let (found, unreadable) = versions::find(snapshots, |name| {
-                let inner = Rc::clone(&inner);
-                let at = format!("/.snapshot/{name}{path}");
-                async move { inner.resolve(&at).await }
-            })
-            .await;
+            let found = inner.session.versions(path.as_bytes()).await?;
             let ms = |t: std::time::SystemTime| {
                 t.duration_since(UNIX_EPOCH)
                     .map_or(0.0, |d| d.as_millis() as f64)
             };
             let name = OsStr::new(path.rsplit('/').next().unwrap_or_default());
+            let versions: Vec<Found> = found
+                .versions
+                .into_iter()
+                .map(|v| {
+                    let entry = Entry::new(name, &v.attr);
+                    let at = format!("/.snapshot/{}{path}", v.snapshot);
+                    inner.remember_version(&at, v.attr.ino);
+                    Found {
+                        path: at,
+                        snapshot: v.snapshot,
+                        taken: ms(v.taken),
+                        modified: entry.modified,
+                        size: entry.size,
+                        kind: entry.kind,
+                    }
+                })
+                .collect();
             Ok(Versions {
-                now: now.as_ref().map(|attr| Entry::new(name, attr)),
-                versions: versions::collapse(now.as_ref(), found)
-                    .into_iter()
-                    .map(|v| {
-                        let entry = Entry::new(name, &v.attr);
-                        Found {
-                            path: format!("/.snapshot/{}{path}", v.snapshot),
-                            snapshot: v.snapshot,
-                            taken: ms(v.taken),
-                            modified: entry.modified,
-                            size: entry.size,
-                            kind: entry.kind,
-                        }
-                    })
-                    .collect(),
-                unreadable,
+                now: found.now.as_ref().map(|attr| Entry::new(name, attr)),
+                versions,
+                unreadable: found.unreadable,
             })
         })
     }
@@ -1787,11 +1873,15 @@ impl Fs {
                 measured_at: f64,
                 limit: Option<u64>,
             }
-            let ino = inner.resolve(&path).await?.ino;
-            let sizes = match inner.vault().remote().folder_sizes(&[ino]).await {
-                Err(e) if e.errno == errno::ENOTSUP => Vec::new(),
-                other => other?,
-            };
+            let remote = inner.vault().remote();
+            let sizes = inner
+                .at_path(&path, |ino| async move {
+                    match remote.folder_sizes(&[ino]).await {
+                        Err(e) if e.errno == errno::ENOTSUP => Ok(Vec::new()),
+                        other => other,
+                    }
+                })
+                .await?;
             Ok(sizes.into_iter().next().map(|s| SizeJs {
                 bytes: s.bytes,
                 files: s.files,

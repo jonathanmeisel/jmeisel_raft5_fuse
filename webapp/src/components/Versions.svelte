@@ -23,18 +23,19 @@
   /// The log's lines about this path, from its folder's log: who changed it.
   let changes = $state([]);
 
+  /// Asks for the versions and the folder's log at once: neither waits for
+  /// the other.
   async function load() {
-    try {
-      found = await fs.versions(path);
-    } catch (e) {
-      error = e.message;
-    }
-    if (dir === "/" || dir.startsWith("/.snapshot")) return;
-    try {
-      const page = await fs.activity(dir, null);
-      changes = page.lines.filter((l) => l.path === path || l.from === path);
-    } catch {
-      // No log (older servers), or none to see: the versions still show.
+    const logged = dir !== "/" && !dir.startsWith("/.snapshot");
+    const [versions, log] = await Promise.allSettled([
+      fs.versions(path),
+      logged ? fs.activity(dir, null) : Promise.resolve(null),
+    ]);
+    if (versions.status === "fulfilled") found = versions.value;
+    else error = versions.reason.message;
+    // No log (older servers), or none to see: the versions still show.
+    if (log.status === "fulfilled" && log.value) {
+      changes = log.value.lines.filter((l) => l.path === path || l.from === path);
     }
   }
   load();

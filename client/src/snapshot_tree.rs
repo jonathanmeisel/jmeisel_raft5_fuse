@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SnapshotInfo};
 
-use crate::vault::{SNAPSHOT_DIR, VIRTUAL_ROOT, Vault, is_group};
+use crate::vault::{Node, SNAPSHOT_DIR, VIRTUAL_ROOT, Vault, is_group};
 
 /// access(2)'s bit for writing: 2 on every system (POSIX leaves the value
 /// open, but Linux and the BSDs agree), and named here for builds without
@@ -216,6 +216,24 @@ impl SnapshotTree {
                 Ok(self.node_attr(&snap, attr))
             }
         }
+    }
+
+    /// What `name` in live directory `parent` was at the snapshot `info`
+    /// lists, with this tree's number for it. `dir` is `parent`'s live key
+    /// (see `Vault::adopt`), so the lookup is one round trip. For Versions,
+    /// which looks in the same folder in every snapshot.
+    pub async fn lookup_in(
+        &self,
+        live: &Vault,
+        info: SnapshotInfo,
+        parent: u64,
+        dir: Arc<Node>,
+        name: &OsStr,
+    ) -> Result<Attr, FsError> {
+        let snap = self.snap(live, info);
+        snap.vault.adopt(parent, dir);
+        let attr = snap.vault.lookup(parent, name).await?;
+        Ok(self.node_attr(&snap, attr))
     }
 
     /// The kernel's number for what `node`, a grant or group, shows in.

@@ -114,8 +114,8 @@ pub fn versions(connect: &ConnectArgs, args: PathArgs) -> Outcome {
             // Each snapshot's vault reads only attributes, so the chunk
             // cache's space only needs to differ between them.
             let space = AtomicU64::new(1);
-            let (found, unreadable) = versions::find(snapshots, |name| {
-                let snap = vault.at_snapshot(&name, space.fetch_add(1, Ordering::Relaxed));
+            let (found, unreadable) = versions::find(snapshots, |info| {
+                let snap = vault.at_snapshot(&info.name, space.fetch_add(1, Ordering::Relaxed));
                 let path = path.clone();
                 async move {
                     let ino = snap.resolve(&path).await?;
