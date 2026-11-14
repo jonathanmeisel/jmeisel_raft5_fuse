@@ -2,6 +2,7 @@ mod chunk_cache;
 // Profiles, terminals and config files: native front ends only.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
+pub mod deleted;
 mod paths;
 pub mod prune_queue;
 pub mod pruner;

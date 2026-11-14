@@ -1290,6 +1290,76 @@ impl Fs {
         })
     }
 
+    /// What is gone from folder `path` (see raft5fs-client's `deleted`):
+    /// `{gone, unreadable}`. Each of `gone` is `{name, kind, size, modified,
+    /// snapshot, taken, path, moved}`, by name, with times in milliseconds
+    /// since the Unix epoch. `path` is where it is under `.snapshot`, and
+    /// opens and copies even if a folder had another name then. `moved` is
+    /// null for something deleted, or, for something moved elsewhere, what
+    /// `locate` takes.
+    pub fn deleted(&self, path: String) -> Promise {
+        #[derive(Serialize)]
+        struct GoneJs {
+            name: String,
+            kind: &'static str,
+            size: Option<u64>,
+            modified: f64,
+            snapshot: String,
+            taken: f64,
+            path: String,
+            moved: Option<String>,
+        }
+        #[derive(Serialize)]
+        struct DeletedJs {
+            gone: Vec<GoneJs>,
+            unreadable: usize,
+        }
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let dir = format!("/{}", path.trim_matches('/'));
+            let found = inner.session.deleted(dir.as_bytes()).await?;
+            let gone = found
+                .gone
+                .into_iter()
+                .map(|g| {
+                    let entry = Entry::new(&g.name, &g.attr);
+                    let at = format!("/.snapshot/{}{dir}/{}", g.snapshot, entry.name);
+                    inner.remember_version(&at, g.attr.ino);
+                    GoneJs {
+                        taken: g
+                            .taken
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0.0, |d| d.as_millis() as f64),
+                        snapshot: g.snapshot,
+                        size: entry.size,
+                        modified: entry.modified,
+                        kind: entry.kind,
+                        name: entry.name,
+                        path: at,
+                        // A string: an inode needn't fit in a JavaScript number.
+                        moved: g.moved.map(|ino| ino.to_string()),
+                    }
+                })
+                .collect();
+            Ok(DeletedJs {
+                gone,
+                unreadable: found.unreadable,
+            })
+        })
+    }
+
+    /// Where something moved is now (a `moved` from `deleted`), as a path,
+    /// or null if this account can't reach it.
+    pub fn locate(&self, moved: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let ino = moved
+                .parse()
+                .map_err(|_| FsError::new(errno::EINVAL, "that isn't something moved"))?;
+            inner.session.locate(ino).await
+        })
+    }
+
     /// Copies `from` (a file, or a directory and everything in it) to
     /// `to`, which must not exist.
     pub fn copy(&self, from: String, to: String) -> Promise {

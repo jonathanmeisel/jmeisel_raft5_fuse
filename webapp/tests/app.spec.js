@@ -1371,21 +1371,55 @@ test("a file's versions come from the snapshots, and can be put back", async ({ 
   await expect(page.getByText(/Put back a\.txt as it was at/)).toBeVisible(SLOW);
   expect((await download(page, "a.txt")).toString()).toBe("one");
 
-  // A folder has one version for each snapshot it is in, and opens there.
+  // A folder's history is its activity, with no versions.
   await menu(page, "drafts", "History");
-  await expect(page.getByRole("dialog").getByRole("button", { name: "Restore…" })).toHaveCount(3, SLOW);
-  await page.getByRole("dialog").getByRole("button", { name: "Open" }).first().click();
-  await expect.poll(() => new URL(page.url()).hash).toBe("#/.snapshot/sam-3/notes/drafts");
-
-  // A folder's history has its activity as a tab.
-  await page.getByText("My files").first().click();
-  await open(page, "notes");
-  await menu(page, "drafts", "History");
-  await page.getByRole("tab", { name: "Activity" }).click();
   await expect(page.getByRole("dialog").getByText("Nothing has changed here lately.")).toBeVisible(SLOW);
-  await page.getByRole("tab", { name: "Versions" }).click();
-  await expect(page.getByRole("dialog").getByRole("button", { name: "Restore…" })).toHaveCount(3, SLOW);
+  await expect(page.getByRole("tab")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).last().click();
+
+  expect(problems).toEqual([]);
+});
+
+test("deleted files show when asked, and come back", async ({ page }) => {
+  const problems = watch(page);
+  await enrol(page, "val");
+  await login(page, "val");
+  const snapshot = async (name) => {
+    const answer = await fetch(`${REISSUE}/snapshot/${name}`);
+    expect(answer.status, await answer.text()).toBe(200);
+  };
+  await addFolder(page, "photos");
+  await open(page, "photos");
+  await addFolder(page, "trip");
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "keep.txt", mimeType: "text/plain", buffer: Buffer.from("keep") },
+    { name: "lost.txt", mimeType: "text/plain", buffer: Buffer.from("lost") },
+  ]);
+  await expect(page.getByText(/Uploading/)).toHaveCount(0, SLOW);
+  await expect(item(page, "lost.txt")).toBeVisible(SLOW);
+  await snapshot("val-1");
+  for (const name of ["lost.txt", "trip"]) {
+    await menu(page, name, "Delete");
+    await page.locator(".wx-modal").getByRole("button", { name: "OK" }).click();
+    await expect(item(page, name)).toHaveCount(0, SLOW);
+  }
+
+  // Off, nothing deleted shows; on, what the snapshot holds does.
+  const toggle = page.getByLabel("Show deleted");
+  await expect(toggle).not.toBeChecked();
+  await toggle.check();
+  await expect(page.getByText("2 deleted or moved")).toBeVisible(SLOW);
+  await expect(item(page, "lost.txt")).toBeVisible(SLOW);
+  await expect(item(page, "trip")).toBeVisible();
+  // It can't be changed, only restored.
+  await menu(page, "lost.txt", "Restore");
+  await expect(page.getByText(/Restored lost\.txt, as of /)).toBeVisible(SLOW);
+  expect((await download(page, "lost.txt")).toString()).toBe("lost");
+
+  // Off again, the deleted folder goes.
+  await toggle.uncheck();
+  await expect(item(page, "trip")).toHaveCount(0, SLOW);
+  await expect(item(page, "keep.txt")).toBeVisible();
 
   expect(problems).toEqual([]);
 });

@@ -27,7 +27,7 @@
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
   import { pathHash, readRoute } from "../lib/route.js";
-  import { sharedIcon } from "../lib/sharedIcons.js";
+  import { fileIcon } from "../lib/sharedIcons.js";
   import { treeFromEntries, treeFromPicker, uploadTree } from "../lib/folders.js";
 
   let { fs, me, storageError, onlogout } = $props();
@@ -99,6 +99,7 @@
     try {
       const list = await fs.readdir("/");
       shown.set("/", JSON.stringify(list));
+      live.set("/", list);
       initial = entries("/", list);
     } catch (e) {
       error = e.message;
@@ -156,6 +157,9 @@
   /// The folder last listed, to show a new listing only if it differs:
   /// showing one disturbs what is on screen.
   let shown = new Map();
+  /// Each folder's last listing, so that its deleted entries can be added
+  /// to it without listing it again.
+  let live = new Map();
 
   async function poll() {
     if (visitor || polling || document.hidden || !api) return;
@@ -180,7 +184,8 @@
     const seen = JSON.stringify(list);
     if (shown.get(dir) === seen) return false;
     shown.set(dir, seen);
-    await api.exec("provide-data", { id: dir, data: entries(dir, list) });
+    live.set(dir, list);
+    await provide(dir);
     return true;
   }
 
@@ -216,7 +221,8 @@
     try {
       const list = await fs.readdir(dir);
       shown.set(dir, JSON.stringify(list));
-      await api.exec("provide-data", { id: dir, data: entries(dir, list) });
+      live.set(dir, list);
+      await provide(dir);
     } catch (e) {
       if (e.code !== "ENOENT") fail(e);
     }
@@ -463,6 +469,146 @@
     return panels[activePanel].selected;
   };
 
+  // ---------------------------------------------------------- deleted files
+  // With "Show deleted" on, a folder also shows what its snapshots hold that
+  // it doesn't now (the wasm `deleted`): greyed icons, which restore, open
+  // or download from the snapshot. Off, nothing more is asked for. On, the
+  // deleted entries are asked for once each time a folder opens, after its
+  // listing, and kept through each listing again.
+
+  const SHOW_DELETED = "raft5fs:show-deleted";
+  function readShowDeleted() {
+    try {
+      return sessionStorage.getItem(SHOW_DELETED) === "on";
+    } catch {
+      return false;
+    }
+  }
+  let showDeleted = $state(readShowDeleted());
+  /// What the open folder's deleted entries are: "looking", a count, or
+  /// why they can't be shown.
+  let goneNote = $state("");
+  /// Each folder's deleted entries, as the wasm `deleted` gave them.
+  let goneIn = new Map();
+  let goneAsked = 0;
+
+  /// Whether folder `dir` can have deleted entries: one inside a share.
+  function canShowDeleted(dir) {
+    return !visitor && dir !== "/" && !dir.startsWith("/.snapshot") && !api?.getFile(dir)?.group;
+  }
+
+  /// The deleted entry at `id`, if it is one.
+  function goneAt(id) {
+    return (goneIn.get(parentOf(id)) ?? []).find((g) => join(parentOf(id), g.name) === id) ?? null;
+  }
+
+  /// Shows folder `dir` as last listed, with its deleted entries if they
+  /// show. A name listed now hides a deleted entry with it.
+  async function provide(dir) {
+    const list = live.get(dir) ?? [];
+    const names = new Set(list.map((e) => e.name));
+    const gone = showDeleted ? (goneIn.get(dir) ?? []).filter((g) => !names.has(g.name)) : [];
+    const extra = gone.map((g) => ({
+      id: join(dir, g.name),
+      type: g.kind === "folder" ? "folder" : "file",
+      ...(g.size != null ? { size: g.size } : {}),
+      date: new Date(g.modified),
+      deleted: g.moved ? "moved" : "deleted",
+    }));
+    await api.exec("provide-data", { id: dir, data: [...entries(dir, list), ...extra] });
+  }
+
+  /// Asks for folder `dir`'s deleted entries, if they show, and shows
+  /// them. A later folder's answer wins.
+  async function refreshGone(dir) {
+    const asked = ++goneAsked;
+    goneNote = "";
+    if (!showDeleted || !canShowDeleted(dir)) return;
+    goneNote = "Looking for deleted files…";
+    let found;
+    try {
+      found = await fs.deleted(dir);
+    } catch (e) {
+      if (asked === goneAsked) goneNote = `Deleted files can't be shown here: ${e.message}`;
+      return;
+    }
+    if (asked !== goneAsked) return;
+    goneIn.set(dir, found.gone);
+    const n = found.gone.length;
+    goneNote = n === 0 ? "Nothing deleted since the oldest snapshot." : `${n} deleted or moved`;
+    if (found.unreadable) goneNote += ` (${found.unreadable} snapshots couldn't be read)`;
+    if (live.has(dir)) await provide(dir);
+  }
+
+  function toggleDeleted(on) {
+    showDeleted = on;
+    try {
+      sessionStorage.setItem(SHOW_DELETED, on ? "on" : "off");
+    } catch {}
+    if (on) {
+      refreshGone(current);
+    } else {
+      goneAsked++;
+      goneNote = "";
+      goneIn.clear();
+      if (live.has(current)) provide(current);
+    }
+  }
+
+  /// Opens deleted entry `id`: a file in the viewer and a folder as its
+  /// snapshot, both as they were. Something moved opens where it is now.
+  function openGone(id) {
+    const g = goneAt(id);
+    if (!g) return;
+    if (g.moved) {
+      goToMoved(id);
+    } else if (g.kind === "folder") {
+      goTo(g.path);
+    } else {
+      dialog = { kind: "view", path: g.path };
+    }
+  }
+
+  /// Puts deleted entry `id` back under its name, or a free one like it if
+  /// that is taken now.
+  function restoreGone(id) {
+    const g = goneAt(id);
+    if (!g) return;
+    const dir = parentOf(id);
+    act(async () => {
+      const name = await freeName(dir, g.name);
+      await fs.copy(g.path, join(dir, name));
+      goneIn.set(dir, (goneIn.get(dir) ?? []).filter((x) => x !== g));
+      notice = `Restored ${name}, as of ${new Date(g.taken).toLocaleString()}.`;
+    }, [dir]);
+  }
+
+  /// Opens the folder that moved entry `id` is in now, with it selected.
+  function goToMoved(id) {
+    const g = goneAt(id);
+    if (!g?.moved) return;
+    act(async () => {
+      const at = await fs.locate(g.moved);
+      if (!at) {
+        error = `${g.name} was moved somewhere you can't open.`;
+        return;
+      }
+      await goTo(parentOf(at));
+      await api.exec("select-file", { id: at });
+    }, []);
+  }
+
+  /// Says why deleted entries among `ids` can't do what was asked, and
+  /// whether there were any.
+  function refuseGone(ids) {
+    const gone = ids.map(goneAt).filter(Boolean);
+    if (!gone.length) return false;
+    error = gone[0].moved
+      ? `${gone[0].name} was moved. Go to where it is now to change it.`
+      : `${gone[0].name} is deleted. Restore it first.`;
+    return true;
+  }
+
   // ---------------------------------------------------------- the URL
   // The open folder is in the URL's fragment (see route.js): browsing adds
   // a history entry, Back and Forward go back to it, and the app opens at
@@ -523,6 +669,7 @@
   /// Adds a history entry for the folder SVAR moved to.
   function moved({ id }) {
     if (id) showSharing(id);
+    if (id) refreshGone(id);
     if (following || !id || location.hash === pathHash(id)) return;
     history.pushState(null, "", pathHash(id));
   }
@@ -533,6 +680,12 @@
 
   function init(fm) {
     api = fm;
+    // A deleted folder opens as its snapshot, and a moved one where it is.
+    api.intercept("set-path", ({ id }) => {
+      if (!goneAt(id)) return;
+      openGone(id);
+      return false;
+    });
     api.on("set-path", moved);
     const start = readRoute()?.path ?? (visitor ? "/" + me.folder : null);
     if (start && start !== "/") queueMicrotask(() => goTo(start, { fromUrl: true }));
@@ -541,6 +694,7 @@
       return false;
     });
     api.intercept("create-file", ({ file, parent }) => {
+      if (refuseGone([parent])) return false;
       if (inRoot(parent) && !account.caps.includes("volumes")) {
         error = "You can't create top-level folders here. Open a folder shared with you to add things to it.";
         return false;
@@ -557,6 +711,7 @@
       return false;
     });
     api.intercept("rename-file", ({ id, name }) => {
+      if (refuseGone([id])) return false;
       // A share's name is its label here, which is this account's own.
       if (api.getFile(id)?.top) {
         act(() => relabel(id, join(parentOf(id), name).slice(1)), []);
@@ -566,12 +721,14 @@
       return false;
     });
     api.intercept("delete-files", ({ ids }) => {
+      if (refuseGone(ids)) return false;
       act(async () => {
         for (const id of ids) await fs.remove(id);
       }, ids.map(parentOf));
       return false;
     });
     api.intercept("move-files", ({ ids, target }) => {
+      if (refuseGone([...ids, target])) return false;
       act(async () => {
         for (const id of ids) {
           if (parentOf(id) !== target) await fs.rename(id, join(target, nameOf(id)));
@@ -580,6 +737,7 @@
       return false;
     });
     api.intercept("copy-files", ({ ids, target }) => {
+      if (refuseGone([...ids, target])) return false;
       act(async () => {
         for (const id of ids) {
           await fs.copy(id, join(target, await freeName(target, nameOf(id))));
@@ -588,12 +746,22 @@
       return false;
     });
     api.intercept("download-file", ({ id }) => {
+      const g = goneAt(id);
+      if (g && !g.moved) {
+        act(() => (g.kind === "folder" ? downloadZip([g.path]) : download(g.path)), []);
+        return false;
+      }
+      if (refuseGone([id])) return false;
       act(() => download(id), []);
       return false;
     });
     // Images, text, video, audio and PDFs open in the viewer; anything
     // else downloads.
     api.intercept("open-file", ({ id }) => {
+      if (goneAt(id)) {
+        openGone(id);
+        return false;
+      }
       const file = api.getFile(id);
       const kind = kindOf(nameOf(id));
       const streams = STREAMED.has(kind) && streaming?.available();
@@ -626,14 +794,33 @@
   /// More, so the menu stays short. More opens a panel, not a submenu: SVAR's
   /// submenus open only on hover, so a phone couldn't reach one.
   function menuOptions(mode, item) {
+    if (item?.deleted === "moved") {
+      return [{ id: "go-moved", text: "Go to where it is now", icon: "wxi-external", handler: () => goToMoved(item.id) }];
+    }
+    if (item?.deleted) {
+      return [
+        { id: "restore-deleted", text: "Restore", icon: "wxi-sync", handler: () => restoreGone(item.id) },
+        { id: "open-deleted", text: "Open", icon: "wxi-external", handler: () => openGone(item.id) },
+        {
+          id: "download-deleted",
+          text: item.type === "folder" ? "Download as ZIP" : "Download",
+          icon: "wxi-download",
+          handler: () => {
+            const g = goneAt(item.id);
+            if (g) act(() => (g.kind === "folder" ? downloadZip([g.path]) : download(g.path)), []);
+          },
+        },
+      ];
+    }
     const options = getMenuOptions(mode);
     // A file's history is its versions, with the changes between them. A
-    // folder's has its activity too, as a tab.
+    // folder's is its activity: what was deleted from it shows in the
+    // folder itself (Show deleted).
     const history = {
       id: "history",
       text: "History",
       icon: "wxi-sync",
-      handler: () => (dialog = { kind: item.type === "folder" && item.top ? "activity" : "versions", path: item.id }),
+      handler: () => (dialog = { kind: item.type === "folder" ? "activity" : "versions", path: item.id }),
     };
     if (mode === "file" && item && !item.id.startsWith("/.snapshot")) return [options[0], history, ...options.slice(1)];
     if (mode === "add") {
@@ -813,6 +1000,15 @@
   {/each}
 
   <SharingBar {here} {current} {limited} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
+  {#if canShowDeleted(current)}
+    <div class="deleted-bar">
+      <label>
+        <input type="checkbox" checked={showDeleted} onchange={(e) => toggleDeleted(e.currentTarget.checked)} />
+        Show deleted
+      </label>
+      {#if showDeleted && goneNote}<span class="gone-note">{goneNote}</span>{/if}
+    </div>
+  {/if}
 
   <div class="fm" role="presentation" ondropcapture={dropFolder}>
     {#if initial}
@@ -821,8 +1017,8 @@
           {init}
           {menuOptions}
           readonly={visitor}
-          icons={sharedIcon}
-          previews={(file) => preview.url(file)}
+          icons={fileIcon}
+          previews={(file) => (file.deleted ? null : preview.url(file))}
         />
     {/if}
   </div>
@@ -893,7 +1089,6 @@
     {fs}
     path={dialog.path}
     onversions={(path) => (dialog = { kind: "versions", path })}
-    ontab={api?.getFile(dialog.path)?.top ? null : () => (dialog = { kind: "versions", path: dialog.path })}
     onclose={() => (dialog = null)}
   />
 {:else if dialog?.kind === "versions"}
@@ -901,7 +1096,6 @@
     {fs}
     path={dialog.path}
     free={freeName}
-    ontab={api?.getFile(dialog.path)?.type === "folder" ? () => (dialog = { kind: "activity", path: dialog.path }) : null}
     onopen={(version) => {
       if (version.kind === "folder") {
         dialog = null;
@@ -1005,5 +1199,11 @@
     background: var(--panel); border-bottom: 1px solid var(--border);
   }
   .fm { flex: 1; min-height: 0; }
+  .deleted-bar {
+    display: flex; gap: 12px; align-items: center; padding: 4px 14px;
+    border-bottom: 1px solid var(--border); font-size: var(--wx-font-size);
+  }
+  .deleted-bar label { display: flex; gap: 6px; align-items: center; }
+  .gone-note { color: var(--wx-color-font-alt); }
   .more { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 </style>

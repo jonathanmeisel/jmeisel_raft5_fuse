@@ -544,3 +544,96 @@ fn versions_open_under_a_folder_key_rotated_since() {
     assert_eq!(names, ["s1"]);
     assert_eq!(found.versions[0].attr.size, 3);
 }
+
+#[test]
+fn deleted_files_come_from_the_snapshots() {
+    let s = Setup::with(|c| c.path_ttl = std::time::Duration::from_secs(60));
+    let mkdir = |parent, name: &str| {
+        s.block(s.session.mkdir(parent, OsStr::new(name), 0o755))
+            .unwrap()
+            .ino
+    };
+    let create = |parent, name: &str, data: &[u8]| {
+        let ino = s
+            .block(s.session.create(parent, OsStr::new(name), 0o644))
+            .unwrap()
+            .ino;
+        write_now(&s, ino, data);
+        ino
+    };
+    let d = mkdir(s.volume, "d");
+    let other = mkdir(s.volume, "other");
+    create(d, "gone", b"gone");
+    create(d, "renamed", b"r");
+    let moved = create(d, "moved", b"m");
+    create(d, "saved", b"old");
+    let sub = mkdir(d, "sub");
+    create(sub, "inner", b"i");
+    s.backend.snapshot("s1");
+
+    s.block(s.session.unlink(d, OsStr::new("gone"))).unwrap();
+    let rename = |from, name: &str, to, new: &str| {
+        s.block(
+            s.session
+                .rename(from, OsStr::new(name), to, OsStr::new(new), false),
+        )
+        .unwrap()
+    };
+    rename(d, "renamed", d, "renamed-too");
+    rename(d, "moved", other, "moved");
+    // An editor's save: a new file renamed over the old one.
+    create(d, "saved.tmp", b"new");
+    rename(d, "saved.tmp", d, "saved");
+    s.block(s.session.unlink(sub, OsStr::new("inner"))).unwrap();
+    s.block(s.session.rmdir(d, OsStr::new("sub"))).unwrap();
+    // Made and deleted between snapshots: in none of them.
+    create(d, "brief", b"b");
+    s.block(s.session.unlink(d, OsStr::new("brief"))).unwrap();
+    s.backend.snapshot("s2");
+    // The folder is renamed since: it is still the same folder.
+    rename(s.volume, "d", s.volume, "e");
+    s.block(s.session.readdir(s.volume)).unwrap();
+
+    let before = requests(&s.session);
+    let found = s.block(s.session.deleted(b"/v/e")).unwrap();
+    let sent = requests(&s.session) - before;
+    let names: Vec<&str> = found
+        .gone
+        .iter()
+        .map(|g| g.name.to_str().unwrap())
+        .collect();
+    assert_eq!(names, ["gone", "moved", "sub"]);
+    assert_eq!(found.unreadable, 0);
+    let by = |name: &str| found.gone.iter().find(|g| g.name == name).unwrap();
+    assert_eq!(by("gone").snapshot, "s1");
+    assert_eq!(by("gone").moved, None);
+    assert_eq!(by("moved").moved, Some(moved));
+    assert_eq!(by("sub").kind, Kind::Directory);
+    // The folder now, its key and the snapshots; the folder in each of 2
+    // snapshots; each of 3 found, in its snapshot and live.
+    assert!(sent <= 3 + 2 + 2 * 3, "deleted sent {sent} requests");
+
+    // A deleted file reads as it was, and copies back.
+    let gone = by("gone");
+    assert_eq!(
+        s.block(s.session.read(gone.attr.ino, 0, 10)).unwrap(),
+        b"gone"
+    );
+    s.block(s.session.copy_file(gone.attr.ino, d, OsStr::new("gone")))
+        .unwrap();
+    let found = s.block(s.session.deleted(b"/v/e")).unwrap();
+    assert!(found.gone.iter().all(|g| g.name != "gone"));
+
+    // Where the moved file is now.
+    assert_eq!(
+        s.block(s.session.locate(moved)).unwrap().as_deref(),
+        Some("/v/other/moved")
+    );
+    // Also with no names remembered, so each is found by listing.
+    let fresh = open(&s.backend, |_| {});
+    assert_eq!(
+        s.block(fresh.locate(moved)).unwrap().as_deref(),
+        Some("/v/other/moved")
+    );
+    assert_eq!(errno(s.block(s.session.deleted(b"/"))), libc::EINVAL);
+}

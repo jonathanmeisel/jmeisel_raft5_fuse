@@ -236,6 +236,30 @@ impl SnapshotTree {
         Ok(self.node_attr(&snap, attr))
     }
 
+    /// Directory `parent` (a live inode number) as it was at the snapshot
+    /// `info` lists: each entry, without `.` and `..`, with this tree's
+    /// number for it. `dir` is `parent`'s live key, as for `lookup_in`.
+    /// The entries keep their own inode numbers.
+    pub async fn listing_in(
+        &self,
+        live: &Vault,
+        info: SnapshotInfo,
+        parent: u64,
+        dir: Arc<Node>,
+    ) -> Result<Vec<(DirItem, u64)>, FsError> {
+        let snap = self.snap(live, info);
+        snap.vault.adopt(parent, dir);
+        let items = snap.vault.readdir(parent).await?;
+        Ok(items
+            .into_iter()
+            .filter(|i| i.name != "." && i.name != "..")
+            .map(|i| {
+                let number = self.number(&snap, i.ino);
+                (i, number)
+            })
+            .collect())
+    }
+
     /// The kernel's number for what `node`, a grant or group, shows in.
     fn shown_parent(&self, snap: &Arc<Snap>, node: u64) -> u64 {
         match snap.vault.root_parent(node) {

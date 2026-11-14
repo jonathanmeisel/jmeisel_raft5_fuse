@@ -5,10 +5,8 @@
   import Dialog from "./Dialog.svelte";
   import { sizeText } from "../lib/sizes.js";
   import { when } from "../lib/when.js";
-  import HistoryTabs from "./HistoryTabs.svelte";
 
-  /// `ontab`, for a folder, shows the tabs to its Activity.
-  let { fs, path, free, onopen, ondownload, onrestored, ontab = null, onclose } = $props();
+  let { fs, path, free, onopen, ondownload, onrestored, onclose } = $props();
   // svelte-ignore state_referenced_locally
   const name = path.slice(path.lastIndexOf("/") + 1);
   // svelte-ignore state_referenced_locally
@@ -84,7 +82,6 @@
 </script>
 
 <Dialog title={`${name}: history`} wide {onclose}>
-  {#if ontab}<HistoryTabs current="versions" {ontab} />{/if}
   {#if found === null && !error}
     <p class="note">Looking through the snapshots…</p>
   {:else if found}

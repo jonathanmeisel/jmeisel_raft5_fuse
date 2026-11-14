@@ -352,6 +352,8 @@ const methods = {
   remove: (path) => session().remove(path),
   rename: (from, to, replace) => session().rename(from, to, replace),
   versions: (path) => session().versions(path),
+  deleted: (path) => session().deleted(path),
+  locate: (moved) => session().locate(moved),
   activity: (path, after) => session().activity(path, after ?? undefined),
   copy: (from, to) => session().copy(from, to),
 

@@ -75,6 +75,16 @@ impl Dentries {
         map.insert((parent, name.to_os_string()), (ino, Instant::now()));
     }
 
+    /// The remembered name of `child` in `parent`, if there is one.
+    pub(crate) fn name_of(&self, parent: u64, child: u64) -> Option<OsString> {
+        let map = self.map.lock().unwrap();
+        map.iter()
+            .find(|((dir, _), (ino, at))| {
+                *dir == parent && *ino == child && at.elapsed() < self.ttl
+            })
+            .map(|((_, name), _)| name.clone())
+    }
+
     /// Forgets `name` in `parent`, which the session just changed.
     pub(crate) fn forget(&self, parent: u64, name: &OsStr) {
         self.map
