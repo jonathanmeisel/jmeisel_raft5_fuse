@@ -3,9 +3,14 @@
 # read-only at /.snapshot and which the web app's Versions reads. Each run:
 #
 # - takes hourly-<date>T<hour> (UTC), and daily-<date> if today has none;
-# - removes hourly-* beyond the newest @SNAPSHOTS_HOURLY@, and daily-* beyond
-#   the newest @SNAPSHOTS_DAILY@. Names sort by time. No other name is
-#   touched, so snapshots taken by hand stay.
+# - keeps the newest @SNAPSHOTS_HOURLY@ hourly-* and @SNAPSHOTS_DAILY@ daily-*.
+#   Names sort by time. No other name is touched, so snapshots taken by
+#   hand stay.
+#
+# The store holds at most 32 snapshots, and refuses another. So the old ones
+# go first, to make room, and the new one after: taking first would fill the
+# store at the hour that adds a daily, and every run after would fail before
+# it removed anything.
 #
 # raft5fs-snapshots.timer runs it every hour on every node, a few minutes
 # apart. The first node to start does the work; the others find it done.
@@ -33,14 +38,6 @@ said() { grep -q "$1" "$out"; }
 # The snapshots' names, one per line. Failing to list is a real failure.
 names() { "$admin" snapshot list | cut -f1; }
 
-# Takes snapshot $1, unless another node took it first.
-take() {
-    if names | grep -qx "$1"; then
-        return
-    fi
-    run snapshot create "$1" || said "already exists" || exit 1
-}
-
 # Removes $1-* beyond the newest $2. One that another node removed first
 # is no longer listed.
 prune() {
@@ -51,11 +48,21 @@ prune() {
     done
 }
 
-if [ "$hourly" -gt 0 ]; then
-    take "hourly-$hour"
-fi
-if [ "$daily" -gt 0 ]; then
-    take "daily-$day"
-fi
-prune hourly "$hourly"
-prune daily "$daily"
+# Keeps the newest $3 of $1-*, ending with snapshot $2: makes room for $2
+# if it isn't taken yet, then takes it, unless another node took it first.
+# With $3 of 0, keeps none and takes nothing.
+keep() {
+    if [ "$3" -eq 0 ]; then
+        prune "$1" 0
+        return
+    fi
+    if names | grep -qx "$2"; then
+        prune "$1" "$3"
+        return
+    fi
+    prune "$1" $(($3 - 1))
+    run snapshot create "$2" || said "already exists" || exit 1
+}
+
+keep hourly "hourly-$hour" "$hourly"
+keep daily "daily-$day" "$daily"
