@@ -812,7 +812,9 @@ test("storage, size limits, and giving a folder away", async ({ browser }) => {
     await expect(jack.getByText(/of a 1\.0 KB limit/)).toBeVisible(SLOW);
     await jack.getByRole("button", { name: "Close" }).click();
     await open(jack, "drop");
-    await expect(jack.getByText(/Holds 0 bytes of its 1\.0 KB limit/)).toBeVisible(SLOW);
+    // The folder's menu says how full it is.
+    await expect(await folderMenu(jack)).toContainText(/Holds 0 bytes of its 1\.0 KB limit/, SLOW);
+    await jack.keyboard.press("Escape");
     await jack.locator("input[type=file]").setInputFiles([
       { name: "big.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(2048, 1) },
     ]);

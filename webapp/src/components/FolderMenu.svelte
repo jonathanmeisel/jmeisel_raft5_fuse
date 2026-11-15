@@ -44,13 +44,13 @@
   );
   /// A reader can't see or change who else has the folder.
   const opens = $derived(!(here?.from && !sources.length && !here.writable));
+  /// With a limit, what it holds against it (nothing, until measured);
+  /// without one, what it holds once measured.
   const holds = $derived(
-    size?.measuredAt
-      ? size.limit
-        ? `Holds ${sizeText(size.bytes)} of its ${sizeText(size.limit)} limit`
-        : `Holds ${sizeText(size.bytes)}`
-      : size?.limit
-        ? `Limited to ${sizeText(size.limit)}`
+    size?.limit
+      ? `Holds ${sizeText(size.bytes)} of its ${sizeText(size.limit)} limit`
+      : size?.measuredAt
+        ? `Holds ${sizeText(size.bytes)}`
         : "",
   );
   const name = $derived(folder.slice(folder.lastIndexOf("/") + 1) || "My files");
@@ -89,7 +89,7 @@
         <i class="wxi-folder logo" aria-hidden="true"></i>
       {/if}
       {@render children?.()}
-      <i class="wxi-angle-down"></i>
+      <i class="wxi-angle-down" aria-hidden="true"></i>
     </button>
   {:else}
     <span class="folder plain">
@@ -102,14 +102,14 @@
       <div class="who"><strong>{name}</strong></div>
       {#if opens}
         <button role="menuitem" class="option" onclick={() => choose(onsharing)}>
-          <i class="wxi-account"></i>
+          <i class="wxi-account" aria-hidden="true"></i>
           <span class="text">{sharing}</span>
         </button>
       {:else}
-        <div class="info"><i class="wxi-account"></i><span class="text">{sharing}</span></div>
+        <div class="info"><i class="wxi-account" aria-hidden="true"></i><span class="text">{sharing}</span></div>
       {/if}
       {#if holds}
-        <div class="info"><i class="wxi-folder"></i><span class="text">{holds}</span></div>
+        <div class="info"><i class="wxi-folder" aria-hidden="true"></i><span class="text">{holds}</span></div>
       {/if}
       <button
         role="menuitemcheckbox"
@@ -118,7 +118,7 @@
         onclick={() => choose(() => ontoggledeleted(!showDeleted))}
       >
         <span class="box" class:on={showDeleted} aria-hidden="true">
-          {#if showDeleted}<i class="wxi-check"></i>{/if}
+          {#if showDeleted}<i class="wxi-check" aria-hidden="true"></i>{/if}
         </span>
         <span class="text">Show deleted</span>
       </button>
