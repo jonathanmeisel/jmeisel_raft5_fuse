@@ -1375,7 +1375,7 @@ test("a file's versions come from the snapshots, and can be put back", async ({ 
 
   // A folder's history is its activity, with no versions.
   await menu(page, "drafts", "History");
-  await expect(page.getByRole("dialog").getByText("Nothing has changed here lately.")).toBeVisible(SLOW);
+  await expect(page.getByRole("dialog").getByText("No recent changes")).toBeVisible(SLOW);
   await expect(page.getByRole("tab")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).last().click();
 

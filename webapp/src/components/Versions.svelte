@@ -134,14 +134,12 @@
         {/each}
       </tbody>
     </table>
-    {#if found.versions.length === 0}
-      <p>No other versions in the snapshots.</p>
+    {#if rows.length === 0}
+      <p>No recent changes</p>
     {/if}
-    <p class="note">
-      Versions come from snapshots: on a server that keeps them, one each hour for a day, and one each
-      day for a week. A {isFolder ? "folder" : "file"} renamed since isn't found in older ones.
-      {#if found.unreadable}{found.unreadable} snapshots couldn't be read.{/if}
-    </p>
+    {#if found.unreadable}
+      <p class="note">{found.unreadable} snapshots couldn't be read.</p>
+    {/if}
   {/if}
   {#if error}<p class="error">{error}</p>{/if}
   <p><button onclick={onclose}>Close</button></p>

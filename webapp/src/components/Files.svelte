@@ -795,7 +795,7 @@
     }
     if (item?.deleted) {
       return [
-        { id: "restore-deleted", text: "Restore", icon: "wxi-sync", handler: () => restoreGone(item.id) },
+        { id: "restore-deleted", text: "Restore", icon: "wxi-undo", handler: () => restoreGone(item.id) },
         { id: "open-deleted", text: "Open", icon: "wxi-external", handler: () => openGone(item.id) },
         {
           id: "download-deleted",
@@ -815,7 +815,7 @@
     const history = {
       id: "history",
       text: "History",
-      icon: "wxi-sync",
+      icon: "wxi-clock",
       handler: () => (dialog = { kind: item.type === "folder" ? "activity" : "versions", path: item.id }),
     };
     if (mode === "file" && item && !item.id.startsWith("/.snapshot")) return [options[0], history, ...options.slice(1)];

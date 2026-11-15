@@ -44,7 +44,7 @@
   {#if !loaded}
     <p class="note">Loading…</p>
   {:else if lines.length === 0 && !error}
-    <p>Nothing has changed here lately.</p>
+    <p>No recent changes</p>
   {/if}
   <ul>
     {#each lines as line, i (i)}
@@ -63,10 +63,6 @@
   {#if next}
     <p><button onclick={more} disabled={busy}>Load more</button></p>
   {/if}
-  <p class="note">
-    The servers keep this for a few days, and say who made each change: it isn't signed by them. A name
-    opens its versions.
-  </p>
   {#if error}<p class="error">{error}</p>{/if}
   <p><button onclick={onclose}>Close</button></p>
 </Dialog>
