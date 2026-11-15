@@ -134,6 +134,7 @@ macro_rules! decide {
 
 // After `decide!`, which they use.
 mod activity;
+mod pruning;
 mod unreachable;
 pub mod usage;
 pub(crate) mod volumes;
@@ -1179,7 +1180,7 @@ impl FsCore {
             }
         }
         txn.write(&reservation_key(new.ino), None).await?;
-        txn.write(&node_keys_key(new.ino), Some(&new.keys)).await?;
+        grants::put_node_keys(txn, new.ino, Some(&new.keys)).await?;
         Ok(Ok(()))
     }
 
@@ -1394,7 +1395,7 @@ impl FsCore {
                         "the moved node's key record must keep its version, under the new parent's",
                     )));
                 }
-                txn.write(&node_keys_key(ino), Some(keys)).await?;
+                grants::put_node_keys(&txn, ino, Some(keys)).await?;
             }
             if moved.attr.kind == Kind::Directory && new_parent != parent {
                 // A directory cannot move below itself, so walk up from the
@@ -2206,7 +2207,7 @@ impl FsCore {
                 } else {
                     txn.write(&grantees_key(ino), None).await?;
                 }
-                txn.write(&node_keys_key(ino), Some(&r.node_keys)).await?;
+                grants::put_node_keys(&txn, ino, Some(&r.node_keys)).await?;
                 rotated.insert(ino, new_version);
             }
             txn.commit().await?;
@@ -2355,7 +2356,7 @@ impl FsCore {
                     format!("inode {ino}'s key record changed meanwhile"),
                 )));
             }
-            txn.write(&node_keys_key(ino), Some(node_keys)).await?;
+            grants::put_node_keys(&txn, ino, Some(node_keys)).await?;
             txn.commit().await?;
             Ok(Ok(()))
         })

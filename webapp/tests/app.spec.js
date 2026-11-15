@@ -1,7 +1,7 @@
 // The whole app, as two people use it: enrol, log in, make a volume,
 // upload and download (one file large enough for object storage), share
 // with a fingerprint, trust, read as the other user, and revoke, which
-// queues a prune that the app works through.
+// leaves a prune that the app works through.
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -379,6 +379,8 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
   });
 
   await test.step("alice revokes, and the app re-seals the folder", async () => {
+    // With re-sealing off in this browser, the folder only waits.
+    await accountMenu(alice, "Re-seal on this device");
     await sharing(alice, "docs");
     const bobRow = alice.getByRole("row").filter({ hasText: "bob" });
     await expect(bobRow).toContainText("read-write", SLOW);
@@ -387,8 +389,11 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await alice.getByRole("button", { name: "Revoke", exact: true }).click();
     await expect(alice.getByText(/Revoked bob's share/)).toBeVisible(SLOW);
     await alice.getByRole("button", { name: "Close" }).click();
-    await expect(alice.getByText(/Re-sealing/)).toBeVisible(SLOW);
-    await expect(alice.getByText(/Re-sealing/)).toHaveCount(0, { timeout: 90_000 });
+    await expect(alice.getByText("/docs waits to be re-sealed")).toBeVisible(SLOW);
+    await expect(alice.getByText(/Re-sealing is off on this device/)).toBeVisible();
+    // On again, this browser does it, and then nothing waits.
+    await accountMenu(alice, "Re-seal on this device");
+    await expect(alice.locator(".prune")).toHaveCount(0, { timeout: 90_000 });
   });
 
   await test.step("bob can no longer open it", async () => {

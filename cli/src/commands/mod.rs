@@ -217,8 +217,8 @@ pub struct SessionArgs {
     /// called.
     #[arg(long)]
     pub no_write_buffer: bool,
-    /// Do not work through this account's prune queue (see `raft5fs prune`)
-    /// in the background while running.
+    /// Do not prune, in the background while running, what the servers say
+    /// waits for a prune that this account can write (see `raft5fs prune`).
     #[arg(long)]
     pub no_background_prune: bool,
 }
@@ -241,7 +241,7 @@ impl SessionArgs {
             config.cache_bytes = bytes;
         }
         if !self.no_background_prune {
-            config.prune_queue = Some((ctx.prune_queue(), PrunerConfig::default()));
+            config.prune = Some(PrunerConfig::default());
         }
         Ok(config)
     }

@@ -191,6 +191,27 @@ pub(crate) const RESERVATION_PREFIX: &[u8] = &[0x0A];
 /// The prefix of every sealed grantee list; see `grants`.
 pub(crate) const GRANTEES_PREFIX: &[u8] = &[0x0B];
 
+/// The prefix of the nodes waiting for a prune: those whose key record
+/// still keeps older versions. See `fs::pruning`.
+pub(crate) const UNPRUNED_PREFIX: &[u8] = &[0x10];
+
+pub(crate) fn unpruned_key(ino: u64) -> Vec<u8> {
+    let mut key = UNPRUNED_PREFIX.to_vec();
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// A claim on a prune, under `0x11`; see `fs::pruning`.
+pub(crate) fn prune_claim_key(ino: u64) -> Vec<u8> {
+    let mut key = vec![0x11];
+    key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// Set once `UNPRUNED_PREFIX` holds every node with older key versions,
+/// including those from before it was kept.
+pub(crate) const UNPRUNED_INDEXED_KEY: &[u8] = b"\x04unpruned_indexed";
+
 /// The prefix of the activity log; see `fs::activity`.
 pub(crate) const ACTIVITY_PREFIX: &[u8] = &[0x0F];
 

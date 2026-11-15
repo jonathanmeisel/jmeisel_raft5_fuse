@@ -6,7 +6,7 @@
 // - The app may serve several filesystems (`filesystems`, from its build
 //   config). Each call works on one, chosen at login, or by an invitation's
 //   filesystem id at enrolment. Everything stored is filed by that id.
-// - IndexedDB keeps pins and the prune queue, under `<fsId>/<user>/<name>`.
+// - IndexedDB keeps pins, under `<fsId>/<user>/<name>`.
 //   Each tab on an account keeps its own copy in the wasm client; every
 //   save also goes to the account's other tabs (a BroadcastChannel), so
 //   none of them saves over another's change.
@@ -160,8 +160,12 @@ async function recall(db) {
 
 // ------------------------------------------------------------------ tabs
 
-/// Whether this tab runs the account's background prune.
+/// Whether this tab holds the account's prune lock: of this browser's tabs,
+/// it is the one to run the background prune.
 let prunesHere = false;
+/// Whether this browser prunes at all: the page's setting (see
+/// pruneSetting.js), which it sends after login.
+let pruneWanted = false;
 
 /// The account's channel to its other tabs, opened before its blobs are
 /// read, so no save made meanwhile is missed: saves that arrive before
@@ -184,7 +188,7 @@ function joined(user, { early }) {
   navigator.locks.request(`raft5fs:${config.fsId}:${user}:prune`, () => {
     if (!fs) return null;
     prunesHere = true;
-    fs.resumePruning();
+    if (pruneWanted) fs.resumePruning();
     return new Promise(() => {});
   });
 }
@@ -595,12 +599,17 @@ const methods = {
   revokeLink: (user) => session().revokeLink(user),
   pruneStatus: () => session().pruneStatus(),
   pruneEstimate: (path) => session().pruneEstimate(path),
-  pruneAgain: (path) => session().pruneAgain(path),
-  /// Pause and resume act only in the tab that runs the prune.
-  pausePruning: () => prunesHere && session().pausePruning(),
-  resumePruning: () => prunesHere && session().resumePruning(),
-  /// "running" or "paused" here, or "elsewhere": another tab runs it.
-  pruning: () => (prunesHere ? (session().pruning ? "running" : "paused") : "elsewhere"),
+  /// Turns this browser's background prune on or off; it runs in the tab
+  /// that holds the prune lock.
+  setPruneHere(on) {
+    pruneWanted = on;
+    if (!prunesHere) return;
+    if (on) session().resumePruning();
+    else session().pausePruning();
+  },
+  /// "off" in this browser, "running" in this tab, or "elsewhere": in
+  /// another of this browser's tabs.
+  pruning: () => (!pruneWanted ? "off" : prunesHere ? "running" : "elsewhere"),
 
   /// Logs out, and forgets the account if this device remembered it.
   async logout() {

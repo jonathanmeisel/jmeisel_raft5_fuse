@@ -18,7 +18,6 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
     WriteFlags,
 };
-use raft5fs_client::prune_queue::PruneQueue;
 use raft5fs_client::pruner::PrunerConfig;
 use raft5fs_client::remote::Credentials;
 use raft5fs_client::session::{Session, SessionConfig};
@@ -128,10 +127,10 @@ impl Raft5Fs {
         self
     }
 
-    /// Works through `queue` in the background while mounted, at the pace
-    /// that `config` sets (see `pruner`).
-    pub fn with_prune_queue(mut self, queue: PruneQueue, config: PrunerConfig) -> Self {
-        self.config().prune_queue = Some((queue, config));
+    /// Prunes in the background while mounted, at the pace that `config`
+    /// sets, what the servers say waits for a prune (see `pruner`).
+    pub fn with_pruning(mut self, config: PrunerConfig) -> Self {
+        self.config().prune = Some(config);
         self
     }
 

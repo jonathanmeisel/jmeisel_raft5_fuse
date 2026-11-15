@@ -50,10 +50,11 @@ use raft5fs_proto::pb::{
 };
 use raft5fs_proto::pb::{
     ActivityRequest, ActivityResponse, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest,
-    FolderLimitRequest, FolderSizesRequest, FolderSizesResponse, GrantLabelRequest,
-    OfferListResponse, OfferVolumeRequest, OrphanListResponse, PinsResponse, PutPinsRequest,
-    SetCapabilitiesRequest, SetQuotaRequest, StorageResponse, UnreachableListResponse,
-    UserListResponse, UsernameRequest, VolumeResponse,
+    ClaimPruneRequest, ClaimPruneResponse, FolderLimitRequest, FolderSizesRequest,
+    FolderSizesResponse, GrantLabelRequest, OfferListResponse, OfferVolumeRequest,
+    OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
+    StorageResponse, UnprunedListResponse, UnreachableListResponse, UserListResponse,
+    UsernameRequest, VolumeResponse,
 };
 use raft5fs_proto::types::Caps;
 use throttle::LoginThrottle;
@@ -836,6 +837,26 @@ impl Fs for FsService {
             .activity(&caller, r.folder, &r.after, r.limit as usize)
             .await;
         Ok(Response::new(page.into()))
+    }
+
+    async fn list_unpruned(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<UnprunedListResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        Ok(Response::new(self.core.unpruned(&caller).await.into()))
+    }
+
+    async fn claim_prune(
+        &self,
+        r: Request<ClaimPruneRequest>,
+    ) -> Result<Response<ClaimPruneResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let claimed = self
+            .core
+            .claim_prune(&caller, r.ino, &r.holder, r.release)
+            .await;
+        Ok(Response::new(claimed.into()))
     }
 
     async fn set_grant_label(

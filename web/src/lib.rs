@@ -9,8 +9,8 @@
 //! - Failures reject with an `Error` whose `code` names the errno
 //!   (`ENOENT`, ...), or `EFINGERPRINT` for a first share that needs the
 //!   other user's fingerprint.
-//! - Nothing secret is stored: only pins and the prune queue, through the
-//!   app's `persist` function (see `store`).
+//! - Nothing secret is stored: only pins, through the app's `persist`
+//!   function (see `store`).
 #![cfg(target_arch = "wasm32")]
 
 mod store;
@@ -23,10 +23,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use futures_util::future::{AbortHandle, LocalBoxFuture, join_all};
+use futures_util::future::{LocalBoxFuture, join_all};
 use js_sys::{Function, Promise, Uint8Array};
-use raft5fs_client::prune_queue::PruneQueue;
-use raft5fs_client::pruner::{self, PrunerConfig};
+use raft5fs_client::pruner::{self, Pruner, PrunerConfig};
 use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::store::Store;
@@ -343,7 +342,7 @@ pub async fn resume(
     open(config, credentials, stored, persist).await
 }
 
-/// A session for `credentials`, with this browser's pins and prune queue.
+/// A session for `credentials`, with this browser's pins.
 async fn open(
     config: Config,
     credentials: Credentials,
@@ -360,7 +359,6 @@ async fn open(
     let store: Arc<dyn Store> = browser.clone();
     let known = KnownKeys::open(Arc::clone(&store), PINS)
         .map_err(|e| failure("EIO", &format!("the pinned keys in this browser: {e}")))?;
-    let queue = PruneQueue::new(store);
 
     let mut session_config = SessionConfig::new(config.servers.clone(), credentials);
     session_config.tls = config.tls();
@@ -387,8 +385,9 @@ async fn open(
         session,
         fs_id: config.fs_id.clone(),
         store: browser,
-        queue,
         pruner: RefCell::new(None),
+        unpruned: RefCell::new(None),
+        prune_paths: RefCell::new(HashMap::new()),
         handles: RefCell::new(HashMap::new()),
         next_handle: Cell::new(1),
         sharing: RefCell::new(HashMap::new()),
@@ -405,11 +404,15 @@ struct Inner {
     session: Arc<Session>,
     /// The filesystem's id, for public links.
     fs_id: String,
-    /// This tab's copy of the account's pins and prune queue.
+    /// This tab's copy of the account's pins.
     store: Arc<BrowserStore>,
-    queue: PruneQueue,
-    /// The background prune of the queue, while it runs.
-    pruner: RefCell<Option<AbortHandle>>,
+    /// The background prune of what the servers list, while it runs here.
+    pruner: RefCell<Option<Pruner>>,
+    /// What waits for a prune, as the servers last said, and when, for a
+    /// tab that doesn't prune (see `Fs::prune_status`).
+    unpruned: RefCell<Option<(f64, Vec<raft5fs_proto::types::Unpruned>)>>,
+    /// Where each node waiting for a prune is, as `locate` found it.
+    prune_paths: RefCell<HashMap<u64, String>>,
     /// Open files: handle to inode. Inodes don't fit in a JavaScript
     /// number (snapshots' are above 2^63), so the app gets small handles.
     handles: RefCell<HashMap<u32, u64>>,
@@ -927,17 +930,58 @@ impl Inner {
     fn start_pruner(&self) -> Result<(), FsError> {
         let vault = Vault::new(Arc::clone(self.vault().remote()))?
             .with_known_keys(self.vault().known_keys().duplicate());
-        let handle = pruner::spawn(vault, self.queue.clone(), PrunerConfig::default());
-        if let Some(old) = self.pruner.replace(Some(handle)) {
-            old.abort();
-        }
+        // Dropping the one before stops it.
+        self.pruner
+            .replace(Some(pruner::spawn(vault, PrunerConfig::default())));
         Ok(())
     }
 
     fn stop_pruner(&self) {
-        if let Some(handle) = self.pruner.take() {
-            handle.abort();
+        drop(self.pruner.take());
+    }
+
+    /// After a revoke: the pruner here looks for it now, and a tab that
+    /// doesn't prune asks the servers again.
+    fn revoked(&self) {
+        self.sharing_changed();
+        self.unpruned.replace(None);
+        if let Some(pruner) = &*self.pruner.borrow() {
+            pruner.kick();
         }
+    }
+
+    /// What waits for a prune, as the servers say, asked at most once a
+    /// minute. Empty if they can't say.
+    async fn unpruned_now(&self) -> Vec<raft5fs_proto::types::Unpruned> {
+        const EVERY_MS: f64 = 60_000.0;
+        let now = js_sys::Date::now();
+        if let Some((at, known)) = &*self.unpruned.borrow()
+            && now - at < EVERY_MS
+        {
+            return known.clone();
+        }
+        let listed = self
+            .vault()
+            .remote()
+            .list_unpruned()
+            .await
+            .unwrap_or_default();
+        self.unpruned.replace(Some((now, listed.clone())));
+        listed
+    }
+
+    /// Where node `ino` is, for people, found once.
+    async fn prune_path(&self, ino: u64) -> String {
+        let known = self.prune_paths.borrow().get(&ino).cloned();
+        if let Some(path) = known {
+            return path;
+        }
+        let path = match self.session.locate(ino).await {
+            Ok(Some(path)) => path,
+            _ => "a folder you can't open".to_string(),
+        };
+        self.prune_paths.borrow_mut().insert(ino, path.clone());
+        path
     }
 
     fn inode(&self, handle: u32) -> Result<u64, FsError> {
@@ -1587,25 +1631,16 @@ impl Fs {
         })
     }
 
-    /// Revokes `user`'s share of directory `path`, and queues it for
-    /// pruning, which this app does in the background while it is open.
-    /// Until that is done, what was written there before is still sealed
-    /// under keys `user` had.
+    /// Revokes `user`'s share of directory `path`. Until it is pruned, what
+    /// was written there before is still sealed under keys `user` had: any
+    /// client that can write it prunes it in the background.
     pub fn revoke(&self, path: String, user: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let ino = inner.resolve(&path).await?.ino;
             inner.vault().revoke(ino, &user).await?;
-            inner.sharing_changed();
-            inner
-                .queue
-                .add(ino, &format!("{path} (revoked {user})"))
-                .map_err(|e| {
-                    FsError::new(
-                        errno::EIO,
-                        format!("revoked, but not queued for pruning: {e}"),
-                    )
-                })
+            inner.revoked();
+            Ok(())
         })
     }
 
@@ -2071,31 +2106,21 @@ impl Fs {
     }
 
     /// Revokes public link `user`, which this account made, wherever its
-    /// folder now is, and queues the folder for pruning, as `revoke` does.
+    /// folder now is, as `revoke` does.
     #[wasm_bindgen(js_name = revokeLink)]
     pub fn revoke_link(&self, user: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
-            let (link, path) = inner
+            let (link, _) = inner
                 .vault()
                 .links()
                 .await?
                 .into_iter()
                 .find(|(link, _)| link.user == user)
                 .ok_or_else(|| FsError::new(errno::ENOENT, "there's no such link"))?;
-            let ino = link.info.folder;
-            inner.vault().revoke(ino, &user).await?;
-            inner.sharing_changed();
-            let path = path.unwrap_or_else(|| format!("folder {ino}"));
-            inner
-                .queue
-                .add(ino, &format!("{path} (revoked a public link)"))
-                .map_err(|e| {
-                    FsError::new(
-                        errno::EIO,
-                        format!("revoked, but not queued for pruning: {e}"),
-                    )
-                })
+            inner.vault().revoke(link.info.folder, &user).await?;
+            inner.revoked();
+            Ok(())
         })
     }
 
@@ -2264,34 +2289,66 @@ impl Fs {
         promise(async move { inner.vault().reset_versions().await })
     }
 
-    /// What waits to be pruned, with each entry's latest status.
+    /// What waits for a prune that this account can write, as
+    /// `[{path, state, by, detail}]`:
+    ///
+    /// - `state`: "pruning", "waiting", or "incomplete" (tried here, and
+    ///   to be tried again; `detail` says why).
+    /// - `by`: who prunes it: null for this tab, else the account holding
+    ///   the claim (this account's own name for another of its devices).
+    /// - `detail`: how far this tab's prune got, or why it stopped.
+    ///
+    /// From this tab's pruner when it runs here; else from the servers,
+    /// asked at most once a minute.
     #[wasm_bindgen(js_name = pruneStatus)]
-    pub fn prune_status(&self) -> Result<JsValue, JsValue> {
+    pub fn prune_status(&self) -> Promise {
         #[derive(Serialize)]
-        struct Queued {
-            note: String,
-            /// Milliseconds since the Unix epoch.
-            since: f64,
-            status: String,
+        struct Waiting {
+            path: String,
+            state: &'static str,
+            by: Option<String>,
+            detail: Option<String>,
         }
-        let io = |e: std::io::Error| failure("EIO", &e.to_string());
-        let statuses = self.0.queue.statuses().map_err(io)?;
-        let entries: Vec<_> = self
-            .0
-            .queue
-            .entries()
-            .map_err(io)?
-            .into_iter()
-            .map(|e| Queued {
-                status: statuses
-                    .get(&e.ino)
-                    .cloned()
-                    .unwrap_or_else(|| "waiting".into()),
-                note: e.note,
-                since: e.since as f64 * 1000.0,
-            })
-            .collect();
-        to_js(&entries)
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let here = inner.pruner.borrow().as_ref().map(Pruner::status);
+            let (waiting, current, incomplete) = match here {
+                Some(s) => (s.waiting, s.current, s.incomplete),
+                None => (inner.unpruned_now().await, None, HashMap::new()),
+            };
+            let mut out = Vec::with_capacity(waiting.len());
+            for node in waiting {
+                let path = inner.prune_path(node.ino).await;
+                let mine = current.as_ref().filter(|(ino, _)| *ino == node.ino);
+                out.push(match (mine, &node.claim, incomplete.get(&node.ino)) {
+                    (Some((_, how)), _, _) => Waiting {
+                        path,
+                        state: "pruning",
+                        by: None,
+                        detail: Some(how.clone()),
+                    },
+                    (None, Some(claim), _) => Waiting {
+                        path,
+                        state: "pruning",
+                        by: Some(claim.user.clone()),
+                        detail: None,
+                    },
+                    (None, None, Some(why)) => Waiting {
+                        path,
+                        state: "incomplete",
+                        by: None,
+                        detail: Some(why.clone()),
+                    },
+                    (None, None, None) => Waiting {
+                        path,
+                        state: "waiting",
+                        by: None,
+                        detail: None,
+                    },
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// How much a prune of directory `path` would re-seal now: a walk that
@@ -2317,27 +2374,14 @@ impl Fs {
         })
     }
 
-    /// Queues directory `path` for pruning again, as after browser storage
-    /// was cleared mid-prune.
-    #[wasm_bindgen(js_name = pruneAgain)]
-    pub fn prune_again(&self, path: String) -> Promise {
-        let inner = Rc::clone(&self.0);
-        promise(async move {
-            let ino = inner.resolve(&path).await?.ino;
-            inner
-                .queue
-                .add(ino, &format!("{path} (pruned again)"))
-                .map_err(|e| FsError::new(errno::EIO, e.to_string()))
-        })
-    }
-
     /// Takes another tab's save of blob `name` (see `store`).
     #[wasm_bindgen(js_name = storeUpdated)]
     pub fn store_updated(&self, name: String, data: Vec<u8>) {
         self.0.store.refresh(&name, &data);
     }
 
-    /// Stops the background prune; what it was doing stays queued.
+    /// Stops the background prune here; what it was doing stays listed,
+    /// for any other pruner.
     #[wasm_bindgen(js_name = pausePruning)]
     pub fn pause_pruning(&self) {
         self.0.stop_pruner();

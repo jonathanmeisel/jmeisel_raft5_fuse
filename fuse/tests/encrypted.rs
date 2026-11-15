@@ -1697,20 +1697,6 @@ fn a_name_that_could_break_a_line_is_no_account() {
 
 // ------------------------------------------------- shares and the pruner
 
-/// Its own prune queue, in a new temporary directory, and the directory.
-fn temp_queue(name: &str) -> (raft5fs_client::prune_queue::PruneQueue, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "raft5fs-test-queue-{name}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    (
-        raft5fs_client::prune_queue::PruneQueue::at(dir.clone()),
-        dir,
-    )
-}
-
 #[test]
 fn shares_say_whose_they_are_and_whether_trusted() {
     use raft5fs_client::vault::ShareTrust;
@@ -1760,14 +1746,21 @@ fn shares_say_whose_they_are_and_whether_trusted() {
     );
 }
 
+/// What waits for a prune that `user` can write, as the servers list it.
+fn waiting(h: &support::Harness, user: &str) -> Vec<u64> {
+    let v = vault(h, user);
+    let listed = h.runtime.block_on(v.remote().list_unpruned()).unwrap();
+    listed.into_iter().map(|u| u.ino).collect()
+}
+
 #[test]
-fn a_mount_prunes_what_is_queued_in_the_background() {
+fn a_mount_prunes_what_waits_in_the_background() {
     let h = support::setup_root();
     let (v, _) = revoked_tree(&h);
     let f = v.join("shared/sub/f");
-    let (queue, dir) = temp_queue("background");
-    queue.add(ino(&v), "v (revoked alice)").unwrap();
-    let _mount = h.pruning_mount(queue);
+    // The revoke left the tree waiting, with no queue to add it to.
+    assert!(waiting(&h, support::TESTER).contains(&ino(&v)));
+    let _mount = h.pruning_mount();
     // Writes through the first mount continue in the meantime.
     let writer = {
         let f = f.clone();
@@ -1777,24 +1770,25 @@ fn a_mount_prunes_what_is_queued_in_the_background() {
             }
         })
     };
-    let queue = raft5fs_client::prune_queue::PruneQueue::at(dir.clone());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !queue.entries().unwrap().is_empty() {
+    loop {
+        let left = waiting(&h, support::TESTER);
+        if left.is_empty() {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "still queued: {:?}",
-            queue.statuses()
+            "still waiting: {left:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     writer.join().unwrap();
     assert_eq!(fs::read(&f).unwrap(), b"write 39");
     assert_fully_pruned(&h, &v);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn a_prune_that_skips_anything_stays_queued() {
+fn only_writers_see_or_claim_a_prune() {
     let h = support::setup_root();
     let v = shared_tree(&h);
     h.add_user("alice");
@@ -1807,31 +1801,29 @@ fn a_prune_that_skips_anything_stays_queued() {
     }
     h.runtime.block_on(mine.revoke(ino(&v), "bob")).unwrap();
 
-    // Alice cannot prune what she can only read. It stays in the queue,
-    // with the reason, for a user who can.
-    let (queue, dir) = temp_queue("skips");
-    queue.add(ino(&v), "v").unwrap();
+    // Alice can only read it: it isn't hers to see waiting, or to claim.
+    assert!(waiting(&h, "alice").is_empty());
     let hers = vault(&h, "alice");
-    let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
-        &hers,
-        &queue,
+    let claim = h.runtime.block_on(hers.remote().claim_prune(
         ino(&v),
-        std::time::Duration::ZERO,
+        raft5fs_client::pruner::new_holder(),
+        false,
     ));
-    assert!(!stats.skipped.is_empty());
-    assert_eq!(queue.entries().unwrap().len(), 1);
-    let status = &queue.statuses().unwrap()[&ino(&v)];
-    assert!(status.starts_with("incomplete"), "{status}");
+    assert!(claim.is_err());
 
-    // The tester can, which empties the queue.
-    let stats = h.runtime.block_on(raft5fs_client::pruner::prune_entry(
-        &mine,
-        &queue,
-        ino(&v),
-        std::time::Duration::ZERO,
-    ));
+    // The tester can, which leaves nothing waiting.
+    assert!(waiting(&h, support::TESTER).contains(&ino(&v)));
+    let stats = h
+        .runtime
+        .block_on(raft5fs_client::pruner::prune_claimed(
+            &mine,
+            ino(&v),
+            raft5fs_client::pruner::new_holder(),
+            &raft5fs_client::pruner::PrunerConfig::default(),
+            &mut |_| {},
+        ))
+        .unwrap();
     assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
-    assert!(queue.entries().unwrap().is_empty());
+    assert!(waiting(&h, support::TESTER).is_empty());
     assert_fully_pruned(&h, &v);
-    let _ = fs::remove_dir_all(&dir);
 }

@@ -25,11 +25,10 @@ use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
 use crate::paths::{DEFAULT_PATH_TTL, Dentries};
-use crate::prune_queue::PruneQueue;
-use crate::pruner::{self, PrunerConfig};
+use crate::pruner::{self, PruneStatus, Pruner, PrunerConfig};
 use crate::remote::ClientTlsConfig;
 use crate::remote::{Credentials, Remote};
-use crate::rt::{self, AbortHandle};
+use crate::rt;
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault, is_group, is_virtual};
 use crate::write_buffer::WriteBuf;
@@ -66,9 +65,9 @@ pub struct SessionConfig {
     /// Where public keys are pinned, or `None` for memory only. The pins
     /// also decide which grants the session trusts enough to write under.
     pub known_keys: Option<KnownKeys>,
-    /// The prune queue to work through in the background while the session
-    /// is open, and how (see `pruner`).
-    pub prune_queue: Option<(PruneQueue, PrunerConfig)>,
+    /// How to prune, in the background while the session is open, what the
+    /// servers say waits for a prune (see `pruner`), or `None` not to.
+    pub prune: Option<PrunerConfig>,
     /// Whether to buffer small sequential writes into batches.
     pub write_buffering: bool,
     /// Whether to refuse to create the files where macOS keeps its metadata
@@ -89,7 +88,7 @@ impl SessionConfig {
             tls: None,
             cache_bytes: DEFAULT_CACHE_BYTES,
             known_keys: None,
-            prune_queue: None,
+            prune: None,
             write_buffering: true,
             hide_apple_double: false,
             path_ttl: DEFAULT_PATH_TTL,
@@ -135,8 +134,8 @@ fn is_apple_double(name: &OsStr) -> bool {
 
 pub struct Session {
     vault: Arc<Vault>,
-    /// The task that works through the prune queue, if there is one.
-    pruner: Mutex<Option<AbortHandle>>,
+    /// The background pruner, if this session prunes.
+    pruner: Mutex<Option<Pruner>>,
     /// The virtual root's timestamps: when the session was opened.
     opened_at: SystemTime,
     /// Buffers of writes that were accepted but not stored, one for each
@@ -192,12 +191,12 @@ impl Session {
             }
             Err(e) => eprintln!("trusted keys not merged with the servers' copy: {e}"),
         }
-        let pruner = match config.prune_queue {
-            Some((queue, prune_config)) => {
+        let pruner = match config.prune {
+            Some(prune_config) => {
                 let pruning = Vault::new(Arc::clone(vault.remote()))
                     .map_err(keys)?
                     .with_known_keys(vault.known_keys().duplicate());
-                Some(pruner::spawn(pruning, queue, prune_config))
+                Some(pruner::spawn(pruning, prune_config))
             }
             None => None,
         };
@@ -212,6 +211,19 @@ impl Session {
             snapshots: SnapshotTree::new(opened_at),
             dentries: Dentries::new(config.path_ttl),
         }))
+    }
+
+    /// Asks this session's pruner, if it has one, to look for work now, as
+    /// after a revoke.
+    pub fn kick_pruner(&self) {
+        if let Some(pruner) = &*self.pruner.lock().unwrap() {
+            pruner.kick();
+        }
+    }
+
+    /// What this session's pruner knows, if it has one.
+    pub fn prune_status(&self) -> Option<PruneStatus> {
+        self.pruner.lock().unwrap().as_ref().map(Pruner::status)
     }
 
     pub fn vault(&self) -> &Arc<Vault> {
@@ -493,10 +505,8 @@ impl Session {
     /// Ends the session. Nothing after this can store what is still
     /// buffered, so it is stored now.
     pub async fn shutdown(&self) {
-        // Anything it was pruning stays in the queue for next time.
-        if let Some(pruner) = self.pruner.lock().unwrap().take() {
-            pruner.abort();
-        }
+        // Anything it was pruning stays listed, for the next pruner.
+        drop(self.pruner.lock().unwrap().take());
         let inos: Vec<u64> = self.write_bufs.lock().unwrap().keys().copied().collect();
         for ino in inos {
             if let Err(e) = self.fsync(ino).await {

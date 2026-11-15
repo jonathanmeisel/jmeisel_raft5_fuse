@@ -26,7 +26,6 @@ use raft5fs_proto::types::check_username;
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Certificate, ClientTlsConfig};
 
-use crate::prune_queue::PruneQueue;
 use crate::remote::Credentials;
 use crate::vault::KnownKeys;
 
@@ -149,12 +148,6 @@ pub fn ca_id(pem: &[u8]) -> Result<String, String> {
 /// whose CA has id `ca_id`, under config directory `base`.
 pub fn default_known_keys(base: &Path, ca_id: &str) -> PathBuf {
     base.join("filesystems").join(ca_id).join("known_keys")
-}
-
-/// `user`'s prune queue on this machine, for the filesystem with id `fs_id`
-/// (`ca_id`). `raft5fs revoke` adds to it, and a mount works through it.
-pub fn prune_queue_for(user: &str, fs_id: &str) -> PruneQueue {
-    PruneQueue::at(state_dir().join(format!("{user}@{fs_id}")))
 }
 
 /// A profile: what a command would otherwise need on its command line.
@@ -412,18 +405,6 @@ impl Context {
         }
     }
 
-    /// This account's prune queue on this machine, for this filesystem.
-    pub fn prune_queue(&self) -> PruneQueue {
-        let fs = match &self.ca_id {
-            Some(id) => id.clone(),
-            None => format!(
-                "plain-{}",
-                crate::short_hash(self.servers.join(" ").as_bytes())
-            ),
-        };
-        prune_queue_for(&self.user, &fs)
-    }
-
     /// The credentials to log in with, given the password.
     pub fn credentials(&self, password: String) -> Credentials {
         let mut credentials = Credentials::new(self.user.clone(), password);
@@ -533,11 +514,6 @@ mod tests {
         let id = ca_id(PEM.as_bytes()).unwrap();
         assert_eq!(ctx.known_keys, Some(default_known_keys(&base, &id)));
         assert!(ctx.tls.is_some());
-        assert!(
-            ctx.prune_queue()
-                .location()
-                .ends_with(&format!("alice@{id}/queue"))
-        );
         // Flags win over the profile.
         let over = Overrides {
             servers: vec!["https://fs2".into()],

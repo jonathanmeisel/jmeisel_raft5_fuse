@@ -1,25 +1,26 @@
 //! `raft5fs prune`.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use raft5fs_proto::types::{FsError, Kind};
 
 use super::{ConnectArgs, Outcome, log_in, runtime};
 use raft5fs_client::cli::Context;
-use raft5fs_client::pruner::{describe, prune_entry};
-use raft5fs_client::vault::PruneStats;
+use raft5fs_client::pruner::{PrunerConfig, describe, new_holder, prune_claimed};
+use raft5fs_client::vault::{PruneStats, Vault};
+use raft5fs_proto::errno;
 
 /// Seals everything still under an old version of a key again under the
 /// current version, then removes the old versions from the key's history. A
 /// key gets a new version when a share is revoked. Until a prune, a revoked
 /// user who has the ciphertext can still read what was sealed under the old
-/// version. Revoking adds the directory to a queue, which a running mount
-/// works through in the background.
+/// version. The servers list what waits for a prune; any mount, WebDAV
+/// server or web app that can write it prunes it in the background.
 #[derive(Args)]
 #[command(verbatim_doc_comment)]
 pub struct PruneArgs {
-    /// Directories to prune now, in place of the queue.
+    /// Directories to prune now, in place of what the servers list.
     pub paths: Vec<String>,
     /// Prune everything shared with this account with write access, now.
     #[arg(long, conflicts_with = "paths")]
@@ -27,7 +28,7 @@ pub struct PruneArgs {
     /// With paths or --all: count what would be done, and change nothing.
     #[arg(long)]
     pub dry_run: bool,
-    /// Show what is queued, and the progress of each prune. Changes
+    /// Show what waits for a prune, and who is pruning it. Changes
     /// nothing.
     #[arg(long, conflicts_with_all = ["paths", "all", "dry_run"])]
     pub status: bool,
@@ -48,63 +49,78 @@ fn report(what: &str, stats: &PruneStats, dry_run: bool) {
     }
 }
 
-/// About how long ago `since` (seconds since the epoch) was.
-fn ago(since: u64) -> String {
+/// About how long from now `ms` (milliseconds since the epoch) is.
+fn from_now(ms: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    let secs = now.saturating_sub(since);
+        .map_or(0, |d| d.as_millis() as u64);
+    let secs = ms.saturating_sub(now) / 1000;
     match secs {
         0..120 => format!("{secs}s"),
-        120..7200 => format!("{}m", secs / 60),
-        7200..172800 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86400),
+        _ => format!("{}m", secs / 60),
+    }
+}
+
+/// Where inode `ino` is, for people.
+async fn shown(vault: &Vault, ino: u64) -> String {
+    match vault.locate(ino).await {
+        Ok(Some(path)) => path,
+        _ => format!("inode {ino}"),
     }
 }
 
 pub fn run(connect: &ConnectArgs, args: PruneArgs) -> Outcome {
     if args.dry_run && args.paths.is_empty() && !args.all {
-        return Err("--dry-run is for paths or --all; what is queued is pruned for real".into());
+        return Err("--dry-run is for paths or --all; what is listed is pruned for real".into());
     }
-    let ctx = Context::resolve(&connect.overrides(), !args.status)?;
-    let queue = ctx.prune_queue();
-    if args.status {
-        let entries = queue.entries().map_err(|e| e.to_string())?;
-        if entries.is_empty() {
-            println!("nothing queued for pruning");
-            return Ok(0);
-        }
-        let statuses = queue.statuses().map_err(|e| e.to_string())?;
-        for entry in entries {
-            let status = statuses.get(&entry.ino).map_or("waiting", String::as_str);
-            let note = if entry.note.is_empty() {
-                format!("inode {}", entry.ino)
-            } else {
-                entry.note.clone()
-            };
-            println!("{note}: queued {} ago; {status}", ago(entry.since));
-        }
-        return Ok(0);
-    }
-
+    let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
     let vault = log_in(&runtime, &ctx)?;
     let mut skipped = false;
     if args.paths.is_empty() && !args.all {
-        let entries = queue.entries().map_err(|e| e.to_string())?;
-        if entries.is_empty() {
-            println!("nothing queued for pruning");
+        let waiting = runtime
+            .block_on(vault.remote().list_unpruned())
+            .map_err(|e| format!("cannot list what waits for a prune: {e}"))?;
+        if waiting.is_empty() {
+            println!("nothing waits for a prune");
+            return Ok(0);
         }
-        for entry in entries {
-            let what = if entry.note.is_empty() {
-                format!("inode {}", entry.ino)
-            } else {
-                entry.note.clone()
-            };
-            let stats = runtime.block_on(prune_entry(&vault, &queue, entry.ino, Duration::ZERO));
-            report(&what, &stats, false);
-            skipped |= !stats.skipped.is_empty();
+        let holder = new_holder();
+        let config = PrunerConfig::default();
+        for node in waiting {
+            let what = runtime.block_on(shown(&vault, node.ino));
+            if args.status {
+                match node.claim {
+                    Some(c) => println!(
+                        "{what}: being pruned by {} (claim ends in {})",
+                        c.user,
+                        from_now(c.expires_ms)
+                    ),
+                    None => println!("{what}: waiting"),
+                }
+                continue;
+            }
+            let pruned = runtime.block_on(prune_claimed(
+                &vault,
+                node.ino,
+                holder,
+                &PrunerConfig {
+                    pace: std::time::Duration::ZERO,
+                    ..config
+                },
+                &mut |_| {},
+            ));
+            match pruned {
+                Ok(stats) => {
+                    report(&what, &stats, false);
+                    skipped |= !stats.skipped.is_empty();
+                }
+                Err(e) if e.errno == errno::EBUSY => println!("{what}: skipped: {e}"),
+                Err(e) => {
+                    println!("{what}: {e}");
+                    skipped = true;
+                }
+            }
         }
         return Ok(if skipped { 2 } else { 0 });
     }
@@ -140,10 +156,6 @@ pub fn run(connect: &ConnectArgs, args: PruneArgs) -> Outcome {
         let stats = runtime.block_on(vault.prune_tree(ino, args.dry_run));
         report(&what, &stats, args.dry_run);
         skipped |= !stats.skipped.is_empty();
-        // Pruned by hand, so it need not stay in the queue.
-        if !args.dry_run && stats.skipped.is_empty() {
-            let _ = queue.remove(ino);
-        }
     }
     Ok(if skipped { 2 } else { 0 })
 }

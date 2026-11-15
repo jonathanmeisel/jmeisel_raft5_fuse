@@ -4,7 +4,6 @@ mod chunk_cache;
 pub mod cli;
 pub mod deleted;
 mod paths;
-pub mod prune_queue;
 pub mod pruner;
 pub mod remote;
 mod rt;

@@ -50,7 +50,7 @@ use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 use crate::entry::decode_entry;
 use crate::layout::{
     GRANT_INDEX_PREFIX, GRANTEES_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX,
-    ROOT_INO, attr_key,
+    ROOT_INO, attr_key, prune_claim_key, unpruned_key,
 };
 use crate::timing::next_key;
 use crate::view::{ReadKeys, View};
@@ -157,6 +157,26 @@ pub(crate) fn node_keys_key(ino: u64) -> Vec<u8> {
     let mut key = NODE_KEYS_PREFIX.to_vec();
     key.extend_from_slice(&ino.to_be_bytes());
     key
+}
+
+/// Writes `ino`'s key record, or removes it (`None`), and keeps the index
+/// of nodes waiting for a prune in step: a record with older versions is
+/// in it, any other is not, and loses any claim on its prune. Every change
+/// to a key record goes through here, so the index is never out of step.
+pub(crate) async fn put_node_keys(
+    txn: &Transaction,
+    ino: u64,
+    keys: Option<&[u8]>,
+) -> Result<(), KvError> {
+    let waiting = keys
+        .and_then(|k| NodeKeys::decode(k).ok())
+        .is_some_and(|k| k.has_history());
+    txn.write(&node_keys_key(ino), keys).await?;
+    if !waiting {
+        txn.write(&prune_claim_key(ino), None).await?;
+    }
+    txn.write(&unpruned_key(ino), waiting.then_some(&[][..]))
+        .await
 }
 
 /// The key that holds `ino`'s sealed grantee list.
@@ -725,7 +745,7 @@ pub(crate) async fn forget_inode(txn: &Transaction, ino: u64) -> Result<(), KvEr
         remove_grant(txn, &user, ino).await?;
     }
     txn.write(&grantees_key(ino), None).await?;
-    txn.write(&node_keys_key(ino), None).await
+    put_node_keys(txn, ino, None).await
 }
 
 #[cfg(test)]

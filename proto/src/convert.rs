@@ -10,10 +10,10 @@ use crate::pb;
 use crate::types::{
     AccountInfo, AccountKeys, AccountKind, Activity, ActivityOp, ActivityPage, Attr,
     BLOCK_RANDOM_LEN, BlockRef, BlockUpload, BlockUrl, Caps, ChunkBody, ChunkWrite, Chunks,
-    DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind, Layout, LinkAccount,
-    ObjectGrid, Offer, Orphan, PreparedUpload, ResealedName, Rotation, SealedChunk,
-    SealedEntryName, SetAttr, SetTime, SnapshotInfo, Storage, Unreachable, UserEntry, VolumeInfo,
-    WriteBody,
+    ClaimOutcome, DirItem, FolderSize, FsError, Grant, GrantedNode, Grantee, KeyPath, Kind, Layout,
+    LinkAccount, ObjectGrid, Offer, Orphan, PreparedUpload, PruneClaim, ResealedName, Rotation,
+    SealedChunk, SealedEntryName, SetAttr, SetTime, SnapshotInfo, Storage, Unpruned, Unreachable,
+    UserEntry, VolumeInfo, WriteBody,
 };
 
 fn malformed(what: &str) -> FsError {
@@ -728,6 +728,89 @@ impl pb::FolderSizesResponse {
                 .collect()),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("folder sizes")),
+        }
+    }
+}
+
+fn claim_of(user: String, expires_ms: u64) -> Option<PruneClaim> {
+    (!user.is_empty()).then_some(PruneClaim { user, expires_ms })
+}
+
+impl From<Result<Vec<Unpruned>, FsError>> for pb::UnprunedListResponse {
+    fn from(r: Result<Vec<Unpruned>, FsError>) -> Self {
+        use pb::unpruned_list_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(nodes) => R::List(pb::UnprunedList {
+                    nodes: nodes
+                        .into_iter()
+                        .map(|n| {
+                            let (claimed_by, claim_expires_ms) = n
+                                .claim
+                                .map_or((String::new(), 0), |c| (c.user, c.expires_ms));
+                            pb::UnprunedNode {
+                                ino: n.ino,
+                                claimed_by,
+                                claim_expires_ms,
+                            }
+                        })
+                        .collect(),
+                }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::UnprunedListResponse {
+    pub fn into_result(self) -> Result<Vec<Unpruned>, FsError> {
+        use pb::unpruned_list_response::Result as R;
+        match self.result {
+            Some(R::List(l)) => Ok(l
+                .nodes
+                .into_iter()
+                .map(|n| Unpruned {
+                    ino: n.ino,
+                    claim: claim_of(n.claimed_by, n.claim_expires_ms),
+                })
+                .collect()),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("nodes waiting for a prune")),
+        }
+    }
+}
+
+impl From<Result<ClaimOutcome, FsError>> for pb::ClaimPruneResponse {
+    fn from(r: Result<ClaimOutcome, FsError>) -> Self {
+        use pb::claim_prune_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(o) => {
+                    let (claimed_by, expires_ms) = o
+                        .claim
+                        .map_or((String::new(), 0), |c| (c.user, c.expires_ms));
+                    R::Outcome(pb::ClaimOutcome {
+                        granted: o.granted,
+                        claimed_by,
+                        expires_ms,
+                    })
+                }
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::ClaimPruneResponse {
+    pub fn into_result(self) -> Result<ClaimOutcome, FsError> {
+        use pb::claim_prune_response::Result as R;
+        match self.result {
+            Some(R::Outcome(o)) => Ok(ClaimOutcome {
+                granted: o.granted,
+                claim: claim_of(o.claimed_by, o.expires_ms),
+            }),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("a prune claim")),
         }
     }
 }

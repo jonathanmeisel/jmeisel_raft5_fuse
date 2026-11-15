@@ -28,6 +28,7 @@
   import { streams } from "../lib/streams.js";
   import { pathHash, readRoute } from "../lib/route.js";
   import { fileIcon } from "../lib/sharedIcons.js";
+  import { pruneHere, setPruneHere } from "../lib/pruneSetting.js";
   import { treeFromEntries, treeFromPicker, uploadTree } from "../lib/folders.js";
 
   let { fs, me, storageError, onlogout } = $props();
@@ -58,7 +59,8 @@
   let nextTransfer = 1;
   let dialog = $state(null);
   let pendingCount = $state(0);
-  let pruneQueued = $state(0);
+  /// Whether this browser re-seals in the background (account menu).
+  let reseal = $state(pruneHere());
   /// Whether this tab is re-sealing now, and video or audio is playing.
   let pruning = false;
   let playing = false;
@@ -106,6 +108,7 @@
       initial = [];
     }
     if (visitor) return;
+    fs.setPruneHere(reseal).catch(() => {});
     refreshPending();
     refreshOffers();
     refreshStorage();
@@ -842,13 +845,6 @@
             { text: "Transfer ownership", open: () => (dialog = { kind: "transfer", path: item.id }) },
           ]
         : []),
-      {
-        text: "Prune again",
-        open: () => {
-          dialog = null;
-          pruneAgain(item.id);
-        },
-      },
     ];
     return [
       zip,
@@ -860,18 +856,10 @@
     ];
   }
 
-  async function pruneAgain(path) {
-    error = "";
-    try {
-      await fs.pruneAgain(path);
-    } catch (e) {
-      fail(e);
-    }
-  }
-
-  // Closing the tab now would lose an upload, or leave a prune for later.
+  // Closing the tab now would lose an upload. A prune isn't lost: any
+  // device that can write the folder finishes it.
   function beforeUnload(event) {
-    if (transfers.some((t) => t.kind === "up") || pruneQueued > 0) {
+    if (transfers.some((t) => t.kind === "up")) {
       event.preventDefault();
     }
   }
@@ -885,6 +873,7 @@
     ...(account.caps.includes("admin") ? [{ id: "users", text: "Users", icon: "wxi-account" }] : []),
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
     { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
+    { id: "reseal", text: "Re-seal on this device", icon: reseal ? "wxi-check" : "wxi-empty" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
 
@@ -904,7 +893,11 @@
   }
 
   function chose(id) {
-    if (id === "logout") onlogout();
+    if (id === "reseal") {
+      reseal = !reseal;
+      setPruneHere(reseal);
+      fs.setPruneHere(reseal).catch(() => {});
+    } else if (id === "logout") onlogout();
     else dialog = { kind: id };
   }
 
@@ -978,10 +971,8 @@
   {#if !visitor}
     <PruneBar
       {fs}
-      onqueued={(n, running) => {
-        pruneQueued = n;
-        pruning = running;
-      }}
+      me={me.user}
+      onrunning={(running) => (pruning = running)}
     />
   {/if}
 

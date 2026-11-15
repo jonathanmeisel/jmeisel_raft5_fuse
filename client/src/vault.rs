@@ -1662,6 +1662,43 @@ impl Vault {
             .collect())
     }
 
+    /// Where live inode `ino` is, as a path from the virtual root, or `None`
+    /// if this account can't reach it by a path it shows. Lists each folder
+    /// on the way (all at once); a session's `locate` uses names it already
+    /// knows first.
+    pub async fn locate(&self, ino: u64) -> Result<Option<String>, FsError> {
+        let (chain, shown) = futures_util::join!(self.remote.key_path(ino), self.grant_paths());
+        let chain = match chain {
+            Ok(chain) => chain,
+            Err(e) if e.errno == errno::ENOENT || e.errno == errno::EACCES => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut shown = shown?;
+        let inos: Vec<u64> = chain.nodes.iter().map(|&(i, _)| i).collect();
+        let Some(top) = inos.first().and_then(|top| shown.remove(top)) else {
+            return Ok(None);
+        };
+        let names = futures_util::future::join_all(inos.windows(2).map(|w| async move {
+            let items = self.readdir(w[0]).await?;
+            Ok::<_, FsError>(
+                items
+                    .into_iter()
+                    .find(|i| i.ino == w[1] && i.name != "." && i.name != "..")
+                    .map(|i| i.name),
+            )
+        }))
+        .await;
+        let mut path = format!("/{top}");
+        for name in names {
+            let Some(name) = name? else {
+                return Ok(None);
+            };
+            path.push('/');
+            path.push_str(&String::from_utf8_lossy(os_bytes::bytes(&name)));
+        }
+        Ok(Some(path))
+    }
+
     /// Shows this account's grant of `ino` as `label`, on all its devices. A
     /// `/` puts it in a group. This changes nothing for anyone else.
     pub async fn relabel(&self, ino: u64, label: &OsStr) -> Result<(), FsError> {

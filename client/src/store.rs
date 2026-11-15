@@ -1,5 +1,5 @@
 //! Small named blobs that a client keeps on its device: the pins of other
-//! users' keys (`KnownKeys`) and the prune queue (`PruneQueue`).
+//! users' keys (`KnownKeys`).
 //!
 //! - `FileStore`: a file for each blob in one directory, readable only by
 //!   its owner. Native clients use it.

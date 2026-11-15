@@ -93,6 +93,13 @@ service Fs {
   // days: who created, edited, renamed or deleted what. Needs read access to
   // the folder. Not for a public link.
   rpc ListActivity(ActivityRequest) returns (ActivityResponse);
+  // The nodes waiting for a prune that the caller can write: those whose
+  // key record still keeps older versions, with any claim on each. Not for
+  // a public link. (Protocol 10.)
+  rpc ListUnpruned(NoArgs) returns (UnprunedListResponse);
+  // Claims the prune of a node for a while, renews the holder's claim, or
+  // gives it up. Needs read-write access to the node. (Protocol 10.)
+  rpc ClaimPrune(ClaimPruneRequest) returns (ClaimPruneResponse);
   // Makes a new top-level directory, granted read-write to its creator.
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume and every grant of it.
@@ -976,6 +983,49 @@ message Orphan {
 
 message OrphanList {
   repeated Orphan orphans = 1;
+}
+
+message UnprunedNode {
+  uint64 ino = 1;
+  // Who holds a claim on its prune, or empty for nobody.
+  string claimed_by = 2;
+  // Milliseconds since the Unix epoch.
+  uint64 claim_expires_ms = 3;
+}
+
+message UnprunedList {
+  repeated UnprunedNode nodes = 1;
+}
+
+message UnprunedListResponse {
+  oneof result {
+    UnprunedList list = 1;
+    Error error = 2;
+  }
+}
+
+message ClaimPruneRequest {
+  uint64 ino = 1;
+  // 16 bytes that name the pruner, so a renewal is told from someone
+  // else's claim.
+  bytes holder = 2;
+  // Gives the claim up, if `holder` holds it.
+  bool release = 3;
+}
+
+message ClaimOutcome {
+  // Whether `holder` holds the claim now.
+  bool granted = 1;
+  // Who holds it, or empty for nobody (after a release).
+  string claimed_by = 2;
+  uint64 expires_ms = 3;
+}
+
+message ClaimPruneResponse {
+  oneof result {
+    ClaimOutcome outcome = 1;
+    Error error = 2;
+  }
 }
 
 message OrphanListResponse {

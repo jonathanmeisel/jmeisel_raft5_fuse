@@ -41,9 +41,6 @@ pub struct RevokeArgs {
     /// The user whose share to remove.
     #[arg(value_name = "USER")]
     pub grantee: String,
-    /// Do not add the directory to the prune queue (see `raft5fs prune`).
-    #[arg(long)]
-    pub no_prune: bool,
 }
 
 #[derive(Args)]
@@ -123,11 +120,10 @@ pub fn revoke(connect: &ConnectArgs, args: RevokeArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
     let vault = log_in(&runtime, &ctx)?;
-    let ino = runtime
+    runtime
         .block_on(async {
             let ino = vault.resolve(&args.path).await?;
-            vault.revoke(ino, &args.grantee).await?;
-            Ok::<_, raft5fs_proto::types::FsError>(ino)
+            vault.revoke(ino, &args.grantee).await
         })
         .map_err(|e| {
             format!(
@@ -136,22 +132,11 @@ pub fn revoke(connect: &ConnectArgs, args: RevokeArgs) -> Outcome {
             )
         })?;
     println!("revoked {}'s share of {}", args.grantee, args.path);
-    if args.no_prune {
-        println!(
-            "not queued for pruning: what was written there before stays sealed under keys \
-             {} had until `raft5fs prune {}`",
-            args.grantee, args.path
-        );
-        return Ok(0);
-    }
-    let queue = ctx.prune_queue();
-    queue
-        .add(ino, &format!("{} (revoked {})", args.path, args.grantee))
-        .map_err(|e| format!("revoked, but cannot queue it for pruning: {e}"))?;
     println!(
-        "queued for pruning, which a running mount does in the background (or run \
-         `raft5fs prune` now). Until it is done, what was written there before is still \
-         sealed under keys {} had; `raft5fs prune --status` shows how it is going.",
+        "Until it is pruned, what was written there before is still sealed under keys {} had. \
+         Any running mount, WebDAV server or web app that can write it prunes it in the \
+         background; `raft5fs prune` does it now, and `raft5fs prune --status` shows how it \
+         is going.",
         args.grantee
     );
     Ok(0)

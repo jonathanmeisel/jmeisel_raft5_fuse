@@ -656,6 +656,30 @@ pub struct ActivityPage {
     pub next: Vec<u8>,
 }
 
+/// Someone's claim on a node's prune (see `Remote::claim_prune`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneClaim {
+    pub user: String,
+    /// Milliseconds since the Unix epoch.
+    pub expires_ms: u64,
+}
+
+/// A node waiting for a prune: its key record still keeps older versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unpruned {
+    pub ino: u64,
+    pub claim: Option<PruneClaim>,
+}
+
+/// What a claim on a prune came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimOutcome {
+    /// Whether the asking holder holds the claim now.
+    pub granted: bool,
+    /// The claim that stands now, if any.
+    pub claim: Option<PruneClaim>,
+}
+
 /// What every public link's account name starts with. Nobody can invite a
 /// user with such a name.
 pub const LINK_PREFIX: &str = "link-";

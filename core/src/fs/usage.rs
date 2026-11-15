@@ -713,6 +713,13 @@ impl FsCore {
             return Ok(None);
         }
         let measured = self.measure_held().await;
+        // The same lease keeps one server at indexing what waits for a
+        // prune, once, after an upgrade.
+        match self.index_unpruned().await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("found {n} nodes waiting for a prune from before the prune index"),
+            Err(e) => eprintln!("indexing what waits for a prune failed: {e}"),
+        }
         // The same lease keeps one server at trimming the activity log.
         match self.trim_activity().await {
             Ok(0) => {}

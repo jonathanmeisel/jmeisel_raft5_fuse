@@ -115,9 +115,7 @@ export function connect({ onStorageError } = {}) {
     revokeLink: (user) => call("revokeLink", [user]),
     pruneStatus: () => call("pruneStatus", []),
     pruneEstimate: (path) => call("pruneEstimate", [path]),
-    pruneAgain: (path) => call("pruneAgain", [path]),
-    pausePruning: () => call("pausePruning", []),
-    resumePruning: () => call("resumePruning", []),
+    setPruneHere: (on) => call("setPruneHere", [!!on]),
     pruning: () => call("pruning", []),
 
     /// Stores what is buffered, then ends the Worker.

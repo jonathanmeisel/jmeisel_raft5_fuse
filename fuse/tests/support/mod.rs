@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fuser::{BackgroundSession, Config, MountOption};
-use raft5fs_client::prune_queue::PruneQueue;
 use raft5fs_client::pruner::PrunerConfig;
 use raft5fs_client::vault::KnownKeys;
 use raft5fs_fuse::filesystem::Raft5Fs;
@@ -38,29 +37,31 @@ impl MountedFs {
     /// Like `mount`, but logged in as `user` (any local user can use the
     /// mountpoint), with the public keys in `known` pinned.
     pub fn mount_as(runtime: &Runtime, servers: Vec<String>, user: &str, known: KnownKeys) -> Self {
-        Self::mount_with(runtime, servers, user, known, None)
+        Self::mount_with(runtime, servers, user, known, false)
     }
 
-    /// Like `mount_as`, and also works through `prune` in the background.
+    /// Like `mount_as`, and with `prune`, also prunes in the background
+    /// what the servers list.
     pub fn mount_with(
         runtime: &Runtime,
         servers: Vec<String>,
         user: &str,
         known: KnownKeys,
-        prune: Option<PruneQueue>,
+        prune: bool,
     ) -> Self {
         let mut fs = Raft5Fs::new(servers, credentials(user), runtime.handle().clone())
             .with_tls(fs_tls())
             .with_known_keys(known);
-        if let Some(queue) = prune {
+        if prune {
             // Fast settings, for tests.
             let config = PrunerConfig {
                 poll: Duration::from_millis(50),
                 pace: Duration::from_millis(1),
                 backoff: Duration::from_millis(200),
                 max_backoff: Duration::from_secs(1),
+                renew: Duration::from_secs(1),
             };
-            fs = fs.with_prune_queue(queue, config);
+            fs = fs.with_pruning(config);
         }
         let path = temp_dir("mnt");
 
@@ -175,15 +176,15 @@ impl Harness {
         )
     }
 
-    /// Another mount as `TESTER`, at the root, that works through `queue`
-    /// in the background.
-    pub fn pruning_mount(&self, queue: PruneQueue) -> MountedFs {
+    /// Another mount as `TESTER`, at the root, that prunes in the
+    /// background.
+    pub fn pruning_mount(&self) -> MountedFs {
         MountedFs::mount_with(
             &self.runtime,
             self.addresses_from(1),
             TESTER,
             self.known_keys(),
-            Some(queue),
+            true,
         )
     }
 }

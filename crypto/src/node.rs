@@ -107,6 +107,12 @@ impl NodeKeys {
         self.version - self.history.len() as u32
     }
 
+    /// Whether older versions are still kept: the node is waiting for a
+    /// prune, which removes them.
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
+    }
+
     /// Returns version `want` of the key. It opens each older version in
     /// turn, starting from the current key. Fails if `want` is below `base`
     /// or above the current version.

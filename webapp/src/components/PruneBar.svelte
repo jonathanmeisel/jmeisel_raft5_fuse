@@ -1,55 +1,52 @@
 <script>
-  // What waits to be re-sealed after a revoke, and how it's going. One
-  // tab per account prunes in the background while the app is open, and
-  // carries on at the next login.
+  // What waits to be re-sealed after a revoke, and who is doing it. The
+  // servers keep the list, so any device that can write a folder can
+  // finish it: of each browser, one tab re-seals in the background, if
+  // "Re-seal on this device" is on (account menu).
   import { onDestroy } from "svelte";
 
-  let { fs, onqueued } = $props();
+  /// `onrunning` hears whether this tab is re-sealing now.
+  let { fs, me, onrunning } = $props();
   const POLL_MS = 3000;
 
-  let queued = $state([]);
-  /// "running", "paused", or "elsewhere" (another tab prunes).
-  let state = $state("running");
+  let waiting = $state([]);
+  /// "running", "elsewhere" (another tab of this browser) or "off".
+  let here = $state("running");
 
   async function poll() {
     try {
-      queued = await fs.pruneStatus();
-      state = await fs.pruning();
-      onqueued(queued.length, queued.length > 0 && state === "running");
+      [waiting, here] = await Promise.all([fs.pruneStatus(), fs.pruning()]);
+      onrunning(waiting.some((w) => w.state === "pruning" && !w.by));
     } catch {}
   }
   poll();
   const timer = setInterval(poll, POLL_MS);
   onDestroy(() => clearInterval(timer));
 
-  async function toggle() {
-    if (state === "running") await fs.pausePruning();
-    else await fs.resumePruning();
-    poll();
+  function line(w) {
+    if (w.state === "pruning" && !w.by) return `Re-sealing ${w.path}`;
+    if (w.state === "pruning" && w.by === me) return `Re-sealing ${w.path} on another device`;
+    if (w.state === "pruning") return `${w.by} is re-sealing ${w.path}`;
+    if (w.state === "incomplete") return `Re-sealing ${w.path} couldn't finish yet: it will try again`;
+    return `${w.path} waits to be re-sealed`;
   }
 </script>
 
-{#if queued.length}
+{#if waiting.length}
   <div class="prune">
-    <div class="items">
-      {#each queued as q}
-        <div>
-          <strong>Re-sealing {q.note}</strong>:
-          {state === "running" ? q.status : state === "paused" ? "paused" : "running in another tab"}
-        </div>
-      {/each}
-      <div class="note">Keep this tab open until it's done; closing it pauses re-sealing until you next log in.</div>
+    {#each waiting as w}
+      <div title={w.detail ?? ""}>{line(w)}</div>
+    {/each}
+    <div class="note">
+      {here === "off"
+        ? "Re-sealing is off on this device. Anyone who can write the folder can finish it, on any device."
+        : "Anyone who can write the folder can finish this, on any device."}
     </div>
-    {#if state !== "elsewhere"}
-      <button onclick={toggle}>{state === "running" ? "Pause" : "Resume"}</button>
-    {/if}
   </div>
 {/if}
 
 <style>
   .prune {
-    display: flex; gap: 12px; align-items: center; padding: 8px 14px;
-    background: var(--warn-bg); border-bottom: 1px solid var(--border);
+    padding: 8px 14px; background: var(--warn-bg); border-bottom: 1px solid var(--border);
   }
-  .items { flex: 1; }
 </style>

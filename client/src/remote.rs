@@ -70,7 +70,7 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    ActivityRequest, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest,
+    ActivityRequest, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, ClaimPruneRequest,
     CreateLinkAccountRequest, FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest,
     PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
@@ -80,8 +80,8 @@ use raft5fs_proto::types::{
     SnapshotInfo,
 };
 use raft5fs_proto::types::{
-    ActivityPage, FolderSize, LinkAccount, Offer, Orphan, Storage, Unreachable, UserEntry,
-    VolumeInfo,
+    ActivityPage, ClaimOutcome, FolderSize, LinkAccount, Offer, Orphan, Storage, Unpruned,
+    Unreachable, UserEntry, VolumeInfo,
 };
 use tonic::Code;
 use tonic::service::Interceptor;
@@ -1069,6 +1069,39 @@ impl Remote {
         self.call(Retry::ReadOnly, |mut c| {
             let req = req.clone();
             async move { c.list_activity(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The nodes waiting for a prune that this account can write (see the
+    /// server's `fs::pruning`), with any claim on each.
+    pub async fn list_unpruned(&self) -> Result<Vec<Unpruned>, FsError> {
+        self.needs_protocol(10, "shared pruning")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.list_unpruned(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Claims the prune of `ino` for `holder` for a while, renews its claim,
+    /// or with `release` gives it up. A claim someone else holds stands.
+    pub async fn claim_prune(
+        &self,
+        ino: u64,
+        holder: [u8; 16],
+        release: bool,
+    ) -> Result<ClaimOutcome, FsError> {
+        self.needs_protocol(10, "shared pruning")?;
+        let req = ClaimPruneRequest {
+            ino,
+            holder: holder.to_vec(),
+            release,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.claim_prune(req).await }
         })
         .await?
         .into_result()
