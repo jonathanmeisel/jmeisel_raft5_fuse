@@ -485,14 +485,14 @@
     }
   }
   let showDeleted = $state(readShowDeleted());
-  /// What the open folder's deleted entries are: "looking", a count, or
-  /// why they can't be shown.
-  let goneNote = $state("");
+  /// Why the open folder's deleted entries can't show, if they can't.
+  let goneError = $state("");
   /// Each folder's deleted entries, as the wasm `deleted` gave them.
   let goneIn = new Map();
   let goneAsked = 0;
 
-  /// Whether folder `dir` can have deleted entries: one inside a share.
+  /// Whether folder `dir` is one inside a share: it can have deleted
+  /// entries, and be shared.
   function canShowDeleted(dir) {
     return !visitor && dir !== "/" && !dir.startsWith("/.snapshot") && !api?.getFile(dir)?.group;
   }
@@ -522,21 +522,17 @@
   /// them. A later folder's answer wins.
   async function refreshGone(dir) {
     const asked = ++goneAsked;
-    goneNote = "";
+    goneError = "";
     if (!showDeleted || !canShowDeleted(dir)) return;
-    goneNote = "Looking for deleted files…";
     let found;
     try {
       found = await fs.deleted(dir);
     } catch (e) {
-      if (asked === goneAsked) goneNote = `Deleted files can't be shown here: ${e.message}`;
+      if (asked === goneAsked) goneError = e.message;
       return;
     }
     if (asked !== goneAsked) return;
     goneIn.set(dir, found.gone);
-    const n = found.gone.length;
-    goneNote = n === 0 ? "Nothing deleted since the oldest snapshot." : `${n} deleted or moved`;
-    if (found.unreadable) goneNote += ` (${found.unreadable} snapshots couldn't be read)`;
     if (live.has(dir)) await provide(dir);
   }
 
@@ -549,7 +545,7 @@
       refreshGone(current);
     } else {
       goneAsked++;
-      goneNote = "";
+      goneError = "";
       goneIn.clear();
       if (live.has(current)) provide(current);
     }
@@ -999,16 +995,20 @@
     </div>
   {/each}
 
-  <SharingBar {here} {current} {limited} ondetails={(path) => (dialog = { kind: "shared-with", path })} />
-  {#if canShowDeleted(current)}
-    <div class="deleted-bar">
-      <label>
-        <input type="checkbox" checked={showDeleted} onchange={(e) => toggleDeleted(e.currentTarget.checked)} />
-        Show deleted
-      </label>
-      {#if showDeleted && goneNote}<span class="gone-note">{goneNote}</span>{/if}
-    </div>
-  {/if}
+  {#snippet deletedToggle()}
+    {#if showDeleted && goneError}<span class="gone-note" title={goneError}>Can't show them here</span>{/if}
+    <label class="toggle">
+      <input type="checkbox" checked={showDeleted} onchange={(e) => toggleDeleted(e.currentTarget.checked)} />
+      Show deleted
+    </label>
+  {/snippet}
+  <SharingBar
+    {here}
+    {limited}
+    shareable={canShowDeleted(current)}
+    ondetails={() => (dialog = { kind: "shared-with", path: current })}
+    end={canShowDeleted(current) ? deletedToggle : null}
+  />
 
   <div class="fm" role="presentation" ondropcapture={dropFolder}>
     {#if initial}
@@ -1199,11 +1199,13 @@
     background: var(--panel); border-bottom: 1px solid var(--border);
   }
   .fm { flex: 1; min-height: 0; }
-  .deleted-bar {
-    display: flex; gap: 12px; align-items: center; padding: 4px 14px;
-    border-bottom: 1px solid var(--border); font-size: var(--wx-font-size);
+  /* In the sharing bar's text, not the app's form fields: the box beside
+     its words, on one line. */
+  .toggle {
+    display: flex; align-items: center; gap: 6px; margin: 0;
+    color: var(--wx-color-font); font-size: inherit; white-space: nowrap; cursor: pointer;
   }
-  .deleted-bar label { display: flex; gap: 6px; align-items: center; }
-  .gone-note { color: var(--wx-color-font-alt); }
+  .toggle input { width: auto; margin: 0; padding: 0; }
+  .gone-note { white-space: nowrap; }
   .more { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 </style>

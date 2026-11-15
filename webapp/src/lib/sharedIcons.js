@@ -8,6 +8,8 @@ const ACCENT = "#DF2F90";
 const FOLDER = "M10,4H4C2.89,4 2,4.89 2,6V18A2,2 0 0,0 4,20H20A2,2 0 0,0 22,18V8C22,6.89 21.1,6 20,6H12L10,4Z";
 
 const MARKS = {
+  /// A folder that isn't shared: no mark.
+  none: "",
   people: `
     <circle cx="12" cy="11.2" r="2.1" fill="#fff"/>
     <path d="M8.2 17a3.8 3.8 0 0 1 7.6 0z" fill="#fff"/>`,
@@ -31,7 +33,8 @@ const urls = Object.fromEntries(
   Object.keys(MARKS).map((kind) => [kind, `data:image/svg+xml,${encodeURIComponent(svg(kind))}`]),
 );
 
-/// The image for a folder shared as `kind` ("people" or "link").
+/// The image for a folder shared as `kind` ("people" or "link"), or not
+/// shared ("none").
 export const markUrl = (kind) => urls[kind];
 
 /// SVAR's `icons(file, size)`: the image for a shared folder, or null for

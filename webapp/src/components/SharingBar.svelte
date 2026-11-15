@@ -1,72 +1,67 @@
 <script>
-  // A line above the files saying how the open folder is shared: with
-  // whom, whether by public link, and through which folder, when the
-  // sharing was set up on a folder above it. For a folder under a share made
-  // to this account, who shared it, and whether this account can change it.
-  // `here` is the Worker's `sharingHere`. It
-  // also names the top-level folder's owner, if someone else, and, for a
-  // folder with a size limit (`limited`, the Worker's `folderSize`), how
-  // full it is.
+  // A line above the files saying whether the open folder is shared: its
+  // folder icon, with the share mark when it is, and "Shared" or "Not
+  // shared", which opens the folder's Sharing (who, how, and sharing it
+  // further). For a folder under a share made to this account, who shared
+  // it, and whether this account can change it. `here` is the Worker's
+  // `sharingHere`; `shareable` says the folder is one that can be shared.
+  // For a folder with a size limit (`limited`, the Worker's `folderSize`),
+  // it also says how full it is. `end` is what shows at the bar's right
+  // end (the Show deleted toggle).
   import { markUrl } from "../lib/sharedIcons.js";
   import { sizeText } from "../lib/sizes.js";
 
-  let { here, current, limited = null, ondetails } = $props();
+  let { here, limited = null, shareable = false, ondetails, end = null } = $props();
 
-  /// "bob", "bob and carol", "bob, carol and dave", "bob, carol and 3 others".
-  function names(people) {
-    if (people.length <= 3) {
-      return people.length > 1 ? `${people.slice(0, -1).join(", ")} and ${people.at(-1)}` : people[0];
-    }
-    return `${people.slice(0, 2).join(", ")} and ${people.length - 2} others`;
-  }
-
-  function what(source) {
-    const people = source.people.length ? `with ${names(source.people)}` : "";
-    const link = source.link ? (people ? " and by public link" : "by public link") : "";
-    return `Shared ${people}${link}`;
-  }
-
-  const folder = (path) => path.replace(/^\//, "");
-  const link = $derived(here?.sources?.some((s) => s.link));
+  const sources = $derived(here?.sources ?? []);
+  const shared = $derived(!!(here?.from || sources.length));
+  const link = $derived(sources.some((s) => s.link));
+  const text = $derived(
+    here?.from
+      ? `Shared with you by ${here.from}${here.writable ? "" : ", read-only"}`
+      : shared
+        ? "Shared"
+        : "Not shared",
+  );
+  /// A reader can't see or change who else has the folder.
+  const opens = $derived(shareable && !(here?.from && !sources.length && !here.writable));
 </script>
 
-{#if here || limited}
+{#if shareable || shared || limited || end}
   <div class="sharing-bar">
-    {#if here}<img src={markUrl(link ? "link" : "people")} alt="" width="22" height="22" />{/if}
+    {#if shareable || shared}
+      <img src={markUrl(shared ? (link ? "link" : "people") : "none")} alt="" width="22" height="22" />
+    {/if}
     <div class="text">
-      {#if here?.from}
-        <p class="source">Shared with you by <strong>{here.from}</strong>{here.writable ? "" : ", read-only"}.</p>
-      {/if}
-      {#each here?.sources ?? [] as source}
+      {#if shareable || shared}
         <p class="source">
-          {what(source)}{#if source.path !== current}{" "}through <strong>{folder(source.path)}</strong>{/if}.
-          <button class="details" onclick={() => ondetails(source.path)}>Details</button>
+          {#if opens}<button class="details" onclick={ondetails}>{text}</button>{:else}{text}{/if}
         </p>
-      {/each}
-      {#if here?.owner}<p class="source">Owned by <strong>{here.owner}</strong>.</p>{/if}
+      {/if}
       {#if limited}
         <p class="source">
           Holds {sizeText(limited.bytes)} of its {sizeText(limited.limit)} limit.
         </p>
       {/if}
     </div>
+    {#if end}<div class="end">{@render end()}</div>{/if}
   </div>
 {/if}
 
 <style>
   .sharing-bar {
-    display: flex; align-items: center; gap: 10px; padding: 6px 16px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 16px;
     background: var(--wx-background); border-bottom: var(--wx-border-medium);
     color: var(--wx-color-font-alt); font-size: 13px;
   }
   .sharing-bar img { flex: none; }
-  .text { min-width: 0; line-height: 1.45; }
-  /* One sentence each, wrapping as text does, with Details as a link at
-     its end. */
+  /* The text keeps room to read on a phone: below that, `end` goes to its
+     own line, at the right. */
+  .text { flex: 1 1 160px; min-width: 0; line-height: 1.45; }
+  .end { margin-left: auto; flex: none; display: flex; align-items: center; gap: 10px; }
   .source { margin: 0; }
-  strong { color: var(--wx-color-font); font-weight: 600; }
   .details {
-    display: inline; padding: 0 0 0 4px; border: none; background: none;
+    display: inline; padding: 0; border: none; background: none; text-align: left;
     font-size: inherit; color: var(--wx-color-primary); text-decoration: underline;
   }
 </style>
