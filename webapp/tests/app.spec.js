@@ -164,6 +164,18 @@ async function sharedMark(page, name) {
   return svg.includes("<rect") ? "link" : svg.includes("<circle") ? "people" : "?";
 }
 
+/// Opens the open folder's menu (its button in the header), and returns it.
+async function folderMenu(page) {
+  await page.getByRole("button", { name: /^Folder \(/ }).click(SLOW);
+  return page.getByRole("menu");
+}
+
+/// The open folder's menu item `name`, with the menu opened.
+async function folderItem(page, name) {
+  const menu = await folderMenu(page);
+  return menu.getByRole("menuitem", { name, exact: true });
+}
+
 async function addFolder(page, name) {
   await page.getByText("Add New").click();
   await page.getByText("Add new folder").click();
@@ -336,18 +348,20 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
 
   await test.step("a subfolder shows the share it inherits, without revoke", async () => {
     await open(alice, "docs");
-    // The bar above the files says whether the open folder is shared.
-    const bar = alice.locator(".sharing-bar .text");
-    await expect(bar).toHaveText(/^\s*Shared\s*$/, SLOW);
+    // The folder's menu says whether it is shared, and opens its sharing.
+    let shared = await folderItem(alice, "Shared");
+    await expect(shared).toBeVisible(SLOW);
+    await alice.keyboard.press("Escape");
     await addFolder(alice, "sub");
     // Closing its sharing leaves the open folder as it was.
-    await bar.getByRole("button", { name: "Shared", exact: true }).click();
+    await (await folderItem(alice, "Shared")).click();
     await alice.getByRole("button", { name: "Close" }).click();
     await expect(item(alice, "sub")).toBeVisible(SLOW);
     await open(alice, "sub");
     // A folder below a shared one is shared too, and its sharing says how.
-    await expect(bar).toHaveText(/^\s*Shared\s*$/, SLOW);
-    await bar.getByRole("button", { name: "Shared", exact: true }).click();
+    shared = await folderItem(alice, "Shared");
+    await expect(shared).toBeVisible(SLOW);
+    await shared.click();
     await expect(alice.getByRole("dialog", { name: "Shared with: /docs/sub" })).toBeVisible();
     await expect(alice.getByRole("row").filter({ hasText: "bob" })).toContainText("via docs", SLOW);
     await alice.getByRole("button", { name: "Close" }).click();
@@ -374,7 +388,8 @@ test("two people share a folder, then one revokes", async ({ browser }) => {
     await expect(bob.getByText(/You and alice are verified/)).toBeVisible(SLOW);
     await bob.getByRole("button", { name: "Close" }).click();
     await open(bob, "docs");
-    await expect(bob.locator(".sharing-bar")).toContainText("Shared with you by alice", SLOW);
+    await expect(await folderMenu(bob)).toContainText("Shared with you by alice", SLOW);
+    await bob.keyboard.press("Escape");
     expect((await download(bob, "small.txt")).equals(small)).toBe(true);
   });
 
@@ -636,7 +651,9 @@ test("a public link opens a folder for anyone, until a writer revokes it", async
     await frank.getByText("My files").first().click();
     await open(frank, "public");
     await expect(item(frank, "note.txt")).toBeVisible(SLOW);
-    await expect(frank.getByText(/Shared with you by/)).toHaveCount(0);
+    await expect(await folderMenu(frank)).toContainText("Shared", SLOW);
+    await expect(frank.getByRole("menu")).not.toContainText("Shared with you by");
+    await frank.keyboard.press("Escape");
   });
 
   expect(problems.flat()).toEqual([]);
@@ -1249,7 +1266,8 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await open(quinn, "quinn");
   await expect.poll(() => new URL(quinn.url()).hash).toBe("#/CS101/quinn");
   // Read-write or not, it says who shared it.
-  await expect(quinn.getByText("Shared with you by rosa", { exact: true })).toBeVisible(SLOW);
+  await expect(await folderItem(quinn, "Shared with you by rosa")).toBeVisible(SLOW);
+  await quinn.keyboard.press("Escape");
   await quinn.locator("input[type=file]").setInputFiles([
     { name: "essay.txt", mimeType: "text/plain", buffer: Buffer.from("my essay") },
   ]);
@@ -1262,7 +1280,10 @@ test("shares group into one folder for each student", async ({ browser }) => {
   await quinn.getByText("CS101", { exact: true }).first().click();
   await expect.poll(() => sharedMark(quinn, "quinn"), SLOW).toBe("people");
   await open(quinn, "assignments");
-  await expect(quinn.getByText("Shared with you by rosa, read-only", { exact: true })).toBeVisible(SLOW);
+  // A reader's says who shared it, but can't open its sharing.
+  await expect(await folderMenu(quinn)).toContainText("Shared with you by rosa, read-only", SLOW);
+  await expect(quinn.getByRole("menuitem", { name: /Shared with you/ })).toHaveCount(0);
+  await quinn.keyboard.press("Escape");
 
   // A group is only a place: its menu has no rename or delete, and a folder
   // made in it is a top-level folder of its own.
@@ -1398,8 +1419,7 @@ test("deleted files show when asked, and come back", async ({ page }) => {
   await addFolder(page, "photos");
   await open(page, "photos");
   // A folder no one else has says so, and its sharing offers to share it.
-  await expect(page.locator(".sharing-bar .text")).toHaveText(/^\s*Not shared\s*$/, SLOW);
-  await page.locator(".sharing-bar").getByRole("button", { name: "Not shared" }).click();
+  await (await folderItem(page, "Not shared")).click();
   await expect(page.getByRole("dialog", { name: "Shared with: /photos" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Share with someone" })).toBeVisible();
   await page.getByRole("button", { name: "Close" }).click();
@@ -1418,9 +1438,11 @@ test("deleted files show when asked, and come back", async ({ page }) => {
   }
 
   // Off, nothing deleted shows; on, what the snapshot holds does.
-  const toggle = page.getByLabel("Show deleted");
-  await expect(toggle).not.toBeChecked();
-  await toggle.check();
+  const toggle = async () =>
+    (await folderMenu(page)).getByRole("menuitemcheckbox", { name: "Show deleted" });
+  let showDeleted = await toggle();
+  await expect(showDeleted).toHaveAttribute("aria-checked", "false");
+  await showDeleted.click();
   await expect(item(page, "lost.txt")).toBeVisible(SLOW);
   await expect(item(page, "trip")).toBeVisible();
   // It can't be changed, only restored.
@@ -1429,7 +1451,9 @@ test("deleted files show when asked, and come back", async ({ page }) => {
   expect((await download(page, "lost.txt")).toString()).toBe("lost");
 
   // Off again, the deleted folder goes.
-  await toggle.uncheck();
+  showDeleted = await toggle();
+  await expect(showDeleted).toHaveAttribute("aria-checked", "true");
+  await showDeleted.click();
   await expect(item(page, "trip")).toHaveCount(0, SLOW);
   await expect(item(page, "keep.txt")).toBeVisible();
 

@@ -14,7 +14,7 @@
   import Viewer from "./Viewer.svelte";
   import UsersDialog from "./UsersDialog.svelte";
   import AccountMenu from "./AccountMenu.svelte";
-  import SharingBar from "./SharingBar.svelte";
+  import FolderMenu from "./FolderMenu.svelte";
   import LinkDialog from "./LinkDialog.svelte";
   import LinksDialog from "./LinksDialog.svelte";
   import People from "./People.svelte";
@@ -640,11 +640,11 @@
     if (kind !== "folder") await api.exec("open-file", { id: path });
   }
 
-  /// The open folder, and how it is shared (see SharingBar).
+  /// The open folder, and how it is shared (see FolderMenu).
   let current = $state("/");
   let here = $state(null);
-  /// The open folder's size and size limit, if it has a limit.
-  let limited = $state(null);
+  /// The open folder's size, as last measured, and its size limit.
+  let folderSize = $state(null);
   let hereAsked = 0;
 
   async function showSharing(path) {
@@ -661,7 +661,7 @@
     // A later move asked again meanwhile: its answer wins.
     if (asked === hereAsked) {
       here = found;
-      limited = size?.limit ? size : null;
+      folderSize = size;
     }
   }
 
@@ -916,9 +916,19 @@
       </span>
       <button class="close" onclick={onlogout}>Close</button>
     {:else}
-      <span class="title">
-        <i class="wxi-folder logo" aria-hidden="true"></i>
-        {#if several}<span class="fs">{me.filesystem}</span>{/if}
+      <span class="menus">
+        <FolderMenu
+          folder={current}
+          {here}
+          size={folderSize}
+          shareable={canShowDeleted(current)}
+          {showDeleted}
+          {goneError}
+          onsharing={() => (dialog = { kind: "shared-with", path: current })}
+          ontoggledeleted={toggleDeleted}
+        >
+          {#if several}<span class="fs">{me.filesystem}</span>{/if}
+        </FolderMenu>
       </span>
       <AccountMenu user={me.user} items={menuItems} onselect={chose} note={storageNote} onopen={refreshStorage} />
     {/if}
@@ -986,20 +996,6 @@
     </div>
   {/each}
 
-  {#snippet deletedToggle()}
-    {#if showDeleted && goneError}<span class="gone-note" title={goneError}>Can't show them here</span>{/if}
-    <label class="toggle">
-      <input type="checkbox" checked={showDeleted} onchange={(e) => toggleDeleted(e.currentTarget.checked)} />
-      Show deleted
-    </label>
-  {/snippet}
-  <SharingBar
-    {here}
-    {limited}
-    shareable={canShowDeleted(current)}
-    ondetails={() => (dialog = { kind: "shared-with", path: current })}
-    end={canShowDeleted(current) ? deletedToggle : null}
-  />
 
   <div class="fm" role="presentation" ondropcapture={dropFolder}>
     {#if initial}
@@ -1176,6 +1172,9 @@
     transform: translateY(2px);
   }
   .fs { color: var(--wx-color-font-alt); overflow: hidden; text-overflow: ellipsis; }
+  /* The folder menu's place: like the title, but it doesn't clip the menu
+     that opens below it. */
+  .menus { flex: 1; min-width: 0; display: flex; align-items: center; white-space: nowrap; }
   .close {
     height: 36px; border: none; border-radius: var(--wx-radius-major, 6px);
     background: var(--wx-background-alt); color: var(--wx-color-font);
@@ -1190,13 +1189,5 @@
     background: var(--panel); border-bottom: 1px solid var(--border);
   }
   .fm { flex: 1; min-height: 0; }
-  /* In the sharing bar's text, not the app's form fields: the box beside
-     its words, on one line. */
-  .toggle {
-    display: flex; align-items: center; gap: 6px; margin: 0;
-    color: var(--wx-color-font); font-size: inherit; white-space: nowrap; cursor: pointer;
-  }
-  .toggle input { width: auto; margin: 0; padding: 0; }
-  .gone-note { white-space: nowrap; }
   .more { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 </style>
