@@ -691,6 +691,51 @@ fn a_deleted_links_pin_goes_from_every_device() {
     assert_eq!(b.known_keys().pinned(&link), None);
 }
 
+/// A link to a folder below a volume is that folder's only grant. Removing
+/// the link's account must not stop the folder from being shared again.
+#[test]
+fn a_folder_shares_again_after_its_only_grantee_is_removed() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    rt_set_admin(&backend, TESTER);
+    let rt = &backend.runtime;
+    let me = vault(&backend, TESTER);
+    let docs = rt
+        .block_on(me.create_volume(OsStr::new("docs"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = rt
+        .block_on(me.mkdir(docs, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    let list = [&[0x0B], &sub.to_be_bytes()[..]].concat();
+
+    let (link, _) = rt
+        .block_on(me.create_link(sub, "/docs/sub", OsStr::new("sub"), None))
+        .unwrap();
+    let stale = backend.read_key(&list).expect("a grantee list");
+    rt.block_on(me.remote().delete_user(&link)).unwrap();
+    // Nobody is left on it, so the list goes with the last grant.
+    assert_eq!(backend.read_key(&list), None);
+    rt.block_on(me.create_link(sub, "/docs/sub", OsStr::new("sub"), None))
+        .unwrap();
+
+    // A list left behind with no grant (an older server's removal) doesn't
+    // block the next share either.
+    let (link, _) = rt
+        .block_on(me.create_link(sub, "/docs/sub", OsStr::new("sub"), None))
+        .unwrap();
+    let grants = backend.keys_with_prefix(&[&[0x07], &sub.to_be_bytes()[..]].concat());
+    assert_eq!(grants.len(), 2);
+    for key in grants {
+        let user = String::from_utf8(key[9..].to_vec()).unwrap();
+        rt.block_on(accounts::remove(&backend.client, &user))
+            .unwrap();
+    }
+    backend.write_key(&list, Some(&stale));
+    rt.block_on(me.create_link(sub, "/docs/sub", OsStr::new("sub"), None))
+        .unwrap_or_else(|e| panic!("share after {link} was removed: {e}"));
+}
+
 /// A share of a folder inside another share to the same user shows once,
 /// as the outer one, and they can write wherever any share above is
 /// read-write.

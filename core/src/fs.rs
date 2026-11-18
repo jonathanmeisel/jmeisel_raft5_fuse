@@ -1928,7 +1928,8 @@ impl FsCore {
     ///   added, sealed under its current key version. It replaces the
     ///   stored list if that list is still at `expected_grantees_seq`, the
     ///   seq of the list it was made from. If not, returns `EAGAIN`,
-    ///   because a grant made in the meantime would be lost from it.
+    ///   because a grant made in the meantime would be lost from it. If
+    ///   nobody else has a grant of the node, the seq doesn't count.
     /// - `listed` names the users on that list. If the node is granted to
     ///   anyone else, also `EAGAIN`: the client read the grants before one
     ///   that its starting list already had, so its list leaves it out, and
@@ -1975,15 +1976,26 @@ impl FsCore {
                 )));
             }
             decide!(check_grantees_version(ino, sealed_grantees, version));
-            if txn.read_one(&grantees_key(ino)).await?.seq != expected_grantees_seq {
+            // Read in the transaction even when its seq doesn't count: a
+            // grant made meanwhile writes it, so this one retries.
+            let stored_seq = txn.read_one(&grantees_key(ino)).await?.seq;
+            let others: Vec<String> = grants::grants_of(&txn, ino)
+                .await?
+                .into_keys()
+                .filter(|user| user != grantee)
+                .collect();
+            // With no other grant, the new list loses nobody. A stored list
+            // can outlive its last grant (its account was removed), and the
+            // client, which saw no grants, expects seq 0.
+            if stored_seq != expected_grantees_seq && !others.is_empty() {
                 return Ok(Err(FsError::new(
                     libc::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
                 )));
             }
             if !listed.is_empty() {
-                for user in grants::grants_of(&txn, ino).await?.into_keys() {
-                    if user != grantee && !listed.contains(&user) {
+                for user in others {
+                    if !listed.contains(&user) {
                         return Ok(Err(FsError::new(
                             libc::EAGAIN,
                             format!("{user}'s grant of inode {ino} isn't on the new grantee list"),

@@ -920,7 +920,7 @@ pub async fn enrol(
             // no use to the new one. Not only for a name with keys now: a
             // grant made as a user was removed can outlive them.
             for ino in granted_in(&txn, user).await? {
-                crate::grants::remove_grant(&txn, user, ino).await?;
+                crate::grants::remove_grant_unlisted(&txn, user, ino).await?;
             }
             txn.write(&pins_key(user), None).await?;
             txn.write(&code_key(user), None).await?;
@@ -1009,7 +1009,7 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&pins_key(user), None).await?;
         txn.write(&usage_key(user), None).await?;
         for ino in granted {
-            crate::grants::remove_grant(&txn, user, ino).await?;
+            crate::grants::remove_grant_unlisted(&txn, user, ino).await?;
         }
         txn.commit().await?;
         Ok(Ok(existed))

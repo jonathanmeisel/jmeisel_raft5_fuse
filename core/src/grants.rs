@@ -669,6 +669,28 @@ pub(crate) async fn remove_grant(txn: &Transaction, user: &str, ino: u64) -> Res
     crate::accounts::drop_unused_link(txn, user).await
 }
 
+/// `remove_grant`, for a removal that can't seal the grantee list again
+/// (an account removed or enrolled again). If no grant of `ino` is left,
+/// the list goes too, as when a revoke leaves nobody. A list left with no
+/// grant keeps its seq, but the next grant of `ino` sees no grants and
+/// expects seq 0.
+///
+/// The read of the list holds it against a grant made at the same time:
+/// every grant writes it, so one of the two transactions retries. The walk
+/// of grants alone can't see a new grant (it locks keys, not the range).
+pub(crate) async fn remove_grant_unlisted(
+    txn: &Transaction,
+    user: &str,
+    ino: u64,
+) -> Result<(), KvError> {
+    remove_grant(txn, user, ino).await?;
+    let list = txn.read_one(&grantees_key(ino)).await?;
+    if list.value.is_some() && grants_of(txn, ino).await?.is_empty() {
+        txn.write(&grantees_key(ino), None).await?;
+    }
+    Ok(())
+}
+
 /// What `user` needs to unwrap `ino`'s key: their grant above it, and the
 /// key records from the granted directory down to `ino`, as `view` has
 /// them.
