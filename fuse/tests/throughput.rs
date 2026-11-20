@@ -77,10 +77,7 @@ fn throughput_on_a_slow_store() {
 
     // As the web app's service worker reads: 1 MiB at a time, in order,
     // through a session of its own.
-    let mut config = SessionConfig::new(
-        h.addresses(),
-        support::credentials(support::TESTER),
-    );
+    let mut config = SessionConfig::new(h.addresses(), support::credentials(support::TESTER));
     config.tls = Some(support::fs_tls());
     config.known_keys = Some(h.known_keys());
     let session = h.runtime.block_on(Session::open(config)).unwrap();

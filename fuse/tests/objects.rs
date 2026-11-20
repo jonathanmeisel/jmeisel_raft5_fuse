@@ -795,7 +795,8 @@ fn a_files_size_counts_blocks_still_uploading() {
     let size = h.runtime.block_on(writer.getattr(file)).unwrap().size;
     assert_eq!(size, data.len() as u64);
     h.runtime.block_on(writer.fsync(file)).unwrap();
-    h.store().set_network(raft5fs_objstore::fake::Network::default());
+    h.store()
+        .set_network(raft5fs_objstore::fake::Network::default());
     // The two whole blocks, and the start of a third.
     assert_eq!(h.store().stats().puts, 3);
     assert_eq!(read_afresh(&h, "f"), data);

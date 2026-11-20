@@ -61,8 +61,8 @@ use raft5fs_proto::types::{
 };
 
 use crate::chunk_cache::{ChunkCache, Lookup};
-use blocks::{BlockEdit, Rewritten};
 pub use blocks::Staged;
+use blocks::{BlockEdit, Rewritten};
 
 mod activity;
 mod blocks;
@@ -2595,7 +2595,11 @@ impl Vault {
         };
         let mut node = None;
         for (chunk, lookup) in chunks.into_iter().zip(lookups) {
-            if self.chunk_from(ino, chunk, lookup, &mut node).await.is_err() {
+            if self
+                .chunk_from(ino, chunk, lookup, &mut node)
+                .await
+                .is_err()
+            {
                 return;
             }
         }

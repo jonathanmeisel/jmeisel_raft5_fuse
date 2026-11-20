@@ -73,9 +73,8 @@ pub struct Gc {
 
 /// See `Gc::before_marking_snapshot`.
 #[cfg(feature = "test-hooks")]
-pub type BeforeMarking = Box<
-    dyn FnMut(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send,
->;
+pub type BeforeMarking =
+    Box<dyn FnMut(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl Default for Gc {
     fn default() -> Self {

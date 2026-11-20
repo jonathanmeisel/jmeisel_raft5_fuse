@@ -25,8 +25,8 @@ use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
 use crate::paths::{DEFAULT_PATH_TTL, Dentries};
-use crate::readahead::ReadAhead;
 use crate::pruner::{self, PruneStatus, Pruner, PrunerConfig};
+use crate::readahead::ReadAhead;
 use crate::remote::ClientTlsConfig;
 use crate::remote::{Credentials, Remote};
 use crate::rt;
@@ -351,7 +351,12 @@ impl Session {
         let Some((start, len)) = buf.run() else {
             return Ok(());
         };
-        if !self.vault.is_whole_block(buf.ino, start, len).await.unwrap_or(false) {
+        if !self
+            .vault
+            .is_whole_block(buf.ino, start, len)
+            .await
+            .unwrap_or(false)
+        {
             return self.commit_buf(buf).await;
         }
         let (start, data) = buf.take().expect("the run checked above");
