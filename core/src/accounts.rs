@@ -40,7 +40,8 @@ use raft5fs_crypto::password::{
 
 use crate::fs::run_txn;
 use crate::layout::{
-    ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLMENT_PREFIX, PINS_PREFIX, usage_key,
+    ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLLMENT_PROOF_PREFIX, ENROLMENT_PREFIX,
+    PINS_PREFIX, usage_key,
 };
 use crate::timing::next_key;
 use crate::view::ReadKeys;
@@ -76,6 +77,40 @@ fn pins_key(user: &str) -> Vec<u8> {
     let mut key = PINS_PREFIX.to_vec();
     key.extend_from_slice(user.as_bytes());
     key
+}
+
+fn proof_key(user: &str) -> Vec<u8> {
+    let mut key = ENROLLMENT_PROOF_PREFIX.to_vec();
+    key.extend_from_slice(user.as_bytes());
+    key
+}
+
+/// The most bytes an invitation proof may take. A proof is 32.
+pub const MAX_INVITE_PROOF: usize = 64;
+
+/// What `user` enrolled with: their public key, and the proof of it from
+/// their invitation (empty for none; raft5fs-crypto's `invitation`).
+/// `ENOENT` if they have not enrolled. Both come from one transaction, so
+/// they belong together.
+pub async fn enrollment(client: &Client, user: &str) -> Result<(Vec<u8>, Vec<u8>), FsError> {
+    run_txn(client, |txn| async move {
+        let [keys, proof] = two(txn.read_many(&[keys_key(user), proof_key(user)]).await?);
+        let Some(keys) = keys.value else {
+            return Ok(Err(FsError::new(
+                libc::ENOENT,
+                format!("{user} hasn't enrolled"),
+            )));
+        };
+        let keys = decide!(decode(user, &keys));
+        Ok(Ok((keys.public_key, proof.value.unwrap_or_default())))
+    })
+    .await?
+}
+
+fn two<T>(values: Vec<T>) -> [T; 2] {
+    values
+        .try_into()
+        .unwrap_or_else(|_| panic!("a read of two keys answers both"))
 }
 
 /// The most that an account's sealed trusted keys may take: some thousands
@@ -889,13 +924,23 @@ pub async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
 /// A grant made at the same time cannot get past this. The grant reads the
 /// account's keys in its own transaction, and this transaction writes them,
 /// so one of the two retries.
+/// `invite_proof` is from an invitation with an introduction, or empty. It
+/// is kept for the inviter to check (`enrollment`), and replaces any proof
+/// from an earlier enrollment.
 pub async fn enrol(
     client: &Client,
     user: &str,
     code: &str,
     keys: &AccountKeys,
+    invite_proof: &[u8],
 ) -> Result<(), FsError> {
     crate::grants::check_username(user)?;
+    if invite_proof.len() > MAX_INVITE_PROOF {
+        return Err(FsError::new(
+            libc::EINVAL,
+            "an invitation proof of the wrong size",
+        ));
+    }
     validate(keys)?;
     let hash = enrolment_code_hash(code);
     let encoded = encode(keys);
@@ -922,8 +967,15 @@ pub async fn enrol(
             for ino in granted_in(&txn, user).await? {
                 crate::grants::remove_grant_unlisted(&txn, user, ino).await?;
             }
+            // Introductions of the old key, and to it, no longer hold.
+            crate::introductions::forget_user(&txn, user).await?;
             txn.write(&pins_key(user), None).await?;
             txn.write(&code_key(user), None).await?;
+            txn.write(
+                &proof_key(user),
+                (!invite_proof.is_empty()).then_some(invite_proof),
+            )
+            .await?;
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.commit().await?;
             Ok(Ok(()))
@@ -1008,6 +1060,8 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
         txn.write(&info_key(user), None).await?;
         txn.write(&pins_key(user), None).await?;
         txn.write(&usage_key(user), None).await?;
+        txn.write(&proof_key(user), None).await?;
+        crate::introductions::forget_user(&txn, user).await?;
         for ino in granted {
             crate::grants::remove_grant_unlisted(&txn, user, ino).await?;
         }

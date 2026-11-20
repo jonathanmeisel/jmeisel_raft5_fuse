@@ -11,6 +11,7 @@ use raft5fs_client::vault::{KnownKeys, VIRTUAL_ROOT, Vault, is_group};
 use raft5fs_core::accounts;
 use raft5fs_crypto::identity::{fingerprint_words, label_signer, seal_label, seal_signed_label};
 use raft5fs_crypto::password::KdfParams;
+use raft5fs_crypto::pins::PinSource;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, credentials_with, fs_tls};
@@ -44,6 +45,7 @@ fn enrol_with(backend: &Backend, user: &str, code: &str) -> [u8; 32] {
             credentials(user),
             code,
             KdfParams::TESTING,
+            None,
         ))
         .unwrap_or_else(|e| panic!("enrol {user}: {e}"))
 }
@@ -944,6 +946,7 @@ fn a_new_password_or_a_new_enrollment_ends_earlier_sessions() {
             credentials_with(user, NEW_PASSWORD),
             &code,
             KdfParams::TESTING,
+            None,
         ))
         .unwrap();
     };
@@ -1472,6 +1475,7 @@ fn an_invitation_works_for_two_weeks() {
             credentials("dave"),
             &code,
             KdfParams::TESTING,
+            None,
         ))
         .unwrap_err();
     assert!(refused.message.contains("expired"), "{refused}");
@@ -1482,6 +1486,7 @@ fn an_invitation_works_for_two_weeks() {
             credentials("dave"),
             "not-the-code",
             KdfParams::TESTING,
+            None,
         ))
         .unwrap_err();
     assert!(!refused.message.contains("expired"), "{refused}");
@@ -1785,4 +1790,175 @@ fn a_public_link_has_no_group() {
         errno(rt.block_on(me.create_link(docs, "/docs", OsStr::new("a/b"), None))),
         libc::EINVAL
     );
+}
+
+/// Makes an invitation from `inviter` for a new account `user`, and enrolls
+/// it, as `raft5fs enrol` does. Returns the invitation as decoded.
+fn invite_and_enrol(backend: &Backend, inviter: &Vault, user: &str) -> Invite {
+    let rt = &backend.runtime;
+    let (_, line) = rt.block_on(inviter.invite(user, Caps::NONE)).unwrap();
+    let invite = Invite::decode(&line.expect("the servers make invitations")).unwrap();
+    rt.block_on(Remote::enrol(
+        &backend.addresses(),
+        Some(fs_tls()),
+        credentials(user),
+        &invite.code,
+        KdfParams::TESTING,
+        invite.introduction.as_ref(),
+    ))
+    .unwrap_or_else(|e| panic!("enrol {user}: {e}"));
+    invite
+}
+
+fn own_key(vault: &Vault) -> [u8; 32] {
+    vault.remote().identity().unwrap().public_key()
+}
+
+fn source_of(vault: &Vault, user: &str) -> Option<PinSource> {
+    vault.pin_details(user).map(|d| d.source)
+}
+
+/// An invitation lets the inviter and the new user trust each other's keys,
+/// with no safety codes: on every device of the inviter.
+#[test]
+fn an_invitation_makes_both_keys_trusted() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let alice = vault(&backend, TESTER);
+    let alice_key = own_key(&alice);
+
+    let invite = invite_and_enrol(&backend, &alice, "carol");
+    let intro = invite.introduction.clone().expect("an introduction");
+    assert_eq!(intro.inviter, TESTER);
+    let carol = vault(&backend, "carol");
+    rt.block_on(carol.accept_invitation(&intro)).unwrap();
+    assert_eq!(carol.known_keys().pinned(TESTER), Some(alice_key));
+    let details = carol.pin_details(TESTER).unwrap();
+    assert_eq!(details.source, PinSource::Invited);
+    assert!(
+        details.introducer,
+        "the inviter checks keys for the new user"
+    );
+
+    let carol_key = own_key(&carol);
+    assert_eq!(alice.known_keys().pinned("carol"), None);
+    rt.block_on(alice.sync_pins()).unwrap();
+    assert_eq!(alice.known_keys().pinned("carol"), Some(carol_key));
+    assert_eq!(source_of(&alice, "carol"), Some(PinSource::Invited));
+
+    // The inviter's other device trusts carol too.
+    let other = vault(&backend, TESTER);
+    rt.block_on(other.sync_pins()).unwrap();
+    assert_eq!(other.known_keys().pinned("carol"), Some(carol_key));
+}
+
+/// A server that gives another key for the new user can't make a proof for
+/// it: the inviter trusts nothing, and waits for the real one.
+#[test]
+fn an_invitation_doesnt_trust_a_key_the_servers_swapped() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let alice = vault(&backend, TESTER);
+    invite_and_enrol(&backend, &alice, "carol");
+    backend.enrol("mallory");
+    // The servers give mallory's key as carol's, beside carol's proof.
+    let mallory = backend.read_key(b"\x06k/mallory").unwrap();
+    let carol = backend.read_key(b"\x06k/carol").unwrap();
+    backend.write_key(b"\x06k/carol", Some(&mallory));
+    rt.block_on(alice.sync_pins()).unwrap();
+    assert_eq!(alice.known_keys().pinned("carol"), None);
+
+    // The real key, once the servers give it, still checks.
+    backend.write_key(b"\x06k/carol", Some(&carol));
+    rt.block_on(alice.sync_pins()).unwrap();
+    assert!(alice.known_keys().pinned("carol").is_some());
+}
+
+/// An invitation to enroll again moves the inviter's pin to the new key.
+#[test]
+fn an_invitation_to_enroll_again_trusts_the_new_key() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let alice = vault(&backend, TESTER);
+    invite_and_enrol(&backend, &alice, "carol");
+    rt.block_on(alice.sync_pins()).unwrap();
+    let old = alice.known_keys().pinned("carol").unwrap();
+
+    let (_, line) = rt.block_on(alice.reissue("carol")).unwrap();
+    let invite = Invite::decode(&line.unwrap()).unwrap();
+    let new = rt
+        .block_on(Remote::enrol(
+            &backend.addresses(),
+            Some(fs_tls()),
+            credentials("carol"),
+            &invite.code,
+            KdfParams::TESTING,
+            invite.introduction.as_ref(),
+        ))
+        .unwrap();
+    assert_ne!(old, new);
+    rt.block_on(alice.sync_pins()).unwrap();
+    assert_eq!(alice.known_keys().pinned("carol"), Some(new));
+}
+
+/// Someone who marked the inviter an introducer trusts the new user too,
+/// and the new user trusts them. Someone who didn't, doesn't. A key learned
+/// from an introduction is never passed on.
+#[test]
+fn introducers_vouch_for_the_people_they_check() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    rt_set_admin(&backend, TESTER);
+    let alice = vault(&backend, TESTER);
+    let alice_words = fingerprint_words(&own_key(&alice));
+    let bob_key = backend.enrol("bob");
+    let dave_key = backend.enrol("dave");
+    let (bob, dave) = (vault(&backend, "bob"), vault(&backend, "dave"));
+    rt.block_on(bob.trust(TESTER, &alice_words)).unwrap();
+    rt.block_on(bob.set_introducer(TESTER, true)).unwrap();
+    rt.block_on(dave.trust(TESTER, &alice_words)).unwrap();
+    rt.block_on(alice.trust("bob", &fingerprint_words(&bob_key)))
+        .unwrap();
+    rt.block_on(alice.trust("dave", &fingerprint_words(&dave_key)))
+        .unwrap();
+
+    let invite = invite_and_enrol(&backend, &alice, "carol");
+    rt.block_on(alice.sync_pins()).unwrap();
+    let carol_key = alice.known_keys().pinned("carol").unwrap();
+
+    rt.block_on(bob.sync_pins()).unwrap();
+    assert_eq!(bob.known_keys().pinned("carol"), Some(carol_key));
+    assert_eq!(
+        source_of(&bob, "carol"),
+        Some(PinSource::Introduced { by: TESTER.into() })
+    );
+    rt.block_on(dave.sync_pins()).unwrap();
+    assert_eq!(dave.known_keys().pinned("carol"), None);
+
+    // The new user trusts the people their inviter checked.
+    let carol = vault(&backend, "carol");
+    rt.block_on(carol.accept_invitation(invite.introduction.as_ref().unwrap()))
+        .unwrap();
+    assert_eq!(carol.known_keys().pinned("bob"), Some(bob_key));
+    assert_eq!(carol.known_keys().pinned("dave"), Some(dave_key));
+
+    // One step only: bob can't make carol an introducer, and introduces her
+    // to nobody.
+    assert_eq!(
+        errno(rt.block_on(bob.set_introducer("carol", true))),
+        libc::EPERM
+    );
+    let erin_key = backend.enrol("erin");
+    let erin = vault(&backend, "erin");
+    rt.block_on(erin.trust("bob", &fingerprint_words(&bob_key)))
+        .unwrap();
+    rt.block_on(erin.set_introducer("bob", true)).unwrap();
+    rt.block_on(bob.trust("erin", &fingerprint_words(&erin_key)))
+        .unwrap();
+    rt.block_on(erin.sync_pins()).unwrap();
+    assert_eq!(erin.known_keys().pinned("carol"), None);
+    assert_eq!(erin.known_keys().pinned(TESTER), Some(own_key(&alice)));
 }

@@ -164,6 +164,7 @@ impl Identity {
 const NONCE_LEN: usize = 24;
 const GRANT_DOMAIN: &[u8] = b"raft5fs/grant";
 const LABEL_DOMAIN: &[u8] = b"raft5fs/label";
+const INTRODUCTION_DOMAIN: &[u8] = b"raft5fs/introduce";
 /// The first byte of a signed label. An unsigned one starts with a random
 /// key, so it can start with this too: it then doesn't open as signed.
 const SIGNED_LABEL: u8 = 0xA5;
@@ -228,6 +229,98 @@ pub fn seal_signed_label(
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&boxed);
     out
+}
+
+/// What an introduction says: `subject`'s key is `key`. With `replaces`,
+/// the introducer checked that `key` replaces that older key of theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Introduced {
+    pub subject: String,
+    pub key: [u8; PUBLIC_KEY_LEN],
+    pub replaces: Option<[u8; PUBLIC_KEY_LEN]>,
+}
+
+/// Seals, from `introducer` (whose account is `introducer_name`) to the
+/// holder of `recipient_key`, that `what.subject`'s key is `what.key`.
+///
+/// Only the recipient can open it, and only with the introducer's key, so
+/// the servers can't make or change one. The recipient trusts it only if
+/// they trust the introducer to check keys (see `pins`).
+pub fn seal_introduction(
+    introducer: &Identity,
+    introducer_name: &str,
+    recipient_key: &[u8; PUBLIC_KEY_LEN],
+    what: &Introduced,
+) -> Vec<u8> {
+    let mut plain = INTRODUCTION_DOMAIN.to_vec();
+    put_bytes(&mut plain, introducer_name.as_bytes());
+    plain.extend_from_slice(recipient_key);
+    put_bytes(&mut plain, what.subject.as_bytes());
+    plain.extend_from_slice(&what.key);
+    match &what.replaces {
+        Some(old) => {
+            plain.push(1);
+            plain.extend_from_slice(old);
+        }
+        None => plain.push(0),
+    }
+    let nonce = ChaChaBox::generate_nonce(&mut OsRng);
+    let boxed = ChaChaBox::new(&PublicKey::from_bytes(*recipient_key), &introducer.secret)
+        .encrypt(&nonce, plain.as_slice())
+        .expect("sealing in-memory data can't fail");
+    let mut out = Vec::with_capacity(4 + introducer_name.len() + NONCE_LEN + boxed.len());
+    put_bytes(&mut out, introducer_name.as_bytes());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&boxed);
+    out
+}
+
+/// Who an introduction claims to be from. This is only a claim until
+/// `open_introduction` opens it with their key.
+pub fn introducer_of(sealed: &[u8]) -> Result<&str, Error> {
+    let what = "an introduction's sender";
+    let name = Reader(sealed).bytes(what)?;
+    std::str::from_utf8(name).map_err(|_| Error(what))
+}
+
+impl Identity {
+    /// Opens an introduction that `seal_introduction` sealed to this
+    /// identity, with the key of the user that `introducer_of` names.
+    pub fn open_introduction(
+        &self,
+        introducer_key: &[u8; PUBLIC_KEY_LEN],
+        sealed: &[u8],
+    ) -> Result<Introduced, Error> {
+        let what = "an introduction";
+        let mut r = Reader(sealed);
+        let introducer = r.bytes(what)?;
+        let nonce = r.take(NONCE_LEN, what)?;
+        let plain = ChaChaBox::new(&PublicKey::from_bytes(*introducer_key), &self.secret)
+            .decrypt(nonce.into(), r.0)
+            .map_err(|_| Error(what))?;
+        let mut r = Reader(&plain);
+        if r.take(INTRODUCTION_DOMAIN.len(), what)? != INTRODUCTION_DOMAIN
+            || r.bytes(what)? != introducer
+            || r.take(PUBLIC_KEY_LEN, what)? != self.public_key()
+        {
+            return Err(Error(what));
+        }
+        let subject = std::str::from_utf8(r.bytes(what)?)
+            .map_err(|_| Error(what))?
+            .to_string();
+        let key = r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap();
+        let replaces = match r.take(1, what)?[0] {
+            0 => None,
+            1 => Some(r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap()),
+            _ => return Err(Error(what)),
+        };
+        r.finish(what)?;
+        Ok(Introduced {
+            subject,
+            key,
+            replaces,
+        })
+    }
 }
 
 /// Who a signed label claims to be from, or `None` if it isn't one. This is
@@ -474,6 +567,46 @@ mod tests {
         assert_eq!(alice.open_label(7, &label).unwrap(), b"photos");
         assert!(alice.open_label(8, &label).is_err());
         assert!(Identity::generate().open_label(7, &label).is_err());
+    }
+
+    #[test]
+    fn an_introduction_opens_only_with_its_introducers_key() {
+        let (alice, bob, eve) = (
+            Identity::generate(),
+            Identity::generate(),
+            Identity::generate(),
+        );
+        let what = Introduced {
+            subject: "carol".into(),
+            key: [3; PUBLIC_KEY_LEN],
+            replaces: Some([2; PUBLIC_KEY_LEN]),
+        };
+        let sealed = seal_introduction(&alice, "alice", &bob.public_key(), &what);
+        assert_eq!(introducer_of(&sealed).unwrap(), "alice");
+        assert_eq!(
+            bob.open_introduction(&alice.public_key(), &sealed).unwrap(),
+            what
+        );
+        // Not with another introducer's key, and not for another recipient.
+        assert!(bob.open_introduction(&eve.public_key(), &sealed).is_err());
+        assert!(eve.open_introduction(&alice.public_key(), &sealed).is_err());
+        // Eve can't make one that claims to be alice's.
+        let forged = seal_introduction(&eve, "alice", &bob.public_key(), &what);
+        assert!(bob.open_introduction(&alice.public_key(), &forged).is_err());
+        // Nor rename the introducer in front of a real one.
+        let mut renamed = Vec::new();
+        put_bytes(&mut renamed, b"alicf");
+        renamed.extend_from_slice(&sealed[4 + 5..]);
+        assert!(
+            bob.open_introduction(&alice.public_key(), &renamed)
+                .is_err()
+        );
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            bob.open_introduction(&alice.public_key(), &tampered)
+                .is_err()
+        );
     }
 
     #[test]

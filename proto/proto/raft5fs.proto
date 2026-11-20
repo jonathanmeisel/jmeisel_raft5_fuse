@@ -266,6 +266,18 @@ service Fs {
   // Replaces them, if they are still at `expected_version`; EAGAIN if not.
   // The answer has the new version, and no `sealed`.
   rpc PutPins(PutPinsRequest) returns (PinsResponse);
+  // What a user enrolled with: their public key, and the proof that their
+  // client made from their invitation's secret (empty for none). ENOENT if
+  // they have not enrolled.
+  rpc GetEnrollment(UsernameRequest) returns (EnrollmentResponse);
+  // Leaves introductions from the caller for other users: one user's key,
+  // sealed to the recipient by the caller (raft5fs-crypto's
+  // `seal_introduction`). The introducer is always the caller.
+  rpc PutIntroductions(PutIntroductionsRequest) returns (EmptyResponse);
+  // The introductions left for the caller.
+  rpc GetIntroductions(NoArgs) returns (IntroductionsResponse);
+  // Removes introductions left for the caller, by subject and introducer.
+  rpc DeleteIntroductions(DeleteIntroductionsRequest) returns (EmptyResponse);
 }
 
 message NoArgs {}
@@ -389,6 +401,9 @@ message EnrolRequest {
   string username = 1;
   string code = 2;
   AccountKeys keys = 3;
+  // From an invitation with an introduction: the proof of `keys`'s public
+  // key (raft5fs-crypto's `invite_proof`). Empty for none.
+  bytes invite_proof = 4;
 }
 
 // `keys` must keep the account's public key. Only the wrapping changes.
@@ -873,6 +888,47 @@ message PinsResponse {
 message PutPinsRequest {
   uint64 expected_version = 1;
   bytes sealed = 2;
+}
+
+message Enrollment {
+  bytes public_key = 1;
+  bytes proof = 2;
+}
+
+message EnrollmentResponse {
+  oneof result {
+    Enrollment enrollment = 1;
+    Error error = 2;
+  }
+}
+
+// One user's key (`subject`), introduced by `introducer` to `recipient`.
+// Only the recipient can open `sealed`. The servers fill in `introducer`.
+message Introduction {
+  string recipient = 1;
+  string subject = 2;
+  string introducer = 3;
+  bytes sealed = 4;
+}
+
+message PutIntroductionsRequest {
+  repeated Introduction introductions = 1;
+}
+
+message Introductions {
+  repeated Introduction introductions = 1;
+}
+
+message IntroductionsResponse {
+  oneof result {
+    Introductions introductions = 1;
+    Error error = 2;
+  }
+}
+
+// Each by its `subject` and `introducer`; the recipient is the caller.
+message DeleteIntroductionsRequest {
+  repeated Introduction introductions = 1;
 }
 
 message CreateLinkAccountRequest {

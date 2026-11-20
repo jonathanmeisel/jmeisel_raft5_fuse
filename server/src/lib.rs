@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use raft5_client::{Client, ClientTls, Error as KvError};
 use raft5fs_core::{
     BlockUpload, Caller, ChunkWrite, FsCore, FsError, MAX_CHUNK_SIZE, NewNode, ResealedName,
-    Rotation, SealedMove, accounts, batch_bytes,
+    Rotation, SealedMove, accounts, batch_bytes, introductions,
 };
 use raft5fs_crypto::password::KdfParams;
 use raft5fs_proto::convert::session_from_metadata;
@@ -55,6 +55,9 @@ use raft5fs_proto::pb::{
     OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
     StorageResponse, UnprunedListResponse, UnreachableListResponse, UserListResponse,
     UsernameRequest, VolumeResponse,
+};
+use raft5fs_proto::pb::{
+    DeleteIntroductionsRequest, EnrollmentResponse, IntroductionsResponse, PutIntroductionsRequest,
 };
 use raft5fs_proto::types::Caps;
 use throttle::LoginThrottle;
@@ -132,6 +135,8 @@ impl FsService {
                 servers: i.servers.clone(),
                 tls_server_name: i.tls_server_name.clone(),
                 ca: i.ca.clone(),
+                // The inviter's client adds its own.
+                introduction: None,
             }
             .encode()
         });
@@ -468,7 +473,14 @@ impl Fs for FsService {
         let enrolled = match r.keys {
             None => Err(FsError::new(libc::EINVAL, "an enrolment needs keys")),
             Some(keys) => {
-                accounts::enrol(self.core.client(), &r.username, &r.code, &keys.into()).await
+                accounts::enrol(
+                    self.core.client(),
+                    &r.username,
+                    &r.code,
+                    &keys.into(),
+                    &r.invite_proof,
+                )
+                .await
             }
         };
         Ok(Response::new(enrolled.into()))
@@ -1059,6 +1071,69 @@ impl Fs for FsService {
         .await
         .map(|version| (version, Vec::new()));
         Ok(Response::new(put.into()))
+    }
+
+    async fn get_enrollment(
+        &self,
+        r: Request<UsernameRequest>,
+    ) -> Result<Response<EnrollmentResponse>, Status> {
+        let (_, r) = self.caller(r).await?;
+        let found = accounts::enrollment(self.core.client(), &r.username).await;
+        Ok(Response::new(found.into()))
+    }
+
+    async fn put_introductions(
+        &self,
+        r: Request<PutIntroductionsRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let introductions: Vec<_> = r
+            .introductions
+            .into_iter()
+            .map(|i| introductions::Introduction {
+                recipient: i.recipient,
+                subject: i.subject,
+                introducer: caller.user.clone(),
+                sealed: i.sealed,
+            })
+            .collect();
+        let put = introductions::put(self.core.client(), &caller.user, &introductions).await;
+        Ok(Response::new(put.into()))
+    }
+
+    async fn get_introductions(
+        &self,
+        r: Request<NoArgs>,
+    ) -> Result<Response<IntroductionsResponse>, Status> {
+        let (caller, _) = self.caller(r).await?;
+        let found = introductions::get(self.core.client(), &caller.user)
+            .await
+            .map(|found| {
+                found
+                    .into_iter()
+                    .map(|i| raft5fs_proto::pb::Introduction {
+                        recipient: i.recipient,
+                        subject: i.subject,
+                        introducer: i.introducer,
+                        sealed: i.sealed,
+                    })
+                    .collect()
+            });
+        Ok(Response::new(found.into()))
+    }
+
+    async fn delete_introductions(
+        &self,
+        r: Request<DeleteIntroductionsRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let which: Vec<(String, String)> = r
+            .introductions
+            .into_iter()
+            .map(|i| (i.subject, i.introducer))
+            .collect();
+        let deleted = introductions::delete(self.core.client(), &caller.user, &which).await;
+        Ok(Response::new(deleted.into()))
     }
 
     async fn list_links(&self, r: Request<NoArgs>) -> Result<Response<LinkListResponse>, Status> {

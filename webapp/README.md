@@ -96,7 +96,11 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   takes one, checking each word as it's typed. A folder's **Sharing**
   (`SharedWith.svelte`) lists who has it and leads to sharing further
   (`ShareDialog.svelte`) and public links. **People** (`People.svelte`) lists
-  whose code this account has checked, and **Shared with me**
+  whose key this account trusts and how: a code read, an invitation, or an
+  introduction from someone marked "Trust people … checks" (an introducer).
+  An invitation made in the app vouches for both keys: after enrolling, the
+  worker logs in once to trust the inviter (`acceptInvitation`), and the
+  inviter's next sync checks the new key's proof (`SETUP.txt` 7.3). **Shared with me**
   (`Pending.svelte`) lists what others have shared. The app looks for new
   shares every minute, and when the tab comes back into view.
 - Public links: `#link=<…>` logs in as the link's own account, in a

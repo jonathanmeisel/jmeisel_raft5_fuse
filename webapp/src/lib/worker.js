@@ -246,6 +246,29 @@ function session() {
   return fs;
 }
 
+/// Logs the new account `user` in once, trusts the key of whoever made
+/// `invitation` (and the people they check), and logs out. Unlike `login`,
+/// it leaves any account remembered in this browser as it is.
+async function acceptInvitation(user, password, invitation) {
+  const db = await openDb();
+  const prefix = `${config.fsId}/${user}/`;
+  const tabs = openChannel(user);
+  let session = null;
+  try {
+    session = await wasm.login(
+      config,
+      user,
+      password,
+      await loadBlobs(db, prefix),
+      persister(db, prefix, tabs.channel),
+    );
+    await session.acceptInvitation(invitation);
+  } finally {
+    await session?.logout().catch(() => {});
+    tabs.channel.close();
+  }
+}
+
 const methods = {
   /// Enrols with `invitation`, on the filesystem it is for.
   async enrol(invitation, password) {
@@ -262,7 +285,18 @@ const methods = {
         { code: "EINVAL" },
       );
     }
-    return { ...(await wasm.enrol(config, invitation, password)), fsId };
+    const enrolled = await wasm.enrol(config, invitation, password);
+    let inviterTrusted = false;
+    let inviterError = null;
+    if (enrolled.inviter) {
+      try {
+        await acceptInvitation(enrolled.user, password, invitation);
+        inviterTrusted = true;
+      } catch (e) {
+        inviterError = e.message;
+      }
+    }
+    return { ...enrolled, fsId, inviterTrusted, inviterError };
   },
 
   /// Logs in to filesystem `fsId`. With `stay`, remembers the account on
@@ -567,6 +601,8 @@ const methods = {
   pending: () => session().pending(),
   trust: (user, words) => session().trust(user, words),
   forgetKey: (user) => session().forgetKey(user),
+  setIntroducer: (user, on) => session().setIntroducer(user, on),
+  trustWarnings: () => session().trustWarnings(),
   syncPins: () => session().syncPins(),
   topFolder: (path) => session().topFolder(path),
   relabelShare: (path, label) => session().relabelShare(path, label),

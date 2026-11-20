@@ -115,6 +115,11 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x06 ++ "c/" ++ username            -> the account record: capabilities, kind,
 //                                          who invited it (`accounts`)
 //   0x06 ++ "p/" ++ username            -> the account's trusted keys, sealed to it (`accounts`)
+//   0x06 ++ "v/" ++ username            -> the proof of the key it enrolled with, from its
+//                                          invitation (`accounts`)
+//   0x06 ++ "i/" ++ recipient ++ 0x00 ++ subject ++ 0x00 ++ introducer
+//                                       -> one user's key, introduced to another
+//                                          (`introductions`)
 //   0x07 ++ ino(BE8) ++ username        -> a grant of that directory to that user (`grants`)
 //   0x08 ++ ino(BE8)                    -> the inode's key record
 //   0x09 ++ username ++ 0x00 ++ ino(BE8) -> index of a user's grants (`grants`)
@@ -260,6 +265,12 @@ pub(crate) const ACCOUNT_INFO_PREFIX: &[u8] = b"\x06c/";
 
 /// The prefix of every account's sealed trusted keys; see `accounts`.
 pub(crate) const PINS_PREFIX: &[u8] = b"\x06p/";
+
+/// The prefix of every account's invitation proof; see `accounts`.
+pub(crate) const ENROLLMENT_PROOF_PREFIX: &[u8] = b"\x06v/";
+
+/// The prefix of every introduction; see `introductions`.
+pub(crate) const INTRODUCTIONS_PREFIX: &[u8] = b"\x06i/";
 
 /// The prefix of every deletion marker; see the layout notes above.
 pub(crate) const TOMBSTONE_PREFIX: &[u8] = &[0x05];

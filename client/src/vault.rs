@@ -51,7 +51,7 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
-use raft5fs_crypto::pins::{PinEntry, PinList, open_pins, seal_pins};
+use raft5fs_crypto::pins::{PendingInvite, PinEntry, PinList, PinSource, open_pins, seal_pins};
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
@@ -68,6 +68,7 @@ mod activity;
 mod blocks;
 mod prune;
 mod rollback;
+mod trust;
 pub use activity::{ActivityLine, ActivityLines, Change};
 pub use prune::{GrantRoot, PruneStats};
 
@@ -702,6 +703,9 @@ pub struct Vault {
     space: u64,
     /// Each file's layout, kept after the first request (see `layout`).
     layouts: Mutex<HashMap<u64, Layout>>,
+    /// What the last merge of the trusted keys said beyond the keys (see
+    /// `trust`).
+    trust: Mutex<trust::TrustState>,
 }
 
 impl Drop for Vault {
@@ -739,6 +743,7 @@ impl Vault {
             cache: Arc::new(Mutex::new(ChunkCache::new(DEFAULT_CACHE_BYTES, CACHE_TTL))),
             space: 0,
             layouts: Mutex::new(HashMap::new()),
+            trust: Mutex::default(),
         })
     }
 
@@ -771,6 +776,7 @@ impl Vault {
             cache: Arc::clone(&self.cache),
             space,
             layouts: Mutex::new(HashMap::new()),
+            trust: Mutex::default(),
         }
     }
 
@@ -806,12 +812,23 @@ impl Vault {
     /// The servers can't read or change the list (raft5fs-crypto's
     /// `pins`). Does nothing on servers older than protocol 3.
     pub async fn sync_pins(&self) -> Result<(), FsError> {
-        self.merge_pins(false).await
+        self.merge_pins(false, &[], &[]).await
     }
 
     /// `sync_pins`, and with `labels_signed`, records that this account has
     /// signed its old labels.
-    async fn merge_pins(&self, labels_signed: bool) -> Result<(), FsError> {
+    ///
+    /// `explicit` and `invites` are changes made here that say more than a
+    /// key: how a key was checked, an introducer mark, an invitation. They
+    /// win over older entries for the same user, as key changes do. On
+    /// protocol 11, the merge also checks open invitations and takes in
+    /// introductions (see `trust`).
+    async fn merge_pins(
+        &self,
+        labels_signed: bool,
+        explicit: &[PinEntry],
+        invites: &[PendingInvite],
+    ) -> Result<(), FsError> {
         if self.remote.protocol() < 3 {
             return Ok(());
         }
@@ -834,9 +851,12 @@ impl Vault {
                     user: user.clone(),
                     key: local.get(user).copied(),
                     at: now,
+                    source: PinSource::Checked,
+                    introducer: false,
                 })
                 .collect(),
         };
+        let inbox = self.introduction_inbox().await;
         for _ in 0..CHANGE_RETRIES {
             let (version, sealed) = self.remote.get_pins().await?;
             let stored = if sealed.is_empty() {
@@ -853,6 +873,19 @@ impl Vault {
                 .collect();
             let mut merged = before.clone();
             for change in &changes {
+                match merged.get(&change.user) {
+                    // Already the same key: keep how it was checked.
+                    Some(e) if e.key == change.key => {}
+                    Some(e) if e.at > change.at => {}
+                    old => {
+                        let mut change = change.clone();
+                        // The same person: their marks stay with a new key.
+                        change.introducer = old.is_some_and(|e| e.introducer);
+                        merged.insert(change.user.clone(), change);
+                    }
+                }
+            }
+            for change in explicit {
                 if merged.get(&change.user).is_none_or(|e| e.at <= change.at) {
                     merged.insert(change.user.clone(), change.clone());
                 }
@@ -863,9 +896,16 @@ impl Vault {
                         user: user.clone(),
                         key: Some(*key),
                         at: now,
+                        source: PinSource::Checked,
+                        introducer: false,
                     });
                 }
             }
+            let mut open_invites = trust::merge_invites(&stored.invites, invites);
+            let mut found = trust::Found::default();
+            self.check_invites(&me, now, &mut merged, &mut open_invites, &mut found)
+                .await;
+            self.take_introductions(&me, now, &inbox, &mut merged, &mut found);
             // This account pins each public link it makes, to share with it.
             // Once a link is gone, so is its pin, everywhere. Link names are
             // random and never reused, so no marker is needed: a device that
@@ -882,12 +922,17 @@ impl Vault {
             let uncounted = stored.counter == 0 && !sealed.is_empty();
             let signed = stored.labels_signed || labels_signed;
             let mut counter = stored.counter;
-            if merged != before || uncounted || signed != stored.labels_signed {
+            if merged != before
+                || open_invites != stored.invites
+                || uncounted
+                || signed != stored.labels_signed
+            {
                 counter = stored.counter.max(floor) + 1;
                 let list = PinList {
                     counter,
                     labels_signed: signed,
                     entries: merged.values().cloned().collect(),
+                    invites: open_invites.clone(),
                 };
                 match self
                     .remote
@@ -927,6 +972,8 @@ impl Vault {
             if changed_here {
                 self.forget_all();
             }
+            self.after_merge(&me, &before, &merged, open_invites, found)
+                .await;
             return Ok(());
         }
         Err(FsError::new(
@@ -1822,7 +1869,7 @@ impl Vault {
             }
         }
         if !done {
-            self.merge_pins(true).await?;
+            self.merge_pins(true, &[], &[]).await?;
         }
         Ok(())
     }
@@ -2390,7 +2437,7 @@ impl Vault {
         // Grants from this user were opened as untrusted before, so open
         // them again.
         self.forget_all();
-        self.share_pins().await;
+        self.share_checked(user, key).await;
         Ok(key)
     }
 
@@ -2409,7 +2456,7 @@ impl Vault {
         })?;
         let key = self.known.check(user, &served)?;
         self.forget_all();
-        self.share_pins().await;
+        self.share_checked(user, key).await;
         Ok(key)
     }
 

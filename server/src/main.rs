@@ -692,6 +692,9 @@ async fn user_command(a: Args) {
                         servers: a.invite_servers.clone(),
                         tls_server_name: a.invite_server_name.clone(),
                         ca,
+                        // Made by the servers' tools, not by a person who
+                        // could vouch for the new key.
+                        introduction: None,
                     };
                     println!("invitation for {name} (as secret as the code -- for {name} alone):");
                     println!("{}", invite.encode());

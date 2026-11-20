@@ -533,6 +533,53 @@ impl pb::PinsResponse {
     }
 }
 
+impl From<Result<(Vec<u8>, Vec<u8>), FsError>> for pb::EnrollmentResponse {
+    fn from(r: Result<(Vec<u8>, Vec<u8>), FsError>) -> Self {
+        use pb::enrollment_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok((public_key, proof)) => R::Enrollment(pb::Enrollment { public_key, proof }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::EnrollmentResponse {
+    /// The public key, and the invitation proof (empty for none).
+    pub fn into_result(self) -> Result<(Vec<u8>, Vec<u8>), FsError> {
+        use pb::enrollment_response::Result as R;
+        match self.result {
+            Some(R::Enrollment(e)) => Ok((e.public_key, e.proof)),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("enrollment")),
+        }
+    }
+}
+
+impl From<Result<Vec<pb::Introduction>, FsError>> for pb::IntroductionsResponse {
+    fn from(r: Result<Vec<pb::Introduction>, FsError>) -> Self {
+        use pb::introductions_response::Result as R;
+        Self {
+            result: Some(match r {
+                Ok(introductions) => R::Introductions(pb::Introductions { introductions }),
+                Err(e) => R::Error(e.into()),
+            }),
+        }
+    }
+}
+
+impl pb::IntroductionsResponse {
+    pub fn into_result(self) -> Result<Vec<pb::Introduction>, FsError> {
+        use pb::introductions_response::Result as R;
+        match self.result {
+            Some(R::Introductions(i)) => Ok(i.introductions),
+            Some(R::Error(e)) => Err(e.into()),
+            None => Err(malformed("introductions")),
+        }
+    }
+}
+
 impl From<Result<pb::IssuedInvite, FsError>> for pb::IssueInviteResponse {
     fn from(r: Result<pb::IssuedInvite, FsError>) -> Self {
         use pb::issue_invite_response::Result as R;

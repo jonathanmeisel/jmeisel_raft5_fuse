@@ -26,6 +26,7 @@ pub mod backup;
 pub mod data;
 pub mod grantees;
 pub mod identity;
+pub mod invitation;
 pub mod node;
 pub mod password;
 pub mod pins;

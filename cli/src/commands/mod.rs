@@ -134,6 +134,11 @@ pub enum Command {
     Trust(share::TrustArgs),
     /// Forget a user's pinned key (for example, after they enrolled again).
     ForgetKey(share::UserArg),
+    /// List the people whose keys you trust, and how each was checked.
+    People,
+    /// Trust (on) or stop trusting (off) the keys that a person checks: an
+    /// introducer. You must have checked their key yourself.
+    Introducer(share::IntroducerArgs),
     /// List what a file or folder was in each snapshot: where to find each
     /// version under .snapshot, and when it was edited.
     Versions(history::PathArgs),
@@ -175,6 +180,8 @@ pub fn run(cli: Cli) -> i32 {
         Command::Grants(args) => share::grants(&cli.connect, args),
         Command::Trust(args) => share::trust(&cli.connect, args),
         Command::ForgetKey(args) => share::forget_key(&cli.connect, args),
+        Command::People => share::people(&cli.connect),
+        Command::Introducer(args) => share::introducer(&cli.connect, args),
         Command::Relabel(args) => share::relabel(&cli.connect, args),
         Command::Versions(args) => history::versions(&cli.connect, args),
         Command::Activity(args) => history::activity(&cli.connect, args),
@@ -256,6 +263,11 @@ fn runtime() -> Runtime {
 fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
     let password = password_from("RAFT5FS_PASSWORD", &format!("password for {}: ", ctx.user))
         .map_err(|e| format!("cannot read a password: {e}"))?;
+    log_in_with(runtime, ctx, password)
+}
+
+/// `log_in` with a password already in hand.
+fn log_in_with(runtime: &Runtime, ctx: &Context, password: String) -> Result<Vault, String> {
     let remote = runtime
         .block_on(Remote::connect(
             &ctx.servers,
@@ -274,6 +286,9 @@ fn log_in(runtime: &Runtime, ctx: &Context) -> Result<Vault, String> {
             }
         }
         Err(e) => eprintln!("warning: trusted keys not merged with the servers' copy: {e}"),
+    }
+    for warning in vault.trust_warnings() {
+        eprintln!("warning: {warning}");
     }
     Ok(vault)
 }

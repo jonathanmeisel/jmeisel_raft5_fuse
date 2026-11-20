@@ -370,6 +370,9 @@ fn groups_show_in_a_mount_and_in_snapshots() {
     rt.block_on(bob.relabel(work, OsStr::new("alone too")))
         .unwrap();
     assert_eq!(names(root), ["alone", "alone too"]);
+    // The kernel keeps the group's entry from the lookups above until its
+    // time runs out. A listing doesn't drop it.
+    past_kernel_cache();
     assert_errno(fs::metadata(&group), libc::ENOENT);
     rt.block_on(bob.relabel(notes, OsStr::new("CS101/notes")))
         .unwrap();

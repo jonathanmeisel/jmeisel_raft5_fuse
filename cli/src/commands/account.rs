@@ -2,13 +2,13 @@
 
 use clap::Args;
 use raft5fs_crypto::password::{KdfParams, check_new_password};
-use raft5fs_proto::invite::{Invite, der_to_pem};
+use raft5fs_proto::invite::{Introduction as InviteIntroduction, Invite, der_to_pem};
 use raft5fs_proto::types::{Caps, check_username};
 
-use super::{ConnectArgs, Outcome, runtime, show_fingerprint};
+use super::{ConnectArgs, Outcome, log_in_with, runtime, show_fingerprint};
 use raft5fs_client::cli::{
-    Context, Profile, config_dir, install_profile, password_from, profile_ca_path, prompt_password,
-    tls_from_pem,
+    Context, Overrides, Profile, config_dir, install_profile, password_from, profile_ca_path,
+    prompt_password, tls_from_pem,
 };
 use raft5fs_client::remote::{Credentials, Remote};
 
@@ -39,49 +39,52 @@ fn new_password(var: &str, username: &str) -> Result<String, String> {
 
 pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
     let base = config_dir();
-    let (profile, ca_pem, code) = if args.invitation.trim().starts_with("raft5fs-invite:") {
-        let invite = Invite::decode(&args.invitation)?;
-        if connect.user.as_ref().is_some_and(|u| *u != invite.user) {
-            return Err(format!("this invitation is for {}", invite.user));
-        }
-        let profile = Profile {
-            user: invite.user.clone(),
-            servers: invite.servers.clone(),
-            tls_server_name: invite.tls_server_name.clone(),
-            ..Profile::default()
+    let (profile, ca_pem, code, introduction) =
+        if args.invitation.trim().starts_with("raft5fs-invite:") {
+            let invite = Invite::decode(&args.invitation)?;
+            if connect.user.as_ref().is_some_and(|u| *u != invite.user) {
+                return Err(format!("this invitation is for {}", invite.user));
+            }
+            let profile = Profile {
+                user: invite.user.clone(),
+                servers: invite.servers.clone(),
+                tls_server_name: invite.tls_server_name.clone(),
+                ..Profile::default()
+            };
+            (
+                profile,
+                Some(der_to_pem(&invite.ca).into_bytes()),
+                invite.code,
+                invite.introduction,
+            )
+        } else {
+            // A bare code: get the rest only from the command line, not from a
+            // profile, which would be another account's.
+            let user = connect
+                .user
+                .clone()
+                .ok_or("enrolling with a bare code needs --user (or use the invitation)")?;
+            if connect.servers.is_empty() {
+                return Err("enrolling with a bare code needs --server".to_string());
+            }
+            let ca_pem = match &connect.ca {
+                Some(path) => Some(
+                    std::fs::read(path)
+                        .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+                ),
+                None if connect.insecure_plaintext => None,
+                None => return Err("--ca is required (or --insecure-plaintext)".to_string()),
+            };
+            let profile = Profile {
+                user,
+                servers: connect.servers.clone(),
+                tls_server_name: connect.tls_server_name.clone(),
+                known_keys: connect.known_keys.clone(),
+                insecure_plaintext: connect.insecure_plaintext,
+                ..Profile::default()
+            };
+            (profile, ca_pem, args.invitation.trim().to_string(), None)
         };
-        (
-            profile,
-            Some(der_to_pem(&invite.ca).into_bytes()),
-            invite.code,
-        )
-    } else {
-        // A bare code: get the rest only from the command line, not from a
-        // profile, which would be another account's.
-        let user = connect
-            .user
-            .clone()
-            .ok_or("enrolling with a bare code needs --user (or use the invitation)")?;
-        if connect.servers.is_empty() {
-            return Err("enrolling with a bare code needs --server".to_string());
-        }
-        let ca_pem = match &connect.ca {
-            Some(path) => Some(
-                std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-            ),
-            None if connect.insecure_plaintext => None,
-            None => return Err("--ca is required (or --insecure-plaintext)".to_string()),
-        };
-        let profile = Profile {
-            user,
-            servers: connect.servers.clone(),
-            tls_server_name: connect.tls_server_name.clone(),
-            known_keys: connect.known_keys.clone(),
-            insecure_plaintext: connect.insecure_plaintext,
-            ..Profile::default()
-        };
-        (profile, ca_pem, args.invitation.trim().to_string())
-    };
     check_username(&profile.user).map_err(|e| e.message)?;
     let name = connect.profile.clone().unwrap_or(profile.user.clone());
     // Check this before the code is used up, so nothing is overwritten
@@ -95,7 +98,7 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
     }
 
     let password = new_password("RAFT5FS_PASSWORD", &profile.user)?;
-    let mut credentials = Credentials::new(profile.user.clone(), password);
+    let mut credentials = Credentials::new(profile.user.clone(), password.clone());
     credentials.allow_plaintext = profile.insecure_plaintext;
     let tls = ca_pem
         .clone()
@@ -107,6 +110,7 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
             credentials,
             &code,
             KdfParams::DEFAULT,
+            introduction.as_ref(),
         ))
         .map_err(|e| format!("cannot enrol: {e}"))?;
 
@@ -119,8 +123,43 @@ pub fn enrol(connect: &ConnectArgs, args: EnrolArgs) -> Outcome {
     );
     println!("your key's fingerprint -- give it to those you share with:");
     println!("{}", show_fingerprint(&public_key));
+    if let Some(intro) = &introduction {
+        trust_inviter(&name, password, intro);
+    }
     println!("next: raft5fs mount <MOUNTPOINT>");
     Ok(0)
+}
+
+/// Logs in as the new profile `name` and trusts the key of the person
+/// whose invitation held `intro`, and the people they check. A failure
+/// only leaves the safety codes to compare, so it is a warning.
+fn trust_inviter(name: &str, password: String, intro: &InviteIntroduction) {
+    let overrides = Overrides {
+        profile: Some(name.to_string()),
+        user: None,
+        ca: None,
+        tls_server_name: None,
+        servers: Vec::new(),
+        known_keys: None,
+        insecure_plaintext: false,
+    };
+    let trusted = Context::resolve(&overrides, true).and_then(|ctx| {
+        let rt = runtime();
+        let vault = log_in_with(&rt, &ctx, password)?;
+        rt.block_on(vault.accept_invitation(intro))
+            .map_err(|e| e.to_string())
+    });
+    match trusted {
+        Ok(()) => println!(
+            "you trust {}'s key, from the invitation; they trust yours once \
+             their raft5fs next runs",
+            intro.inviter
+        ),
+        Err(e) => eprintln!(
+            "warning: {e}; compare safety codes with {} (raft5fs trust)",
+            intro.inviter
+        ),
+    }
 }
 
 pub fn passwd(connect: &ConnectArgs) -> Outcome {

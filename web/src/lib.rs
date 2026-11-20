@@ -34,6 +34,7 @@ use raft5fs_crypto::identity::{
     PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
 };
 use raft5fs_crypto::password::{AUTH_LEN, KdfParams, check_new_password};
+use raft5fs_crypto::pins::PinSource;
 use raft5fs_crypto::{KEY_LEN, Key};
 use raft5fs_proto::errno;
 use raft5fs_proto::invite::Invite;
@@ -276,12 +277,14 @@ pub async fn enrol(
     }
     check_new_password(&password).map_err(|why| failure("EINVAL", &why))?;
     let user = invite.user.clone();
+    let inviter = invite.introduction.as_ref().map(|i| i.inviter.clone());
     let key = Remote::enrol(
         &config.servers,
         config.tls(),
         config.credentials(invite.user, password),
         &invite.code,
         KdfParams::DEFAULT,
+        invite.introduction.as_ref(),
     )
     .await
     // The servers refuse a used or wrong code with EACCES, in their own
@@ -290,14 +293,18 @@ pub async fn enrol(
         errno::EACCES => failure("EACCES", "invalid enrollment code"),
         _ => fs_failure(e),
     })?;
+    /// `inviter`: who made the invitation, if it can make their key trusted
+    /// once logged in (`acceptInvitation`).
     #[derive(Serialize)]
     struct Enrolled {
         user: String,
         fingerprint: Fingerprint,
+        inviter: Option<String>,
     }
     to_js(&Enrolled {
         user,
         fingerprint: Fingerprint::of(&key),
+        inviter,
     })
 }
 
@@ -1681,7 +1688,7 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let wanted = caps_named(&caps)?;
-            let (code, invitation) = inner.vault().remote().issue_invite(&user, wanted).await?;
+            let (code, invitation) = inner.vault().invite(&user, wanted).await?;
             #[derive(Serialize)]
             struct Issued {
                 invitation: Option<String>,
@@ -1757,7 +1764,7 @@ impl Fs {
     pub fn reissue_invite(&self, user: String) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
-            let (code, invitation) = inner.vault().remote().reissue_invite(&user).await?;
+            let (code, invitation) = inner.vault().reissue(&user).await?;
             #[derive(Serialize)]
             struct Issued {
                 invitation: Option<String>,
@@ -2171,8 +2178,10 @@ impl Fs {
     }
 
     /// Whose key this account has pinned, in name order: `[{user, fingerprint,
-    /// keyChanged}]`, where `keyChanged` says the servers now give another key
-    /// for them. Public links are pinned to share with them, but aren't people.
+    /// keyChanged, how, by, introducer}]`, where `keyChanged` says the servers
+    /// now give another key for them, `how` says how the key was checked, and
+    /// `introducer` whether the keys they check are trusted here. Public links
+    /// are pinned to share with them, but aren't people.
     pub fn people(&self) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
@@ -2182,6 +2191,11 @@ impl Fs {
                 user: String,
                 fingerprint: Fingerprint,
                 key_changed: bool,
+                /// `checked` (safety code), `invited`, or `introduced`.
+                how: &'static str,
+                /// Who introduced them, for `introduced`.
+                by: Option<String>,
+                introducer: bool,
             }
             let mut pins: Vec<_> = inner
                 .vault()
@@ -2194,10 +2208,19 @@ impl Fs {
             let mut people = Vec::with_capacity(pins.len());
             for (user, key) in pins {
                 let key_changed = inner.vault().key_changed(&user).await.unwrap_or(false);
+                let details = inner.vault().pin_details(&user);
+                let (how, by) = match details.as_ref().map(|d| &d.source) {
+                    Some(PinSource::Invited) => ("invited", None),
+                    Some(PinSource::Introduced { by }) => ("introduced", Some(by.clone())),
+                    _ => ("checked", None),
+                };
                 people.push(Person {
                     user,
                     fingerprint: Fingerprint::of(&key),
                     key_changed,
+                    how,
+                    by,
+                    introducer: details.is_some_and(|d| d.introducer),
                 });
             }
             Ok(people)
@@ -2266,6 +2289,35 @@ impl Fs {
 
     /// Forgets `user`'s pinned key, here and on the account's other
     /// devices.
+    /// After enrolling with `invitation`: trusts the key of the person who
+    /// made it, and the people they check. Fails, trusting nothing, if the
+    /// servers give another key for them.
+    #[wasm_bindgen(js_name = acceptInvitation)]
+    pub fn accept_invitation(&self, invitation: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let invite = Invite::decode(&invitation).map_err(|e| FsError::new(errno::EINVAL, e))?;
+            match &invite.introduction {
+                Some(intro) => inner.vault().accept_invitation(intro).await,
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Whether to trust the keys that `user` checks.
+    #[wasm_bindgen(js_name = setIntroducer)]
+    pub fn set_introducer(&self, user: String, on: bool) -> Promise {
+        let inner = Rc::clone(&self.0);
+        promise(async move { inner.vault().set_introducer(&user, on).await })
+    }
+
+    /// Checks of invitations and introductions that didn't pass, as
+    /// sentences, newest last.
+    #[wasm_bindgen(js_name = trustWarnings)]
+    pub fn trust_warnings(&self) -> Vec<String> {
+        self.0.vault().trust_warnings()
+    }
+
     #[wasm_bindgen(js_name = forgetKey)]
     pub fn forget_key(&self, user: String) -> Promise {
         let inner = Rc::clone(&self.0);

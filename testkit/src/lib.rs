@@ -844,6 +844,7 @@ pub fn enrol(runtime: &Runtime, client: &Client, addresses: &[String], name: &st
             credentials(name),
             &code,
             KdfParams::TESTING,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("enrol {name}: {e}"))

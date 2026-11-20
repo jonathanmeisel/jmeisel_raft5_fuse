@@ -77,6 +77,7 @@ fn a_browser_logs_in_over_grpc_web_from_the_apps_origin_only() {
             alice,
             &code,
             KdfParams::TESTING,
+            None,
         )
         .await
         .unwrap();
@@ -208,6 +209,7 @@ fn the_web_port_serves_over_tls() {
             credentials("bob"),
             &code,
             KdfParams::TESTING,
+            None,
         )
         .await
         .unwrap();

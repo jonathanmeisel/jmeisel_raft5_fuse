@@ -604,6 +604,37 @@ disagree, the latest change wins. Enrolling again drops the copy, since
 a new key pair can't open it. (Servers older than protocol 3 keep no
 copy; then each device pins on its own.)
 
+Invitations and introducers. Reading fingerprints is only needed where
+nothing else vouches for a key:
+
+- An invitation that a person makes (`raft5fs admin invite` or
+  `reenroll`, or the web app's Users screen) also carries a secret from
+  their own client, which the servers never see. The new user's client
+  proves its key with it when enrolling, and trusts the inviter's key,
+  which the invitation holds. The inviter's devices check the proof at
+  their next login or sync, and trust the new key: no fingerprints either
+  way. An invitation from `raft5fs-server user add` carries none, since
+  no person made it.
+- So an invitation now vouches for keys, as well as holding the code.
+  Send it in person or over an end-to-end encrypted app, not by email: who
+  reads it on the way can enroll as the user and be trusted by the
+  inviter.
+- An introducer is someone whose key you checked yourself (fingerprint or
+  invitation) and whose checks you trust: you mark them, and the person
+  who invited you is one already. When an introducer checks someone new,
+  they vouch for that key to everyone they checked, in a box only you can
+  open with their key. You then trust it as "introduced by" them. It goes
+  one step only: a key you were introduced to isn't passed on, and its
+  holder can't be your introducer.
+
+  raft5fs people                 whose key you trust, and how it was checked
+  raft5fs introducer alice on    trust the keys that alice checks
+
+A server can only hold back a proof or an introduction, which leaves the
+fingerprints to read as before. It can't make one that checks. A device
+of an introducer that someone took over could vouch for false keys, to
+those who marked them. These need servers with protocol 11.
+
 A server could hand back an older copy, or an older key record for a
 folder. An older copy could bring back a key that alice has since
 replaced, and an older key record could make her seal new files under a

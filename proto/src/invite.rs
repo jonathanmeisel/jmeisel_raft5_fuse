@@ -22,7 +22,9 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
 use crate::wire::{Reader, put, put_u32};
 
+/// Version 1 has no introduction. Version 2 is version 1 and then one.
 const PREFIX: &str = "raft5fs-invite:1:";
+const PREFIX_2: &str = "raft5fs-invite:2:";
 
 /// What an invitation holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,20 @@ pub struct Invite {
     pub tls_server_name: Option<String>,
     /// The CA certificate, in DER.
     pub ca: Vec<u8>,
+    /// Added by the inviter's own client, not by the servers.
+    pub introduction: Option<Introduction>,
+}
+
+/// What lets the inviter and the new user trust each other's keys with no
+/// safety codes (see `raft5fs_crypto::invitation`). The servers never see
+/// it, so it makes an invitation as secret as its code already is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Introduction {
+    /// The inviter's account, and its public key.
+    pub inviter: String,
+    pub inviter_key: [u8; 32],
+    /// What the new user's client proves its key with.
+    pub secret: [u8; 32],
 }
 
 impl Invite {
@@ -50,19 +66,32 @@ impl Invite {
             self.tls_server_name.as_deref().unwrap_or("").as_bytes(),
         );
         put(&mut out, &self.ca);
-        format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
+        let prefix = match &self.introduction {
+            None => PREFIX,
+            Some(intro) => {
+                put(&mut out, intro.inviter.as_bytes());
+                put(&mut out, &intro.inviter_key);
+                put(&mut out, &intro.secret);
+                PREFIX_2
+            }
+        };
+        format!("{prefix}{}", URL_SAFE_NO_PAD.encode(out))
     }
 
     /// Reads an invitation in the format that `encode` writes. Whitespace
     /// around it is allowed. Anything else is refused, with the reason.
     pub fn decode(line: &str) -> Result<Self, String> {
         let line = line.trim();
-        let Some(body) = line.strip_prefix(PREFIX) else {
-            return Err(if line.starts_with("raft5fs-invite:") {
-                "this invitation is for another version of raft5fs".to_string()
-            } else {
-                "not a raft5fs invitation".to_string()
-            });
+        let (body, introduced) = match (line.strip_prefix(PREFIX), line.strip_prefix(PREFIX_2)) {
+            (Some(body), _) => (body, false),
+            (_, Some(body)) => (body, true),
+            _ => {
+                return Err(if line.starts_with("raft5fs-invite:") {
+                    "this invitation is for another version of raft5fs".to_string()
+                } else {
+                    "not a raft5fs invitation".to_string()
+                });
+            }
         };
         let bytes = URL_SAFE_NO_PAD
             .decode(body)
@@ -77,6 +106,18 @@ impl Invite {
         let servers = (0..count).map(|_| r.string()).collect::<Result<_, _>>()?;
         let name = r.string()?;
         let ca = r.bytes()?.to_vec();
+        let introduction = if introduced {
+            let inviter = r.string()?;
+            crate::types::check_username(&inviter).map_err(|e| e.message)?;
+            let garbled = r.garbled();
+            Some(Introduction {
+                inviter,
+                inviter_key: r.bytes()?.try_into().map_err(|_| garbled.clone())?,
+                secret: r.bytes()?.try_into().map_err(|_| garbled)?,
+            })
+        } else {
+            None
+        };
         if !r.rest.is_empty() || ca.is_empty() {
             return Err("the invitation is garbled".to_string());
         }
@@ -87,6 +128,7 @@ impl Invite {
             servers,
             tls_server_name: (!name.is_empty()).then_some(name),
             ca,
+            introduction,
         })
     }
 }
@@ -135,6 +177,18 @@ mod tests {
             servers: vec!["https://fs1:27060".into(), "https://fs2:27060".into()],
             tls_server_name: Some("raft5fs".into()),
             ca: vec![0x30, 0x82, 1, 2, 3, 4, 5],
+            introduction: None,
+        }
+    }
+
+    fn introduced() -> Invite {
+        Invite {
+            introduction: Some(Introduction {
+                inviter: "alice".into(),
+                inviter_key: [4; 32],
+                secret: [5; 32],
+            }),
+            ..invite()
         }
     }
 
@@ -146,6 +200,7 @@ mod tests {
                 tls_server_name: None,
                 ..invite()
             },
+            introduced(),
         ] {
             let line = i.encode();
             assert!(!line.contains(char::is_whitespace));
@@ -158,10 +213,24 @@ mod tests {
         let line = invite().encode();
         assert!(Invite::decode("hello").is_err());
         assert!(
-            Invite::decode(&line.replace(":1:", ":2:"))
+            Invite::decode(&line.replace(":1:", ":9:"))
                 .unwrap_err()
                 .contains("another version")
         );
+        // A version 1 body under the version 2 prefix lacks its introduction.
+        assert!(Invite::decode(&line.replace(":1:", ":2:")).is_err());
+        let intro = introduced().encode();
+        assert!(intro.starts_with(PREFIX_2));
+        assert!(Invite::decode(&format!("{intro}AAAA")).is_err());
+        let bad_inviter = Invite {
+            introduction: Some(Introduction {
+                inviter: "x\nalice".into(),
+                inviter_key: [4; 32],
+                secret: [5; 32],
+            }),
+            ..invite()
+        };
+        assert!(Invite::decode(&bad_inviter.encode()).is_err());
         assert!(Invite::decode(&line[..line.len() - 4]).is_err());
         assert!(Invite::decode(&format!("{line}AAAA")).is_err());
         assert!(Invite::decode(&format!("{line}!")).is_err());

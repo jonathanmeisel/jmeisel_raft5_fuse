@@ -149,7 +149,7 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
                 caps = caps.with(cap, on);
             }
             let issued = runtime
-                .block_on(remote.issue_invite(&args.name, caps))
+                .block_on(vault.invite(&args.name, caps))
                 .map_err(|e| format!("cannot invite {}: {e}", args.name))?;
             print_invitation(&args.name, issued);
             println!("they can: {}", caps_text(caps));
@@ -188,7 +188,7 @@ pub fn run(connect: &ConnectArgs, command: AdminCommand) -> Outcome {
         AdminCommand::Reenroll(args) => {
             check_impact(&runtime, remote, &args, "letting them enroll again")?;
             let issued = runtime
-                .block_on(remote.reissue_invite(&args.name))
+                .block_on(vault.reissue(&args.name))
                 .map_err(|e| format!("cannot let {} enroll again: {e}", args.name))?;
             print_invitation(&args.name, issued);
             println!(
@@ -349,6 +349,12 @@ fn print_invitation(name: &str, (code, invitation): (String, Option<String>)) {
         Some(invitation) => {
             println!("invitation for {name} (as secret as a password -- for {name} alone):");
             println!("{invitation}");
+            if invitation.starts_with("raft5fs-invite:2:") {
+                println!(
+                    "it also lets you and {name} trust each other's keys with no safety codes, \
+                     so send it over an end-to-end encrypted channel or in person"
+                );
+            }
             println!(
                 "(they run `raft5fs enrol '<invitation>'`, or paste it into the web app's \
                  enroll screen)"

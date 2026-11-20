@@ -54,13 +54,16 @@ use std::time::Duration;
 
 use raft5fs_crypto::Key;
 use raft5fs_crypto::identity::{Identity, PUBLIC_KEY_LEN};
+use raft5fs_crypto::invitation::invite_proof;
 use raft5fs_crypto::password::{self, AUTH_LEN, KdfParams, PasswordKeys, new_salt, verifier};
 use raft5fs_objstore::http::{self, HttpConfig};
 use zeroize::Zeroizing;
 
 use raft5fs_proto::convert::{name_bytes, session_to_metadata};
 use raft5fs_proto::errno;
+pub use raft5fs_proto::invite::Introduction as InviteIntroduction;
 use raft5fs_proto::pb::FolderSizesRequest;
+pub use raft5fs_proto::pb::Introduction;
 use raft5fs_proto::pb::fs_client::FsClient;
 use raft5fs_proto::pb::{
     AccessRequest, AccountKeys, ChangePasswordRequest, CreateRequest, CreateVolumeRequest,
@@ -74,6 +77,7 @@ use raft5fs_proto::pb::{
     CreateLinkAccountRequest, FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest,
     PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
 };
+use raft5fs_proto::pb::{DeleteIntroductionsRequest, PutIntroductionsRequest};
 use raft5fs_proto::types::{
     AccountInfo, Attr, BlockUpload, Caps, ChunkWrite, Chunks, DirItem, FsError, Grant, GrantedNode,
     KeyPath, NewNode, ObjectGrid, PreparedUpload, ResealedName, Rotation, SealedMove, SetAttr,
@@ -424,12 +428,17 @@ impl Remote {
     /// the account, and stores it wrapped under the key from
     /// `credentials.password`. Returns the new public key, so the user can
     /// note its fingerprint.
+    ///
+    /// With `introduction` from the invitation, it also sends the proof of
+    /// the new key (raft5fs-crypto's `invitation`), so the inviter can
+    /// trust it with no safety codes.
     pub async fn enrol(
         addresses: &[String],
         tls: Option<ClientTlsConfig>,
         credentials: Credentials,
         code: &str,
         params: KdfParams,
+        introduction: Option<&InviteIntroduction>,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
         let username = credentials.username.clone();
         let password = Zeroizing::new(credentials.password.clone());
@@ -439,10 +448,20 @@ impl Remote {
             .map_err(|e| FsError::new(errno::EIO, e))?;
         let identity = Identity::generate();
         let (keys, _) = account_keys(username, password, params, &identity).await?;
+        let invite_proof = introduction.map_or_else(Vec::new, |intro| {
+            invite_proof(
+                &intro.secret,
+                username,
+                &intro.inviter,
+                &identity.public_key(),
+            )
+            .to_vec()
+        });
         let req = EnrolRequest {
             username: username.to_string(),
             code: code.to_string(),
             keys: Some(keys),
+            invite_proof,
         };
         // Never sent again: the first enrolment uses up the code, so a
         // resend after it was stored would report a false refusal.
@@ -1673,6 +1692,59 @@ impl Remote {
             .await?
             .into_result()?
             .0)
+    }
+
+    /// What `user` enrolled with: their public key, and the proof of it
+    /// from their invitation (empty for none). `ENOENT` if they have not
+    /// enrolled.
+    pub async fn get_enrollment(&self, user: &str) -> Result<(Vec<u8>, Vec<u8>), FsError> {
+        self.needs_protocol(11, "invitations that check keys")?;
+        let req = UsernameRequest {
+            username: user.to_string(),
+        };
+        self.call(Retry::ReadOnly, |mut c| {
+            let req = req.clone();
+            async move { c.get_enrollment(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Leaves `introductions` from this account for their recipients.
+    pub async fn put_introductions(&self, introductions: Vec<Introduction>) -> Result<(), FsError> {
+        self.needs_protocol(11, "introductions")?;
+        let req = PutIntroductionsRequest { introductions };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.put_introductions(req).await }
+        })
+        .await?
+        .into_result()
+    }
+
+    /// The introductions left for this account.
+    pub async fn get_introductions(&self) -> Result<Vec<Introduction>, FsError> {
+        self.needs_protocol(11, "introductions")?;
+        self.call(Retry::ReadOnly, |mut c| async move {
+            c.get_introductions(NoArgs {}).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Removes introductions left for this account, by subject and
+    /// introducer.
+    pub async fn delete_introductions(&self, which: Vec<Introduction>) -> Result<(), FsError> {
+        self.needs_protocol(11, "introductions")?;
+        let req = DeleteIntroductionsRequest {
+            introductions: which,
+        };
+        self.call(Retry::Idempotent, |mut c| {
+            let req = req.clone();
+            async move { c.delete_introductions(req).await }
+        })
+        .await?
+        .into_result()
     }
 
     /// The public links that this account made.

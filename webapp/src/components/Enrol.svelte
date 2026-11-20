@@ -44,11 +44,23 @@
     always under your name, in My safety code.
   </p>
   <Fingerprint fingerprint={enrolled.fingerprint} />
+  {#if enrolled.inviterTrusted}
+    <p class="note">
+      Your invitation came from <strong>{enrolled.inviter}</strong>, so the two of you already trust
+      each other's keys. You won't need to read safety codes with {enrolled.inviter}, or with the
+      people {enrolled.inviter} has checked.
+    </p>
+  {:else if enrolled.inviter}
+    <p class="error">
+      Couldn't confirm {enrolled.inviter}'s key from your invitation: {enrolled.inviterError}.
+      Read safety codes with {enrolled.inviter} the first time you share.
+    </p>
+  {/if}
   <p><button class="primary" onclick={() => ondone(enrolled.user)}>Continue to log in</button></p>
 {:else}
   <form onsubmit={submit}>
     <label for="invitation">Invitation</label>
-    <textarea id="invitation" rows="4" bind:value={invitation} required placeholder="raft5fs-invite:1:…"></textarea>
+    <textarea id="invitation" rows="4" bind:value={invitation} required placeholder="raft5fs-invite:…"></textarea>
     <label for="new-password">New password</label>
     <input id="new-password" type="password" autocomplete="new-password" bind:value={password} required />
     <label for="again">Again</label>

@@ -119,6 +119,7 @@ fn main() {
                 servers: vec![native_address.clone()],
                 tls_server_name: None,
                 ca: ca.clone(),
+                introduction: None,
             };
             invites.insert(user, invite.encode());
         }
@@ -188,6 +189,7 @@ async fn control(listener: TcpListener, client: raft5_client::Client, server: St
                     servers: vec![server.clone()],
                     tls_server_name: None,
                     ca: ca.clone(),
+                    introduction: None,
                 }
                 .encode(),
             ),

@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 
 use clap::Args;
 use raft5fs_crypto::identity::fingerprint_words;
+use raft5fs_crypto::pins::PinSource;
 
 use super::{ConnectArgs, Outcome, log_in, runtime, show_fingerprint};
 use raft5fs_client::cli::Context;
@@ -189,6 +190,62 @@ pub fn trust(connect: &ConnectArgs, args: TrustArgs) -> Outcome {
         "what {} shares with you is writable now, mounts included",
         args.who
     );
+    Ok(0)
+}
+
+#[derive(Args)]
+pub struct IntroducerArgs {
+    /// The person.
+    #[arg(value_name = "USER")]
+    pub who: String,
+    pub switch: super::admin::Switch,
+}
+
+pub fn people(connect: &ConnectArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    let mut people: Vec<(String, [u8; 32])> = vault
+        .known_keys()
+        .entries()
+        .into_iter()
+        .filter(|(user, _)| !user.starts_with(raft5fs_proto::types::LINK_PREFIX))
+        .collect();
+    people.sort();
+    if people.is_empty() {
+        println!("you trust nobody's key yet (raft5fs trust, or an invitation)");
+    }
+    for (user, _) in people {
+        let (how, introducer) = match vault.pin_details(&user) {
+            Some(d) => (
+                match d.source {
+                    PinSource::Checked => "safety code checked".to_string(),
+                    PinSource::Invited => "through an invitation".to_string(),
+                    PinSource::Introduced { by } => format!("introduced by {by}"),
+                },
+                d.introducer,
+            ),
+            None => ("safety code checked".to_string(), false),
+        };
+        let mark = if introducer { "\tintroducer" } else { "" };
+        println!("{user}\t{how}{mark}");
+    }
+    Ok(0)
+}
+
+pub fn introducer(connect: &ConnectArgs, args: IntroducerArgs) -> Outcome {
+    let ctx = Context::resolve(&connect.overrides(), true)?;
+    let runtime = runtime();
+    let vault = log_in(&runtime, &ctx)?;
+    let on = matches!(args.switch, super::admin::Switch::On);
+    runtime
+        .block_on(vault.set_introducer(&args.who, on))
+        .map_err(|e| format!("cannot change {}: {e}", args.who))?;
+    if on {
+        println!("you now trust the keys that {} checks", args.who);
+    } else {
+        println!("you no longer take in keys that {} checks", args.who);
+    }
     Ok(0)
 }
 

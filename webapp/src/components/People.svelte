@@ -1,7 +1,8 @@
 <script>
-  // Whose safety code this account has checked. Their keys follow the account
-  // to its other devices. Someone whose key has changed since (they may have
-  // enrolled again) shows here, to check again.
+  // Whose key this account trusts, and how: a safety code read, an invitation,
+  // or an introduction from someone it trusts to check keys (an introducer).
+  // Their keys follow the account to its other devices. Someone whose key has
+  // changed since (they may have enrolled again) shows here, to check again.
   import Dialog from "./Dialog.svelte";
   import CodeInput from "./CodeInput.svelte";
   import Fingerprint from "./Fingerprint.svelte";
@@ -9,6 +10,7 @@
 
   let { fs, mine, onclose } = $props();
   let people = $state(null);
+  let warnings = $state([]);
   /// {user, keyChanged} being checked; `user` is empty for someone new.
   let checking = $state(null);
   /// Whom to confirm forgetting, and whose code shows.
@@ -23,6 +25,7 @@
   async function load() {
     try {
       people = await fs.people();
+      warnings = await fs.trustWarnings();
     } catch (e) {
       error = e.message;
       people = [];
@@ -64,6 +67,15 @@
     });
   }
 
+  const setIntroducer = (user, on) => run(() => fs.setIntroducer(user, on));
+
+  /// How a person's key came to be trusted, in a few words.
+  function how(p) {
+    if (p.how === "invited") return "through an invitation";
+    if (p.how === "introduced") return `introduced by ${p.by}`;
+    return "checked";
+  }
+
   const forget = (user) =>
     run(async () => {
       await fs.forgetKey(user);
@@ -95,9 +107,11 @@
     </form>
   {:else}
     <p class="note">
-      People whose safety code you've checked. You can share with them, and change what they share with
-      you, without checking again.
+      People whose key you trust: you read their safety code, one of you invited the other, or someone
+      you trust to check keys introduced them. You can share with them, and change what they share
+      with you, without checking again.
     </p>
+    {#each warnings as w}<p class="error">{w}</p>{/each}
     {#if people.length === 0}
       <p>You haven't checked anyone yet.</p>
     {/if}
@@ -106,7 +120,7 @@
         <div class="line">
           <span>
             <strong>{p.user}</strong>
-            {#if p.keyChanged}<span class="error">, key changed</span>{:else}<span class="note">, checked</span>{/if}
+            {#if p.keyChanged}<span class="error">, key changed</span>{:else}<span class="note">, {how(p)}</span>{/if}
           </span>
           <span class="actions">
             {#if p.keyChanged}
@@ -117,6 +131,17 @@
             <button class="danger" onclick={() => (forgetting = p.user)}>Forget…</button>
           </span>
         </div>
+        {#if !p.keyChanged && p.how !== "introduced"}
+          <label class="introducer">
+            <input
+              type="checkbox"
+              checked={p.introducer}
+              disabled={busy}
+              onchange={(e) => setIntroducer(p.user, e.target.checked)}
+            />
+            Trust people {p.user} checks
+          </label>
+        {/if}
         {#if shown === p.user}<Fingerprint fingerprint={p.fingerprint} />{/if}
         {#if forgetting === p.user}
           <p class="note">
@@ -142,4 +167,5 @@
   .person { padding: 8px 0; border-bottom: 1px solid var(--border); }
   .line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
   .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .introducer { display: flex; align-items: center; gap: 6px; font-size: 0.9em; margin-top: 4px; }
 </style>

@@ -23,6 +23,12 @@
 </script>
 
 <p>Invitation for <strong>{user}</strong>. Send it to {user} alone: whoever has it can take the name.</p>
+{#if invitation?.startsWith("raft5fs-invite:2:")}
+  <p class="note">
+    It also lets you and {user} trust each other's keys with no safety codes. Send it in person or
+    over an end-to-end encrypted app (such as Signal), not by email.
+  </p>
+{/if}
 {#if link}
   <label for="invite-link">Link to enroll in this app</label>
   <div class="row">

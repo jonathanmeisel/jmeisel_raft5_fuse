@@ -86,6 +86,7 @@ fn enrol_with(
         support::credentials_with(name, password),
         code,
         KdfParams::TESTING,
+        None,
     ))
 }
 

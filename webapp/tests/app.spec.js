@@ -557,6 +557,88 @@ test("an admin invites, changes, re-enrolls and removes a user", async ({ browse
   expect(problems.flat()).toEqual([]);
 });
 
+test("an invitation makes keys trusted, and introducers vouch for who they check", async ({ browser }) => {
+  const wes = await (await browser.newContext()).newPage();
+  const xia = await (await browser.newContext()).newPage();
+  const yan = await (await browser.newContext()).newPage();
+  const zoe = await (await browser.newContext()).newPage();
+  const problems = [wes, xia, yan, zoe].map(watch);
+  let link;
+
+  /// Checks `user`'s safety code `words` in `page`'s People.
+  async function check(page, user, words) {
+    await page.getByRole("button", { name: "Check someone's safety code" }).click();
+    await page.getByLabel("Their account name").fill(user);
+    await page.getByLabel("Their safety code").fill(words);
+    await page.getByRole("button", { name: "Check", exact: true }).click();
+    await expect(page.locator(".person").filter({ hasText: user })).toContainText("checked", SLOW);
+  }
+
+  await test.step("wes, xia and yan check each other; xia trusts whom wes checks", async () => {
+    const wesWords = await enrol(wes, "wes");
+    const xiaWords = await enrol(xia, "xia");
+    const yanWords = await enrol(yan, "yan");
+    await login(wes, "wes");
+    await login(xia, "xia");
+    await login(yan, "yan");
+    await accountMenu(wes, "People");
+    await check(wes, "xia", xiaWords);
+    await check(wes, "yan", yanWords);
+    await wes.getByRole("button", { name: "Close" }).click();
+    await accountMenu(xia, "People");
+    await check(xia, "wes", wesWords);
+    await xia.getByRole("checkbox", { name: "Trust people wes checks" }).check();
+    await expect(xia.getByRole("checkbox", { name: "Trust people wes checks" })).toBeChecked(SLOW);
+    await xia.getByRole("button", { name: "Close" }).click();
+    await accountMenu(yan, "People");
+    await check(yan, "wes", wesWords);
+    await yan.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("wes invites zoe, who trusts wes from the invitation", async () => {
+    await accountMenu(wes, "Users");
+    await wes.getByRole("button", { name: "Invite someone" }).click();
+    await wes.getByLabel("Their account name").fill("zoe");
+    await wes.getByRole("button", { name: "Invite", exact: true }).click();
+    link = await wes.getByLabel("Link to enroll in this app").inputValue();
+    expect(decodeURIComponent(link)).toContain("raft5fs-invite:2:");
+    await expect(wes.getByText(/trust each other's keys with no safety codes/)).toBeVisible();
+    await wes.getByRole("button", { name: "Done" }).click();
+    await wes.getByRole("button", { name: "Close" }).click();
+    await zoe.goto(link);
+    await zoe.getByLabel("New password").fill(PASSWORD);
+    await zoe.getByLabel("Again").fill(PASSWORD);
+    await zoe.getByRole("button", { name: "Enroll" }).click();
+    await expect(zoe.getByText(/Your invitation came from wes/)).toBeVisible(SLOW);
+    await zoe.getByRole("button", { name: "Continue to log in" }).click();
+    await login(zoe, "zoe");
+  });
+
+  await test.step("wes trusts zoe, and shares with her with no safety code", async () => {
+    await accountMenu(wes, "People");
+    await expect(wes.locator(".person").filter({ hasText: "zoe" })).toContainText("through an invitation", SLOW);
+    await wes.getByRole("button", { name: "Close" }).click();
+    await addFolder(wes, "for-zoe");
+    await sharing(wes, "for-zoe", "Share with someone");
+    await wes.getByLabel("User", { exact: true }).fill("zoe");
+    await wes.getByRole("button", { name: "Share", exact: true }).click();
+    await expect(wes.getByText(/Shared with zoe/)).toBeVisible(SLOW);
+    await wes.getByRole("button", { name: "Done" }).click();
+  });
+
+  await test.step("xia trusts zoe through wes; yan, who didn't mark wes, doesn't", async () => {
+    await accountMenu(xia, "People");
+    await expect(xia.locator(".person").filter({ hasText: "zoe" })).toContainText("introduced by wes", SLOW);
+    await xia.getByRole("button", { name: "Close" }).click();
+    await accountMenu(yan, "People");
+    await expect(yan.locator(".person").filter({ hasText: "wes" })).toBeVisible(SLOW);
+    await expect(yan.locator(".person").filter({ hasText: "zoe" })).toHaveCount(0);
+    await yan.getByRole("button", { name: "Close" }).click();
+  });
+
+  expect(problems.flat()).toEqual([]);
+});
+
 test("a public link opens a folder for anyone, until a writer revokes it", async ({ browser }) => {
   const frank = await (await browser.newContext()).newPage();
   const gina = await (await browser.newContext()).newPage();
