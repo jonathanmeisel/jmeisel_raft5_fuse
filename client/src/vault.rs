@@ -62,6 +62,7 @@ use raft5fs_proto::types::{
 
 use crate::chunk_cache::{ChunkCache, Lookup};
 use blocks::{BlockEdit, Rewritten};
+pub use blocks::Staged;
 
 mod activity;
 mod blocks;
@@ -545,6 +546,10 @@ fn spans(chunk_size: u64, offset: u64, len: usize) -> Vec<Span> {
 
 /// How many object ranges one read fetches at the same time.
 const MAX_FETCHES: usize = 8;
+
+/// How many pieces `Vault::prefetch` splits its chunks into, each fetched
+/// at the same time as the others.
+const PREFETCH_PIECES: u64 = 8;
 
 /// A chunk's sealed bytes from a read, or `None` for a hole. Every read
 /// here fetches object-storage segments first (`fetch_segments`), so a
@@ -2544,6 +2549,56 @@ impl Vault {
             }
         }
         Ok(out)
+    }
+
+    /// Reads chunks `chunks` of `ino` into the cache, for a reader that will
+    /// want them soon (see `readahead`).
+    ///
+    /// - Fetches the chunks in up to `PREFETCH_PIECES` pieces at the same
+    ///   time, because a store limits the speed of each request.
+    /// - Skips a piece whose chunks are all cached. The read that uses them
+    ///   confirms them.
+    /// - Drops errors: the read that wants a chunk fetches it again.
+    pub async fn prefetch(&self, ino: u64, chunks: std::ops::RangeInclusive<u64>) {
+        let (first, last) = (*chunks.start(), *chunks.end());
+        let per = (last - first + 1).div_ceil(PREFETCH_PIECES);
+        let pieces = (first..=last).step_by(per as usize).map(|start| {
+            let end = (start + per - 1).min(last);
+            self.cache_chunks(ino, start, end)
+        });
+        futures_util::future::join_all(pieces).await;
+    }
+
+    /// `prefetch` for one piece.
+    async fn cache_chunks(&self, ino: u64, first: u64, last: u64) {
+        let lookups: Vec<Lookup> = {
+            let mut cache = self.cache.lock().unwrap();
+            (first..=last)
+                .map(|index| cache.get(self.space, ino, index))
+                .collect()
+        };
+        if lookups
+            .iter()
+            .all(|l| matches!(l, Lookup::Unconfirmed { .. }))
+        {
+            return;
+        }
+        let known: Vec<u64> = lookups
+            .iter()
+            .map(|l| match l {
+                Lookup::Unconfirmed { version, .. } => *version,
+                Lookup::Miss { .. } => 0,
+            })
+            .collect();
+        let Ok((_, chunks)) = self.fetch(ino, first, last, &known).await else {
+            return;
+        };
+        let mut node = None;
+        for (chunk, lookup) in chunks.into_iter().zip(lookups) {
+            if self.chunk_from(ino, chunk, lookup, &mut node).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Returns the plaintext for one chunk of a read: the cached bytes that

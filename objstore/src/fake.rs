@@ -54,6 +54,31 @@ struct State {
     /// How far this store's clock is ahead of the real clock.
     skew: Duration,
     stats: Stats,
+    /// A slow network, for benchmarks (see `FakeStore::set_network`).
+    network: Network,
+    /// How many more PUTs to refuse (see `FakeStore::fail_puts`).
+    failing_puts: u64,
+}
+
+/// How long each request takes: `latency`, plus its body (sent or
+/// received) at `bytes_per_sec`. The rate is for each request alone, as a
+/// real store limits each connection, so requests at the same time do not
+/// slow each other.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Network {
+    pub latency: Duration,
+    /// 0 for no limit.
+    pub bytes_per_sec: u64,
+}
+
+impl Network {
+    fn delay(&self, bytes: usize) -> Duration {
+        let transfer = match self.bytes_per_sec {
+            0 => Duration::ZERO,
+            rate => Duration::from_secs_f64(bytes as f64 / rate as f64),
+        };
+        self.latency + transfer
+    }
 }
 
 pub struct FakeStore {
@@ -84,13 +109,24 @@ impl FakeStore {
             page_size: 1000,
             skew: Duration::ZERO,
             stats: Stats::default(),
+            network: Network::default(),
+            failing_puts: 0,
         }));
         let shared = Arc::clone(&state);
         // Blocks are bigger than axum's default limit on a body (2 MB).
         let mut app = Router::new()
-            .fallback(move |method, uri, headers, body| {
+            .fallback(move |method, uri, headers, body: Bytes| {
                 let state = Arc::clone(&shared);
-                async move { handle(&state, addr, method, uri, headers, body) }
+                async move {
+                    let network = state.lock().unwrap().network;
+                    let sent = body.len();
+                    let response = handle(&state, addr, method, uri, headers, body);
+                    let received = axum::body::HttpBody::size_hint(response.body())
+                        .exact()
+                        .unwrap_or(0) as usize;
+                    tokio::time::sleep(network.delay(sent + received)).await;
+                    response
+                }
             })
             .layer(axum::extract::DefaultBodyLimit::disable());
         if let Some(origin) = web_origin {
@@ -157,6 +193,17 @@ impl FakeStore {
 
     pub fn set_page_size(&self, n: usize) {
         self.state.lock().unwrap().page_size = n.max(1);
+    }
+
+    /// Makes every later request take as long as on `network`.
+    pub fn set_network(&self, network: Network) {
+        self.state.lock().unwrap().network = network;
+    }
+
+    /// Refuses the next `n` PUTs with a server error, as a store that is
+    /// failing does. They store nothing and do not count in `stats`.
+    pub fn fail_puts(&self, n: u64) {
+        self.state.lock().unwrap().failing_puts = n;
     }
 
     /// Moves this store's clock forward by `by`.
@@ -251,6 +298,10 @@ fn handle(
             response
         }
         Method::PUT => {
+            if state.failing_puts > 0 {
+                state.failing_puts -= 1;
+                return error(StatusCode::INTERNAL_SERVER_ERROR, "InternalError");
+            }
             let declared = headers
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())

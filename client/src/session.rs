@@ -25,13 +25,14 @@ use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
 use crate::paths::{DEFAULT_PATH_TTL, Dentries};
+use crate::readahead::ReadAhead;
 use crate::pruner::{self, PruneStatus, Pruner, PrunerConfig};
 use crate::remote::ClientTlsConfig;
 use crate::remote::{Credentials, Remote};
 use crate::rt;
 use crate::snapshot_tree::{SnapshotTree, is_snapshot_dir, is_snapshot_ino, read_only};
 use crate::vault::{DEFAULT_CACHE_BYTES, KnownKeys, VIRTUAL_ROOT, Vault, is_group, is_virtual};
-use crate::write_buffer::WriteBuf;
+use crate::write_buffer::{Pending, WriteBuf};
 
 /// How long buffered bytes wait, not stored, after the writer's last write,
 /// when nothing else flushes them. Without this, a writer that stops
@@ -105,6 +106,54 @@ pub struct FsStats {
 
 type Slot = Arc<tokio::sync::Mutex<WriteBuf>>;
 
+/// How many whole blocks of one file upload at the same time (see
+/// `Session::end_batch`).
+const MAX_STAGED: usize = 3;
+
+/// Stores everything in `buf`: its staged blocks, oldest first, then its
+/// run. Stops at the first failure, which it keeps in `buf.err` (see
+/// `Session::commit_buf`) and returns. What it did not get to stays
+/// buffered, for the next flush.
+async fn store(vault: &Vault, buf: &mut WriteBuf) -> Result<(), FsError> {
+    while !buf.staged.is_empty() {
+        commit_oldest(vault, buf).await?;
+    }
+    let Some((start, data)) = buf.take() else {
+        return Ok(());
+    };
+    let committed = commit_result(buf.ino, start, vault.write(buf.ino, start, &data).await);
+    if let Err(e) = &committed {
+        buf.err.get_or_insert_with(|| e.clone());
+    }
+    committed
+}
+
+/// Waits for the oldest staged block's upload and commits it. A failure is
+/// kept in `buf.err` and returned.
+async fn commit_oldest(vault: &Vault, buf: &mut WriteBuf) -> Result<(), FsError> {
+    let Some(pending) = buf.staged.pop_front() else {
+        return Ok(());
+    };
+    let committed = match pending.staged.await {
+        Ok(staged) => {
+            let start = pending.end - staged.size();
+            commit_result(buf.ino, start, vault.commit_staged(buf.ino, staged).await)
+        }
+        // The upload task ended without an answer, so the bytes are gone.
+        Err(_) => Err(FsError::new(
+            errno::EIO,
+            format!("inode {}: a block upload stopped before it ended", buf.ino),
+        )),
+    };
+    // Its bytes now count in the servers' size, not the buffer's (see
+    // `getattr`).
+    buf.taken += 1;
+    if let Err(e) = &committed {
+        buf.err.get_or_insert_with(|| e.clone());
+    }
+    committed
+}
+
 /// What a committed run means for its caller: success, or the error to
 /// report. A short write counts as a failure here: for the caller that
 /// waits on it, a buffered run is stored or not.
@@ -149,6 +198,8 @@ pub struct Session {
     pub(crate) snapshots: SnapshotTree,
     /// Names resolved by path, for front ends that use paths.
     pub(crate) dentries: Dentries,
+    /// Fetches ahead of files read in order.
+    readahead: ReadAhead,
 }
 
 impl Session {
@@ -201,8 +252,10 @@ impl Session {
             None => None,
         };
         let opened_at = raft5fs_proto::clock::now();
+        let readahead = ReadAhead::new(vault.remote().chunk_size(), config.cache_bytes);
         Ok(Arc::new(Self {
             vault: Arc::new(vault),
+            readahead,
             pruner: Mutex::new(pruner),
             opened_at,
             write_bufs: Mutex::new(HashMap::new()),
@@ -280,18 +333,42 @@ impl Session {
     /// promise for writeback errors. Without this, a later successful
     /// commit would let `fsync` report success over the lost data.
     async fn commit_buf(&self, buf: &mut WriteBuf) -> Result<(), FsError> {
-        let Some((start, data)) = buf.take() else {
+        store(&self.vault, buf).await
+    }
+
+    /// Ends a run that fills its batch. A run that is one whole block is
+    /// staged: its upload starts in the background, and the writer goes on
+    /// while it runs. Anything else is committed now.
+    ///
+    /// - Up to `MAX_STAGED` blocks of a file upload at the same time. Past
+    ///   that, this commits the oldest first, which also bounds the memory
+    ///   that a writer holds.
+    /// - Staged blocks commit in order, before anything written after them
+    ///   (see `store`), so no reader sees a later block before an earlier
+    ///   one.
+    /// - A failure is kept in `buf.err`, as for any commit.
+    async fn end_batch(&self, buf: &mut WriteBuf) -> Result<(), FsError> {
+        let Some((start, len)) = buf.run() else {
             return Ok(());
         };
-        let committed = commit_result(
-            buf.ino,
-            start,
-            self.vault.write(buf.ino, start, &data).await,
-        );
-        if let Err(e) = &committed {
-            buf.err.get_or_insert_with(|| e.clone());
+        if !self.vault.is_whole_block(buf.ino, start, len).await.unwrap_or(false) {
+            return self.commit_buf(buf).await;
         }
-        committed
+        let (start, data) = buf.take().expect("the run checked above");
+        let (done, staged) = tokio::sync::oneshot::channel();
+        let vault = Arc::clone(&self.vault);
+        let ino = buf.ino;
+        rt::spawn(async move {
+            let _ = done.send(vault.stage_block(ino, start, data).await);
+        });
+        buf.staged.push_back(Pending {
+            end: start + len as u64,
+            staged,
+        });
+        while buf.staged.len() > MAX_STAGED {
+            commit_oldest(&self.vault, buf).await?;
+        }
+        Ok(())
     }
 
     /// Makes sure that `ino`'s buffer is committed `AUTO_FLUSH_DELAY` after
@@ -324,16 +401,9 @@ impl Session {
                 }
                 rt::sleep(wait).await;
             };
-            let Some((start, data)) = buf.take() else {
-                return;
-            };
-            let stored = vault.write(buf.ino, start, &data).await;
-            if let Err(e) = commit_result(buf.ino, start, stored) {
-                // No caller waits on this commit, so the only place for the
-                // failure is back in the buffer, for the next flush, fsync,
-                // or write to report.
-                buf.err.get_or_insert(e);
-            }
+            // No caller waits on this commit, so a failure stays in the
+            // buffer, for the next flush, fsync, or write to report.
+            let _ = store(&vault, &mut buf).await;
         });
     }
 
@@ -483,7 +553,7 @@ impl Session {
             offset += n as u64;
             data = &data[n..];
             if offset == batch.end
-                && let Err(e) = self.commit_buf(&mut buf).await
+                && let Err(e) = self.end_batch(&mut buf).await
             {
                 // A batch that held only this call's bytes lost nothing
                 // that another caller was told about. This call reports it,
@@ -714,7 +784,7 @@ impl Session {
             self.snapshots.read(ino, offset, len).await
         } else {
             self.flush(ino).await?;
-            self.vault.read(ino, offset, len).await
+            self.read_ahead_of(ino, offset, len).await
         };
         if let Err(e) = &read
             && e.errno != errno::ENOENT
@@ -722,6 +792,30 @@ impl Session {
             eprintln!("read from inode {ino} at offset {offset} failed: {e}");
         }
         read
+    }
+
+    /// Reads from the vault, with read-ahead (see `readahead`):
+    ///
+    /// - Starts a fetch of the chunks after this read, if the file is read
+    ///   in order, to run while this read does.
+    /// - Waits for fetches already running for the chunks this read wants,
+    ///   so it finds them cached and does not fetch them twice.
+    async fn read_ahead_of(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        let plan = self.readahead.before(ino, offset, len);
+        if let Some((chunks, done)) = plan.fetch {
+            let vault = Arc::clone(&self.vault);
+            rt::spawn(async move {
+                vault.prefetch(ino, chunks).await;
+                let _ = done.send(true);
+            });
+        }
+        for mut fetch in plan.wait {
+            // A fetch that ended, or was dropped, is as good as done.
+            let _ = fetch.wait_for(|done| *done).await;
+        }
+        let read = self.vault.read(ino, offset, len).await?;
+        self.readahead.after(ino, len, read.len());
+        Ok(read)
     }
 
     /// Writes `data` at `offset`, buffered unless the session was opened

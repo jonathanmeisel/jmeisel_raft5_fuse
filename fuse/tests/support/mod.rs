@@ -213,6 +213,12 @@ pub fn setup_with_objects() -> Harness {
     setup_with(TEST_CHUNK_SIZE, true, true, true)
 }
 
+/// Like `setup_with_objects`, with chunks of `chunk_size` bytes. The grid
+/// scales with it.
+pub fn setup_with_objects_and_chunk_size(chunk_size: u64) -> Harness {
+    setup_with(chunk_size, true, true, true)
+}
+
 /// Like `setup_with_objects`, but the servers leave every object with no
 /// pointer to garbage collection. For tests of the sweep.
 pub fn setup_with_objects_no_prompt_delete() -> Harness {

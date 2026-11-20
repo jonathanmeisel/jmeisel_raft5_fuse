@@ -65,7 +65,17 @@ const MARK_WINDOW: usize = 1024;
 pub struct Gc {
     holder: [u8; 16],
     candidates: HashMap<ObjectName, SystemTime>,
+    /// Runs after the snapshots are listed and before each one is marked,
+    /// with its id. A test uses it to remove a snapshot at that moment.
+    #[cfg(feature = "test-hooks")]
+    pub before_marking_snapshot: Option<BeforeMarking>,
 }
+
+/// See `Gc::before_marking_snapshot`.
+#[cfg(feature = "test-hooks")]
+pub type BeforeMarking = Box<
+    dyn FnMut(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send,
+>;
 
 impl Default for Gc {
     fn default() -> Self {
@@ -74,6 +84,8 @@ impl Default for Gc {
         Gc {
             holder,
             candidates: HashMap::new(),
+            #[cfg(feature = "test-hooks")]
+            before_marking_snapshot: None,
         }
     }
 }
@@ -129,6 +141,10 @@ impl FsCore {
             .await
             .map_err(|e| format!("listing snapshots: {e}"))?;
         for snapshot in &snapshots {
+            #[cfg(feature = "test-hooks")]
+            if let Some(hook) = gc.before_marking_snapshot.as_mut() {
+                hook(&snapshot.id).await;
+            }
             mark(View::at(&self.client, &snapshot.id), grid, &mut referenced)
                 .await
                 .map_err(|e| {

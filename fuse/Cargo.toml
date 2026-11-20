@@ -17,7 +17,7 @@ tonic = { workspace = true }
 [dev-dependencies]
 raft5-client = { workspace = true }
 raft5-server = { workspace = true }
-raft5fs-core = { workspace = true }
+raft5fs-core = { workspace = true, features = ["test-hooks"] }
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true, features = ["fake"] }
 raft5fs-server = { workspace = true }

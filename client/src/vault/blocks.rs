@@ -25,7 +25,7 @@ use raft5fs_crypto::data::seal_chunk;
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{
     Attr, BlockRef, BlockUpload, ChunkBody, ChunkWrite, Chunks, FsError, Layout, ObjectGrid,
-    WriteBody,
+    WriteBody, WriteError,
 };
 
 use super::{CHANGE_RETRIES, Node, Vault, changed, sealed_blob};
@@ -384,5 +384,122 @@ impl Vault {
             random: up.random,
             nseg,
         })
+    }
+
+    /// Whether `len` bytes at `offset` of `ino` are exactly one whole
+    /// block, which `stage_block` can upload with no read first.
+    pub async fn is_whole_block(&self, ino: u64, offset: u64, len: usize) -> Result<bool, FsError> {
+        let Some(grid) = self.remote.grid() else {
+            return Ok(false);
+        };
+        let chunk_size = self.remote.chunk_size();
+        let index = offset / chunk_size;
+        let whole = offset.is_multiple_of(chunk_size)
+            && grid.in_blocks(index)
+            && grid.block_start(index) == index
+            && len as u64 == u64::from(grid.per_block) * chunk_size;
+        Ok(whole && self.layout(ino).await? == Layout::Hybrid)
+    }
+
+    /// Seals and uploads `data`, one whole block at `offset` of `ino` (see
+    /// `is_whole_block`), and does not commit it. `commit_staged` commits
+    /// it. Between the two, the caller can stage the next blocks, so their
+    /// uploads run at the same time.
+    ///
+    /// It never fails: a block that could not be uploaded comes back
+    /// `Staged::Failed`, and `commit_staged` then writes it as usual.
+    pub async fn stage_block(&self, ino: u64, offset: u64, data: Vec<u8>) -> Staged {
+        let chunk_size = self.remote.chunk_size() as usize;
+        let start = offset / chunk_size as u64;
+        let generation = self
+            .cache
+            .lock()
+            .unwrap()
+            .get(self.space, ino, start)
+            .generation();
+        let uploaded = async {
+            let node = self.fresh_node(ino).await?;
+            let plains: Vec<Vec<u8>> = data.chunks(chunk_size).map(<[u8]>::to_vec).collect();
+            self.upload_block(&node, ino, start, &plains).await
+        };
+        match uploaded.await {
+            Ok(block) => Staged::Uploaded {
+                offset,
+                data,
+                block,
+                generation,
+            },
+            Err(_) => Staged::Failed { offset, data },
+        }
+    }
+
+    /// Commits a block that `stage_block` uploaded, as the whole block,
+    /// whatever it held before. If the upload failed, or the commit fails
+    /// (the key changed, or the upload's name is too old to commit), it
+    /// writes the block again as usual. That is safe, because writing the
+    /// same whole block twice stores the same thing.
+    pub async fn commit_staged(&self, ino: u64, staged: Staged) -> Result<Attr, WriteError> {
+        let (offset, data, block, generation) = match staged {
+            Staged::Uploaded {
+                offset,
+                data,
+                block,
+                generation,
+            } => (offset, data, block, generation),
+            Staged::Failed { offset, data } => return self.write(ino, offset, &data).await,
+        };
+        let chunk_size = self.remote.chunk_size();
+        let start = offset / chunk_size;
+        let end = offset + data.len() as u64;
+        let write = ChunkWrite {
+            index: start,
+            expected_seq: None,
+            body: WriteBody::Block(block),
+        };
+        let blocks = start..=start + u64::from(block.nseg) - 1;
+        match self.remote.write_chunks(ino, &[write], end).await {
+            Ok((attr, seq)) => {
+                let mut cache = self.cache.lock().unwrap();
+                cache.invalidate(self.space, ino, blocks);
+                if seq != 0 {
+                    for (j, plain) in data.chunks(chunk_size as usize).enumerate() {
+                        let index = start + j as u64;
+                        cache.insert(self.space, ino, index, plain.into(), seq, generation);
+                    }
+                }
+                Ok(attr)
+            }
+            Err(_) => {
+                // It is not known whether the commit was stored, so do not
+                // trust the cache.
+                self.cache.lock().unwrap().invalidate_ino(self.space, ino);
+                self.write(ino, offset, &data).await
+            }
+        }
+    }
+}
+
+/// A whole block that `Vault::stage_block` sealed and uploaded, waiting for
+/// `Vault::commit_staged`. It keeps the bytes, to cache them once committed
+/// or to write them again.
+pub enum Staged {
+    Uploaded {
+        offset: u64,
+        data: Vec<u8>,
+        block: BlockRef,
+        /// The cache's generation for the block before the upload, so a
+        /// change in the meantime keeps these bytes out of the cache.
+        generation: u64,
+    },
+    /// The upload failed. The commit writes the bytes as usual.
+    Failed { offset: u64, data: Vec<u8> },
+}
+
+impl Staged {
+    /// How many bytes of the file the block holds.
+    pub fn size(&self) -> u64 {
+        match self {
+            Staged::Uploaded { data, .. } | Staged::Failed { data, .. } => data.len() as u64,
+        }
     }
 }

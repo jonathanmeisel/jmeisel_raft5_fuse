@@ -1,6 +1,10 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use raft5fs_proto::types::FsError;
+use tokio::sync::oneshot;
+
+use crate::vault::Staged;
 // `std::time::Instant` panics in a browser; this is the same type natively.
 use web_time::Instant;
 
@@ -23,13 +27,29 @@ pub struct WriteBuf {
     /// When the run got its first byte, and its latest.
     since: Option<Instant>,
     last: Option<Instant>,
-    /// How many runs `take` has handed out to be stored.
+    /// When any byte last came, whatever has happened to it since.
+    last_write: Option<Instant>,
+    /// How many runs `take` has handed out to be stored, and staged blocks
+    /// committed.
     pub taken: u64,
+    /// Whole blocks taken from the run and uploading, oldest first, not yet
+    /// committed (see `Session::end_batch`). They count as buffered: they
+    /// are committed, in order, before the run.
+    pub staged: VecDeque<Pending>,
+}
+
+/// A whole block uploading in the background.
+pub struct Pending {
+    /// Where its bytes end in the file.
+    pub end: u64,
+    /// The upload's result, to commit.
+    pub staged: oneshot::Receiver<Staged>,
 }
 
 impl WriteBuf {
+    /// Whether nothing waits to be stored: no run, and no staged block.
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.data.is_empty() && self.staged.is_empty()
     }
 
     /// Whether a write at `offset` continues the buffered run, or there is
@@ -47,23 +67,37 @@ impl WriteBuf {
             self.since = Some(now);
         }
         self.last = Some(now);
+        self.last_write = Some(now);
         self.data.extend_from_slice(bytes);
     }
 
-    /// Where the run ends, if there is one: the file is at least this
-    /// long once it is stored.
+    /// The run's offset and length, if there is one.
+    pub fn run(&self) -> Option<(u64, usize)> {
+        (!self.data.is_empty()).then_some((self.start, self.data.len()))
+    }
+
+    /// Where the run and the staged blocks end, if there are any: the file
+    /// is at least this long once they are stored.
     pub fn end(&self) -> Option<u64> {
-        (!self.data.is_empty()).then(|| self.start + self.data.len() as u64)
+        let run = (!self.data.is_empty()).then(|| self.start + self.data.len() as u64);
+        run.into_iter()
+            .chain(self.staged.iter().map(|p| p.end))
+            .max()
     }
 
     /// How long until the run should be stored by time: once no byte came
     /// for `quiet`, or once its first byte is `max_age` old. Zero if that
     /// is now, and `None` if there is no run.
+    /// With no run but staged blocks, they are due once no byte came for
+    /// `quiet`.
     pub fn due_in(&self, quiet: Duration, max_age: Duration) -> Option<Duration> {
-        let (since, last) = (self.since?, self.last?);
         if self.data.is_empty() {
-            return None;
+            if self.staged.is_empty() {
+                return None;
+            }
+            return Some(quiet.saturating_sub(self.last_write?.elapsed()));
         }
+        let (since, last) = (self.since?, self.last?);
         Some(
             quiet
                 .saturating_sub(last.elapsed())
@@ -87,6 +121,9 @@ impl WriteBuf {
     /// any commit in progress (see `Session::discard_ino`).
     pub fn discard(&mut self) {
         self.data.clear();
+        // Their uploads end by themselves. The objects have no pointer, so
+        // the servers' garbage collection removes them.
+        self.staged.clear();
         self.since = None;
         self.last = None;
         self.err = None;

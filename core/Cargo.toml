@@ -16,5 +16,10 @@ raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true, features = ["raft5"] }
 tracing = "0.1"
 
+[features]
+# Hooks that let tests act at set points inside a long operation (see
+# `gc::Gc::before_marking_snapshot`). Only tests turn this on.
+test-hooks = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }

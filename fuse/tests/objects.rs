@@ -611,6 +611,73 @@ fn a_read_fetches_only_the_segments_it_needs_once() {
     assert_eq!(fetched(&before), (2, (TEST_BLOCK_CHUNKS - 1) * S));
 }
 
+/// A session of `TESTER`'s own, as the web app and WebDAV use.
+fn session(h: &support::Harness) -> Arc<raft5fs_client::session::Session> {
+    let mut config = raft5fs_client::session::SessionConfig::new(
+        h.addresses(),
+        support::credentials(support::TESTER),
+    );
+    config.tls = Some(support::fs_tls());
+    config.known_keys = Some(h.known_keys());
+    h.runtime
+        .block_on(raft5fs_client::session::Session::open(config))
+        .unwrap()
+}
+
+/// A session that reads a file in order fetches ahead of the reader, but
+/// downloads each segment once. A chunk that changes after it was fetched
+/// ahead reads as it is now.
+#[test]
+fn reading_in_order_fetches_ahead_once_and_never_stale() {
+    let h = support::setup_with_objects();
+    const BLOCKS: u64 = 4;
+    let mut data = pattern(K * C + BLOCKS * B);
+    let f = h.path().join("f");
+    fs::write(&f, &data).unwrap();
+    let file = ino(&f);
+    let reader = session(&h);
+    let read = |at: u64| {
+        h.runtime
+            .block_on(reader.read(file, at, C as usize))
+            .unwrap()
+    };
+
+    let before = h.store().stats();
+    // Far enough in that the fetches ahead have passed the chunk below.
+    for at in (0..6).map(|i| i * C) {
+        assert!(read(at) == data[at as usize..(at + C) as usize]);
+    }
+    // Another client changes a chunk that was fetched ahead.
+    let before_write = h.store().stats();
+    let changed = (K + 8) * C + 5;
+    let writer = fs::OpenOptions::new().write(true).open(&f).unwrap();
+    writer.write_all_at(b"changed", changed).unwrap();
+    writer.sync_all().unwrap();
+    drop(writer);
+    data[changed as usize..changed as usize + 7].copy_from_slice(b"changed");
+    let after_write = h.store().stats();
+
+    for at in (6..K + BLOCKS * TEST_BLOCK_CHUNKS).map(|i| i * C) {
+        assert!(
+            read(at) == data[at as usize..(at + C) as usize],
+            "chunk {} reads as it is now",
+            at / C
+        );
+    }
+    // Each segment once. The rewrite gave every chunk of its block a new
+    // version, so the reader fetches again those of them that it fetched
+    // ahead before the change, and nothing else twice.
+    let segments = BLOCKS * TEST_BLOCK_CHUNKS;
+    let by_reader = (before_write.bytes_read - before.bytes_read)
+        + (h.store().stats().bytes_read - after_write.bytes_read);
+    assert_eq!(by_reader % S, 0);
+    assert!(
+        (segments..=segments + TEST_BLOCK_CHUNKS).contains(&(by_reader / S)),
+        "{} segments downloaded for {segments}",
+        by_reader / S
+    );
+}
+
 #[test]
 fn a_snapshot_reads_the_blocks_it_was_taken_with() {
     let h = support::setup_with_objects();
@@ -671,6 +738,69 @@ fn a_sequential_write_uploads_each_block_once() {
     assert_eq!(read_afresh(&h, "f"), data);
 }
 
+/// A block whose upload fails, while the writer goes on, is written again
+/// when its turn to commit comes. The file is whole, each block stored
+/// once.
+#[test]
+fn a_block_whose_upload_fails_is_written_again() {
+    let h = support::setup_with_objects();
+    let data = pattern(K * C + 3 * B);
+    h.store().fail_puts(1);
+    let f = h.path().join("f");
+    let mut file = fs::File::create(&f).unwrap();
+    file.write_all(&data).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(h.store().stats().puts, 3);
+    assert_eq!(read_afresh(&h, "f"), data);
+}
+
+/// A store that keeps failing makes the writer's `fsync` fail: a block
+/// staged in the background does not hide its error.
+#[test]
+fn a_block_that_cant_be_stored_fails_fsync() {
+    let h = support::setup_with_objects();
+    let data = pattern(K * C + 3 * B);
+    h.store().fail_puts(u64::MAX);
+    let f = h.path().join("f");
+    let mut file = fs::File::create(&f).unwrap();
+    let stored = file.write_all(&data).and_then(|()| file.sync_all());
+    assert!(stored.is_err(), "the failed blocks must be reported");
+    h.store().fail_puts(0);
+}
+
+/// While whole blocks upload in the background, the file's size counts
+/// them, and they are all stored once the writer flushes.
+#[test]
+fn a_files_size_counts_blocks_still_uploading() {
+    let h = support::setup_with_objects();
+    let f = h.path().join("f");
+    fs::write(&f, b"").unwrap();
+    let file = ino(&f);
+    let writer = session(&h);
+    // Slow enough that the uploads are still running when the size is
+    // asked for.
+    h.store().set_network(raft5fs_objstore::fake::Network {
+        latency: Duration::from_millis(300),
+        bytes_per_sec: 0,
+    });
+    let data = pattern(K * C + 2 * B + 10);
+    for (i, piece) in data.chunks(C as usize).enumerate() {
+        let at = i as u64 * C;
+        assert_eq!(
+            h.runtime.block_on(writer.write(file, at, piece)).unwrap(),
+            piece.len()
+        );
+    }
+    let size = h.runtime.block_on(writer.getattr(file)).unwrap().size;
+    assert_eq!(size, data.len() as u64);
+    h.runtime.block_on(writer.fsync(file)).unwrap();
+    h.store().set_network(raft5fs_objstore::fake::Network::default());
+    // The two whole blocks, and the start of a third.
+    assert_eq!(h.store().stats().puts, 3);
+    assert_eq!(read_afresh(&h, "f"), data);
+}
+
 #[test]
 fn a_small_write_into_a_block_keeps_the_rest_of_it() {
     let h = support::setup_with_objects();
@@ -696,6 +826,52 @@ fn a_small_write_into_a_block_keeps_the_rest_of_it() {
     // A new object for the block, and the objects it replaced are deleted.
     assert!(h.store().stats().puts > puts);
     objects_settle_at(&h, objects);
+}
+
+/// Two clients that change different chunks of one block at the same time
+/// both keep their change. Each one reads the block, changes it, and
+/// commits a new object, so one of them commits against a block that the
+/// other just replaced. That commit gets `EAGAIN`, and the client starts
+/// again from the new block.
+///
+/// An object that a commit replaced goes at once. An upload whose commit
+/// lost never had a pointer, so only the sweep finds it.
+#[test]
+fn two_writers_into_one_block_both_keep_their_change() {
+    let h = support::setup_with_objects();
+    let mut data = pattern(K * C + B);
+    let f = h.path().join("f");
+    fs::write(&f, &data).unwrap();
+    let file = ino(&f);
+    let objects = h.store().keys().len();
+    let (a, b) = (vault(&h), vault(&h));
+    const ROUNDS: u8 = 5;
+    let puts = h.store().stats().puts;
+    for round in 1..=ROUNDS {
+        let (at_a, at_b) = (K * C + 3, (K + 2) * C + 7);
+        let (bytes_a, bytes_b) = ([round; 10], [round + 100; 10]);
+        let (one, two) = h.runtime.block_on(async {
+            tokio::join!(a.write(file, at_a, &bytes_a), b.write(file, at_b, &bytes_b))
+        });
+        one.unwrap();
+        two.unwrap();
+        data[at_a as usize..at_a as usize + 10].fill(round);
+        data[at_b as usize..at_b as usize + 10].fill(round + 100);
+        assert_eq!(read_afresh(&h, "f"), data, "round {round}");
+    }
+    // One upload per write that committed, and one more for each commit
+    // that lost the race.
+    let lost = (h.store().stats().puts - puts - 2 * u64::from(ROUNDS)) as usize;
+    assert!(lost > 0, "no commit lost a race, so nothing was retried");
+    objects_settle_at(&h, objects + lost);
+
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let first = SystemTime::now() + LATER;
+    assert_eq!(sweep(&h, &core, &mut gc, first).deleted, 0);
+    assert_eq!(sweep(&h, &core, &mut gc, first + WAIT).deleted, lost);
+    assert_eq!(h.store().keys().len(), objects);
+    assert_eq!(read_afresh(&h, "f"), data);
 }
 
 #[test]
@@ -959,6 +1135,49 @@ fn what_a_snapshot_holds_stays_until_the_snapshot_goes() {
     let after = first + WAIT * 3;
     assert_eq!(sweep(&h, &core, &mut gc, after).deleted, 0);
     assert_eq!(sweep(&h, &core, &mut gc, after + WAIT).deleted, 1);
+    assert!(h.store().keys().is_empty());
+}
+
+/// A snapshot removed after the sweep listed it, and before the sweep
+/// marked it, stops that sweep, which deletes nothing. If the sweep read
+/// the missing snapshot as empty, it would delete what the snapshot held.
+#[test]
+fn a_snapshot_removed_while_a_sweep_runs_stops_it() {
+    let h = support::setup_with_objects_no_prompt_delete();
+    let f = h.path().join("f");
+    fs::write(&f, pattern(K * C + B)).unwrap();
+    h.snapshot("s");
+    // Only the snapshot points to the file's block now.
+    fs::remove_file(&f).unwrap();
+    assert_eq!(h.store().keys().len(), 1);
+
+    let core = h.gc_core();
+    let mut gc = raft5fs_core::gc::Gc::default();
+    let first = SystemTime::now() + LATER;
+    // Two sweeps make the block's object a candidate if a sweep misses the
+    // snapshot, so the third would delete it.
+    for at in [first, first + WAIT] {
+        assert_eq!(sweep(&h, &core, &mut gc, at).deleted, 0);
+    }
+    let client = h.client.clone();
+    gc.before_marking_snapshot = Some(Box::new(move |_id| {
+        let client = client.clone();
+        Box::pin(async move {
+            raft5fs_core::snapshots::remove(&client, "s").await.unwrap();
+        })
+    }));
+    let failed = h.runtime.block_on(core.gc_once(&mut gc, first + WAIT * 2));
+    let why = failed.expect_err("a sweep that can't read a snapshot it listed must stop");
+    assert!(why.contains("marking snapshot"), "{why}");
+    assert_eq!(h.store().keys().len(), 1);
+    assert_eq!(h.store().stats().deleted, 0);
+
+    // The snapshot is gone for good now, so later sweeps delete the block,
+    // after the usual two sweeps.
+    gc.before_marking_snapshot = None;
+    let later = first + WAIT * 3 + raft5fs_core::gc::LEASE_TTL;
+    assert_eq!(sweep(&h, &core, &mut gc, later).deleted, 0);
+    assert_eq!(sweep(&h, &core, &mut gc, later + WAIT).deleted, 1);
     assert!(h.store().keys().is_empty());
 }
 
