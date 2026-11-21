@@ -1,0 +1,13 @@
+{
+  // The browser build: rust-analyzer checks the workspace for wasm32, so
+  // code behind `cfg(target_arch = "wasm32")` (all of web/, and parts of
+  // client/) is indexed. Open it beside the usual window, which stays native.
+  // Native-only crates (fuse, server) show errors here; ignore them.
+  "folders": [{ "path": "." }],
+  "settings": {
+    "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
+    // Its own build directory, so it doesn't wait on the native window's
+    // or a terminal's cargo lock.
+    "rust-analyzer.cargo.targetDir": "target/rust-analyzer-wasm"
+  }
+}
