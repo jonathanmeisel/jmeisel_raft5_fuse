@@ -112,7 +112,10 @@ impl ReadAhead {
         let in_order = offset == run.next;
         run.next = end;
         if !in_order {
+            // A new run fetches from where it starts. What the old run
+            // fetched past it is in the cache or in `fetches` still.
             run.window = 0;
+            run.ahead = 0;
             return plan;
         }
         // Not `clamp`: with large chunks the most can be below the start.
@@ -210,6 +213,18 @@ mod tests {
 
         r.after(7, C as usize, 10);
         assert!(r.before(7, 42 * C, C as usize).fetch.is_none());
+    }
+
+    /// After a jump back, as a video player seeks to the start, a new run
+    /// fetches ahead at once, not only once it passes where the old one got.
+    #[test]
+    fn a_jump_back_starts_fetching_ahead_again() {
+        let r = ahead();
+        for i in 0..6 {
+            r.before(7, i * C, C as usize);
+        }
+        assert!(r.before(7, 0, C as usize).fetch.is_none());
+        assert_eq!(fetched(&r.before(7, C, C as usize)), Some(2..=3));
     }
 
     #[test]
