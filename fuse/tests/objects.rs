@@ -5,6 +5,8 @@
 
 mod support;
 
+use support::{assert_fs_errno, connect, pattern, vault_trusting_tester};
+
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -16,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::{Node, Vault};
 use raft5fs_core::{
-    BlockRef, BlockUpload, ChunkBody, ChunkWrite, FsError, Layout, ObjectGrid, SetAttr, WriteBody,
+    BlockRef, BlockUpload, ChunkBody, ChunkWrite, Layout, ObjectGrid, SetAttr, WriteBody,
 };
 use raft5fs_crypto::data::{CHUNK_OVERHEAD, open_chunk, seal_chunk};
 use raft5fs_objstore::http::{self, HttpConfig};
@@ -37,23 +39,6 @@ fn server_process_mode() {
     support::serve_if_requested();
 }
 
-fn connect(h: &support::Harness) -> Remote {
-    let credentials = support::credentials(support::TESTER);
-    h.runtime
-        .block_on(Remote::connect(
-            &h.addresses(),
-            credentials,
-            Some(support::fs_tls()),
-        ))
-        .unwrap()
-}
-
-fn vault(h: &support::Harness) -> Vault {
-    Vault::new(Arc::new(connect(h)))
-        .unwrap()
-        .with_known_keys(h.known_keys())
-}
-
 fn ino(path: &Path) -> u64 {
     fs::metadata(path).unwrap().ino()
 }
@@ -64,14 +49,6 @@ fn plaintext_http() -> http::Client {
         ..HttpConfig::default()
     })
     .unwrap()
-}
-
-#[track_caller]
-fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, FsError>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.errno, errno, "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
 }
 
 /// A file `v/f` with a few inline bytes, in a harness with object storage,
@@ -161,21 +138,22 @@ fn objects_settle_at(h: &support::Harness, n: usize) {
 fn the_servers_say_how_blocks_are_laid_out() {
     let h = support::setup_with_objects();
     assert_eq!(
-        connect(&h).grid(),
+        connect(&h, support::TESTER).grid(),
         Some(ObjectGrid {
             from_index: K,
             per_block: TEST_BLOCK_CHUNKS as u32,
         })
     );
     let plain = support::setup();
-    assert_eq!(connect(&plain).grid(), None);
+    assert_eq!(connect(&plain, support::TESTER).grid(), None);
     // Without object storage, there is nothing to upload to.
     fs::write(plain.path().join("f"), b"x").unwrap();
     let file = ino(&plain.path().join("f"));
     assert_fs_errno(
-        plain
-            .runtime
-            .block_on(connect(&plain).prepare_uploads(file, &[BlockUpload { index: K, nseg: 1 }])),
+        plain.runtime.block_on(
+            connect(&plain, support::TESTER)
+                .prepare_uploads(file, &[BlockUpload { index: K, nseg: 1 }]),
+        ),
         libc::ENOTSUP,
     );
 }
@@ -185,7 +163,7 @@ fn files_made_with_object_storage_are_hybrid() {
     let h = support::setup_with_objects();
     fs::write(h.path().join("f"), b"x").unwrap();
     fs::create_dir(h.path().join("d")).unwrap();
-    let remote = connect(&h);
+    let remote = connect(&h, support::TESTER);
     let attr = |p: &str| {
         h.runtime
             .block_on(remote.getattr(ino(&h.path().join(p))))
@@ -200,7 +178,7 @@ fn files_made_with_object_storage_are_hybrid() {
 #[test]
 fn a_block_round_trips() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let (file, node) = hybrid_file(&h, &mine);
 
@@ -328,7 +306,7 @@ fn a_block_round_trips() {
 #[test]
 fn commits_are_checked() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let (file, node) = hybrid_file(&h, &mine);
     let write = |w: ChunkWrite| h.runtime.block_on(remote.write_chunks(file, &[w], 0));
@@ -413,7 +391,7 @@ fn commits_are_checked() {
 #[test]
 fn a_client_that_cant_read_blocks_is_refused_not_given_zeros() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let (file, node) = hybrid_file(&h, &mine);
     let block = upload(&h, mine.remote(), &node, file, K, &[vec![1; 10]]);
     h.runtime
@@ -423,7 +401,7 @@ fn a_client_that_cant_read_blocks_is_refused_not_given_zeros() {
         )
         .unwrap();
 
-    let old = connect(&h).without_object_reads();
+    let old = connect(&h, support::TESTER).without_object_reads();
     assert_fs_errno(
         h.runtime.block_on(old.read_chunks(file, K, 1, &[])),
         libc::ENOTSUP,
@@ -439,7 +417,7 @@ fn a_client_that_cant_read_blocks_is_refused_not_given_zeros() {
 #[test]
 fn truncating_trims_the_block_the_end_falls_in() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let (file, node) = hybrid_file(&h, &mine);
     let full: Vec<Vec<u8>> = (0..TEST_BLOCK_CHUNKS)
@@ -522,7 +500,7 @@ fn commit(
 #[test]
 fn a_mount_reads_blocks() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let (file, node) = hybrid_file(&h, &mine);
     let end = K2 * C + 50;
     commit(
@@ -544,7 +522,7 @@ fn a_mount_reads_blocks() {
     expected[at(K2 * C)..].fill(3);
 
     // Through its own vault, which has nothing cached...
-    let reader = vault(&h);
+    let reader = vault_trusting_tester(&h, support::TESTER);
     let read = h
         .runtime
         .block_on(reader.read(file, 0, end as usize + 100))
@@ -565,7 +543,7 @@ fn a_mount_reads_blocks() {
 #[test]
 fn a_read_fetches_only_the_segments_it_needs_once() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let (file, node) = hybrid_file(&h, &mine);
     let full: Vec<Vec<u8>> = (0..TEST_BLOCK_CHUNKS)
         .map(|j| vec![j as u8 + 1; C as usize])
@@ -577,7 +555,7 @@ fn a_read_fetches_only_the_segments_it_needs_once() {
     };
 
     // A few bytes of the third segment: only that segment.
-    let reader = vault(&h);
+    let reader = vault_trusting_tester(&h, support::TESTER);
     let before = h.store().stats();
     let got = h
         .runtime
@@ -587,7 +565,7 @@ fn a_read_fetches_only_the_segments_it_needs_once() {
     assert_eq!(fetched(&before), (1, S));
 
     // The whole block, from a vault with nothing cached: one ranged GET.
-    let fresh = vault(&h);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     let before = h.store().stats();
     let got = h
         .runtime
@@ -681,7 +659,7 @@ fn reading_in_order_fetches_ahead_once_and_never_stale() {
 #[test]
 fn a_snapshot_reads_the_blocks_it_was_taken_with() {
     let h = support::setup_with_objects();
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let (file, node) = hybrid_file(&h, &mine);
     let end = K * C + 10;
     commit(&h, &mine, &node, file, K, &[vec![1; 10]], end);
@@ -696,10 +674,6 @@ fn a_snapshot_reads_the_blocks_it_was_taken_with() {
 
 /// How much of a file one block holds.
 const B: u64 = TEST_BLOCK_CHUNKS * C;
-
-fn pattern(len: u64) -> Vec<u8> {
-    (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
-}
 
 /// How many segments the block at chunk `index` of `ino` holds, if there is
 /// a block.
@@ -845,7 +819,10 @@ fn two_writers_into_one_block_both_keep_their_change() {
     fs::write(&f, &data).unwrap();
     let file = ino(&f);
     let objects = h.store().keys().len();
-    let (a, b) = (vault(&h), vault(&h));
+    let (a, b) = (
+        vault_trusting_tester(&h, support::TESTER),
+        vault_trusting_tester(&h, support::TESTER),
+    );
     const ROUNDS: u8 = 5;
     let puts = h.store().stats().puts;
     for round in 1..=ROUNDS {
@@ -953,7 +930,7 @@ fn pruning_reseals_blocks_into_new_objects() {
     // Granted and revoked: the volume's key rotates, and big's key is
     // stale.
     h.add_user("alice");
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -976,7 +953,7 @@ fn pruning_reseals_blocks_into_new_objects() {
         let version = u32::from_be_bytes(stored(&h, big, start).unwrap()[..4].try_into().unwrap());
         assert!(version > old_version);
     }
-    let fresh = vault(&h);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     assert_eq!(
         h.runtime
             .block_on(fresh.read(big, 0, data.len() + 10))
@@ -1026,7 +1003,7 @@ fn a_snapshot_keeps_what_prompt_deletion_would_take() {
     fs::remove_file(&f).unwrap();
     objects_settle_at(&h, 1);
 
-    let then = vault(&h).at_snapshot("s", 1);
+    let then = vault_trusting_tester(&h, support::TESTER).at_snapshot("s", 1);
     assert_eq!(
         h.runtime.block_on(then.read(file, 0, data.len())).unwrap(),
         data
@@ -1075,7 +1052,7 @@ fn garbage_goes_after_two_sweeps_and_nothing_else_does() {
     let f = file_with_garbage(&h);
     let expected = fs::read(&f).unwrap();
     // An upload that no commit named, and an object that is not ours.
-    let mine = vault(&h);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let file = ino(&f);
     let node = h.runtime.block_on(mine.node(file)).unwrap();
     upload(&h, mine.remote(), &node, file, K2, &[vec![1; 10]]);
@@ -1126,7 +1103,7 @@ fn what_a_snapshot_holds_stays_until_the_snapshot_goes() {
         let s = sweep(&h, &core, &mut gc, at);
         assert_eq!((s.snapshots, s.referenced, s.deleted), (1, 1, 0));
     }
-    let then = vault(&h).at_snapshot("s", 1);
+    let then = vault_trusting_tester(&h, support::TESTER).at_snapshot("s", 1);
     assert_eq!(
         h.runtime.block_on(then.read(file, 0, data.len())).unwrap(),
         data

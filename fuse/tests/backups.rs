@@ -4,6 +4,8 @@
 
 mod support;
 
+use support::pattern;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::FileExt;
@@ -29,10 +31,6 @@ const C: u64 = TEST_CHUNK_SIZE;
 const K: u64 = TEST_OBJECT_FROM_CHUNKS;
 /// How much of a file one block holds.
 const B: u64 = TEST_BLOCK_CHUNKS * C;
-
-fn pattern(len: u64) -> Vec<u8> {
-    (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
-}
 
 /// A harness with objects, and an empty backup space beside it.
 fn setup() -> (support::Harness, FakeStore, BackupStore) {

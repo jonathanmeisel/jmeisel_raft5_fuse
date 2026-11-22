@@ -13,6 +13,8 @@
 
 mod support;
 
+use support::pattern;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -36,10 +38,6 @@ const NETWORK: Network = Network {
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
-}
-
-fn pattern(len: u64) -> Vec<u8> {
-    (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
 }
 
 fn report(what: &str, took: Duration) {

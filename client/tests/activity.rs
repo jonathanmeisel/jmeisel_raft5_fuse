@@ -2,38 +2,16 @@
 //! who may read it, and how it reads.
 
 use std::ffi::OsStr;
-use std::sync::Arc;
 
-use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::{ActivityLine, Change, Vault};
 use raft5fs_core::accounts;
 use raft5fs_crypto::identity::fingerprint_words;
-use raft5fs_proto::types::{ActivityOp, Caps, FsError};
-use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, credentials_with, fs_tls};
+use raft5fs_proto::types::{ActivityOp, Caps};
+use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, connect, errno, try_connect, vault};
 
 #[test]
 fn server_process_mode() {
     raft5fs_testkit::serve_if_requested();
-}
-
-fn connect(backend: &Backend, user: &str, secret: Option<&str>) -> Result<Remote, String> {
-    let credentials = match secret {
-        Some(secret) => credentials_with(user, secret),
-        None => credentials(user),
-    };
-    backend.runtime.block_on(Remote::connect(
-        &backend.addresses(),
-        credentials,
-        Some(fs_tls()),
-    ))
-}
-
-fn vault(backend: &Backend, user: &str) -> Vault {
-    Vault::new(Arc::new(connect(backend, user, None).unwrap())).unwrap()
-}
-
-fn errno<T: std::fmt::Debug>(result: Result<T, FsError>) -> i32 {
-    result.unwrap_err().errno
 }
 
 fn lines(backend: &Backend, vault: &Vault, folder: u64) -> Vec<ActivityLine> {
@@ -92,11 +70,7 @@ fn changes_are_logged_with_who_made_them() {
     rt.block_on(me.grant(docs, "bob", true, OsStr::new("docs")))
         .unwrap();
     let bob = vault(&backend, "bob");
-    let my_key = connect(&backend, TESTER, None)
-        .unwrap()
-        .identity()
-        .unwrap()
-        .public_key();
+    let my_key = connect(&backend, TESTER).identity().unwrap().public_key();
     rt.block_on(bob.trust(TESTER, &fingerprint_words(&my_key)))
         .unwrap();
     for i in 0..3 {
@@ -221,7 +195,7 @@ fn only_those_who_can_read_a_folder_see_its_log() {
     let (link, secret) = rt
         .block_on(me.create_link(docs, "/docs", OsStr::new("docs"), None))
         .unwrap();
-    let visitor = connect(&backend, &link, Some(&secret)).unwrap();
+    let visitor = try_connect(&backend, &link, &secret).unwrap();
     assert_eq!(
         errno(rt.block_on(visitor.list_activity(docs, &[], 0))),
         libc::EACCES

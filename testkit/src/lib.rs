@@ -33,7 +33,7 @@ use raft5_client::{
 use raft5_server::auth::{AuthConfig, InitialAdmin, hash_password};
 use raft5_server::{ClientApiTls, ServerConfig, serve_config};
 use raft5fs_client::remote::{Credentials, Remote};
-use raft5fs_client::vault::KnownKeys;
+use raft5fs_client::vault::{KnownKeys, Vault};
 use raft5fs_core::backup::BackupStore;
 use raft5fs_core::objects::{DEFAULT_GET_TTL, DEFAULT_PUT_TTL, ObjectSettings};
 use raft5fs_core::{FsCore, accounts};
@@ -41,6 +41,7 @@ use raft5fs_crypto::password::KdfParams;
 use raft5fs_objstore::fake::{self, FakeStore};
 use raft5fs_objstore::http::HttpConfig;
 use raft5fs_objstore::{S3Config, S3Store};
+use raft5fs_proto::types::FsError;
 use raft5fs_server::auth::{DEFAULT_SESSION_TTL, Signer};
 use raft5fs_server::{FsService, InviteSettings, Store};
 use tokio::runtime::Runtime;
@@ -895,4 +896,61 @@ pub fn temp_dir(label: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&path).expect("create temp dir");
     path
+}
+
+// ---------------------------------------------------- helpers for tests
+
+/// Logs `user` in, with `password(user)`. Panics if that fails.
+pub fn connect(backend: &Backend, user: &str) -> Remote {
+    try_connect(backend, user, &password(user)).unwrap_or_else(|e| panic!("log in as {user}: {e}"))
+}
+
+/// Logs `user` in with `password`.
+pub fn try_connect(backend: &Backend, user: &str, password: &str) -> Result<Remote, String> {
+    backend.runtime.block_on(Remote::connect(
+        &backend.addresses(),
+        credentials_with(user, password),
+        Some(fs_tls()),
+    ))
+}
+
+/// A vault for `user` that trusts no keys yet.
+pub fn vault(backend: &Backend, user: &str) -> Vault {
+    Vault::new(Arc::new(connect(backend, user))).expect("open the account's keys")
+}
+
+/// A vault for `user` that trusts `TESTER`'s key, as the test mounts do
+/// (see `Backend::known_keys`).
+pub fn vault_trusting_tester(backend: &Backend, user: &str) -> Vault {
+    vault(backend, user).with_known_keys(backend.known_keys())
+}
+
+/// `len` bytes that differ from their neighbours and are never zero, so
+/// a hole (zeros) or a shifted copy can't pass for them.
+pub fn pattern(len: u64) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 251) as u8 + 1).collect()
+}
+
+/// The errno of a call that must fail.
+#[track_caller]
+pub fn errno<T: std::fmt::Debug>(result: Result<T, FsError>) -> i32 {
+    result.expect_err("the call should fail").errno
+}
+
+/// Checks that a call through a mount failed with `errno`.
+#[track_caller]
+pub fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
+    match result {
+        Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
+        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
+    }
+}
+
+/// Checks that a call to the client library failed with `errno`.
+#[track_caller]
+pub fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, FsError>, errno: i32) {
+    match result {
+        Err(e) => assert_eq!(e.errno, errno, "wrong error: {e}"),
+        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
+    }
 }

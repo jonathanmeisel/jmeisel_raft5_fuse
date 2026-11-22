@@ -5,6 +5,8 @@
 
 mod support;
 
+use support::{assert_errno, assert_fs_errno, try_connect, vault_trusting_tester};
+
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -26,24 +28,6 @@ fn server_process_mode() {
     support::serve_if_requested();
 }
 
-fn connect(h: &support::Harness, user: &str, password: &str) -> Result<Remote, String> {
-    let credentials = support::credentials_with(user, password);
-    h.runtime.block_on(Remote::connect(
-        &h.addresses(),
-        credentials,
-        Some(support::fs_tls()),
-    ))
-}
-
-/// `user`'s vault, logged in again, so it knows no keys yet, but with
-/// `TESTER`'s public key pinned (see `Harness::known_keys`).
-fn vault(h: &support::Harness, user: &str) -> Vault {
-    let remote = connect(h, user, &support::password(user)).unwrap();
-    Vault::new(Arc::new(remote))
-        .unwrap()
-        .with_known_keys(h.known_keys())
-}
-
 fn ino(path: &Path) -> u64 {
     fs::metadata(path).unwrap().ino()
 }
@@ -56,22 +40,6 @@ fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-#[track_caller]
-fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
-}
-
-#[track_caller]
-fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, raft5fs_core::FsError>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.errno, errno, "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
 }
 
 fn enrol_with(
@@ -97,15 +65,15 @@ fn an_enrolled_user_mounts_and_uses_the_filesystem() {
     let f = h.path().join("vol/hello");
     fs::write(&f, b"world").unwrap();
     assert_eq!(fs::read(&f).unwrap(), b"world");
-    let remote = connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
+    let remote = try_connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
     assert!(remote.identity().is_some(), "the login opened the key pair");
 }
 
 #[test]
 fn a_wrong_password_and_an_unknown_user_are_refused_alike() {
     let h = support::setup_root();
-    let wrong = connect(&h, support::TESTER, "not it").err().unwrap();
-    let unknown = connect(&h, "nobody", "anything").err().unwrap();
+    let wrong = try_connect(&h, support::TESTER, "not it").err().unwrap();
+    let unknown = try_connect(&h, "nobody", "anything").err().unwrap();
     assert!(wrong.contains("login refused"), "{wrong}");
     assert_eq!(wrong, unknown);
 }
@@ -122,17 +90,17 @@ fn an_enrolment_code_works_once_and_only_for_its_user() {
     assert_eq!(wrong.unwrap_err().errno, libc::EACCES);
     let someone_elses = enrol_with(&h, "bob", &code, "pw");
     assert_eq!(someone_elses.unwrap_err().errno, libc::EACCES);
-    assert!(connect(&h, "alice", "pw").is_err(), "not enrolled yet");
+    assert!(try_connect(&h, "alice", "pw").is_err(), "not enrolled yet");
 
     enrol_with(&h, "alice", &code, "pw").unwrap();
-    connect(&h, "alice", "pw").unwrap();
+    try_connect(&h, "alice", "pw").unwrap();
     let again = enrol_with(&h, "alice", &code, "other");
     assert_eq!(
         again.unwrap_err().errno,
         libc::EACCES,
         "the code was used up"
     );
-    connect(&h, "alice", "pw").unwrap();
+    try_connect(&h, "alice", "pw").unwrap();
 }
 
 #[test]
@@ -141,17 +109,17 @@ fn enrolling_again_drops_the_old_key_pairs_grants() {
     fs::create_dir(h.root().join("v")).unwrap();
     fs::write(h.root().join("v/f"), b"x").unwrap();
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&h.root().join("v")), "alice", true, OsStr::new("v")))
         .unwrap();
-    let before = connect(&h, "alice", &support::password("alice")).unwrap();
+    let before = try_connect(&h, "alice", &support::password("alice")).unwrap();
     assert_eq!(h.runtime.block_on(before.list_grants()).unwrap().len(), 1);
 
     // A user who enrols with a new code gets a new key pair and nothing
     // else, not the right to delete or overwrite what they cannot read.
     h.enrol("alice");
-    let after = connect(&h, "alice", &support::password("alice")).unwrap();
+    let after = try_connect(&h, "alice", &support::password("alice")).unwrap();
     assert!(h.runtime.block_on(after.list_grants()).unwrap().is_empty());
     let mut index = vec![0x09];
     index.extend_from_slice(b"alice\0");
@@ -176,7 +144,7 @@ fn a_login_refuses_weaker_key_stretching_than_it_accepts() {
         .map(drop)
         .unwrap_err();
     assert!(refused.contains("weaker key stretching"), "{refused}");
-    connect(&h, "alice", &support::password("alice")).unwrap();
+    try_connect(&h, "alice", &support::password("alice")).unwrap();
 }
 
 #[test]
@@ -184,14 +152,14 @@ fn a_password_change_keeps_the_key_pair() {
     let h = support::setup_root();
     h.add_user("alice");
     let old = support::password("alice");
-    let remote = connect(&h, "alice", &old).unwrap();
+    let remote = try_connect(&h, "alice", &old).unwrap();
     let key = remote.identity().unwrap().public_key();
 
     h.runtime
         .block_on(remote.change_password("new password", KdfParams::TESTING))
         .unwrap();
-    assert!(connect(&h, "alice", &old).is_err());
-    let after = connect(&h, "alice", "new password").unwrap();
+    assert!(try_connect(&h, "alice", &old).is_err());
+    let after = try_connect(&h, "alice", "new password").unwrap();
     assert_eq!(after.identity().unwrap().public_key(), key);
 }
 
@@ -204,7 +172,7 @@ fn no_password_reaches_the_store() {
         .block_on(accounts::issue_code(&h.client, "alice"))
         .unwrap();
     enrol_with(&h, "alice", &code, password).unwrap();
-    connect(&h, "alice", password).unwrap();
+    try_connect(&h, "alice", password).unwrap();
 
     for key in h.keys_with_prefix(&[]) {
         let value = h.read_key(&key).unwrap_or_default();
@@ -251,7 +219,7 @@ fn removing_a_user_cuts_them_off_and_drops_their_grants() {
     fs::create_dir(h.root().join("v")).unwrap();
     fs::write(h.root().join("v/f"), b"x").unwrap();
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&h.root().join("v")), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -265,7 +233,7 @@ fn removing_a_user_cuts_them_off_and_drops_their_grants() {
     );
     // Her mount's next request is refused, and so is a new login.
     assert!(fs::read(alice.path.join("v/f")).is_err());
-    assert!(connect(&h, "alice", &support::password("alice")).is_err());
+    assert!(try_connect(&h, "alice", &support::password("alice")).is_err());
     let mut index = vec![0x09];
     index.extend_from_slice(b"alice\0");
     assert!(h.keys_with_prefix(&index).is_empty(), "her grants are gone");
@@ -308,7 +276,7 @@ fn nothing_ungranted_is_reachable() {
     assert!(names(&alice.path).is_empty());
 
     // Directly to the servers, with the inode numbers: still nothing.
-    let remote = connect(&h, "alice", &support::password("alice")).unwrap();
+    let remote = try_connect(&h, "alice", &support::password("alice")).unwrap();
     let run = |f| h.runtime.block_on(f);
     assert_fs_errno(run(remote.getattr(volume)), libc::EACCES);
     assert_fs_errno(run(remote.getattr(file)), libc::EACCES);
@@ -323,7 +291,7 @@ fn nothing_ungranted_is_reachable() {
     // The real root belongs to no one, not even the volumes' owners.
     assert_fs_errno(run(remote.getattr(1)), libc::EACCES);
     assert_fs_errno(h.runtime.block_on(remote.readdir(1)), libc::EACCES);
-    let tester = connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
+    let tester = try_connect(&h, support::TESTER, &support::password(support::TESTER)).unwrap();
     assert_fs_errno(h.runtime.block_on(tester.readdir(1)), libc::EACCES);
 
     // alice cannot make anything there either, with or without keys.
@@ -344,7 +312,7 @@ fn a_read_only_grant_shows_its_directory_and_nothing_above() {
     fs::write(team.join("private"), b"x").unwrap();
     h.add_user("alice");
 
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let shared = ino(&team.join("shared"));
     h.runtime
         .block_on(mine.grant(shared, "alice", false, OsStr::new("from-tester")))
@@ -362,7 +330,7 @@ fn a_read_only_grant_shows_its_directory_and_nothing_above() {
     assert_errno(fs::create_dir(granted.join("dir")), libc::EROFS);
     assert_errno(fs::remove_file(granted.join("notes")), libc::EROFS);
 
-    let remote = connect(&h, "alice", &support::password("alice")).unwrap();
+    let remote = try_connect(&h, "alice", &support::password("alice")).unwrap();
     assert_fs_errno(h.runtime.block_on(remote.getattr(ino(&team))), libc::EACCES);
     assert_fs_errno(
         h.runtime
@@ -377,7 +345,7 @@ fn a_writable_grant_shares_both_ways() {
     let team = h.path().join("team");
     fs::create_dir(&team).unwrap();
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&team), "alice", true, OsStr::new("team")))
         .unwrap();
@@ -388,9 +356,9 @@ fn a_writable_grant_shares_both_ways() {
     assert_eq!(fs::read(team.join("from-alice/hello")).unwrap(), b"hi");
 
     // Keys that alice made unwrap for the volume's owner, from the start.
-    let fresh = vault(&h, support::TESTER);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     let hers = ino(&team.join("from-alice/hello"));
-    let theirs = vault(&h, "alice");
+    let theirs = vault_trusting_tester(&h, "alice");
     let a = h.runtime.block_on(fresh.node(hers)).unwrap();
     let b = h.runtime.block_on(theirs.node(hers)).unwrap();
     assert_eq!(a.key, b.key);
@@ -405,7 +373,7 @@ fn a_moved_node_gets_a_new_key_under_its_new_parent() {
     fs::write(v.join("a/f"), b"x").unwrap();
     let f = ino(&v.join("a/f"));
     let sub = ino(&v.join("a/sub"));
-    let before = vault(&h, support::TESTER);
+    let before = vault_trusting_tester(&h, support::TESTER);
     let f_key = h.runtime.block_on(before.node(f)).unwrap().key.clone();
     let sub_key = h.runtime.block_on(before.node(sub)).unwrap().key.clone();
 
@@ -425,7 +393,7 @@ fn a_moved_node_gets_a_new_key_under_its_new_parent() {
     h.runtime
         .block_on(before.grant(ino(&v.join("b")), "alice", false, OsStr::new("b")))
         .unwrap();
-    let alices = vault(&h, "alice");
+    let alices = vault_trusting_tester(&h, "alice");
     let (f_now, sub_now) = (
         h.runtime.block_on(alices.node(f)).unwrap(),
         h.runtime.block_on(alices.node(sub)).unwrap(),
@@ -447,7 +415,7 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
     let h = support::setup_root();
     fs::create_dir(h.path().join("v")).unwrap();
     let v = ino(&h.path().join("v"));
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let parent = h.runtime.block_on(mine.node(v)).unwrap();
     // A create as an honest client would send it, but for `ino`, with a key
@@ -487,7 +455,7 @@ fn a_create_must_bring_a_reserved_inode_and_a_fitting_key_record() {
 
     // Another user's reservation does not work either.
     h.add_user("alice");
-    let alice = connect(&h, "alice", &support::password("alice")).unwrap();
+    let alice = try_connect(&h, "alice", &support::password("alice")).unwrap();
     let hers = h.runtime.block_on(alice.allocate_inode()).unwrap();
     assert_fs_errno(create("hers", hers, version), libc::EACCES);
 }
@@ -498,7 +466,7 @@ fn removing_a_volume_removes_its_grants_and_keys() {
     fs::create_dir(h.path().join("gone")).unwrap();
     let volume = ino(&h.path().join("gone"));
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(volume, "alice", false, OsStr::new("gone")))
         .unwrap();
@@ -556,7 +524,7 @@ fn no_name_reaches_the_store() {
     fs::write(v.join("dir-zebra/file-zebra"), b"x").unwrap();
     fs::rename(v.join("dir-zebra/file-zebra"), v.join("moved-zebra")).unwrap();
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(
             ino(&v.join("dir-zebra")),
@@ -587,7 +555,7 @@ fn names_survive_listing_moving_and_sharing() {
     assert_errno(fs::read(v.join("a/one")), libc::ENOENT);
 
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -605,7 +573,7 @@ fn a_plain_name_is_refused() {
     fs::create_dir(h.path().join("v")).unwrap();
     fs::write(h.path().join("v/f"), b"x").unwrap();
     let v = ino(&h.path().join("v"));
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let parent = h.runtime.block_on(mine.node(v)).unwrap();
 
@@ -641,7 +609,7 @@ fn an_entry_filed_under_another_name_is_left_out() {
     fs::create_dir(&v).unwrap();
     fs::write(v.join("a"), b"a").unwrap();
     fs::write(v.join("b"), b"b").unwrap();
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let dir = h.runtime.block_on(mine.node(ino(&v))).unwrap();
     let dirent = |name: &str| {
         let mut key = vec![0x03];
@@ -654,7 +622,7 @@ fn an_entry_filed_under_another_name_is_left_out() {
     let a = h.read_key(&dirent("a")).unwrap();
     h.write_key(&dirent("b"), Some(&a));
 
-    let fresh = vault(&h, support::TESTER);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     let listed: Vec<String> = h
         .runtime
         .block_on(fresh.readdir(ino(&v)))
@@ -750,8 +718,8 @@ fn concurrent_writes_to_one_chunk_lose_nothing() {
     let f = h.path().join("v/f");
     fs::write(&f, vec![0u8; 1000]).unwrap();
     let file = ino(&f);
-    let a = vault(&h, support::TESTER);
-    let b = vault(&h, support::TESTER);
+    let a = vault_trusting_tester(&h, support::TESTER);
+    let b = vault_trusting_tester(&h, support::TESTER);
     // Each writer writes its own bytes of the same chunk, again and again.
     // Every write is a read-modify-write of the whole chunk.
     h.runtime.block_on(async {
@@ -780,7 +748,7 @@ fn the_server_takes_no_mis_sealed_or_stale_data() {
     let f = h.path().join("v/f");
     fs::write(&f, b"sealed").unwrap();
     let file = ino(&f);
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
 
     // A chunk sealed under a key version that the file does not have.
@@ -842,7 +810,7 @@ fn a_block_pointer_is_never_read_as_a_hole() {
     key.extend_from_slice(&file.to_be_bytes());
     key.extend_from_slice(&0u64.to_be_bytes());
     h.write_key(&key, Some(&pointer));
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     assert_fs_errno(
         h.runtime
             .block_on(mine.remote().read_chunks(file, 0, 1, &[])),
@@ -865,7 +833,7 @@ fn a_nearer_grant_counts_even_below_a_path_the_server_knows() {
     let h = support::setup_root();
     let v = shared_tree(&h);
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -888,11 +856,11 @@ fn a_node_moved_from_under_a_grant_is_cut_off_though_its_path_was_known() {
     let v = shared_tree(&h);
     let f = ino(&v.join("shared/sub/f"));
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v.join("shared")), "alice", true, OsStr::new("shared")))
         .unwrap();
-    let remote = connect(&h, "alice", &support::password("alice")).unwrap();
+    let remote = try_connect(&h, "alice", &support::password("alice")).unwrap();
     h.runtime.block_on(remote.getattr(f)).unwrap();
 
     fs::rename(v.join("shared/sub"), v.join("sub")).unwrap();
@@ -909,12 +877,12 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
         ino(&v.join("shared/sub/g")),
     );
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
     // Everything that alice could ever learn: the keys as they are now.
-    let hers = vault(&h, "alice");
+    let hers = vault_trusting_tester(&h, "alice");
     let her_sub_key = h.runtime.block_on(hers.node(sub)).unwrap().key.clone();
     let her_f_key = h.runtime.block_on(hers.node(f)).unwrap().key.clone();
     let alice = h.mount_as("alice");
@@ -968,7 +936,7 @@ fn a_revoked_user_is_cut_off_and_new_writes_are_sealed_beyond_them() {
     assert!(record(&h, sub).name_key(sub, &her_sub_key).is_err());
 
     // Data written before is still readable, through the history.
-    let fresh = vault(&h, support::TESTER);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     assert_eq!(
         h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
         b"untouched"
@@ -982,7 +950,7 @@ fn a_revocation_keeps_the_grants_below_it_usable() {
     let sub = ino(&v.join("shared/sub"));
     h.add_user("alice");
     h.add_user("bob");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -996,7 +964,7 @@ fn a_revocation_keeps_the_grants_below_it_usable() {
     // cannot reach above his grant to rotate anything there himself.
     assert_eq!(record(&h, sub).version, 2);
     assert_eq!(record(&h, ino(&v.join("shared"))).version, 2);
-    let bobs = vault(&h, "bob");
+    let bobs = vault_trusting_tester(&h, "bob");
     let grants = h.runtime.block_on(bobs.remote().list_grants()).unwrap();
     assert_eq!(grants[0].key_version, 2);
     let bob = h.mount_as("bob");
@@ -1012,11 +980,11 @@ fn revoking_takes_the_key_above_unless_it_is_a_volume() {
     let shared = ino(&v.join("shared"));
     h.add_user("alice");
     h.add_user("bob");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(shared, "alice", true, OsStr::new("shared")))
         .unwrap();
-    let hers = vault(&h, "alice");
+    let hers = vault_trusting_tester(&h, "alice");
     h.runtime
         .block_on(hers.grant(shared, "bob", false, OsStr::new("shared")))
         .unwrap();
@@ -1028,7 +996,7 @@ fn revoking_takes_the_key_above_unless_it_is_a_volume() {
         libc::ENOENT,
     );
     h.runtime.block_on(mine.revoke(shared, "bob")).unwrap();
-    let bobs = vault(&h, "bob");
+    let bobs = vault_trusting_tester(&h, "bob");
     assert!(
         h.runtime
             .block_on(bobs.remote().list_grants())
@@ -1049,14 +1017,14 @@ fn concurrent_writers_rotate_a_stale_path_once() {
     let v = shared_tree(&h);
     let f = ino(&v.join("shared/sub/f"));
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
 
-    let a = vault(&h, support::TESTER);
-    let b = vault(&h, support::TESTER);
+    let a = vault_trusting_tester(&h, support::TESTER);
+    let b = vault_trusting_tester(&h, support::TESTER);
     h.runtime.block_on(async {
         let (x, y) = tokio::join!(a.write(f, 0, b"aaaa"), b.write(f, 10, b"bbbb"));
         x.unwrap();
@@ -1075,7 +1043,7 @@ fn a_changed_public_key_is_refused_until_forgotten() {
     let h = support::setup_root();
     let v = shared_tree(&h);
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let first = h
         .runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
@@ -1096,7 +1064,7 @@ fn a_changed_public_key_is_refused_until_forgotten() {
     h.runtime
         .block_on(mine.grant(ino(&v), "bob", true, OsStr::new("v")))
         .unwrap();
-    let bobs = vault(&h, "bob");
+    let bobs = vault_trusting_tester(&h, "bob");
     h.runtime
         .block_on(bobs.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -1172,11 +1140,11 @@ fn revoked_tree(h: &support::Harness) -> (std::path::PathBuf, raft5fs_crypto::Ke
     let big: Vec<u8> = (0..h.chunk_size * 5 / 2).map(|i| i as u8).collect();
     fs::write(v.join("shared/sub/big"), &big).unwrap();
     h.add_user("alice");
-    let mine = vault(h, support::TESTER);
+    let mine = vault_trusting_tester(h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
-    let hers = vault(h, "alice");
+    let hers = vault_trusting_tester(h, "alice");
     let her_g_key = h
         .runtime
         .block_on(hers.node(ino(&v.join("shared/sub/g"))))
@@ -1198,7 +1166,7 @@ fn pruning_reseals_everything_and_drops_every_old_version() {
     let g_mtime = fs::metadata(v.join("shared/sub/g")).unwrap().mtime();
     assert!(record(&h, ino(&v)).base() < record(&h, ino(&v)).version);
 
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let dry = h.runtime.block_on(mine.prune_tree(ino(&v), true));
     assert!(dry.skipped.is_empty(), "{:?}", dry.skipped);
     assert!(dry.chunks > 0 && dry.names > 0 && dry.rotated > 0 && dry.dropped > 0);
@@ -1225,7 +1193,7 @@ fn pruning_reseals_everything_and_drops_every_old_version() {
         fs::metadata(v.join("shared/sub/g")).unwrap().mtime(),
         g_mtime
     );
-    let fresh = vault(&h, support::TESTER);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     assert_eq!(
         h.runtime.block_on(fresh.read(g, 0, 100)).unwrap(),
         b"untouched"
@@ -1249,7 +1217,7 @@ fn a_prune_is_refused_while_anything_is_under_a_version_it_drops() {
     let (v, _) = revoked_tree(&h);
     let g = ino(&v.join("shared/sub/g"));
     let sub = ino(&v.join("shared/sub"));
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     // A new key for g, with its chunk still sealed under the old key.
     h.runtime.block_on(mine.freshen(g)).unwrap();
@@ -1295,7 +1263,7 @@ fn names_sealed_under_an_old_key_are_refused() {
     let h = support::setup_root();
     let (v, _) = revoked_tree(&h);
     let sub = ino(&v.join("shared/sub"));
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let node = h.runtime.block_on(mine.node(sub)).unwrap();
     let old = node
         .record
@@ -1330,7 +1298,7 @@ fn pruning_through_a_read_only_grant_changes_nothing() {
     let v = shared_tree(&h);
     h.add_user("alice");
     h.add_user("bob");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -1341,7 +1309,7 @@ fn pruning_through_a_read_only_grant_changes_nothing() {
     let before = record(&h, ino(&v));
     assert!(before.base() < before.version);
 
-    let hers = vault(&h, "alice");
+    let hers = vault_trusting_tester(&h, "alice");
     let roots = h.runtime.block_on(hers.grant_roots()).unwrap();
     assert_eq!(roots.len(), 1);
     assert!(!roots[0].writable);
@@ -1364,7 +1332,7 @@ fn pruning_while_a_mount_writes_loses_nothing() {
             }
         })
     };
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let stats = h.runtime.block_on(mine.prune_tree(ino(&v), false));
     writer.join().unwrap();
     assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
@@ -1380,7 +1348,7 @@ fn a_small_write_into_a_cached_chunk_fetches_nothing() {
     let f = h.path().join("f");
     fs::write(&f, b"").unwrap();
     let file = ino(&f);
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let remote = mine.remote();
     let run = |offset, data: &[u8]| h.runtime.block_on(mine.write(file, offset, data)).unwrap();
 
@@ -1405,8 +1373,8 @@ fn a_cached_chunk_is_never_served_stale() {
     let f = h.path().join("f");
     fs::write(&f, vec![1; 1000]).unwrap();
     let file = ino(&f);
-    let reader = vault(&h, support::TESTER);
-    let writer = vault(&h, support::TESTER);
+    let reader = vault_trusting_tester(&h, support::TESTER);
+    let writer = vault_trusting_tester(&h, support::TESTER);
     assert_eq!(h.runtime.block_on(reader.read(file, 0, 4)).unwrap(), [1; 4]);
 
     h.runtime.block_on(writer.write(file, 0, &[9; 4])).unwrap();
@@ -1449,7 +1417,7 @@ fn a_rotation_seals_to_no_grantee_the_server_made_up() {
     let v = shared_tree(&h);
     h.add_user("alice");
     h.add_user("eve");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -1458,7 +1426,7 @@ fn a_rotation_seals_to_no_grantee_the_server_made_up() {
     let revoked = h.runtime.block_on(mine.revoke(ino(&v), "alice"));
     assert_fs_errno(revoked, libc::EPERM);
     // Whatever eve's grant holds, it is not the volume's key.
-    let eves = vault(&h, "eve");
+    let eves = vault_trusting_tester(&h, "eve");
     assert!(h.runtime.block_on(eves.node(ino(&v))).is_err());
     // Sharing further does not seal anything to her either.
     h.add_user("bob");
@@ -1473,7 +1441,7 @@ fn a_rotation_seals_to_no_grantee_the_server_made_up() {
     h.runtime.block_on(mine.revoke(ino(&v), "eve")).unwrap();
     h.runtime.block_on(mine.revoke(ino(&v), "alice")).unwrap();
     assert!(h.runtime.block_on(eves.node(ino(&v))).is_err());
-    let after = vault(&h, support::TESTER);
+    let after = vault_trusting_tester(&h, support::TESTER);
     let grantees = h.runtime.block_on(after.grantees(ino(&v))).unwrap();
     let names: Vec<_> = grantees.iter().map(|g| g.user.as_str()).collect();
     assert_eq!(names, [support::TESTER]);
@@ -1487,7 +1455,10 @@ fn grants_made_at_once_both_stay_on_the_sealed_list() {
     for user in users {
         h.add_user(user);
     }
-    let vaults: Vec<Vault> = users.iter().map(|_| vault(&h, support::TESTER)).collect();
+    let vaults: Vec<Vault> = users
+        .iter()
+        .map(|_| vault_trusting_tester(&h, support::TESTER))
+        .collect();
     let grant = |i: usize| vaults[i].grant(ino(&v), users[i], false, OsStr::new("v"));
     h.runtime.block_on(async {
         let (a, b, c, d) = tokio::join!(grant(0), grant(1), grant(2), grant(3));
@@ -1496,7 +1467,7 @@ fn grants_made_at_once_both_stay_on_the_sealed_list() {
         }
     });
     // Every one of them is on the list that a revocation checks against.
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let mut names: Vec<_> = h
         .runtime
         .block_on(mine.grantees(ino(&v)))
@@ -1526,7 +1497,7 @@ fn a_share_from_someone_unpinned_is_read_only_until_trusted() {
     // Mallory (or a server that makes her up) shares a volume of her own
     // with the tester, with the same name as the tester's own volume...
     let mallory_key = h.enrol("mallory");
-    let hers = vault(&h, "mallory");
+    let hers = vault_trusting_tester(&h, "mallory");
     let fake = h
         .runtime
         .block_on(hers.create_volume(OsStr::new("mine"), 0o755))
@@ -1549,7 +1520,7 @@ fn a_share_from_someone_unpinned_is_read_only_until_trusted() {
         libc::EACCES,
     );
     assert_errno(fs::create_dir(mount.root.join("photos/2024")), libc::EACCES);
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     assert_fs_errno(
         h.runtime
             .block_on(mine.grant(fake, "mallory", true, OsStr::new("x"))),
@@ -1581,7 +1552,7 @@ fn an_entry_pointed_at_another_inode_is_refused() {
     fs::create_dir(&v).unwrap();
     fs::write(v.join("a"), b"a").unwrap();
     fs::write(v.join("b"), b"b").unwrap();
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     let dir = h.runtime.block_on(mine.node(ino(&v))).unwrap();
     let dirent = |name: &str| {
         let mut key = vec![0x03];
@@ -1599,7 +1570,7 @@ fn an_entry_pointed_at_another_inode_is_refused() {
     h.write_key(&dirent("a"), Some(&a));
     h.write_key(&dirent("b"), Some(&b));
 
-    let fresh = vault(&h, support::TESTER);
+    let fresh = vault_trusting_tester(&h, support::TESTER);
     let listed: Vec<String> = h
         .runtime
         .block_on(fresh.readdir(ino(&v)))
@@ -1622,7 +1593,7 @@ fn a_key_record_rolled_back_is_refused() {
     let v = shared_tree(&h);
     let v_ino = ino(&v);
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(v_ino, "alice", false, OsStr::new("v")))
         .unwrap();
@@ -1685,7 +1656,7 @@ fn a_name_that_could_break_a_line_is_no_account() {
         let issued = h.runtime.block_on(accounts::issue_code(&h.client, bad));
         assert_fs_errno(issued, libc::EINVAL);
     }
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     fs::create_dir(h.root().join("v")).unwrap();
     let granted = h.runtime.block_on(mine.grant(
         ino(&h.root().join("v")),
@@ -1705,11 +1676,11 @@ fn shares_say_whose_they_are_and_whether_trusted() {
     let v = shared_tree(&h);
     h.add_user("alice");
     let mallory_key = h.enrol("mallory");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("from-tester")))
         .unwrap();
-    let hers = vault(&h, "mallory");
+    let hers = vault_trusting_tester(&h, "mallory");
     let fake = h
         .runtime
         .block_on(hers.create_volume(OsStr::new("m"), 0o755))
@@ -1719,7 +1690,7 @@ fn shares_say_whose_they_are_and_whether_trusted() {
         .block_on(hers.grant(fake, "alice", true, OsStr::new("from-mallory")))
         .unwrap();
 
-    let alices = vault(&h, "alice");
+    let alices = vault_trusting_tester(&h, "alice");
     let shares = h.runtime.block_on(alices.shares()).unwrap();
     let by_label = |label: &str| {
         shares
@@ -1749,7 +1720,7 @@ fn shares_say_whose_they_are_and_whether_trusted() {
 
 /// What waits for a prune that `user` can write, as the servers list it.
 fn waiting(h: &support::Harness, user: &str) -> Vec<u64> {
-    let v = vault(h, user);
+    let v = vault_trusting_tester(h, user);
     let listed = h.runtime.block_on(v.remote().list_unpruned()).unwrap();
     listed.into_iter().map(|u| u.ino).collect()
 }
@@ -1794,7 +1765,7 @@ fn only_writers_see_or_claim_a_prune() {
     let v = shared_tree(&h);
     h.add_user("alice");
     h.add_user("bob");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     for user in ["alice", "bob"] {
         h.runtime
             .block_on(mine.grant(ino(&v), user, false, OsStr::new("v")))
@@ -1804,7 +1775,7 @@ fn only_writers_see_or_claim_a_prune() {
 
     // Alice can only read it: it isn't hers to see waiting, or to claim.
     assert!(waiting(&h, "alice").is_empty());
-    let hers = vault(&h, "alice");
+    let hers = vault_trusting_tester(&h, "alice");
     let claim = h.runtime.block_on(hers.remote().claim_prune(
         ino(&v),
         raft5fs_client::pruner::new_holder(),

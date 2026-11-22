@@ -4,6 +4,8 @@
 
 mod support;
 
+use support::assert_errno;
+
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1195,14 +1197,6 @@ fn a_lost_acknowledged_write_is_reported_by_fsync() {
 }
 
 // ---------------------------------------------------------------- helpers
-
-#[track_caller]
-fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
-}
 
 // ------------------------------------------------------- identity, tokens
 

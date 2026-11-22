@@ -2,12 +2,9 @@
 //! store and servers.
 
 use std::ffi::OsStr;
-use std::sync::Arc;
 
-use raft5fs_client::remote::Remote;
-use raft5fs_client::vault::Vault;
 use raft5fs_core::dirent_prefix;
-use raft5fs_testkit::{Backend, TESTER, credentials, fs_tls};
+use raft5fs_testkit::{Backend, TESTER, vault};
 
 const MIB: u64 = 1 << 20;
 
@@ -16,25 +13,13 @@ fn server_process_mode() {
     raft5fs_testkit::serve_if_requested();
 }
 
-fn vault(backend: &Backend) -> Vault {
-    let remote = backend
-        .runtime
-        .block_on(Remote::connect(
-            &backend.addresses(),
-            credentials(TESTER),
-            Some(fs_tls()),
-        ))
-        .unwrap();
-    Vault::new(Arc::new(remote)).unwrap()
-}
-
 /// Four full chunks of 1 MiB are just over 4 MiB with their overhead. A
 /// fresh client has nothing cached, so the servers must send all of them.
 #[test]
 fn a_cold_read_of_a_full_batch_of_inline_chunks_works() {
     let backend = Backend::start(MIB, false, true);
     let rt = &backend.runtime;
-    let writer = vault(&backend);
+    let writer = vault(&backend, TESTER);
     let v = rt
         .block_on(writer.create_volume(OsStr::new("v"), 0o755))
         .unwrap()
@@ -46,7 +31,7 @@ fn a_cold_read_of_a_full_batch_of_inline_chunks_works() {
     let data: Vec<u8> = (0..6 * MIB as usize).map(|i| (i % 251) as u8).collect();
     rt.block_on(writer.write(f, 0, &data)).unwrap();
 
-    let reader = vault(&backend);
+    let reader = vault(&backend, TESTER);
     let got = rt
         .block_on(reader.read(f, 0, data.len()))
         .expect("a cold read of a full batch");
@@ -63,7 +48,7 @@ fn a_listing_larger_than_the_default_message_limit_arrives_whole() {
 
     let backend = Backend::start(MIB, false, true);
     let rt = &backend.runtime;
-    let v = vault(&backend);
+    let v = vault(&backend, TESTER);
     let dir = rt
         .block_on(v.create_volume(OsStr::new("v"), 0o755))
         .unwrap()

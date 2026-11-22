@@ -14,26 +14,13 @@ use raft5fs_crypto::password::KdfParams;
 use raft5fs_crypto::pins::PinSource;
 use raft5fs_proto::invite::Invite;
 use raft5fs_proto::types::{AccountKind, Caps, FsError, NewNode};
-use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, credentials_with, fs_tls};
+use raft5fs_testkit::{
+    Backend, TEST_CHUNK_SIZE, TESTER, connect, credentials, credentials_with, errno, fs_tls, vault,
+};
 
 #[test]
 fn server_process_mode() {
     raft5fs_testkit::serve_if_requested();
-}
-
-fn errno<T: std::fmt::Debug>(result: Result<T, FsError>) -> i32 {
-    result.unwrap_err().errno
-}
-
-fn connect(backend: &Backend, user: &str) -> Remote {
-    backend
-        .runtime
-        .block_on(Remote::connect(
-            &backend.addresses(),
-            credentials(user),
-            Some(fs_tls()),
-        ))
-        .unwrap_or_else(|e| panic!("log in as {user}: {e}"))
 }
 
 fn enrol_with(backend: &Backend, user: &str, code: &str) -> [u8; 32] {
@@ -121,10 +108,6 @@ fn volumes_need_the_capability() {
         ))),
         libc::ENOENT
     );
-}
-
-fn vault(backend: &Backend, user: &str) -> Vault {
-    Vault::new(Arc::new(connect(backend, user))).unwrap()
 }
 
 /// Logs in as a link, as a visitor's browser does.

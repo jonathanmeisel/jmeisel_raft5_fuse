@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::vault::VIRTUAL_ROOT;
-use raft5fs_proto::types::{FsError, Kind};
-use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, VOLUME, credentials, fs_tls};
+use raft5fs_proto::types::Kind;
+use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, VOLUME, credentials, errno, fs_tls};
 
 #[test]
 fn server_process_mode() {
@@ -56,10 +56,6 @@ fn open(backend: &Backend, edit: impl FnOnce(&mut SessionConfig)) -> Arc<Session
         .runtime
         .block_on(Session::open(config))
         .expect("open a session")
-}
-
-fn errno<T: std::fmt::Debug>(result: Result<T, FsError>) -> i32 {
-    result.expect_err("an error").errno
 }
 
 #[test]

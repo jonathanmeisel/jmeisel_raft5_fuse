@@ -4,15 +4,14 @@
 
 mod support;
 
+use support::{assert_errno, assert_fs_errno, connect, vault_trusting_tester};
+
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use raft5fs_client::remote::Remote;
-use raft5fs_client::vault::Vault;
 use raft5fs_core::{ChunkWrite, WriteBody};
 
 /// Not a real test: the entry point that lets the harness run a filesystem
@@ -21,23 +20,6 @@ use raft5fs_core::{ChunkWrite, WriteBody};
 #[test]
 fn server_process_mode() {
     support::serve_if_requested();
-}
-
-fn connect(h: &support::Harness, user: &str) -> Remote {
-    let credentials = support::credentials(user);
-    h.runtime
-        .block_on(Remote::connect(
-            &h.addresses(),
-            credentials,
-            Some(support::fs_tls()),
-        ))
-        .unwrap()
-}
-
-fn vault(h: &support::Harness, user: &str) -> Vault {
-    Vault::new(Arc::new(connect(h, user)))
-        .unwrap()
-        .with_known_keys(h.known_keys())
 }
 
 fn ino(path: &Path) -> u64 {
@@ -52,22 +34,6 @@ fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-#[track_caller]
-fn assert_errno<T: std::fmt::Debug>(result: std::io::Result<T>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.raw_os_error(), Some(errno), "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
-}
-
-#[track_caller]
-fn assert_fs_errno<T: std::fmt::Debug>(result: Result<T, raft5fs_core::FsError>, errno: i32) {
-    match result {
-        Err(e) => assert_eq!(e.errno, errno, "wrong error: {e}"),
-        Ok(v) => panic!("expected errno {errno}, got Ok({v:?})"),
-    }
 }
 
 /// `root`'s view of snapshot `name`.
@@ -216,7 +182,7 @@ fn access_in_a_snapshot_is_as_it_was_when_it_was_taken() {
     fs::write(team.join("plan"), b"secret plan").unwrap();
     h.add_user("alice");
     h.add_user("bob");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&team), "alice", false, OsStr::new("theirs")))
         .unwrap();
@@ -260,7 +226,7 @@ fn a_snapshot_still_opens_after_its_keys_are_rotated_and_pruned() {
     fs::write(v.join("shared/sub/f"), b"before").unwrap();
     fs::write(v.join("shared/sub/g"), b"untouched").unwrap();
     h.add_user("alice");
-    let mine = vault(&h, support::TESTER);
+    let mine = vault_trusting_tester(&h, support::TESTER);
     h.runtime
         .block_on(mine.grant(ino(&v), "alice", false, OsStr::new("v")))
         .unwrap();
@@ -326,7 +292,7 @@ fn a_removed_snapshot_is_gone_from_the_mount() {
 fn groups_show_in_a_mount_and_in_snapshots() {
     let h = support::setup_root();
     h.add_user("bob");
-    let owner = vault(&h, support::TESTER);
+    let owner = vault_trusting_tester(&h, support::TESTER);
     let rt = &h.runtime;
     let class = rt
         .block_on(owner.create_volume(OsStr::new("cs101"), 0o755))
@@ -364,7 +330,7 @@ fn groups_show_in_a_mount_and_in_snapshots() {
     assert_errno(fs::rename(&group, root.join("renamed")), libc::EPERM);
 
     // A group goes when nothing shows in it, and a mount stops seeing it.
-    let bob = vault(&h, "bob");
+    let bob = vault_trusting_tester(&h, "bob");
     rt.block_on(bob.relabel(notes, OsStr::new("alone")))
         .unwrap();
     rt.block_on(bob.relabel(work, OsStr::new("alone too")))
@@ -410,7 +376,7 @@ fn versions_come_from_the_snapshots_by_path() {
     fs::write(h.path().join("a.txt.new"), b"three!!").unwrap();
     fs::rename(h.path().join("a.txt.new"), &file).unwrap();
 
-    let me = vault(&h, support::TESTER);
+    let me = vault_trusting_tester(&h, support::TESTER);
     let rt = &h.runtime;
     let path = format!("{}/a.txt", support::VOLUME);
     let now = rt
