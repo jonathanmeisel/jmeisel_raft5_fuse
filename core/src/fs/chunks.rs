@@ -48,126 +48,21 @@ impl FsCore {
         }
         let count = u64::from(count).min(cap);
 
-        // Each chunk is stored at its own index, or in a block at the
-        // block's start: one key for a run of consecutive chunks. A run
-        // holds each chunk's index and the seq the client has it at.
-        let mut runs: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
-        for (i, index) in (first..first.saturating_add(count)).enumerate() {
-            let stored = grid
-                .filter(|g| g.in_blocks(index))
-                .map_or(index, |g| g.block_start(index));
-            let held = known.get(i).copied().unwrap_or(0);
-            match runs.last_mut() {
-                Some((at, chunks)) if *at == stored => chunks.push((index, held)),
-                _ => runs.push((stored, vec![(index, held)])),
-            }
-        }
-        // If the client has every chunk of a run, the key's seq alone shows
-        // whether they are still current. That costs eight bytes whatever
-        // the value's size, and all of those are read in one read.
-        let held_runs: Vec<usize> = (0..runs.len())
-            .filter(|&r| runs[r].1.iter().all(|&(_, held)| held != 0))
-            .collect();
-        let held_keys: Vec<Vec<u8>> = held_runs
-            .iter()
-            .map(|&r| chunk_key(ino, runs[r].0))
-            .collect();
-        let mut current: Vec<Option<u64>> = vec![None; runs.len()];
-        for (&r, seq) in held_runs
-            .iter()
-            .zip(view.read_versions_many(&held_keys).await?)
-        {
-            if runs[r].1.iter().all(|&(_, held)| held == seq) {
-                current[r] = Some(seq);
-            }
-        }
-        // Every other run's value, in one read.
-        let fetched_runs: Vec<usize> = (0..runs.len()).filter(|&r| current[r].is_none()).collect();
-        let fetched_keys: Vec<Vec<u8>> = fetched_runs
-            .iter()
-            .map(|&r| chunk_key(ino, runs[r].0))
-            .collect();
-        let mut fetched: Vec<Option<raft5_client::Entry>> = vec![None; runs.len()];
-        for (&r, entry) in fetched_runs
-            .iter()
-            .zip(view.read_many(&fetched_keys).await?)
-        {
-            fetched[r] = Some(entry);
-        }
-
-        let unchanged = |index, seq| SealedChunk {
-            index,
-            seq,
-            body: ChunkBody::Hole,
-            unchanged: true,
-        };
+        let runs = runs_of(first, count, known, grid);
+        let (current, fetched) = read_runs(&view, ino, &runs).await?;
         let mut chunks = Vec::with_capacity(count as usize);
         let mut blocks = Vec::new();
-        for ((stored, run), (current, read)) in
-            runs.into_iter().zip(current.into_iter().zip(fetched))
-        {
+        for (run, (current, read)) in runs.into_iter().zip(current.into_iter().zip(fetched)) {
             if let Some(seq) = current {
-                chunks.extend(run.into_iter().map(|(index, _)| unchanged(index, seq)));
+                chunks.extend(run.chunks.iter().map(|&(index, _)| unchanged(index, seq)));
                 continue;
             }
             let read = read.expect("every run not current was read");
-            let is_current = |held: u64| held != 0 && held == read.seq;
-            if !grid.is_some_and(|g| g.in_blocks(stored)) {
-                // An inline chunk has its own key, so its run has one
-                // chunk.
-                let (index, held) = run[0];
-                if is_current(held) {
-                    chunks.push(unchanged(index, held));
-                    continue;
-                }
-                let body = match read.value.map(ChunkValue::decode) {
-                    None => ChunkBody::Hole,
-                    Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
-                    Some(ChunkValue::Block(_)) => {
-                        return Err(FsError::new(
-                            libc::EIO,
-                            format!("inode {ino}: a block pointer where chunk {index} belongs"),
-                        ));
-                    }
-                };
-                chunks.push(SealedChunk {
-                    index,
-                    seq: read.seq,
-                    body,
-                    unchanged: false,
-                });
-                continue;
-            }
-            let block = match read.value.map(ChunkValue::decode) {
-                None => None,
-                Some(ChunkValue::Block(block)) => {
-                    let url = self.read_url(ino, &block, objects_ok)?;
-                    blocks.push(BlockUrl { block, url });
-                    Some((blocks.len() as u32 - 1, block.nseg))
-                }
-                Some(ChunkValue::Inline(_)) => {
-                    return Err(FsError::new(
-                        libc::EIO,
-                        format!("inode {ino}: a sealed chunk where block {stored} belongs"),
-                    ));
-                }
-            };
-            for (index, held) in run {
-                if is_current(held) {
-                    chunks.push(unchanged(index, held));
-                    continue;
-                }
-                let segment = (index - stored) as u32;
-                let body = match block {
-                    Some((block, nseg)) if segment < nseg => ChunkBody::Segment { block, segment },
-                    _ => ChunkBody::Hole,
-                };
-                chunks.push(SealedChunk {
-                    index,
-                    seq: read.seq,
-                    body,
-                    unchanged: false,
-                });
+            if grid.is_some_and(|g| g.in_blocks(run.stored)) {
+                let block = self.block_of(ino, run.stored, read.value, objects_ok, &mut blocks)?;
+                chunks.extend(answer_block(&run, read.seq, block));
+            } else {
+                chunks.push(answer_inline(ino, &run, read)?);
             }
         }
         Ok(Chunks {
@@ -175,6 +70,31 @@ impl FsCore {
             chunks,
             blocks,
         })
+    }
+
+    /// The block that `value`, the stored pointer at chunk `stored`, names,
+    /// added to `blocks` with its read URL: its place in `blocks` and its
+    /// segment count. `None` for no block there (a hole).
+    fn block_of(
+        &self,
+        ino: u64,
+        stored: u64,
+        value: Option<Vec<u8>>,
+        objects_ok: bool,
+        blocks: &mut Vec<BlockUrl>,
+    ) -> Result<Option<(u32, u32)>, FsError> {
+        match value.map(ChunkValue::decode) {
+            None => Ok(None),
+            Some(ChunkValue::Block(block)) => {
+                let url = self.read_url(ino, &block, objects_ok)?;
+                blocks.push(BlockUrl { block, url });
+                Ok(Some((blocks.len() as u32 - 1, block.nseg)))
+            }
+            Some(ChunkValue::Inline(_)) => Err(FsError::new(
+                libc::EIO,
+                format!("inode {ino}: a sealed chunk where block {stored} belongs"),
+            )),
+        }
     }
 
     /// A presigned URL that reads `block` of `ino`, for a client that can
@@ -458,5 +378,186 @@ impl FsCore {
                 .await?,
             );
         }
+    }
+}
+
+/// Chunks that `read_chunks` reads under one key: `stored` is the key's
+/// index (the chunk's own, or its block's start), and each chunk is its
+/// index and the seq the client holds it at (0 for none).
+struct Run {
+    stored: u64,
+    chunks: Vec<(u64, u64)>,
+}
+
+/// Groups chunks `first..first + count` by the key each is stored under:
+/// its own index, or in a block at the block's start. `known[i]` is the seq
+/// the client holds chunk `first + i` at, or missing for none.
+fn runs_of(first: u64, count: u64, known: &[u64], grid: Option<ObjectGrid>) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (i, index) in (first..first.saturating_add(count)).enumerate() {
+        let stored = grid
+            .filter(|g| g.in_blocks(index))
+            .map_or(index, |g| g.block_start(index));
+        let held = known.get(i).copied().unwrap_or(0);
+        match runs.last_mut() {
+            Some(run) if run.stored == stored => run.chunks.push((index, held)),
+            _ => runs.push(Run {
+                stored,
+                chunks: vec![(index, held)],
+            }),
+        }
+    }
+    runs
+}
+
+/// Reads `runs` of `ino` in two reads, and gives, for each run, either the
+/// seq that every chunk of it is still current at, or its key's entry:
+///
+/// - A run the client holds whole needs only its key's seq to show whether
+///   it is still current. That costs eight bytes whatever the value's size.
+/// - Every other run's value is read.
+async fn read_runs(
+    view: &View<'_>,
+    ino: u64,
+    runs: &[Run],
+) -> Result<(Vec<Option<u64>>, Vec<Option<raft5_client::Entry>>), FsError> {
+    let held_runs: Vec<usize> = (0..runs.len())
+        .filter(|&r| runs[r].chunks.iter().all(|&(_, held)| held != 0))
+        .collect();
+    let held_keys: Vec<Vec<u8>> = held_runs
+        .iter()
+        .map(|&r| chunk_key(ino, runs[r].stored))
+        .collect();
+    let mut current: Vec<Option<u64>> = vec![None; runs.len()];
+    for (&r, seq) in held_runs
+        .iter()
+        .zip(view.read_versions_many(&held_keys).await?)
+    {
+        if runs[r].chunks.iter().all(|&(_, held)| held == seq) {
+            current[r] = Some(seq);
+        }
+    }
+    let fetched_runs: Vec<usize> = (0..runs.len()).filter(|&r| current[r].is_none()).collect();
+    let fetched_keys: Vec<Vec<u8>> = fetched_runs
+        .iter()
+        .map(|&r| chunk_key(ino, runs[r].stored))
+        .collect();
+    let mut fetched: Vec<Option<raft5_client::Entry>> = vec![None; runs.len()];
+    for (&r, entry) in fetched_runs
+        .iter()
+        .zip(view.read_many(&fetched_keys).await?)
+    {
+        fetched[r] = Some(entry);
+    }
+    Ok((current, fetched))
+}
+
+/// A chunk the client already holds at `seq`: no bytes.
+fn unchanged(index: u64, seq: u64) -> SealedChunk {
+    SealedChunk {
+        index,
+        seq,
+        body: ChunkBody::Hole,
+        unchanged: true,
+    }
+}
+
+/// The answer for an inline chunk, which has its own key, so its run holds
+/// it alone.
+fn answer_inline(ino: u64, run: &Run, read: raft5_client::Entry) -> Result<SealedChunk, FsError> {
+    let (index, held) = run.chunks[0];
+    if held != 0 && held == read.seq {
+        return Ok(unchanged(index, held));
+    }
+    let body = match read.value.map(ChunkValue::decode) {
+        None => ChunkBody::Hole,
+        Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
+        Some(ChunkValue::Block(_)) => {
+            return Err(FsError::new(
+                libc::EIO,
+                format!("inode {ino}: a block pointer where chunk {index} belongs"),
+            ));
+        }
+    };
+    Ok(SealedChunk {
+        index,
+        seq: read.seq,
+        body,
+        unchanged: false,
+    })
+}
+
+/// The answers for a run of chunks in one block, read at `seq`. `block` is
+/// the block's place in the reply and its segment count, or `None` for no
+/// block. A chunk past the block's last segment is a hole.
+fn answer_block(run: &Run, seq: u64, block: Option<(u32, u32)>) -> Vec<SealedChunk> {
+    run.chunks
+        .iter()
+        .map(|&(index, held)| {
+            if held != 0 && held == seq {
+                return unchanged(index, held);
+            }
+            let segment = (index - run.stored) as u32;
+            let body = match block {
+                Some((block, nseg)) if segment < nseg => ChunkBody::Segment { block, segment },
+                _ => ChunkBody::Hole,
+            };
+            SealedChunk {
+                index,
+                seq,
+                body,
+                unchanged: false,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid() -> ObjectGrid {
+        crate::objects::grid_for(64, 2 * 64, 4 * 64).unwrap()
+    }
+
+    #[test]
+    fn inline_chunks_are_one_run_each_and_a_block_is_one_run() {
+        let runs = runs_of(0, 8, &[5, 6], Some(grid()));
+        let shape: Vec<(u64, Vec<(u64, u64)>)> =
+            runs.into_iter().map(|r| (r.stored, r.chunks)).collect();
+        assert_eq!(
+            shape,
+            [
+                (0, vec![(0, 5)]),
+                (1, vec![(1, 6)]),
+                (2, vec![(2, 0), (3, 0), (4, 0), (5, 0)]),
+                (6, vec![(6, 0), (7, 0)]),
+            ]
+        );
+        // With no grid, every chunk is inline.
+        assert_eq!(runs_of(3, 2, &[], None).len(), 2);
+    }
+
+    #[test]
+    fn a_block_answers_holes_past_its_last_segment() {
+        let run = Run {
+            stored: 2,
+            chunks: vec![(2, 9), (3, 0), (4, 0)],
+        };
+        let got = answer_block(&run, 9, Some((0, 2)));
+        assert!(got[0].unchanged, "held at the current seq");
+        assert_eq!(
+            got[1].body,
+            ChunkBody::Segment {
+                block: 0,
+                segment: 1
+            }
+        );
+        assert_eq!(got[2].body, ChunkBody::Hole);
+        let none = answer_block(&run, 10, None);
+        assert!(
+            none.iter()
+                .all(|c| c.body == ChunkBody::Hole && !c.unchanged)
+        );
     }
 }
