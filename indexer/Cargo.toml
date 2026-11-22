@@ -1,0 +1,11 @@
+[package]
+name = "raft5fs-indexer"
+description = "Search indexing for native clients: the text of files that raft5fs-search can't read alone (PDF)."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+raft5fs-client = { workspace = true }
+raft5fs-search = { workspace = true }
+pdf-extract = "0.9"
+tokio = { workspace = true }

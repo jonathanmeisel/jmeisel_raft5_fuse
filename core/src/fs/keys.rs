@@ -260,7 +260,7 @@ impl FsCore {
             grants::put_grant(&txn, user, grant).await?;
             let record = raft5fs_proto::types::VolumeInfo {
                 owner: Some(user.to_string()),
-                offer: None,
+                ..Default::default()
             };
             txn.write(
                 &crate::layout::volume_key(new.ino),

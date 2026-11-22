@@ -24,6 +24,8 @@ raft5fs-client = { workspace = true }
 raft5fs-crypto = { workspace = true }
 raft5fs-fuse = { workspace = true, optional = true }
 raft5fs-proto = { workspace = true }
+raft5fs-search = { workspace = true }
+raft5fs-indexer = { workspace = true }
 raft5fs-webdav = { workspace = true, optional = true }
 tokio = { workspace = true }
 toml = "1"

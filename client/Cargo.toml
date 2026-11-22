@@ -11,6 +11,7 @@ http-body = "1"
 raft5fs-crypto = { workspace = true }
 raft5fs-objstore = { workspace = true }
 raft5fs-proto = { workspace = true }
+raft5fs-search = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "1"
@@ -38,3 +39,4 @@ wasm-bindgen-futures = "0.4"
 [dev-dependencies]
 raft5fs-testkit = { workspace = true }
 raft5fs-core = { workspace = true }
+raft5fs-search = { workspace = true }

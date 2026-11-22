@@ -11,6 +11,7 @@ mod link;
 mod mount;
 mod profile;
 mod prune;
+mod search;
 mod share;
 mod volume;
 #[cfg(feature = "webdav")]
@@ -21,10 +22,12 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use raft5fs_client::cli::{Context, Overrides, parse_size, password_from};
+use raft5fs_client::indexer::IndexerConfig;
 use raft5fs_client::pruner::PrunerConfig;
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::SessionConfig;
 use raft5fs_client::vault::Vault;
+use raft5fs_indexer::Native;
 use tokio::runtime::Runtime;
 
 #[derive(Parser)]
@@ -156,6 +159,10 @@ pub enum Command {
     Pending,
     /// Prune old key versions: what is queued, or the given directories.
     Prune(prune::PruneArgs),
+    /// Index volumes for search now, or show how far indexing got.
+    Index(search::IndexArgs),
+    /// Search the volumes you can read that have an index.
+    Search(search::SearchArgs),
     /// List profiles, or show one.
     #[command(subcommand)]
     Profile(profile::ProfileCommand),
@@ -188,6 +195,8 @@ pub fn run(cli: Cli) -> i32 {
         Command::ResetVersions => share::reset_versions(&cli.connect),
         Command::Pending => share::pending(&cli.connect),
         Command::Prune(args) => prune::run(&cli.connect, args),
+        Command::Index(args) => search::index(&cli.connect, args),
+        Command::Search(args) => search::search(&cli.connect, args),
         Command::Profile(command) => profile::run(command),
     };
     match result {
@@ -228,6 +237,19 @@ pub struct SessionArgs {
     /// waits for a prune that this account can write (see `raft5fs prune`).
     #[arg(long)]
     pub no_background_prune: bool,
+    /// Do not index volumes for search in the background (see `raft5fs
+    /// index`). On by default, except on Android.
+    #[arg(long, conflicts_with = "background_index")]
+    pub no_background_index: bool,
+    /// Index volumes for search in the background, where that is off by
+    /// default (Android).
+    #[arg(long)]
+    pub background_index: bool,
+    /// A volume, as your root shows it, that this device does not index
+    /// (others still may). Can be given more than once; adds to the
+    /// profile's `index_skip`.
+    #[arg(long = "index-skip", value_name = "VOLUME")]
+    pub index_skip: Vec<String>,
 }
 
 impl SessionArgs {
@@ -249,6 +271,19 @@ impl SessionArgs {
         }
         if !self.no_background_prune {
             config.prune = Some(PrunerConfig::default());
+        }
+        // Indexing reads every file and is slow on a phone, so there it
+        // waits to be asked for.
+        let by_default = !cfg!(target_os = "android");
+        if self.background_index || (by_default && !self.no_background_index) {
+            let mut skip = ctx.index_skip.clone();
+            skip.extend(self.index_skip.iter().cloned());
+            let index = IndexerConfig {
+                device: search::device_name(),
+                skip,
+                ..IndexerConfig::default()
+            };
+            config.index = Some((index, Arc::new(Native)));
         }
         Ok(config)
     }

@@ -17,7 +17,7 @@ mod wire;
 /// clients to agree, so that a client can refuse a server older than it
 /// needs with a clear message. Servers and the web app are released apart,
 /// so they can drift.
-pub const PROTOCOL: u32 = 11;
+pub const PROTOCOL: u32 = 12;
 
 /// The protocol version that first has each feature. A client checks the
 /// servers' version before it uses one, so older servers give a clear
@@ -41,6 +41,8 @@ pub mod since {
     pub const SHARED_PRUNING: u32 = 10;
     /// Invitations that check keys, and introductions.
     pub const INVITE_TRUST: u32 = 11;
+    /// Claims on indexing a volume for search, and the owner's switch.
+    pub const SEARCH_INDEX: u32 = 12;
 }
 
 /// Generated wire types and the tonic client and server.

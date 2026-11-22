@@ -179,6 +179,10 @@ pub struct Profile {
     /// behind a private CA, such as a MinIO deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_ca: Option<PathBuf>,
+    /// For `mount` and `webdav`: volumes, as the root shows them, that this
+    /// device does not index for search (others still may).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_skip: Vec<String>,
 }
 
 impl Profile {
@@ -305,6 +309,8 @@ pub struct Context {
     /// The object store's extra CA certificate, in PEM, if the profile
     /// names one.
     pub object_ca: Option<Vec<u8>>,
+    /// Volumes this device does not index (`Profile::index_skip`).
+    pub index_skip: Vec<String>,
 }
 
 impl Context {
@@ -378,6 +384,7 @@ impl Context {
             ca_id,
             known_keys,
             cache_size: profile.cache_size,
+            index_skip: profile.index_skip,
             object_ca: profile
                 .object_ca
                 .map(|path| {

@@ -20,6 +20,16 @@ pub trait MaybeSend {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MaybeSend for T {}
 
+/// `Sync` natively, as `MaybeSend` is `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Sync + ?Sized> MaybeSync for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSync for T {}
+
 /// A boxed future, `Send` natively (see `MaybeSend`).
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxFuture<'a, T> = futures_util::future::BoxFuture<'a, T>;

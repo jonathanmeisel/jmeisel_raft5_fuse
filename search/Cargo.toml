@@ -1,0 +1,11 @@
+[package]
+name = "raft5fs-search"
+description = "Search over a volume's files, kept as sealed index files in the volume: records and segments, text extraction, keyword (BM25) ranking and rank fusion. No I/O and no models, so it builds for native clients and for the browser."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+raft5fs-wire = { workspace = true }
+quick-xml = "0.37"
+unicode-segmentation = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }

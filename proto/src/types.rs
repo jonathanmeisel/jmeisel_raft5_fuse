@@ -526,6 +526,8 @@ pub struct VolumeInfo {
     /// A transfer the owner offered and the recipient hasn't answered:
     /// to whom, and when (seconds since the Unix epoch).
     pub offer: Option<(String, u64)>,
+    /// Whether its owner turned search indexing off, for everyone.
+    pub indexing_off: bool,
 }
 
 /// `bytes` as people read it, as in "4.2 GB".
