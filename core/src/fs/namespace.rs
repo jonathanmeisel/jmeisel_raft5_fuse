@@ -628,15 +628,7 @@ impl FsCore {
                 if noreplace {
                     return Ok(Err(FsError::errno(libc::EEXIST)));
                 }
-                let mut victim = decide!(live(victim_ino, next()).ok_or_else(enoent));
-                decide!(check_kind(&victim, moved.attr.kind));
-                victim.mark_deleted();
-                victim.attr.ctime = now;
-                write_entry(&txn, &victim).await?;
-                if victim.attr.kind == Kind::Directory && !is_empty_dir(&txn, victim_ino).await? {
-                    return Ok(Err(FsError::errno(libc::ENOTEMPTY)));
-                }
-                txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
+                decide!(replace_victim(&txn, victim_ino, next(), moved.attr.kind, now).await?);
             }
 
             // The sealed name and key record are for one inode, which must
@@ -652,47 +644,9 @@ impl FsCore {
             if moves && let Err(e) = self.check_move_room(ino, parent, new_parent).await {
                 return Ok(Err(e));
             }
-            // Its name is sealed under the new parent's key, and a stale
-            // node must not look fresh after the move.
-            decide!(self.fresh(&txn, new_parent).await?);
-            decide!(self.fresh(&txn, ino).await?);
-            let mut records = vec![node_keys_key(new_parent)];
-            if moves {
-                records.push(node_keys_key(ino));
-            }
-            let mut records = txn.get_many(&records).await?.into_iter();
-            let (dst_version, _) = decide!(versions_of(new_parent, records.next().flatten()));
-            decide!(check_name_version(
-                new_parent,
-                &sealed.sealed_name,
-                dst_version
-            ));
-            if moves {
-                // Its key moves with it, wrapped again under the new
-                // parent's key.
-                let keys = &sealed.node_keys;
-                let (version, _) = decide!(versions_of(ino, records.next().flatten()));
-                if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
-                    return Ok(Err(FsError::new(
-                        raft5fs_proto::errno::EKEYEXPIRED,
-                        "the moved node's key record must keep its version, under the new parent's",
-                    )));
-                }
-                grants::put_node_keys(&txn, ino, Some(keys)).await?;
-            }
+            decide!(self.move_keys(&txn, sealed, ino, new_parent, moves).await?);
             if moved.attr.kind == Kind::Directory && new_parent != parent {
-                // A directory cannot move below itself, so walk up from the
-                // destination. The walk reads every ancestor, so a rename
-                // at the same time that would close a loop the other way
-                // (and writes one of them) conflicts with this one and
-                // cannot get past it.
-                let mut cur = new_parent;
-                while cur != ROOT_INO {
-                    if cur == ino {
-                        return Ok(Err(FsError::errno(libc::EINVAL)));
-                    }
-                    cur = decide!(live_entry(&txn, cur).await?).parent;
-                }
+                decide!(check_no_loop(&txn, ino, new_parent).await?);
             }
             if new_parent != parent {
                 // A file's parent too: see `create_child`.
@@ -712,24 +666,10 @@ impl FsCore {
         })
         .await??;
         if let Some((old_sealed, kind)) = moved {
-            let mut renamed = activity::change(
-                ActivityOp::Renamed,
-                kind,
-                sealed.ino,
-                new_parent,
-                Some(SealedEntryName {
-                    parent: new_parent,
-                    tag: new_name.as_bytes().to_vec(),
-                    sealed: sealed.sealed_name.clone(),
-                }),
-            );
-            renamed.from = Some(SealedEntryName {
-                parent,
-                tag: name.as_bytes().to_vec(),
-                sealed: old_sealed,
-            });
-            renamed.replaced = replaced.is_some();
-            self.note(caller, renamed).await;
+            let from = (parent, name, old_sealed);
+            let to = (new_parent, new_name);
+            self.note_rename(caller, sealed, from, to, kind, replaced.is_some())
+                .await;
         }
 
         if let Some(victim) = replaced {
@@ -743,6 +683,81 @@ impl FsCore {
             self.count_move(sealed.ino, parent, new_parent).await;
         }
         Ok(replaced)
+    }
+
+    /// The part of `rename` that moves keys, in its transaction:
+    ///
+    /// - The new parent and the moved node must have fresh keys, so a
+    ///   stale node doesn't look fresh after the move.
+    /// - The new name must be sealed under the new parent's current key.
+    /// - A move to another folder takes the node's key record with it,
+    ///   wrapped again under the new parent's key, at the same version.
+    async fn move_keys(
+        &self,
+        txn: &Transaction,
+        sealed: &SealedMove,
+        ino: u64,
+        new_parent: u64,
+        moves: bool,
+    ) -> Result<Result<(), FsError>, KvError> {
+        decide!(self.fresh(txn, new_parent).await?);
+        decide!(self.fresh(txn, ino).await?);
+        let mut records = vec![node_keys_key(new_parent)];
+        if moves {
+            records.push(node_keys_key(ino));
+        }
+        let mut records = txn.get_many(&records).await?.into_iter();
+        let (dst_version, _) = decide!(versions_of(new_parent, records.next().flatten()));
+        decide!(check_name_version(
+            new_parent,
+            &sealed.sealed_name,
+            dst_version
+        ));
+        if moves {
+            let keys = &sealed.node_keys;
+            let (version, _) = decide!(versions_of(ino, records.next().flatten()));
+            if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
+                return Ok(Err(FsError::new(
+                    raft5fs_proto::errno::EKEYEXPIRED,
+                    "the moved node's key record must keep its version, under the new parent's",
+                )));
+            }
+            grants::put_node_keys(txn, ino, Some(keys)).await?;
+        }
+        Ok(Ok(()))
+    }
+
+    /// Records a rename in the activity log: `from` is the old folder,
+    /// tag and sealed name, `to` the new folder and tag.
+    async fn note_rename(
+        &self,
+        caller: &Caller,
+        sealed: &SealedMove,
+        from: (u64, &OsStr, Vec<u8>),
+        to: (u64, &OsStr),
+        kind: Kind,
+        replaced: bool,
+    ) {
+        let (parent, name, old_sealed) = from;
+        let (new_parent, new_name) = to;
+        let mut renamed = activity::change(
+            ActivityOp::Renamed,
+            kind,
+            sealed.ino,
+            new_parent,
+            Some(SealedEntryName {
+                parent: new_parent,
+                tag: new_name.as_bytes().to_vec(),
+                sealed: sealed.sealed_name.clone(),
+            }),
+        );
+        renamed.from = Some(SealedEntryName {
+            parent,
+            tag: name.as_bytes().to_vec(),
+            sealed: old_sealed,
+        });
+        renamed.replaced = replaced;
+        self.note(caller, renamed).await;
     }
 
     /// Does everything after the tombstone: removes the chunks, then the
@@ -807,4 +822,46 @@ impl FsCore {
         }
         Ok(inos.len())
     }
+}
+
+/// The part of `rename` that removes the entry a rename replaces, in its
+/// transaction: `value` is the victim's stored Entry. It must be the same
+/// kind as the moved node, and an empty folder. Its tombstone makes a
+/// later start finish removing it if this server stops first.
+async fn replace_victim(
+    txn: &Transaction,
+    victim_ino: u64,
+    value: Option<Vec<u8>>,
+    moved_kind: Kind,
+    now: SystemTime,
+) -> Result<Result<(), FsError>, KvError> {
+    let mut victim = decide!(live(victim_ino, value).ok_or_else(enoent));
+    decide!(check_kind(&victim, moved_kind));
+    victim.mark_deleted();
+    victim.attr.ctime = now;
+    write_entry(txn, &victim).await?;
+    if victim.attr.kind == Kind::Directory && !is_empty_dir(txn, victim_ino).await? {
+        return Ok(Err(FsError::errno(libc::ENOTEMPTY)));
+    }
+    txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
+    Ok(Ok(()))
+}
+
+/// Refuses (`EINVAL`) to move directory `ino` below itself, by walking up
+/// from `new_parent`. The walk reads every ancestor in the transaction, so
+/// a rename at the same time that would close a loop the other way (and
+/// writes one of them) conflicts with this one and cannot get past it.
+async fn check_no_loop(
+    txn: &Transaction,
+    ino: u64,
+    new_parent: u64,
+) -> Result<Result<(), FsError>, KvError> {
+    let mut cur = new_parent;
+    while cur != ROOT_INO {
+        if cur == ino {
+            return Ok(Err(FsError::errno(libc::EINVAL)));
+        }
+        cur = decide!(live_entry(txn, cur).await?).parent;
+    }
+    Ok(Ok(()))
 }
