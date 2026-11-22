@@ -269,7 +269,7 @@ impl FsCore {
         let mut start = prefix.clone();
         if !after.is_empty() {
             if !after.starts_with(&prefix) {
-                return Err(FsError::new(libc::EINVAL, "that page isn't this folder's"));
+                return Err(FsError::new(errno::EINVAL, "that page isn't this folder's"));
             }
             start = after.to_vec();
             // The next key after it.

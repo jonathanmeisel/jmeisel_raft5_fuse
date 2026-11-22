@@ -46,14 +46,14 @@ impl FsCore {
             && !self.sealed_a_grant_to(caller, user).await?
         {
             return Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 "a public link can only ask for the key of who shared its folder",
             ));
         }
         crate::accounts::get(&self.client, user)
             .await?
             .map(|keys| keys.public_key)
-            .ok_or_else(|| FsError::new(libc::ENOENT, format!("{user} hasn't enrolled")))
+            .ok_or_else(|| FsError::new(errno::ENOENT, format!("{user} hasn't enrolled")))
     }
 
     /// Whether `sender` sealed one of `caller`'s grants, now or in a snapshot,
@@ -115,7 +115,7 @@ impl FsCore {
                 .is_none()
             {
                 return Ok(Err(FsError::new(
-                    libc::ENOENT,
+                    errno::ENOENT,
                     format!("{grantee} hasn't enrolled"),
                 )));
             }
@@ -127,7 +127,7 @@ impl FsCore {
             let (version, _) = decide!(key_versions(&txn, ino).await?);
             if grant.key_version != version {
                 return Ok(Err(FsError::new(
-                    raft5fs_proto::errno::EKEYEXPIRED,
+                    errno::EKEYEXPIRED,
                     format!("a grant must hold the current key version, {version}"),
                 )));
             }
@@ -145,7 +145,7 @@ impl FsCore {
             // client, which saw no grants, expects seq 0.
             if stored_seq != expected_grantees_seq && !others.is_empty() {
                 return Ok(Err(FsError::new(
-                    libc::EAGAIN,
+                    errno::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
                 )));
             }
@@ -153,7 +153,7 @@ impl FsCore {
                 for user in others {
                     if !listed.contains(&user) {
                         return Ok(Err(FsError::new(
-                            libc::EAGAIN,
+                            errno::EAGAIN,
                             format!("{user}'s grant of inode {ino} isn't on the new grantee list"),
                         )));
                     }
@@ -184,7 +184,7 @@ impl FsCore {
                 .await?
                 .value
             else {
-                return Ok(Err(FsError::errno(libc::ENOENT)));
+                return Ok(Err(FsError::errno(errno::ENOENT)));
             };
             let mut grant = decide!(grants::decode_grant(ino, &row));
             grant.sealed_label = sealed_label.to_vec();
@@ -218,7 +218,7 @@ impl FsCore {
             .contains(raft5fs_proto::types::Caps::VOLUMES)
         {
             return Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 "you can't create volumes on this filesystem",
             ));
         }
@@ -236,7 +236,7 @@ impl FsCore {
         let made = run_txn(&self.client, move |txn| async move {
             let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
             if txn.read_one(dirent).await?.value.is_some() {
-                return Ok(Err(FsError::errno(libc::EEXIST)));
+                return Ok(Err(FsError::errno(errno::EEXIST)));
             }
             // No parent key: only grants give a volume's key to users.
             decide!(self.claim(&txn, caller, new, (1, 0)).await?);
@@ -307,7 +307,7 @@ impl FsCore {
                 check_sealed_size("a grant's key", sealed, MAX_SEALED_GRANT)?;
             }
         }
-        let changed = |what: String| Ok(Err(FsError::new(libc::EAGAIN, what)));
+        let changed = |what: String| Ok(Err(FsError::new(errno::EAGAIN, what)));
         run_txn(&self.client, move |txn| async move {
             // Versions that this transaction has changed, for the children
             // that are rotated after their parents.
@@ -323,7 +323,7 @@ impl FsCore {
                     return changed(format!("inode {ino} has key version {version} now"));
                 }
                 let Ok((new_version, new_wrapped_under)) = NodeKeys::versions(&r.node_keys) else {
-                    return Ok(Err(FsError::new(libc::EINVAL, "an unreadable key record")));
+                    return Ok(Err(FsError::new(errno::EINVAL, "an unreadable key record")));
                 };
                 let parent_version = if wrapped_under == 0 {
                     0
@@ -334,7 +334,7 @@ impl FsCore {
                 };
                 if new_version != version + 1 {
                     return Ok(Err(FsError::new(
-                        libc::EINVAL,
+                        errno::EINVAL,
                         format!("inode {ino}'s new key record must be version {}", version + 1),
                     )));
                 }
@@ -397,7 +397,7 @@ impl FsCore {
         self.check_chunk_writes(writes)?;
         if writes.iter().any(|w| w.expected_seq.is_none()) {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "a re-sealed chunk must say the seq it was read at",
             ));
         }
@@ -430,7 +430,7 @@ impl FsCore {
     ) -> Result<(), FsError> {
         if names.len() > RESEAL_NAMES_BATCH {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "more names than one re-seal takes",
             ));
         }
@@ -447,7 +447,7 @@ impl FsCore {
                 let dirent = dirent_key(dir, &n.tag);
                 if named(&txn, &dirent).await? != Some(n.ino) {
                     return Ok(Err(FsError::new(
-                        libc::EAGAIN,
+                        errno::EAGAIN,
                         format!("an entry of inode {dir} changed meanwhile"),
                     )));
                 }
@@ -483,24 +483,24 @@ impl FsCore {
         check_sealed_size("a key record", node_keys, MAX_SEALED_RECORD)?;
         self.guard_now(&self.live(), caller, ino, true).await?;
         let pruned = NodeKeys::decode(node_keys)
-            .map_err(|e| FsError::new(libc::EINVAL, format!("inode {ino}: {e}")))?;
+            .map_err(|e| FsError::new(errno::EINVAL, format!("inode {ino}: {e}")))?;
         let before_bytes = self
             .client
             .read_one(&node_keys_key(ino))
             .await?
             .value
-            .ok_or_else(|| FsError::new(libc::EIO, format!("inode {ino} has no key record")))?;
+            .ok_or_else(|| FsError::new(errno::EIO, format!("inode {ino} has no key record")))?;
         let before = NodeKeys::decode(&before_bytes)
-            .map_err(|e| FsError::new(libc::EIO, format!("inode {ino}: {e}")))?;
+            .map_err(|e| FsError::new(errno::EIO, format!("inode {ino}: {e}")))?;
         if before.version != expected_version {
             return Err(FsError::new(
-                libc::EAGAIN,
+                errno::EAGAIN,
                 format!("inode {ino} has key version {} now", before.version),
             ));
         }
         if !pruned.is_pruning_of(&before) {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("inode {ino}'s new key record isn't its old one cut short"),
             ));
         }
@@ -509,7 +509,7 @@ impl FsCore {
         }
         if let Some(what) = self.sealed_below(ino, pruned.base()).await? {
             return Err(FsError::new(
-                libc::EBUSY,
+                errno::EBUSY,
                 format!(
                     "{what} of inode {ino} is still sealed under a key version before {}",
                     pruned.base()
@@ -520,7 +520,7 @@ impl FsCore {
         run_txn(&self.client, move |txn| async move {
             if txn.read_one(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
                 return Ok(Err(FsError::new(
-                    libc::EAGAIN,
+                    errno::EAGAIN,
                     format!("inode {ino}'s key record changed meanwhile"),
                 )));
             }
@@ -642,7 +642,7 @@ impl FsCore {
         self.guard_now(&self.live(), caller, ino, true).await?;
         if self.resolve(&self.live(), ino).await?.parent != ROOT_INO {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("inode {ino} isn't a volume"),
             ));
         }

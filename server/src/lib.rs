@@ -70,6 +70,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::auth::Signer;
 use crate::timing::Timed;
+use raft5fs_proto::errno;
 
 /// The largest request that the server accepts: one write batch, which is
 /// at most one maximum-size chunk, plus space for framing. This is above
@@ -228,7 +229,7 @@ impl FsService {
         match self.logins.wait(name, address, Instant::now()) {
             None => Ok(()),
             Some(wait) => Err(FsError::new(
-                libc::EBUSY,
+                errno::EBUSY,
                 format!(
                     "too many failed logins: try again in {} seconds",
                     wait.as_secs().max(1)
@@ -391,7 +392,7 @@ fn live_only(snapshot: &str) -> Result<(), FsError> {
     if snapshot.is_empty() {
         Ok(())
     } else {
-        Err(FsError::new(libc::EROFS, "a snapshot is read-only"))
+        Err(FsError::new(errno::EROFS, "a snapshot is read-only"))
     }
 }
 
@@ -459,7 +460,7 @@ impl Fs for FsService {
                 self.logins
                     .failed(&r.username, address, &r.auth, Instant::now());
                 Err(FsError::new(
-                    libc::EACCES,
+                    errno::EACCES,
                     "login refused: the username or password was wrong",
                 ))
             }
@@ -471,7 +472,7 @@ impl Fs for FsService {
     async fn enrol(&self, r: Request<EnrolRequest>) -> Result<Response<EmptyResponse>, Status> {
         let r = r.into_inner();
         let enrolled = match r.keys {
-            None => Err(FsError::new(libc::EINVAL, "an enrolment needs keys")),
+            None => Err(FsError::new(errno::EINVAL, "an enrolment needs keys")),
             Some(keys) => {
                 accounts::enrol(
                     self.core.client(),
@@ -498,7 +499,7 @@ impl Fs for FsService {
             return Ok(Response::new(Err::<(), _>(e).into()));
         }
         let changed = match r.keys {
-            None => Err(FsError::new(libc::EINVAL, "a password change needs keys")),
+            None => Err(FsError::new(errno::EINVAL, "a password change needs keys")),
             Some(keys) => {
                 accounts::change_password(
                     self.core.client(),
@@ -511,7 +512,7 @@ impl Fs for FsService {
         };
         match &changed {
             Ok(()) => self.logins.succeeded(&r.username),
-            Err(e) if e.errno == libc::EACCES => {
+            Err(e) if e.errno == errno::EACCES => {
                 self.logins
                     .failed(&r.username, address, &r.old_auth, Instant::now());
             }
@@ -709,7 +710,7 @@ impl Fs for FsService {
                     )
                     .await
             }
-            None => Err(FsError::new(libc::EINVAL, "a grant request needs a grant")),
+            None => Err(FsError::new(errno::EINVAL, "a grant request needs a grant")),
         };
         Ok(Response::new(granted.into()))
     }
@@ -970,7 +971,7 @@ impl Fs for FsService {
             match self.core.measure().await? {
                 Some(_) => Ok(()),
                 None => Err(FsError::new(
-                    libc::EBUSY,
+                    errno::EBUSY,
                     "another server is measuring now: try again in a minute",
                 )),
             }
@@ -1037,7 +1038,7 @@ impl Fs for FsService {
     ) -> Result<Response<EmptyResponse>, Status> {
         let (caller, r) = self.caller(r).await?;
         let made = match r.keys {
-            None => Err(FsError::new(libc::EINVAL, "a link needs keys")),
+            None => Err(FsError::new(errno::EINVAL, "a link needs keys")),
             Some(keys) => {
                 accounts::create_link(
                     self.core.client(),

@@ -39,6 +39,7 @@ use crate::snapshots;
 use crate::timing::{self, next_key};
 use crate::view::{ReadKeys, View, exactly};
 use raft5fs_proto::clock;
+use raft5fs_proto::errno;
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
@@ -98,7 +99,7 @@ const MAX_SEALED_RECORD: usize = 1 << 20;
 /// these, but they store them on every node, and they count towards nothing.
 fn check_sealed_size(what: &str, sealed: &[u8], max: usize) -> Result<(), FsError> {
     if sealed.len() > max {
-        return Err(FsError::new(libc::EINVAL, format!("{what} is too large")));
+        return Err(FsError::new(errno::EINVAL, format!("{what} is too large")));
     }
     Ok(())
 }
@@ -173,7 +174,7 @@ async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError>
 /// keeps no data there.
 fn no_objects() -> FsError {
     FsError::new(
-        libc::ENOTSUP,
+        errno::ENOTSUP,
         "this filesystem keeps no data in object storage",
     )
 }
@@ -316,7 +317,7 @@ fn check_sealed_and_seq(
     };
     if sealed_under != Some(version) {
         return Err(FsError::new(
-            raft5fs_proto::errno::EKEYEXPIRED,
+            errno::EKEYEXPIRED,
             format!("chunks of inode {ino} must be sealed under key version {version}"),
         ));
     }
@@ -324,7 +325,7 @@ fn check_sealed_and_seq(
         && (seq != expected || (existing && seq == 0))
     {
         return Err(FsError::new(
-            libc::EAGAIN,
+            errno::EAGAIN,
             format!("chunk {} of inode {ino} changed meanwhile", w.index),
         ));
     }
@@ -354,7 +355,7 @@ async fn check_fits(
         Ok(Ok(()))
     } else {
         Ok(Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!(
                 "chunk {} of inode {ino} doesn't fit in a file of {size} bytes",
                 w.index
@@ -372,7 +373,7 @@ fn check_name_version(dir: u64, sealed_name: &[u8], version: u32) -> Result<(), 
         Ok(())
     } else {
         Err(FsError::new(
-            raft5fs_proto::errno::EKEYEXPIRED,
+            errno::EKEYEXPIRED,
             format!("names in inode {dir} must be sealed under key version {version}"),
         ))
     }
@@ -493,15 +494,15 @@ async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
 }
 
 fn enoent() -> FsError {
-    FsError::errno(libc::ENOENT)
+    FsError::errno(errno::ENOENT)
 }
 
 /// Checks that `entry` is of `kind`. Returns the errno for a file used as a
 /// directory, or the reverse.
 fn check_kind(entry: &Entry, kind: Kind) -> Result<(), FsError> {
     match (kind, entry.attr.kind) {
-        (Kind::File, Kind::Directory) => Err(FsError::errno(libc::EISDIR)),
-        (Kind::Directory, Kind::File) => Err(FsError::errno(libc::ENOTDIR)),
+        (Kind::File, Kind::Directory) => Err(FsError::errno(errno::EISDIR)),
+        (Kind::Directory, Kind::File) => Err(FsError::errno(errno::ENOTDIR)),
         _ => Ok(()),
     }
 }
@@ -614,7 +615,7 @@ impl FsCore {
             Ok(View::at(&self.client, id))
         } else {
             Err(FsError::new(
-                libc::ENOENT,
+                errno::ENOENT,
                 format!("no snapshot {}", String::from_utf8_lossy(id)),
             ))
         }
@@ -707,7 +708,7 @@ impl FsCore {
         write: bool,
     ) -> Result<(), FsError> {
         if write && view.is_snapshot() {
-            return Err(FsError::new(libc::EROFS, "a snapshot is read-only"));
+            return Err(FsError::new(errno::EROFS, "a snapshot is read-only"));
         }
         self.guard(view, caller, ino, write).await?
     }
@@ -718,12 +719,12 @@ impl FsCore {
     fn check_entry_name(name: &OsStr, sealed_name: &[u8]) -> Result<(), FsError> {
         if name.len() != TAG_LEN || sealed_name.is_empty() {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "a name here must be a tag, with the real name sealed",
             ));
         }
         if sealed_name.len() > MAX_SEALED_NAME {
-            return Err(FsError::new(libc::ENAMETOOLONG, "that name is too long"));
+            return Err(FsError::new(errno::ENAMETOOLONG, "that name is too long"));
         }
         Ok(())
     }
@@ -733,7 +734,7 @@ impl FsCore {
     fn check_chunk_writes(&self, writes: &[ChunkWrite]) -> Result<(), FsError> {
         if writes.len() > chunks_per_batch(self.chunk_size) {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "more chunks than one write takes",
             ));
         }
@@ -742,7 +743,7 @@ impl FsCore {
             match &w.body {
                 WriteBody::Inline(blob) if blob.len() > largest => {
                     return Err(FsError::new(
-                        libc::EINVAL,
+                        errno::EINVAL,
                         "a sealed chunk larger than a chunk",
                     ));
                 }
@@ -838,7 +839,7 @@ mod tests {
                 None,
                 false
             )),
-            Err(raft5fs_proto::errno::EKEYEXPIRED)
+            Err(errno::EKEYEXPIRED)
         );
         // An expected seq must still be the chunk's.
         let expects = block_write(3, Some(5));
@@ -848,7 +849,7 @@ mod tests {
         );
         assert_eq!(
             errno(check_sealed_and_seq(7, &expects, 3, Some(6), false)),
-            Err(libc::EAGAIN)
+            Err(errno::EAGAIN)
         );
         // A re-seal needs the chunk to exist; a write expecting none doesn't.
         let none = block_write(3, Some(0));
@@ -858,7 +859,7 @@ mod tests {
         );
         assert_eq!(
             errno(check_sealed_and_seq(7, &none, 3, Some(0), true)),
-            Err(libc::EAGAIN)
+            Err(errno::EAGAIN)
         );
     }
 }

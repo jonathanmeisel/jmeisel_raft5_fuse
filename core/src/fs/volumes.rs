@@ -49,7 +49,7 @@ pub(crate) fn encode_volume(v: &VolumeInfo) -> Vec<u8> {
 }
 
 pub(crate) fn decode_volume(ino: u64, bytes: &[u8]) -> Result<VolumeInfo, FsError> {
-    let garbled = || FsError::new(libc::EIO, format!("volume {ino}'s record is garbled"));
+    let garbled = || FsError::new(errno::EIO, format!("volume {ino}'s record is garbled"));
     let mut rest = bytes;
     let mut take = |n: usize| -> Result<&[u8], FsError> {
         let (head, tail) = rest.split_at_checked(n).ok_or_else(garbled)?;
@@ -100,7 +100,7 @@ pub(crate) async fn check_owner_kept(
     let record = decide!(volume_of(txn, ino).await?);
     Ok(if record.and_then(|v| v.owner).as_deref() == Some(user) {
         Err(FsError::new(
-            libc::EPERM,
+            errno::EPERM,
             format!("{user} owns this volume, so keeps read-write access to it: transfer it first"),
         ))
     } else {
@@ -147,7 +147,7 @@ async fn writes_at(
 /// Volume `ino`'s record, in `txn`; `EINVAL` if `ino` isn't a volume.
 async fn record_of(txn: &Transaction, ino: u64) -> Result<Result<VolumeInfo, FsError>, KvError> {
     Ok(decide!(volume_of(txn, ino).await?)
-        .ok_or_else(|| FsError::new(libc::EINVAL, format!("inode {ino} isn't a volume"))))
+        .ok_or_else(|| FsError::new(errno::EINVAL, format!("inode {ino} isn't a volume"))))
 }
 
 impl FsCore {
@@ -157,7 +157,7 @@ impl FsCore {
         self.guard_now(&view, caller, ino, false).await?;
         if self.resolve(&view, ino).await?.parent != ROOT_INO {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("inode {ino} isn't a volume"),
             ));
         }
@@ -168,11 +168,11 @@ impl FsCore {
     /// read-write access to it. Replaces any offer made before.
     pub async fn offer_volume(&self, caller: &Caller, ino: u64, to: &str) -> Result<(), FsError> {
         if to == caller.user {
-            return Err(FsError::new(libc::EINVAL, "it is yours already"));
+            return Err(FsError::new(errno::EINVAL, "it is yours already"));
         }
         if to.starts_with(LINK_PREFIX) {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "a public link can't own a volume",
             ));
         }
@@ -184,13 +184,13 @@ impl FsCore {
                 || !decide!(writes_at(&txn, ino, &caller.user).await?)
             {
                 return Ok(Err(FsError::new(
-                    libc::EPERM,
+                    errno::EPERM,
                     "only the volume's owner can give it away",
                 )));
             }
             if !decide!(writes_at(&txn, ino, to).await?) {
                 return Ok(Err(FsError::new(
-                    libc::EPERM,
+                    errno::EPERM,
                     format!("{to} needs read-write access to it first: share it with them"),
                 )));
             }
@@ -209,12 +209,12 @@ impl FsCore {
             let mut record = decide!(record_of(&txn, ino).await?);
             if record.owner.as_deref() != Some(caller.user.as_str()) {
                 return Ok(Err(FsError::new(
-                    libc::EPERM,
+                    errno::EPERM,
                     "only the volume's owner can withdraw its offer",
                 )));
             }
             if record.offer.take().is_none() {
-                return Ok(Err(FsError::new(libc::ENOENT, "there is no offer")));
+                return Ok(Err(FsError::new(errno::ENOENT, "there is no offer")));
             }
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
@@ -239,7 +239,7 @@ impl FsCore {
                 Ok(())
             } else {
                 Err(FsError::new(
-                    libc::ENOENT,
+                    errno::ENOENT,
                     "this volume isn't offered to you",
                 ))
             }
@@ -262,7 +262,7 @@ impl FsCore {
             let old = if accept {
                 if !decide!(writes_at(&txn, ino, &caller.user).await?) {
                     return Ok(Err(FsError::new(
-                        libc::EPERM,
+                        errno::EPERM,
                         "you need read-write access to it, to own it",
                     )));
                 }
@@ -385,7 +385,7 @@ impl FsCore {
             let mut record = decide!(record_of(&txn, ino).await?);
             if !decide!(writes_at(&txn, ino, user).await?) || user.starts_with(LINK_PREFIX) {
                 return Ok(Err(FsError::new(
-                    libc::EPERM,
+                    errno::EPERM,
                     format!("{user} has no read-write access to it, so can't own it"),
                 )));
             }
@@ -468,7 +468,7 @@ mod tests {
             decode_volume(9, &bytes[..bytes.len() - 1])
                 .unwrap_err()
                 .errno,
-            libc::EIO
+            errno::EIO
         );
     }
 }

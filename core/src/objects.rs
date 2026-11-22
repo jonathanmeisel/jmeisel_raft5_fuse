@@ -24,6 +24,7 @@ use raft5fs_proto::types::{BlockRef, ChunkWrite, FsError, Layout, ObjectGrid, Wr
 use crate::fs::{TXN_TTL, run_txn};
 use crate::layout::{OBJECT_GRID_KEY, chunk_key};
 use crate::view::ReadKeys;
+use raft5fs_proto::errno;
 
 pub const DEFAULT_OBJECT_FROM: u64 = 10 << 20;
 pub const DEFAULT_OBJECT_BLOCK: u64 = 16 << 20;
@@ -198,13 +199,13 @@ pub(crate) fn check_placement(
     grid: Option<ObjectGrid>,
     w: &ChunkWrite,
 ) -> Result<(), FsError> {
-    let invalid = |why: String| Err(FsError::new(libc::EINVAL, format!("inode {ino}: {why}")));
+    let invalid = |why: String| Err(FsError::new(errno::EINVAL, format!("inode {ino}: {why}")));
     let grid = match (layout, grid) {
         (Layout::Inline, _) => None,
         (Layout::Hybrid, Some(grid)) => Some(grid),
         (Layout::Hybrid, None) => {
             return Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!("inode {ino} is hybrid, but no object grid is recorded"),
             ));
         }
@@ -245,7 +246,7 @@ pub(crate) fn check_minted(
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             "the block's name wasn't minted recently enough to commit; upload it again",
         ))
     }
@@ -313,17 +314,17 @@ mod tests {
         ok(Layout::Hybrid, write(6, block(1))).unwrap();
         ok(Layout::Inline, write(2, inline())).unwrap();
 
-        assert_eq!(errno(Layout::Hybrid, write(2, inline())), libc::EINVAL);
-        assert_eq!(errno(Layout::Hybrid, write(1, block(1))), libc::EINVAL);
-        assert_eq!(errno(Layout::Hybrid, write(3, block(1))), libc::EINVAL);
-        assert_eq!(errno(Layout::Hybrid, write(2, block(5))), libc::EINVAL);
-        assert_eq!(errno(Layout::Hybrid, write(2, block(0))), libc::EINVAL);
-        assert_eq!(errno(Layout::Inline, write(2, block(1))), libc::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(2, inline())), errno::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(1, block(1))), errno::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(3, block(1))), errno::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(2, block(5))), errno::EINVAL);
+        assert_eq!(errno(Layout::Hybrid, write(2, block(0))), errno::EINVAL);
+        assert_eq!(errno(Layout::Inline, write(2, block(1))), errno::EINVAL);
         assert_eq!(
             check_placement(9, Layout::Hybrid, None, &write(0, inline()))
                 .unwrap_err()
                 .errno,
-            libc::EIO
+            errno::EIO
         );
     }
 

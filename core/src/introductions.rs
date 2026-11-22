@@ -22,6 +22,7 @@ use crate::grants::Reads;
 use crate::layout::INTRODUCTIONS_PREFIX;
 use crate::timing::next_key;
 use raft5fs_proto::clock;
+use raft5fs_proto::errno;
 
 /// How long an introduction waits for its recipient: long enough for them
 /// to come back from a trip, and to mark the introducer (see the client's
@@ -76,7 +77,7 @@ pub async fn put(
     refuse_link(introducer)?;
     if introductions.len() > MAX_INTRODUCTIONS {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!("at most {MAX_INTRODUCTIONS} introductions at once"),
         ));
     }
@@ -85,13 +86,16 @@ pub async fn put(
         check_username(&i.subject)?;
         if i.sealed.is_empty() || i.sealed.len() > MAX_INTRODUCTION_BYTES {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 "an introduction of the wrong size",
             ));
         }
         // A link has no one to vouch for it, and checks nobody.
         if i.subject.starts_with(LINK_PREFIX) || i.recipient.starts_with(LINK_PREFIX) {
-            return Err(FsError::new(libc::EINVAL, "a public link isn't introduced"));
+            return Err(FsError::new(
+                errno::EINVAL,
+                "a public link isn't introduced",
+            ));
         }
     }
     let made = clock::now_secs().to_be_bytes();
@@ -144,7 +148,7 @@ pub async fn delete(
 ) -> Result<(), FsError> {
     if which.len() > MAX_INTRODUCTIONS {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!("at most {MAX_INTRODUCTIONS} introductions at once"),
         ));
     }

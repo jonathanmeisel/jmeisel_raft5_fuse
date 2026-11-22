@@ -35,7 +35,7 @@ impl FsCore {
             Layout::Inline => None,
             Layout::Hybrid => Some(self.grid.ok_or_else(|| {
                 FsError::new(
-                    libc::EIO,
+                    errno::EIO,
                     format!("inode {ino} is hybrid, but no object grid is recorded"),
                 )
             })?),
@@ -91,7 +91,7 @@ impl FsCore {
                 Ok(Some((blocks.len() as u32 - 1, block.nseg)))
             }
             Some(ChunkValue::Inline(_)) => Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!("inode {ino}: a sealed chunk where block {stored} belongs"),
             )),
         }
@@ -109,13 +109,13 @@ impl FsCore {
     ) -> Result<String, FsError> {
         if !objects_ok {
             return Err(FsError::new(
-                libc::ENOTSUP,
+                errno::ENOTSUP,
                 format!("inode {ino} keeps data in object storage, which this client can't read"),
             ));
         }
         let Some(objects) = &self.objects else {
             return Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!("inode {ino} keeps data in object storage, which this server can't reach"),
             ));
         };
@@ -141,7 +141,7 @@ impl FsCore {
         };
         if blocks.len() > MAX_UPLOADS {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("at most {MAX_UPLOADS} blocks at a time"),
             ));
         }
@@ -151,7 +151,7 @@ impl FsCore {
         check_kind(&entry, Kind::File)?;
         if entry.attr.layout != Layout::Hybrid {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("inode {ino} keeps nothing in object storage"),
             ));
         }
@@ -171,13 +171,13 @@ impl FsCore {
             .map(|b| {
                 if !grid.in_blocks(b.index) || grid.block_start(b.index) != b.index {
                     return Err(FsError::new(
-                        libc::EINVAL,
+                        errno::EINVAL,
                         format!("no block starts at chunk {}", b.index),
                     ));
                 }
                 if b.nseg == 0 || b.nseg > grid.per_block {
                     return Err(FsError::new(
-                        libc::EINVAL,
+                        errno::EINVAL,
                         format!(
                             "a block holds 1 to {} segments, not {}",
                             grid.per_block, b.nseg
@@ -216,7 +216,7 @@ impl FsCore {
         };
         Ok(match ChunkValue::decode(value) {
             ChunkValue::Inline(blob) if plain_len(&blob) > keep => Err(FsError::new(
-                libc::EAGAIN,
+                errno::EAGAIN,
                 format!("chunk {index} of inode {ino} holds more than a truncate keeps"),
             )),
             _ => Ok(()),
@@ -474,7 +474,7 @@ fn answer_inline(ino: u64, run: &Run, read: raft5_client::Entry) -> Result<Seale
         Some(ChunkValue::Inline(blob)) => ChunkBody::Inline(blob),
         Some(ChunkValue::Block(_)) => {
             return Err(FsError::new(
-                libc::EIO,
+                errno::EIO,
                 format!("inode {ino}: a block pointer where chunk {index} belongs"),
             ));
         }

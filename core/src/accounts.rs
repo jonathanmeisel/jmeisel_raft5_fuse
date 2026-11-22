@@ -46,6 +46,7 @@ use crate::layout::{
 use crate::timing::next_key;
 use crate::view::{ReadKeys, exactly};
 use raft5fs_proto::clock;
+use raft5fs_proto::errno;
 use raft5fs_proto::types::{
     AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
     UserEntry,
@@ -98,7 +99,7 @@ pub async fn enrollment(client: &Client, user: &str) -> Result<(Vec<u8>, Vec<u8>
         let [keys, proof] = exactly(txn.read_many(&[keys_key(user), proof_key(user)]).await?);
         let Some(keys) = keys.value else {
             return Ok(Err(FsError::new(
-                libc::ENOENT,
+                errno::ENOENT,
                 format!("{user} hasn't enrolled"),
             )));
         };
@@ -127,7 +128,7 @@ pub async fn pins(client: &Client, user: &str) -> Result<(u64, Vec<u8>), FsError
 /// or use it to store things.
 pub(crate) fn refuse_link(user: &str) -> Result<(), FsError> {
     if user.starts_with(LINK_PREFIX) {
-        return Err(FsError::new(libc::EACCES, "a public link can only read"));
+        return Err(FsError::new(errno::EACCES, "a public link can only read"));
     }
     Ok(())
 }
@@ -143,7 +144,7 @@ pub async fn put_pins(
 ) -> Result<u64, FsError> {
     refuse_link(user)?;
     if sealed.len() > MAX_PINS_BYTES {
-        return Err(FsError::new(libc::EINVAL, "too many trusted keys"));
+        return Err(FsError::new(errno::EINVAL, "too many trusted keys"));
     }
     run_txn(client, |txn| async move {
         let current = match txn.read_one(&pins_key(user)).await?.value {
@@ -152,7 +153,7 @@ pub async fn put_pins(
         };
         if current != expected {
             return Ok(Err(FsError::new(
-                libc::EAGAIN,
+                errno::EAGAIN,
                 "the trusted keys changed in the meantime",
             )));
         }
@@ -169,7 +170,7 @@ pub async fn put_pins(
 fn decode_pins(user: &str, stored: &[u8]) -> Result<(u64, Vec<u8>), FsError> {
     let (version, sealed) = stored.split_first_chunk::<8>().ok_or_else(|| {
         FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("the trusted keys stored for {user:?} are garbled"),
         )
     })?;
@@ -208,7 +209,7 @@ fn encode_info(info: &AccountInfo) -> Vec<u8> {
 fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
     let garbled = || {
         FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("the account record stored for {user:?} is garbled"),
         )
     };
@@ -300,7 +301,7 @@ fn encode(keys: &AccountKeys) -> Vec<u8> {
 fn decode(user: &str, mut bytes: &[u8]) -> Result<AccountKeys, FsError> {
     let garbled = || {
         FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("the account keys stored for {user:?} are garbled"),
         )
     };
@@ -331,7 +332,7 @@ fn decode(user: &str, mut bytes: &[u8]) -> Result<AccountKeys, FsError> {
 fn validate(keys: &AccountKeys) -> Result<(), FsError> {
     let bad = |what: &str| {
         Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!("bad account keys: {what}"),
         ))
     };
@@ -424,7 +425,7 @@ pub async fn issue_code(client: &Client, user: &str) -> Result<String, FsError> 
 fn refuse_link_name(user: &str) -> Result<(), FsError> {
     if user.starts_with(LINK_PREFIX) {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!("names that start with {LINK_PREFIX} are for public links"),
         ));
     }
@@ -457,17 +458,17 @@ pub async fn create_link(
     crate::grants::check_username(user)?;
     if !user.starts_with(LINK_PREFIX) {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             format!("a link's name starts with {LINK_PREFIX}"),
         ));
     }
     validate(keys)?;
     if note.len() > MAX_LINK_NOTE {
-        return Err(FsError::new(libc::EINVAL, "the link's note is too long"));
+        return Err(FsError::new(errno::EINVAL, "the link's note is too long"));
     }
     let now = clock::now_secs();
     if expires.is_some_and(|at| at <= now) {
-        return Err(FsError::new(libc::EINVAL, "the link would expire at once"));
+        return Err(FsError::new(errno::EINVAL, "the link would expire at once"));
     }
     for stale in links_of(client, owner).await? {
         if stale.info.created + LINK_SETUP_GRACE < now
@@ -494,7 +495,7 @@ pub async fn create_link(
             let mine = decide!(info_in(&txn, owner).await?).unwrap_or_default();
             if mine.kind != AccountKind::Person || !mine.caps.contains(Caps::LINKS) {
                 return Ok(Err(FsError::new(
-                    libc::EACCES,
+                    errno::EACCES,
                     "you can't make public links on this filesystem",
                 )));
             }
@@ -503,7 +504,7 @@ pub async fn create_link(
                 || txn.read_one(&info_key(user)).await?.value.is_some();
             if taken {
                 return Ok(Err(FsError::new(
-                    libc::EEXIST,
+                    errno::EEXIST,
                     format!("the name {user} is taken"),
                 )));
             }
@@ -560,7 +561,7 @@ pub(crate) async fn check_link_grant(
         Ok(())
     } else {
         Err(FsError::new(
-            libc::EPERM,
+            errno::EPERM,
             "a public link can only be shared by its maker, read-only, with its own folder",
         ))
     })
@@ -658,7 +659,7 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
             || txn.read_one(&code_key(user)).await?.value.is_some();
         if !exists {
             return Ok(Err(FsError::new(
-                libc::ENOENT,
+                errno::ENOENT,
                 format!("there is no user {user}"),
             )));
         }
@@ -704,7 +705,7 @@ pub async fn admin_set_quota(
 fn refuse_link_quota(user: &str) -> Result<(), FsError> {
     if user.starts_with(LINK_PREFIX) {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             "a public link owns nothing, so has no quota",
         ));
     }
@@ -722,7 +723,7 @@ async fn change_info(
         || txn.read_one(&code_key(user)).await?.value.is_some();
     if !exists {
         return Ok(Err(FsError::new(
-            libc::ENOENT,
+            errno::ENOENT,
             format!("there is no user {user}"),
         )));
     }
@@ -743,7 +744,7 @@ async fn require_admin(txn: &Transaction, caller: &str) -> Result<Result<(), FsE
             Ok(())
         } else {
             Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 "only administrators can manage users",
             ))
         },
@@ -772,7 +773,7 @@ pub async fn issue_invite(
                 || txn.read_one(&info_key(user)).await?.value.is_some();
             if taken {
                 return Ok(Err(FsError::new(
-                    libc::EEXIST,
+                    errno::EEXIST,
                     format!("the name {user} is taken"),
                 )));
             }
@@ -812,7 +813,7 @@ pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result
                 || txn.read_one(&code_key(user)).await?.value.is_some();
             if !exists {
                 return Ok(Err(FsError::new(
-                    libc::ENOENT,
+                    errno::ENOENT,
                     format!("there is no user {user}"),
                 )));
             }
@@ -837,13 +838,13 @@ pub async fn admin_set_caps(
 ) -> Result<AccountInfo, FsError> {
     if user == caller && off.contains(Caps::ADMIN) {
         return Err(FsError::new(
-            libc::EPERM,
+            errno::EPERM,
             "you can't take away your own admin capability",
         ));
     }
     if user.starts_with(LINK_PREFIX) {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             "a public link has no capabilities",
         ));
     }
@@ -853,7 +854,7 @@ pub async fn admin_set_caps(
             || txn.read_one(&code_key(user)).await?.value.is_some();
         if !exists {
             return Ok(Err(FsError::new(
-                libc::ENOENT,
+                errno::ENOENT,
                 format!("there is no user {user}"),
             )));
         }
@@ -872,14 +873,14 @@ pub async fn admin_set_caps(
 /// `ENOENT` if there was nothing to remove.
 pub async fn admin_remove(client: &Client, caller: &str, user: &str) -> Result<(), FsError> {
     if user == caller {
-        return Err(FsError::new(libc::EPERM, "you can't remove yourself"));
+        return Err(FsError::new(errno::EPERM, "you can't remove yourself"));
     }
     is_admin(client, caller).await?;
     if remove(client, user).await? {
         Ok(())
     } else {
         Err(FsError::new(
-            libc::ENOENT,
+            errno::ENOENT,
             format!("there is no user {user}"),
         ))
     }
@@ -925,7 +926,7 @@ pub async fn enrol(
     crate::grants::check_username(user)?;
     if invite_proof.len() > MAX_INVITE_PROOF {
         return Err(FsError::new(
-            libc::EINVAL,
+            errno::EINVAL,
             "an invitation proof of the wrong size",
         ));
     }
@@ -938,14 +939,14 @@ pub async fn enrol(
             let issued = txn.read_one(&code_key(user)).await?.value;
             let Some(issued) = issued.filter(|i| i.get(..32) == Some(hash.as_slice())) else {
                 return Ok(Err(FsError::new(
-                    libc::EACCES,
+                    errno::EACCES,
                     format!("no such enrolment code for {user}"),
                 )));
             };
             let expires = code_expires(&issued);
             if expires != 0 && expires < clock::now_secs() {
                 return Ok(Err(FsError::new(
-                    libc::EACCES,
+                    errno::EACCES,
                     format!("{user}'s invitation has expired: ask an admin for a new one"),
                 )));
             }
@@ -1013,13 +1014,13 @@ pub async fn change_password(
             };
             let Some(current) = current.filter(|c| check_verifier(old_auth, &c.verifier)) else {
                 return Ok(Err(FsError::new(
-                    libc::EACCES,
+                    errno::EACCES,
                     "the username or old password was wrong",
                 )));
             };
             if current.public_key != keys.public_key {
                 return Ok(Err(FsError::new(
-                    libc::EINVAL,
+                    errno::EINVAL,
                     "a password change can't replace the key pair",
                 )));
             }
@@ -1127,11 +1128,11 @@ mod tests {
         let bytes = encode(&k);
         assert_eq!(
             decode("u", &bytes[..bytes.len() - 1]).unwrap_err().errno,
-            libc::EIO
+            errno::EIO
         );
         let mut longer = bytes.clone();
         longer.push(0);
-        assert_eq!(decode("u", &longer).unwrap_err().errno, libc::EIO);
+        assert_eq!(decode("u", &longer).unwrap_err().errno, errno::EIO);
     }
 
     #[test]
@@ -1158,13 +1159,13 @@ mod tests {
             decode_info("u", &bytes[..bytes.len() - 1])
                 .unwrap_err()
                 .errno,
-            libc::EIO
+            errno::EIO
         );
         let mut other_version = bytes.clone();
         other_version[0] = 2;
         assert_eq!(
             decode_info("u", &other_version).unwrap_err().errno,
-            libc::EIO
+            errno::EIO
         );
     }
 
@@ -1178,7 +1179,7 @@ mod tests {
         let mut bad_params = keys();
         bad_params.kdf_params = vec![0; 5];
         for k in [short_salt, no_private, bad_params] {
-            assert_eq!(validate(&k).unwrap_err().errno, libc::EINVAL);
+            assert_eq!(validate(&k).unwrap_err().errno, errno::EINVAL);
         }
     }
 }

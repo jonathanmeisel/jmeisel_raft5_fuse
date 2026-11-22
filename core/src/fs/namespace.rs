@@ -47,7 +47,7 @@ impl FsCore {
         );
         let dir = live(parent, dir.value).ok_or_else(enoent)?;
         if dir.attr.kind != Kind::Directory {
-            return Err(FsError::errno(libc::ENOTDIR));
+            return Err(FsError::errno(errno::ENOTDIR));
         }
         let Some(bytes) = dirent.value else {
             return Err(enoent());
@@ -87,7 +87,7 @@ impl FsCore {
         self.guard_now(&view, caller, ino, false).await?;
         let entry = self.resolve(&view, ino).await?;
         if entry.attr.kind != Kind::Directory {
-            return Err(FsError::errno(libc::ENOTDIR));
+            return Err(FsError::errno(errno::ENOTDIR));
         }
 
         let mut items = vec![
@@ -293,7 +293,7 @@ impl FsCore {
             );
             let mut dir = decide!(dir_entry(parent, dir.value));
             if taken.value.is_some() {
-                return Ok(Err(FsError::errno(libc::EEXIST)));
+                return Ok(Err(FsError::errno(errno::EEXIST)));
             }
             let (parent_version, _) = decide!(versions_of(parent, record.value));
             decide!(check_name_version(parent, &new.sealed_name, parent_version));
@@ -357,8 +357,7 @@ impl FsCore {
         ino: u64,
         made: Result<T, FsError>,
     ) -> Result<T, FsError> {
-        let retry =
-            |e: &FsError| e.errno == raft5fs_proto::errno::EKEYEXPIRED || e.errno == libc::EAGAIN;
+        let retry = |e: &FsError| e.errno == errno::EKEYEXPIRED || e.errno == errno::EAGAIN;
         if made.as_ref().is_err_and(|e| !retry(e)) {
             let user = caller.user.as_bytes();
             let key = &reservation_key(ino);
@@ -441,12 +440,12 @@ impl FsCore {
             != Some(user.as_bytes())
         {
             return Ok(Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 format!("inode {} isn't reserved for {user}", new.ino),
             )));
         }
         if existing.value.is_some() {
-            return Ok(Err(FsError::errno(libc::EEXIST)));
+            return Ok(Err(FsError::errno(errno::EEXIST)));
         }
         match NodeKeys::versions(&new.keys) {
             Ok(found) if found == versions => {}
@@ -454,7 +453,7 @@ impl FsCore {
             // Fetching the key again fixes that.
             _ => {
                 return Ok(Err(FsError::new(
-                    raft5fs_proto::errno::EKEYEXPIRED,
+                    errno::EKEYEXPIRED,
                     format!(
                         "a new node's key record must be version {} under parent version {}",
                         versions.0, versions.1
@@ -532,7 +531,7 @@ impl FsCore {
             // check fails, dropping the transaction undoes it.
             write_entry(&txn, &entry).await?;
             if kind == Kind::Directory && !is_empty_dir(&txn, ino).await? {
-                return Ok(Err(FsError::errno(libc::ENOTEMPTY)));
+                return Ok(Err(FsError::errno(errno::ENOTEMPTY)));
             }
             txn.write(dirent, None).await?;
             txn.write(&tombstone_key(ino), Some(&[1])).await?;
@@ -626,7 +625,7 @@ impl FsCore {
             let now = SystemTime::now();
             if let Some(victim_ino) = victim_ino {
                 if noreplace {
-                    return Ok(Err(FsError::errno(libc::EEXIST)));
+                    return Ok(Err(FsError::errno(errno::EEXIST)));
                 }
                 decide!(replace_victim(&txn, victim_ino, next(), moved.attr.kind, now).await?);
             }
@@ -635,7 +634,7 @@ impl FsCore {
             // be the inode that moves.
             if sealed.ino != ino {
                 return Ok(Err(FsError::new(
-                    libc::ESTALE,
+                    errno::ESTALE,
                     "the name moved meanwhile names another inode now",
                 )));
             }
@@ -718,7 +717,7 @@ impl FsCore {
             let (version, _) = decide!(versions_of(ino, records.next().flatten()));
             if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
                 return Ok(Err(FsError::new(
-                    raft5fs_proto::errno::EKEYEXPIRED,
+                    errno::EKEYEXPIRED,
                     "the moved node's key record must keep its version, under the new parent's",
                 )));
             }
@@ -841,7 +840,7 @@ async fn replace_victim(
     victim.attr.ctime = now;
     write_entry(txn, &victim).await?;
     if victim.attr.kind == Kind::Directory && !is_empty_dir(txn, victim_ino).await? {
-        return Ok(Err(FsError::errno(libc::ENOTEMPTY)));
+        return Ok(Err(FsError::errno(errno::ENOTEMPTY)));
     }
     txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
     Ok(Ok(()))
@@ -859,7 +858,7 @@ async fn check_no_loop(
     let mut cur = new_parent;
     while cur != ROOT_INO {
         if cur == ino {
-            return Ok(Err(FsError::errno(libc::EINVAL)));
+            return Ok(Err(FsError::errno(errno::EINVAL)));
         }
         cur = decide!(live_entry(txn, cur).await?).parent;
     }

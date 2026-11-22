@@ -73,7 +73,7 @@ impl FsCore {
         let granted: HashSet<u64> = self.granted().await?.into_keys().collect();
         if !roots(&tree, &granted).contains(&ino) {
             return Err(FsError::new(
-                libc::EINVAL,
+                errno::EINVAL,
                 format!("inode {ino} isn't one that nobody can reach"),
             ));
         }
@@ -106,7 +106,7 @@ impl FsCore {
             while at != ROOT_INO {
                 if !grants::grants_of(&txn, at).await?.is_empty() {
                     return Ok(Err(FsError::new(
-                        libc::EBUSY,
+                        errno::EBUSY,
                         format!("inode {at} has a grant now: not removing inode {ino}"),
                     )));
                 }
@@ -123,7 +123,7 @@ impl FsCore {
             write_entry(&txn, &entry).await?;
             if kind == Kind::Directory && !is_empty_dir(&txn, ino).await? {
                 return Ok(Err(FsError::new(
-                    libc::EBUSY,
+                    errno::EBUSY,
                     format!("folder {ino} has new entries: not removing it"),
                 )));
             }

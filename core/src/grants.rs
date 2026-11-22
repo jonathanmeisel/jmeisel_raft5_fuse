@@ -54,6 +54,7 @@ use crate::layout::{
 };
 use crate::timing::next_key;
 use crate::view::{ReadKeys, View, exactly};
+use raft5fs_proto::errno;
 
 /// Deeper than any real tree. A longer walk means a loop in the parent
 /// links, which only corruption could make.
@@ -195,7 +196,7 @@ pub(crate) fn check_grantees_version(ino: u64, sealed: &[u8], version: u32) -> R
         Ok(())
     } else {
         Err(FsError::new(
-            raft5fs_proto::errno::EKEYEXPIRED,
+            errno::EKEYEXPIRED,
             format!("inode {ino}'s grantee list must be sealed under key version {version}"),
         ))
     }
@@ -251,7 +252,7 @@ pub(crate) fn encode_grant(grant: &Grant) -> Vec<u8> {
 pub(crate) fn decode_grant(ino: u64, bytes: &[u8]) -> Result<Grant, FsError> {
     let garbled = || {
         FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("the grant row of inode {ino} is garbled"),
         )
     };
@@ -291,9 +292,9 @@ pub(crate) async fn key_versions(
 pub(crate) fn versions_of(ino: u64, record: Option<Vec<u8>>) -> Result<(u32, u32), FsError> {
     match record {
         Some(bytes) => NodeKeys::versions(&bytes)
-            .map_err(|e| FsError::new(libc::EIO, format!("inode {ino}: {e}"))),
+            .map_err(|e| FsError::new(errno::EIO, format!("inode {ino}: {e}"))),
         None => Err(FsError::new(
-            libc::EIO,
+            errno::EIO,
             format!("inode {ino} has no key record"),
         )),
     }
@@ -317,13 +318,13 @@ async fn walk(
     let at = r.snapshot();
     let refused = || {
         FsError::new(
-            libc::EACCES,
+            errno::EACCES,
             format!("nothing granted to {user} covers inode {ino}"),
         )
     };
     let gone = |cur: u64| {
         if cur == ino {
-            FsError::errno(libc::ENOENT)
+            FsError::errno(errno::ENOENT)
         } else {
             refused()
         }
@@ -369,7 +370,7 @@ async fn walk(
         cur = entry.parent;
     }
     Ok(Err(FsError::new(
-        libc::EIO,
+        errno::EIO,
         format!("inode {ino}'s parent links loop"),
     )))
 }
@@ -439,7 +440,7 @@ pub(crate) async fn authorize(
         }
     }
     Ok(Err(FsError::new(
-        libc::EROFS,
+        errno::EROFS,
         format!("inode {ino} is shared with {user} read-only"),
     )))
 }
@@ -500,7 +501,7 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
         // parent's key record is checked against its child first, as if
         // each was read in turn.
         if below.is_none() && entry.is_none() {
-            return Ok(Err(FsError::errno(libc::ENOENT)));
+            return Ok(Err(FsError::errno(errno::ENOENT)));
         }
         let (version, wrapped_under) = match versions_of(cur, keys) {
             Ok(versions) => versions,
@@ -512,7 +513,7 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
             return Ok(Err(e));
         }
         let Some(bytes) = entry else {
-            return Ok(Err(FsError::errno(libc::ENOENT)));
+            return Ok(Err(FsError::errno(errno::ENOENT)));
         };
         // A volume's root: no parent key wraps it.
         if wrapped_under == 0 {
@@ -522,7 +523,7 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
         cur = decode_entry(cur, &bytes).parent;
     }
     Ok(Err(FsError::new(
-        libc::EIO,
+        errno::EIO,
         format!("inode {ino}'s parent links loop"),
     )))
 }
@@ -534,7 +535,7 @@ fn check_wrapped((child, wrapped_under): (u64, u32), parent_version: u32) -> Res
         Ok(())
     } else {
         Err(FsError::new(
-            raft5fs_proto::errno::EKEYEXPIRED,
+            errno::EKEYEXPIRED,
             format!(
                 "inode {child} needs a new key: it is wrapped under an old one of its parent's"
             ),
@@ -700,8 +701,8 @@ pub(crate) async fn key_path(
     let records: Vec<Vec<u8>> = path.iter().map(|&node| node_keys_key(node)).collect();
     let mut nodes = Vec::with_capacity(path.len());
     for (node, keys) in path.into_iter().zip(view.get_many(&records).await?) {
-        let keys =
-            keys.ok_or_else(|| FsError::new(libc::EIO, format!("inode {node} has no key record")))?;
+        let keys = keys
+            .ok_or_else(|| FsError::new(errno::EIO, format!("inode {node} has no key record")))?;
         nodes.push((node, keys));
     }
     Ok(KeyPath { grant, nodes })
@@ -781,7 +782,10 @@ mod tests {
         let bytes = encode_grant(&grant);
         assert_eq!(decode_grant(9, &bytes).unwrap(), grant);
         for cut in 0..bytes.len() {
-            assert_eq!(decode_grant(9, &bytes[..cut]).unwrap_err().errno, libc::EIO);
+            assert_eq!(
+                decode_grant(9, &bytes[..cut]).unwrap_err().errno,
+                errno::EIO
+            );
         }
     }
 

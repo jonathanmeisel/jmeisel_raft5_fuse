@@ -529,7 +529,7 @@ impl FsCore {
         self.ask_remeasure();
         let (used, limit) = (size_text(used), size_text(limit));
         Err(FsError::new(
-            libc::EDQUOT,
+            errno::EDQUOT,
             match tally {
                 Tally::Owner(owner) => format!("{owner}'s storage is full ({used} of {limit})"),
                 Tally::Folder(_) => {
@@ -625,7 +625,7 @@ impl FsCore {
                 .is_err()
         {
             return Err(FsError::new(
-                libc::EACCES,
+                errno::EACCES,
                 "only the volume's owner or an admin sets size limits",
             ));
         }
@@ -703,7 +703,7 @@ impl FsCore {
         let holder = self.usage.holder;
         if !take_lease(&self.client, USAGE_LEASE_KEY, holder, SystemTime::now())
             .await
-            .map_err(|e| FsError::new(libc::EIO, e))?
+            .map_err(|e| FsError::new(errno::EIO, e))?
         {
             return Ok(None);
         }

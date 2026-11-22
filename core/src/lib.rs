@@ -24,3 +24,43 @@ pub use raft5fs_proto::types::{
     PreparedUpload, RESEAL_NAMES_BATCH, ResealedName, Rotation, SealedChunk, SealedMove, SetAttr,
     SetTime, SnapshotInfo, WriteBody,
 };
+
+/// The servers answer with `raft5fs_proto::errno` values, which every
+/// client reads, on any platform. On Linux, where the servers run, they
+/// must be the system's own, so a mount reports the right error.
+#[cfg(all(test, target_os = "linux"))]
+mod errno_tests {
+    use raft5fs_proto::errno;
+
+    #[test]
+    fn the_protocols_errnos_are_linuxs() {
+        let pairs = [
+            (errno::EPERM, libc::EPERM),
+            (errno::ENOENT, libc::ENOENT),
+            (errno::EIO, libc::EIO),
+            (errno::EAGAIN, libc::EAGAIN),
+            (errno::EACCES, libc::EACCES),
+            (errno::EBUSY, libc::EBUSY),
+            (errno::EEXIST, libc::EEXIST),
+            (errno::EXDEV, libc::EXDEV),
+            (errno::ENOTDIR, libc::ENOTDIR),
+            (errno::EISDIR, libc::EISDIR),
+            (errno::EINVAL, libc::EINVAL),
+            (errno::EROFS, libc::EROFS),
+            (errno::ENAMETOOLONG, libc::ENAMETOOLONG),
+            (errno::ENOSYS, libc::ENOSYS),
+            (errno::ENOTEMPTY, libc::ENOTEMPTY),
+            (errno::ENOTSUP, libc::ENOTSUP),
+            (errno::ENOTCONN, libc::ENOTCONN),
+            (errno::ETIMEDOUT, libc::ETIMEDOUT),
+            (errno::ECONNREFUSED, libc::ECONNREFUSED),
+            (errno::EHOSTUNREACH, libc::EHOSTUNREACH),
+            (errno::ESTALE, libc::ESTALE),
+            (errno::EDQUOT, libc::EDQUOT),
+            (errno::EKEYEXPIRED, libc::EKEYEXPIRED),
+        ];
+        for (ours, linux) in pairs {
+            assert_eq!(ours, linux);
+        }
+    }
+}

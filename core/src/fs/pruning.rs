@@ -141,7 +141,7 @@ impl FsCore {
         crate::accounts::refuse_link(&caller.user)?;
         let holder: [u8; 16] = holder
             .try_into()
-            .map_err(|_| FsError::new(libc::EINVAL, "a pruner names itself with 16 bytes"))?;
+            .map_err(|_| FsError::new(errno::EINVAL, "a pruner names itself with 16 bytes"))?;
         self.guard_now(&self.live(), caller, ino, true).await?;
         let user = caller.user.as_str();
         let outcome = run_txn(&self.client, move |txn| async move {
