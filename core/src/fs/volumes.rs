@@ -472,3 +472,21 @@ mod tests {
         );
     }
 }
+
+/// The stored layout of a volume record, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn a_volume_record_keeps_its_bytes() {
+        let golden = "0100000005616c69636500000003626f620000000000000063";
+        let built = VolumeInfo {
+            owner: Some("alice".into()),
+            offer: Some(("bob".into(), 99)),
+        };
+        assert_eq!(raft5fs_wire::hex(&encode_volume(&built)), golden);
+        let back = decode_volume(9, &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(raft5fs_wire::hex(&encode_volume(&back)), golden);
+    }
+}

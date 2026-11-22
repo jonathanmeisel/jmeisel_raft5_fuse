@@ -270,3 +270,23 @@ mod tests {
         assert!(decode_claim(&value[..20]).is_none());
     }
 }
+
+/// The stored layout of a prune claim, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn a_claim_keeps_its_bytes() {
+        let golden = "0707070707070707070707070707070700000000000004d2616c696365";
+        assert_eq!(
+            raft5fs_wire::hex(&encode_claim(&[7; 16], 1234, "alice")),
+            golden
+        );
+        let (holder, claim) = decode_claim(&raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(
+            (holder, claim.expires_ms, claim.user.as_str()),
+            ([7; 16], 1234, "alice")
+        );
+    }
+}

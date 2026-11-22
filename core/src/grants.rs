@@ -805,3 +805,24 @@ mod tests {
         assert!(check_username("a\nb").is_err());
     }
 }
+
+/// The stored layout of a grant, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn a_grant_keeps_its_bytes() {
+        let grant = Grant {
+            ino: 9,
+            writable: true,
+            key_version: 3,
+            sealed_key: vec![1, 2],
+            sealed_label: vec![3],
+        };
+        let golden = "01000000030000000201020000000103";
+        assert_eq!(raft5fs_wire::hex(&encode_grant(&grant)), golden);
+        let back = decode_grant(9, &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(back, grant);
+    }
+}

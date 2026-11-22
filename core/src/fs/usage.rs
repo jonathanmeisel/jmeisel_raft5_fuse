@@ -902,3 +902,27 @@ mod tests {
         assert_eq!(since(&[(5, 10), (6, -3), (9, 100)], 6), 100);
     }
 }
+
+/// The stored layouts of sizes, usage and limits, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn sizes_usage_and_limits_keep_their_bytes() {
+        let size = "000000000000000100000000000000020000000000000003";
+        assert_eq!(raft5fs_wire::hex(&encode_size(1, 2, 3)), size);
+        assert_eq!(
+            decode_size(&raft5fs_wire::from_hex(size).unwrap()),
+            Some((1, 2, 3))
+        );
+        let usage = "00000000000000050000000000000006";
+        assert_eq!(raft5fs_wire::hex(&encode_usage(5, 6)), usage);
+        assert_eq!(
+            decode_usage(&raft5fs_wire::from_hex(usage).unwrap()),
+            Some((5, 6))
+        );
+        assert_eq!(decode_limit(&7u64.to_be_bytes()), Some(7));
+        assert_eq!(decode_limit(&[0; 7]), None);
+    }
+}

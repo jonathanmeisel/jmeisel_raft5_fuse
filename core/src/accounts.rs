@@ -1183,3 +1183,61 @@ mod tests {
         }
     }
 }
+
+/// The stored layouts of accounts, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    fn info(quota: Option<u64>) -> AccountInfo {
+        AccountInfo {
+            caps: Caps::VOLUMES | Caps::LINKS,
+            kind: AccountKind::Link,
+            invited_by: "alice".into(),
+            created: 1_700_000_000,
+            owner: "bob".into(),
+            expires: Some(1_800_000_000),
+            folder: 42,
+            note: vec![1, 2, 3],
+            quota,
+        }
+    }
+
+    #[test]
+    fn account_records_keep_their_bytes() {
+        for (quota, golden) in [
+            (
+                Some(5_000),
+                "01000000050100000005616c696365000000006553f10000000003626f62000000006b49d200000000000000002a000000030102030000000000001388",
+            ),
+            (
+                None,
+                "01000000050100000005616c696365000000006553f10000000003626f62000000006b49d200000000000000002a00000003010203",
+            ),
+        ] {
+            assert_eq!(raft5fs_wire::hex(&encode_info(&info(quota))), golden);
+            let back = decode_info("u", &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+            assert_eq!(raft5fs_wire::hex(&encode_info(&back)), golden);
+        }
+        let keys = AccountKeys {
+            salt: vec![1],
+            kdf_params: vec![2, 2],
+            verifier: vec![3, 3, 3],
+            public_key: vec![4; 4],
+            wrapped_private_key: vec![5; 5],
+        };
+        let golden = "0000000101000000020202000000030303030000000404040404000000050505050505";
+        assert_eq!(raft5fs_wire::hex(&encode(&keys)), golden);
+        let back = decode("u", &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(raft5fs_wire::hex(&encode(&back)), golden);
+
+        let mut code = vec![9; 32];
+        code.extend_from_slice(&1000u64.to_be_bytes());
+        assert_eq!(code_expires(&code), 1000 + CODE_LIFETIME_SECS);
+        assert_eq!(code_expires(&code[..32]), 0);
+
+        let mut pins = 7u64.to_be_bytes().to_vec();
+        pins.extend_from_slice(b"sealed");
+        assert_eq!(decode_pins("u", &pins).unwrap(), (7, b"sealed".to_vec()));
+    }
+}

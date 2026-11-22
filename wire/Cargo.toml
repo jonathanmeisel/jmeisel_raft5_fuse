@@ -1,0 +1,7 @@
+[package]
+name = "raft5fs-wire"
+description = "The byte layout that raft5fs's stored records, sealed contents and one-line strings share: fixed-width big-endian numbers and length-prefixed fields. No dependencies."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

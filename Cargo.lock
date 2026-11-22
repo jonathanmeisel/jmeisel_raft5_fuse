@@ -2497,6 +2497,7 @@ dependencies = [
  "raft5fs-crypto",
  "raft5fs-objstore",
  "raft5fs-proto",
+ "raft5fs-wire",
  "tokio",
  "tracing",
 ]
@@ -2654,6 +2655,10 @@ dependencies = [
  "reqwest",
  "tokio",
 ]
+
+[[package]]
+name = "raft5fs-wire"
+version = "0.1.0"
 
 [[package]]
 name = "rand"

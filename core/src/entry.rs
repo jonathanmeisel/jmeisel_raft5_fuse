@@ -160,3 +160,37 @@ mod tests {
         assert_eq!(decode_entry(5, &bytes).attr.layout, Layout::Hybrid);
     }
 }
+
+/// The stored layout of an Entry, pinned: these bytes must never change.
+#[cfg(test)]
+mod golden {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn an_entry_keeps_its_bytes() {
+        let at = |s: u64| UNIX_EPOCH + Duration::new(1_700_000_000 + s, 5);
+        let entry = Entry {
+            attr: Attr {
+                ino: 9,
+                kind: Kind::File,
+                size: 1234,
+                perm: 0o640,
+                nlink: 1,
+                atime: at(1),
+                mtime: at(2),
+                ctime: at(3),
+                layout: Layout::Hybrid,
+            },
+            parent: 3,
+        };
+        let golden = "0001a0010000000000000000000000000004d200000001000000006553f10100000005000000006553f10200000005000000006553f103000000050000000000000003";
+        assert_eq!(raft5fs_wire::hex(&encode_entry(&entry)), golden);
+        let bytes = raft5fs_wire::from_hex(golden).unwrap();
+        assert_eq!(
+            raft5fs_wire::hex(&encode_entry(&decode_entry(9, &bytes))),
+            golden
+        );
+    }
+}

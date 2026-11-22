@@ -455,3 +455,18 @@ fn decode_lease(value: &[u8]) -> Option<([u8; 16], u64)> {
         u64::from_be_bytes(value[16..].try_into().unwrap()),
     ))
 }
+
+/// The stored layout of the GC lease, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn a_lease_keeps_its_bytes() {
+        let mut value = vec![3; 16];
+        value.extend_from_slice(&99u64.to_be_bytes());
+        assert_eq!(decode_lease(&value), Some(([3; 16], 99)));
+        assert_eq!(decode_lease(&value[..23]), None);
+        assert_eq!(decode_lease(&[value.clone(), vec![0]].concat()), None);
+    }
+}

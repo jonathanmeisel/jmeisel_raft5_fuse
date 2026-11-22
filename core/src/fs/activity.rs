@@ -438,3 +438,35 @@ mod tests {
         assert_eq!(decode(&key, &encode(&a)[..10]), None);
     }
 }
+
+/// The stored layout of an activity record's value, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn an_activity_record_keeps_its_bytes() {
+        let name = |parent, tag: &[u8]| SealedEntryName {
+            parent,
+            tag: tag.to_vec(),
+            sealed: vec![9, 9],
+        };
+        let a = Activity {
+            at_ms: 1,
+            user: "alice".into(),
+            op: ActivityOp::Renamed,
+            kind: Kind::Directory,
+            ino: 5,
+            parent: 7,
+            name: Some(name(7, b"new")),
+            from: None,
+            replaced: true,
+            moved_out: false,
+            path: Vec::new(),
+        };
+        assert_eq!(
+            raft5fs_wire::hex(&encode(&a)),
+            "01010100000005616c6963650000000000000007010000000000000007000000036e657700000002090900"
+        );
+    }
+}

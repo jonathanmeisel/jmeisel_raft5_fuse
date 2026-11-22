@@ -347,3 +347,18 @@ mod tests {
         assert!(at(121).is_err());
     }
 }
+
+/// The stored layout of the object grid, pinned.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    #[test]
+    fn a_grid_keeps_its_bytes() {
+        let grid = grid_for(64, 2 * 64, 4 * 64).unwrap();
+        let golden = "000000000000000200000004";
+        assert_eq!(raft5fs_wire::hex(&encode_grid(grid)), golden);
+        let back = decode_grid(&raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(raft5fs_wire::hex(&encode_grid(back)), golden);
+    }
+}
