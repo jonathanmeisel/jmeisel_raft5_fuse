@@ -103,35 +103,33 @@ impl FsCore {
         check_sealed_grant(&grant.sealed_key, &grant.sealed_label, sealed_grantees)?;
         let ino = grant.ino;
         run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, ino, true).await?);
+            self.guard(&txn, caller, ino, true).await?;
             // A revoked user may still have a stale key.
-            decide!(self.fresh(&txn, ino).await?);
-            let entry = decide!(live_entry(&txn, ino).await?);
-            decide!(check_kind(&entry, Kind::Directory));
+            self.fresh(&txn, ino).await?;
+            let entry = live_entry(&txn, ino).await?;
+            check_kind(&entry, Kind::Directory)?;
             if txn
                 .read_one(&crate::accounts::keys_key(grantee))
                 .await?
                 .value
                 .is_none()
             {
-                return Ok(Err(FsError::new(
-                    errno::ENOENT,
-                    format!("{grantee} hasn't enrolled"),
-                )));
+                return Err(
+                    FsError::new(errno::ENOENT, format!("{grantee} hasn't enrolled")).into(),
+                );
             }
-            decide!(
-                crate::accounts::check_link_grant(&txn, &caller.user, grantee, ino, grant.writable)
-                    .await?
-            );
-            decide!(volumes::check_owner_kept(&txn, ino, grantee, Some(grant.writable)).await?);
-            let (version, _) = decide!(key_versions(&txn, ino).await?);
+            crate::accounts::check_link_grant(&txn, &caller.user, grantee, ino, grant.writable)
+                .await?;
+            volumes::check_owner_kept(&txn, ino, grantee, Some(grant.writable)).await?;
+            let (version, _) = key_versions(&txn, ino).await?;
             if grant.key_version != version {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EKEYEXPIRED,
                     format!("a grant must hold the current key version, {version}"),
-                )));
+                )
+                .into());
             }
-            decide!(check_grantees_version(ino, sealed_grantees, version));
+            check_grantees_version(ino, sealed_grantees, version)?;
             // Read in the transaction even when its seq doesn't count: a
             // grant made meanwhile writes it, so this one retries.
             let stored_seq = txn.read_one(&grantees_key(ino)).await?.seq;
@@ -144,27 +142,29 @@ impl FsCore {
             // can outlive its last grant (its account was removed), and the
             // client, which saw no grants, expects seq 0.
             if stored_seq != expected_grantees_seq && !others.is_empty() {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EAGAIN,
                     format!("inode {ino}'s grantee list changed meanwhile"),
-                )));
+                )
+                .into());
             }
             if !listed.is_empty() {
                 for user in others {
                     if !listed.contains(&user) {
-                        return Ok(Err(FsError::new(
+                        return Err(FsError::new(
                             errno::EAGAIN,
                             format!("{user}'s grant of inode {ino} isn't on the new grantee list"),
-                        )));
+                        )
+                        .into());
                     }
                 }
             }
             grants::put_grant(&txn, grantee, grant).await?;
             txn.write(&grantees_key(ino), Some(sealed_grantees)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Replaces the label of `caller`'s own grant of `ino`, which only they
@@ -184,15 +184,15 @@ impl FsCore {
                 .await?
                 .value
             else {
-                return Ok(Err(FsError::errno(errno::ENOENT)));
+                return Err(FsError::errno(errno::ENOENT).into());
             };
-            let mut grant = decide!(grants::decode_grant(ino, &row));
+            let mut grant = grants::decode_grant(ino, &row)?;
             grant.sealed_label = sealed_label.to_vec();
             grants::put_grant(&txn, &caller.user, &grant).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Makes a new volume: a directory under the real root, at `new`'s
@@ -234,12 +234,12 @@ impl FsCore {
             sealed_label: sealed_label.to_vec(),
         };
         let made = run_txn(&self.client, move |txn| async move {
-            let mut root = decide!(live_entry(&txn, ROOT_INO).await?);
+            let mut root = live_entry(&txn, ROOT_INO).await?;
             if txn.read_one(dirent).await?.value.is_some() {
-                return Ok(Err(FsError::errno(errno::EEXIST)));
+                return Err(FsError::errno(errno::EEXIST).into());
             }
             // No parent key: only grants give a volume's key to users.
-            decide!(self.claim(&txn, caller, new, (1, 0)).await?);
+            self.claim(&txn, caller, new, (1, 0)).await?;
             let now = SystemTime::now();
             let entry = Entry {
                 attr: Attr {
@@ -271,9 +271,9 @@ impl FsCore {
                 .await?;
             touch_dir(&txn, &mut root, now).await?;
             txn.commit().await?;
-            Ok(Ok(entry.attr))
+            Ok(entry.attr)
         })
-        .await?;
+        .await;
         self.release_if_failed(caller, new.ino, made).await
     }
 
@@ -307,36 +307,36 @@ impl FsCore {
                 check_sealed_size("a grant's key", sealed, MAX_SEALED_GRANT)?;
             }
         }
-        let changed = |what: String| Ok(Err(FsError::new(errno::EAGAIN, what)));
+        let changed = |what: String| Err(FsError::new(errno::EAGAIN, what).into());
         run_txn(&self.client, move |txn| async move {
             // Versions that this transaction has changed, for the children
             // that are rotated after their parents.
             let mut rotated: HashMap<u64, u32> = HashMap::new();
             for r in rotations {
                 let ino = r.ino;
-                decide!(self.guard(&txn, caller, ino, true).await?);
+                self.guard(&txn, caller, ino, true).await?;
                 let [entry, record] =
                     exactly(txn.read_many(&[attr_key(ino), node_keys_key(ino)]).await?);
-                let entry = decide!(live(ino, entry.value).ok_or_else(enoent));
-                let (version, wrapped_under) = decide!(versions_of(ino, record.value));
+                let entry = live(ino, entry.value).ok_or_else(enoent)?;
+                let (version, wrapped_under) = versions_of(ino, record.value)?;
                 if version != r.expected_version {
                     return changed(format!("inode {ino} has key version {version} now"));
                 }
                 let Ok((new_version, new_wrapped_under)) = NodeKeys::versions(&r.node_keys) else {
-                    return Ok(Err(FsError::new(errno::EINVAL, "an unreadable key record")));
+                    return Err(FsError::new(errno::EINVAL, "an unreadable key record").into());
                 };
                 let parent_version = if wrapped_under == 0 {
                     0
                 } else if let Some(&v) = rotated.get(&entry.parent) {
                     v
                 } else {
-                    decide!(key_versions(&txn, entry.parent).await?).0
+                    key_versions(&txn, entry.parent).await?.0
                 };
                 if new_version != version + 1 {
-                    return Ok(Err(FsError::new(
+                    return Err(FsError::new(
                         errno::EINVAL,
                         format!("inode {ino}'s new key record must be version {}", version + 1),
-                    )));
+                    ).into());
                 }
                 if new_wrapped_under != parent_version {
                     return changed(format!(
@@ -358,7 +358,7 @@ impl FsCore {
                 for (user, mut grant) in existing {
                     let sealed = resealed[user.as_str()];
                     if sealed.is_empty() {
-                        decide!(volumes::check_owner_kept(&txn, ino, &user, None).await?);
+                        volumes::check_owner_kept(&txn, ino, &user, None).await?;
                         grants::remove_grant(&txn, &user, ino).await?;
                     } else {
                         grant.key_version = new_version;
@@ -369,7 +369,7 @@ impl FsCore {
                 }
                 // The remaining grantees, listed again under the new key.
                 if kept > 0 {
-                    decide!(check_grantees_version(ino, &r.sealed_grantees, new_version));
+                    check_grantees_version(ino, &r.sealed_grantees, new_version)?;
                     txn.write(&grantees_key(ino), Some(&r.sealed_grantees))
                         .await?;
                 } else {
@@ -379,9 +379,9 @@ impl FsCore {
                 rotated.insert(ino, new_version);
             }
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Seals chunks of file `ino` again under its current key version. Each
@@ -402,18 +402,18 @@ impl FsCore {
             ));
         }
         let dropped = run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, ino, true).await?);
-            decide!(self.fresh(&txn, ino).await?);
+            self.guard(&txn, caller, ino, true).await?;
+            self.fresh(&txn, ino).await?;
             // As in `write_chunks`, read the Entry first, so no chunk is
             // stored after a deletion has started.
-            let entry = decide!(live_entry(&txn, ino).await?);
-            decide!(check_kind(&entry, Kind::File));
+            let entry = live_entry(&txn, ino).await?;
+            check_kind(&entry, Kind::File)?;
             let size = entry.attr.size;
-            let dropped = decide!(put_chunks(self, &txn, &entry, writes, true, size).await?);
+            let dropped = put_chunks(self, &txn, &entry, writes, true, size).await?;
             txn.commit().await?;
-            Ok(Ok(dropped))
+            Ok(dropped)
         })
-        .await??;
+        .await?;
         self.discard(dropped);
         Ok(())
     }
@@ -438,26 +438,27 @@ impl FsCore {
             Self::check_entry_name(&n.tag, &n.sealed_name)?;
         }
         run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, dir, true).await?);
-            decide!(self.fresh(&txn, dir).await?);
-            decide!(modifiable_dir(&txn, dir).await?);
-            let (version, _) = decide!(key_versions(&txn, dir).await?);
+            self.guard(&txn, caller, dir, true).await?;
+            self.fresh(&txn, dir).await?;
+            modifiable_dir(&txn, dir).await?;
+            let (version, _) = key_versions(&txn, dir).await?;
             for n in names {
-                decide!(check_name_version(dir, &n.sealed_name, version));
+                check_name_version(dir, &n.sealed_name, version)?;
                 let dirent = dirent_key(dir, &n.tag);
                 if named(&txn, &dirent).await? != Some(n.ino) {
-                    return Ok(Err(FsError::new(
+                    return Err(FsError::new(
                         errno::EAGAIN,
                         format!("an entry of inode {dir} changed meanwhile"),
-                    )));
+                    )
+                    .into());
                 }
                 txn.write(&dirent, Some(&dirent_value(n.ino, &n.sealed_name)))
                     .await?;
             }
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Replaces `ino`'s key record, at `expected_version`, with
@@ -519,16 +520,17 @@ impl FsCore {
         let before_bytes = &before_bytes;
         run_txn(&self.client, move |txn| async move {
             if txn.read_one(&node_keys_key(ino)).await?.value.as_ref() != Some(before_bytes) {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EAGAIN,
                     format!("inode {ino}'s key record changed meanwhile"),
-                )));
+                )
+                .into());
             }
             grants::put_node_keys(&txn, ino, Some(node_keys)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Describes the first thing found that is sealed under a version of

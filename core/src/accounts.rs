@@ -38,7 +38,7 @@ use raft5fs_crypto::password::{
     KdfParams, SALT_LEN, check_verifier, enrolment_code_hash, new_enrolment_code,
 };
 
-use crate::fs::run_txn;
+use crate::fs::{TxnError, run_txn};
 use crate::layout::{
     ACCOUNT_INFO_PREFIX, ACCOUNT_KEYS_PREFIX, ENROLLMENT_PROOF_PREFIX, ENROLMENT_PREFIX,
     PINS_PREFIX, usage_key,
@@ -51,17 +51,6 @@ use raft5fs_proto::types::{
     AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
     UserEntry,
 };
-
-/// In a transaction attempt, unwraps a decision, or ends the attempt with
-/// it as `Ok(Err(..))`, which `run_txn` does not retry (as in `fs`).
-macro_rules! decide {
-    ($result:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(e) => return Ok(Err(e)),
-        }
-    };
-}
 
 pub(crate) fn keys_key(user: &str) -> Vec<u8> {
     let mut key = ACCOUNT_KEYS_PREFIX.to_vec();
@@ -98,15 +87,12 @@ pub async fn enrollment(client: &Client, user: &str) -> Result<(Vec<u8>, Vec<u8>
     run_txn(client, |txn| async move {
         let [keys, proof] = exactly(txn.read_many(&[keys_key(user), proof_key(user)]).await?);
         let Some(keys) = keys.value else {
-            return Ok(Err(FsError::new(
-                errno::ENOENT,
-                format!("{user} hasn't enrolled"),
-            )));
+            return Err(FsError::new(errno::ENOENT, format!("{user} hasn't enrolled")).into());
         };
-        let keys = decide!(decode(user, &keys));
-        Ok(Ok((keys.public_key, proof.value.unwrap_or_default())))
+        let keys = decode(user, &keys)?;
+        Ok((keys.public_key, proof.value.unwrap_or_default()))
     })
-    .await?
+    .await
 }
 
 /// The most that an account's sealed trusted keys may take: some thousands
@@ -148,22 +134,21 @@ pub async fn put_pins(
     }
     run_txn(client, |txn| async move {
         let current = match txn.read_one(&pins_key(user)).await?.value {
-            Some(stored) => decide!(decode_pins(user, &stored)).0,
+            Some(stored) => decode_pins(user, &stored)?.0,
             None => 0,
         };
         if current != expected {
-            return Ok(Err(FsError::new(
-                errno::EAGAIN,
-                "the trusted keys changed in the meantime",
-            )));
+            return Err(
+                FsError::new(errno::EAGAIN, "the trusted keys changed in the meantime").into(),
+            );
         }
         let mut stored = (current + 1).to_be_bytes().to_vec();
         stored.extend_from_slice(sealed);
         txn.write(&pins_key(user), Some(&stored)).await?;
         txn.commit().await?;
-        Ok(Ok(current + 1))
+        Ok(current + 1)
     })
-    .await?
+    .await
 }
 
 /// A stored pins record: its version, then the sealed list.
@@ -471,29 +456,29 @@ pub async fn create_link(
     run_txn(client, |txn| {
         let (encoded, record) = (&encoded, &record);
         async move {
-            let mine = decide!(info_in(&txn, owner).await?).unwrap_or_default();
+            let mine = info_in(&txn, owner).await?.unwrap_or_default();
             if mine.kind != AccountKind::Person || !mine.caps.contains(Caps::LINKS) {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EACCES,
                     "you can't make public links on this filesystem",
-                )));
+                )
+                .into());
             }
             let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some()
                 || txn.read_one(&info_key(user)).await?.value.is_some();
             if taken {
-                return Ok(Err(FsError::new(
-                    errno::EEXIST,
-                    format!("the name {user} is taken"),
-                )));
+                return Err(
+                    FsError::new(errno::EEXIST, format!("the name {user} is taken")).into(),
+                );
             }
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.write(&info_key(user), Some(record)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await?
+    .await
 }
 
 /// The public links that `owner` made, in name order.
@@ -529,21 +514,22 @@ pub(crate) async fn check_link_grant(
     grantee: &str,
     ino: u64,
     writable: bool,
-) -> Result<Result<(), FsError>, KvError> {
+) -> Result<(), TxnError> {
     if !grantee.starts_with(LINK_PREFIX) {
-        return Ok(Ok(()));
+        return Ok(());
     }
-    let info = decide!(info_in(txn, grantee).await?).unwrap_or_default();
+    let info = info_in(txn, grantee).await?.unwrap_or_default();
     let ok =
         info.kind == AccountKind::Link && info.owner == granter && info.folder == ino && !writable;
-    Ok(if ok {
+    if ok {
         Ok(())
     } else {
         Err(FsError::new(
             errno::EPERM,
             "a public link can only be shared by its maker, read-only, with its own folder",
-        ))
-    })
+        )
+        .into())
+    }
 }
 
 /// Removes link account `user` if `txn` leaves it no grant: a link lasts
@@ -591,13 +577,10 @@ pub async fn info(client: &Client, user: &str) -> Result<AccountInfo, FsError> {
 }
 
 /// `user`'s record as `txn` sees it, if there is one.
-async fn info_in(
-    txn: &Transaction,
-    user: &str,
-) -> Result<Result<Option<AccountInfo>, FsError>, KvError> {
+async fn info_in(txn: &Transaction, user: &str) -> Result<Option<AccountInfo>, TxnError> {
     Ok(match txn.read_one(&info_key(user)).await?.value {
-        Some(bytes) => decode_info(user, &bytes).map(Some),
-        None => Ok(None),
+        Some(bytes) => Some(decode_info(user, &bytes)?),
+        None => None,
     })
 }
 
@@ -613,7 +596,7 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
     run_txn(client, |txn| {
         let stored = &stored;
         async move {
-            let mut info = decide!(info_in(&txn, user).await?).unwrap_or_else(|| AccountInfo {
+            let mut info = info_in(&txn, user).await?.unwrap_or_else(|| AccountInfo {
                 created: clock::now_secs(),
                 ..AccountInfo::default()
             });
@@ -622,10 +605,10 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
             txn.write(&info_key(user), Some(&encode_info(&info)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await??;
+    .await?;
     Ok(code)
 }
 
@@ -637,19 +620,16 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
         let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some();
         if !exists {
-            return Ok(Err(FsError::new(
-                errno::ENOENT,
-                format!("there is no user {user}"),
-            )));
+            return Err(FsError::new(errno::ENOENT, format!("there is no user {user}")).into());
         }
-        let mut info = decide!(info_in(&txn, user).await?).unwrap_or_default();
+        let mut info = info_in(&txn, user).await?.unwrap_or_default();
         info.caps = (info.caps | on).with(off, false);
         txn.write(&info_key(user), Some(&encode_info(&info)))
             .await?;
         txn.commit().await?;
-        Ok(Ok(info.caps))
+        Ok(info.caps)
     })
-    .await?
+    .await
 }
 
 /// For an administrator: sets how much the volumes `user` owns may hold
@@ -657,11 +637,11 @@ pub async fn set_caps(client: &Client, user: &str, on: Caps, off: Caps) -> Resul
 /// for one.
 pub async fn set_quota(client: &Client, user: &str, quota: Option<u64>) -> Result<(), FsError> {
     run_txn(client, |txn| async move {
-        decide!(change_info(&txn, user, |info| info.quota = quota).await?);
+        change_info(&txn, user, |info| info.quota = quota).await?;
         txn.commit().await?;
-        Ok(Ok(()))
+        Ok(())
     })
-    .await?
+    .await
 }
 
 /// Admin `caller` sets `user`'s quota (`set_quota`).
@@ -673,12 +653,12 @@ pub async fn admin_set_quota(
 ) -> Result<(), FsError> {
     refuse_link_quota(user)?;
     run_txn(client, |txn| async move {
-        decide!(require_admin(&txn, caller).await?);
-        decide!(change_info(&txn, user, |info| info.quota = quota).await?);
+        require_admin(&txn, caller).await?;
+        change_info(&txn, user, |info| info.quota = quota).await?;
         txn.commit().await?;
-        Ok(Ok(()))
+        Ok(())
     })
-    .await?
+    .await
 }
 
 fn refuse_link_quota(user: &str) -> Result<(), FsError> {
@@ -697,37 +677,29 @@ async fn change_info(
     txn: &Transaction,
     user: &str,
     change: impl FnOnce(&mut AccountInfo),
-) -> Result<Result<AccountInfo, FsError>, KvError> {
+) -> Result<AccountInfo, TxnError> {
     let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
         || txn.read_one(&code_key(user)).await?.value.is_some();
     if !exists {
-        return Ok(Err(FsError::new(
-            errno::ENOENT,
-            format!("there is no user {user}"),
-        )));
+        return Err(FsError::new(errno::ENOENT, format!("there is no user {user}")).into());
     }
-    let mut info = decide!(info_in(txn, user).await?).unwrap_or_default();
+    let mut info = info_in(txn, user).await?.unwrap_or_default();
     change(&mut info);
     txn.write(&info_key(user), Some(&encode_info(&info)))
         .await?;
-    Ok(Ok(info))
+    Ok(info)
 }
 
 /// Refuses (`EACCES`) unless `caller` is a person with the `admin`
 /// capability, as `txn` sees it. Read in the same transaction as what it
 /// allows, so an admin who just lost the capability can't still act.
-async fn require_admin(txn: &Transaction, caller: &str) -> Result<Result<(), FsError>, KvError> {
-    let info = decide!(info_in(txn, caller).await?).unwrap_or_default();
-    Ok(
-        if info.kind == AccountKind::Person && info.caps.contains(Caps::ADMIN) {
-            Ok(())
-        } else {
-            Err(FsError::new(
-                errno::EACCES,
-                "only administrators can manage users",
-            ))
-        },
-    )
+async fn require_admin(txn: &Transaction, caller: &str) -> Result<(), TxnError> {
+    let info = info_in(txn, caller).await?.unwrap_or_default();
+    if info.kind == AccountKind::Person && info.caps.contains(Caps::ADMIN) {
+        Ok(())
+    } else {
+        Err(FsError::new(errno::EACCES, "only administrators can manage users").into())
+    }
 }
 
 /// Admin `caller` invites a new user `user`, who gets `caps`. Returns the
@@ -746,15 +718,14 @@ pub async fn issue_invite(
     run_txn(client, |txn| {
         let stored = &stored;
         async move {
-            decide!(require_admin(&txn, caller).await?);
+            require_admin(&txn, caller).await?;
             let taken = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some()
                 || txn.read_one(&info_key(user)).await?.value.is_some();
             if taken {
-                return Ok(Err(FsError::new(
-                    errno::EEXIST,
-                    format!("the name {user} is taken"),
-                )));
+                return Err(
+                    FsError::new(errno::EEXIST, format!("the name {user} is taken")).into(),
+                );
             }
             let info = AccountInfo {
                 caps,
@@ -767,10 +738,10 @@ pub async fn issue_invite(
             txn.write(&info_key(user), Some(&encode_info(&info)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await??;
+    .await?;
     Ok(code)
 }
 
@@ -787,21 +758,18 @@ pub async fn reissue_invite(client: &Client, caller: &str, user: &str) -> Result
     run_txn(client, |txn| {
         let stored = &stored;
         async move {
-            decide!(require_admin(&txn, caller).await?);
+            require_admin(&txn, caller).await?;
             let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
                 || txn.read_one(&code_key(user)).await?.value.is_some();
             if !exists {
-                return Ok(Err(FsError::new(
-                    errno::ENOENT,
-                    format!("there is no user {user}"),
-                )));
+                return Err(FsError::new(errno::ENOENT, format!("there is no user {user}")).into());
             }
             txn.write(&code_key(user), Some(stored)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await??;
+    .await?;
     Ok(code)
 }
 
@@ -828,23 +796,20 @@ pub async fn admin_set_caps(
         ));
     }
     run_txn(client, |txn| async move {
-        decide!(require_admin(&txn, caller).await?);
+        require_admin(&txn, caller).await?;
         let exists = txn.read_one(&keys_key(user)).await?.value.is_some()
             || txn.read_one(&code_key(user)).await?.value.is_some();
         if !exists {
-            return Ok(Err(FsError::new(
-                errno::ENOENT,
-                format!("there is no user {user}"),
-            )));
+            return Err(FsError::new(errno::ENOENT, format!("there is no user {user}")).into());
         }
-        let mut info = decide!(info_in(&txn, user).await?).unwrap_or_default();
+        let mut info = info_in(&txn, user).await?.unwrap_or_default();
         info.caps = (info.caps | on).with(off, false);
         txn.write(&info_key(user), Some(&encode_info(&info)))
             .await?;
         txn.commit().await?;
-        Ok(Ok(info))
+        Ok(info)
     })
-    .await?
+    .await
 }
 
 /// Admin `caller` removes `user` (`remove`): an account, an invitation not
@@ -878,7 +843,7 @@ pub async fn is_admin(client: &Client, caller: &str) -> Result<(), FsError> {
         client,
         |txn| async move { require_admin(&txn, caller).await },
     )
-    .await?
+    .await
 }
 
 /// Stores `user`'s keys if `code` is the code issued to them, and uses the
@@ -917,17 +882,19 @@ pub async fn enrol(
         async move {
             let issued = txn.read_one(&code_key(user)).await?.value;
             let Some(issued) = issued.filter(|i| i.get(..32) == Some(hash.as_slice())) else {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EACCES,
                     format!("no such enrolment code for {user}"),
-                )));
+                )
+                .into());
             };
             let expires = code_expires(&issued);
             if expires != 0 && expires < clock::now_secs() {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EACCES,
                     format!("{user}'s invitation has expired: ask an admin for a new one"),
-                )));
+                )
+                .into());
             }
             // Whatever this name had was sealed to another key pair, so it is
             // no use to the new one. Not only for a name with keys now: a
@@ -946,10 +913,10 @@ pub async fn enrol(
             .await?;
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await?
+    .await
 }
 
 /// The inodes that `user` has grants of, from their grant index, as `txn`
@@ -987,28 +954,28 @@ pub async fn change_password(
             let current = match txn.read_one(&keys_key(user)).await?.value {
                 Some(bytes) => match decode(user, &bytes) {
                     Ok(current) => Some(current),
-                    Err(e) => return Ok(Err(e)),
+                    Err(e) => return Err(e.into()),
                 },
                 None => None,
             };
             let Some(current) = current.filter(|c| check_verifier(old_auth, &c.verifier)) else {
-                return Ok(Err(FsError::new(
-                    errno::EACCES,
-                    "the username or old password was wrong",
-                )));
+                return Err(
+                    FsError::new(errno::EACCES, "the username or old password was wrong").into(),
+                );
             };
             if current.public_key != keys.public_key {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EINVAL,
                     "a password change can't replace the key pair",
-                )));
+                )
+                .into());
             }
             txn.write(&keys_key(user), Some(encoded)).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         }
     })
-    .await?
+    .await
 }
 
 /// Removes `user`: their keys, any code issued to them, their record, and
@@ -1034,9 +1001,9 @@ pub async fn remove(client: &Client, user: &str) -> Result<bool, FsError> {
             crate::grants::remove_grant_unlisted(&txn, user, ino).await?;
         }
         txn.commit().await?;
-        Ok(Ok(existed))
+        Ok(existed)
     })
-    .await?
+    .await
 }
 
 /// Every account with keys, and every account with an unused code, in name

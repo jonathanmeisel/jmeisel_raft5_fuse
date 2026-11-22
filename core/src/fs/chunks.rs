@@ -205,22 +205,23 @@ impl FsCore {
         txn: &Transaction,
         ino: u64,
         new_size: u64,
-    ) -> Result<Result<(), FsError>, KvError> {
+    ) -> Result<(), TxnError> {
         let keep = new_size % self.chunk_size;
         if keep == 0 {
-            return Ok(Ok(()));
+            return Ok(());
         }
         let index = new_size / self.chunk_size;
         let Some(value) = txn.read_one(&chunk_key(ino, index)).await?.value else {
-            return Ok(Ok(()));
+            return Ok(());
         };
-        Ok(match ChunkValue::decode(value) {
+        match ChunkValue::decode(value) {
             ChunkValue::Inline(blob) if plain_len(&blob) > keep => Err(FsError::new(
                 errno::EAGAIN,
                 format!("chunk {index} of inode {ino} holds more than a truncate keeps"),
-            )),
+            )
+            .into()),
             _ => Ok(()),
-        })
+        }
     }
 
     /// For a truncate to `new_size`, the block that the new end falls in
@@ -235,19 +236,19 @@ impl FsCore {
         txn: &Transaction,
         entry: &Entry,
         new_size: u64,
-    ) -> Result<Result<(), FsError>, KvError> {
+    ) -> Result<(), TxnError> {
         let Some(grid) = self.grid.filter(|_| entry.attr.layout == Layout::Hybrid) else {
-            return Ok(Ok(()));
+            return Ok(());
         };
         // The first chunk that is completely past the new end.
         let cut = new_size.div_ceil(self.chunk_size);
         if cut == 0 || !grid.in_blocks(cut - 1) {
-            return Ok(Ok(()));
+            return Ok(());
         }
         let start = grid.block_start(cut - 1);
         let key = chunk_key(entry.attr.ino, start);
         let Some(value) = txn.read_one(&key).await?.value else {
-            return Ok(Ok(()));
+            return Ok(());
         };
         if let ChunkValue::Block(mut block) = ChunkValue::decode(value) {
             let keep = (cut - start) as u32;
@@ -256,7 +257,7 @@ impl FsCore {
                 txn.write(&key, Some(&encode_pointer(&block))).await?;
             }
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Stores sealed chunks of `ino` and grows the file to `end`.
@@ -277,25 +278,24 @@ impl FsCore {
     ) -> Result<(Attr, u64), FsError> {
         self.check_chunk_writes(writes)?;
         let (attr, dropped, grown, parent) = run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, ino, true).await?);
-            decide!(self.fresh(&txn, ino).await?);
+            self.guard(&txn, caller, ino, true).await?;
+            self.fresh(&txn, ino).await?;
             // Read the Entry first. This is required: a deletion marks the
             // Entry before it removes the chunks, in a transaction that
             // conflicts with this one on the Entry. So no chunk is stored
             // after the deletion's scan has passed it. The Entry is removed
             // last, so no chunk is stored for an inode that nothing can
             // reach.
-            let mut entry = decide!(live_entry(&txn, ino).await?);
-            decide!(check_kind(&entry, Kind::File));
+            let mut entry = live_entry(&txn, ino).await?;
+            check_kind(&entry, Kind::File)?;
             if let Err(e) = self
                 .check_room(entry.parent, end.saturating_sub(entry.attr.size))
                 .await
             {
-                return Ok(Err(e));
+                return Err(e.into());
             }
             let before = entry.attr.size;
-            let dropped =
-                decide!(put_chunks(self, &txn, &entry, writes, false, before.max(end)).await?);
+            let dropped = put_chunks(self, &txn, &entry, writes, false, before.max(end)).await?;
             if end > entry.attr.size {
                 entry.attr.size = end;
             }
@@ -305,9 +305,9 @@ impl FsCore {
             write_entry(&txn, &entry).await?;
             let seq = txn.commit().await?;
             let grown = entry.attr.size - before;
-            Ok(Ok(((entry.attr, seq), dropped, grown, entry.parent)))
+            Ok(((entry.attr, seq), dropped, grown, entry.parent))
         })
-        .await??;
+        .await?;
         self.discard(dropped);
         self.count(parent, grown as i64).await;
         self.note_edit(caller, ino, parent).await;
@@ -325,7 +325,7 @@ impl FsCore {
         ino: u64,
         first_index: u64,
         layout: Layout,
-    ) -> Result<Vec<Dropped>, KvError> {
+    ) -> Result<Vec<Dropped>, FsError> {
         let prefix = chunk_prefix(ino);
         let grid = self.grid.filter(|_| layout == Layout::Hybrid);
         let mut dropped = Vec::new();

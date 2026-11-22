@@ -99,16 +99,17 @@ impl FsCore {
         let dirent = &dirent_key(parent, OsStr::from_bytes(name));
         run_txn(&self.client, move |txn| async move {
             let Some(mut entry) = live(ino, txn.read_one(&attr_key(ino)).await?.value) else {
-                return Ok(Ok(()));
+                return Ok(());
             };
             // No grant of it, or of any folder above it.
             let mut at = ino;
             while at != ROOT_INO {
                 if !grants::grants_of(&txn, at).await?.is_empty() {
-                    return Ok(Err(FsError::new(
+                    return Err(FsError::new(
                         errno::EBUSY,
                         format!("inode {at} has a grant now: not removing inode {ino}"),
-                    )));
+                    )
+                    .into());
                 }
                 at = match txn.read_one(&attr_key(at)).await?.value {
                     Some(bytes) => decode_entry(at, &bytes).parent,
@@ -116,23 +117,24 @@ impl FsCore {
                 };
             }
             if named(&txn, dirent).await? != Some(ino) {
-                return Ok(Ok(()));
+                return Ok(());
             }
             entry.mark_deleted();
             entry.attr.ctime = SystemTime::now();
             write_entry(&txn, &entry).await?;
             if kind == Kind::Directory && !is_empty_dir(&txn, ino).await? {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EBUSY,
                     format!("folder {ino} has new entries: not removing it"),
-                )));
+                )
+                .into());
             }
             txn.write(dirent, None).await?;
             txn.write(&tombstone_key(ino), Some(&[1])).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Every live node from the root down, read outside a transaction.

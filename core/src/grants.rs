@@ -48,6 +48,7 @@ use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::types::{FsError, Grant, GrantedNode, Grantee, KeyPath};
 
 use crate::entry::decode_entry;
+use crate::fs::TxnError;
 use crate::layout::{
     GRANT_INDEX_PREFIX, GRANTEES_PREFIX, GRANTS_PREFIX, NODE_KEYS_PREFIX, RESERVATION_PREFIX,
     ROOT_INO, attr_key, prune_claim_key, unpruned_key,
@@ -267,11 +268,8 @@ pub(crate) fn decode_grant(ino: u64, bytes: &[u8]) -> Result<Grant, FsError> {
 
 /// Reads `(version, parent_version)` from `ino`'s key record. Every inode
 /// of the filesystem has one.
-pub(crate) async fn key_versions(
-    r: &impl Reads,
-    ino: u64,
-) -> Result<Result<(u32, u32), FsError>, KvError> {
-    Ok(versions_of(ino, r.get(&node_keys_key(ino)).await?))
+pub(crate) async fn key_versions(r: &impl Reads, ino: u64) -> Result<(u32, u32), TxnError> {
+    Ok(versions_of(ino, r.get(&node_keys_key(ino)).await?)?)
 }
 
 /// The versions in `ino`'s key record, as read.
@@ -300,7 +298,7 @@ async fn walk(
     paths: &Paths,
     user: &str,
     ino: u64,
-) -> Result<Result<(Grant, Vec<u64>), FsError>, KvError> {
+) -> Result<(Grant, Vec<u64>), TxnError> {
     let at = r.snapshot();
     let refused = || {
         FsError::new(
@@ -321,13 +319,13 @@ async fn walk(
         // The real root is granted to no one. The nodes directly below it
         // are the volumes, and each one is reached only by its own grants.
         if cur == ROOT_INO {
-            return Ok(Err(refused()));
+            return Err(refused().into());
         }
         if let Some(known) = paths.get(at, user, cur) {
             if let Some(grant) = follows(r, user, &known).await? {
                 path.extend_from_slice(&known);
                 paths.remember(at, user, &path);
-                return Ok(Ok((grant, path)));
+                return Ok((grant, path));
             }
             paths.forget(at, user, cur);
         }
@@ -335,11 +333,11 @@ async fn walk(
         // The grant counts only if the Entry exists.
         let [entry, grant] = exactly(r.get_many(&[attr_key(cur), grant_key(cur, user)]).await?);
         let Some(bytes) = entry else {
-            return Ok(Err(gone(cur)));
+            return Err(gone(cur).into());
         };
         let entry = decode_entry(cur, &bytes);
         if entry.is_deleted() {
-            return Ok(Err(gone(cur)));
+            return Err(gone(cur).into());
         }
         path.push(cur);
         if let Some(bytes) = grant {
@@ -347,18 +345,15 @@ async fn walk(
             if grant.is_ok() {
                 paths.remember(at, user, &path);
             }
-            return Ok(grant.map(|grant| (grant, path)));
+            return Ok(grant.map(|grant| (grant, path))?);
         }
         // No parent is recorded, so there is no way up.
         if entry.parent == 0 {
-            return Ok(Err(refused()));
+            return Err(refused().into());
         }
         cur = entry.parent;
     }
-    Ok(Err(FsError::new(
-        errno::EIO,
-        format!("inode {ino}'s parent links loop"),
-    )))
+    Err(FsError::new(errno::EIO, format!("inode {ino}'s parent links loop")).into())
 }
 
 /// Returns the grant at the top of `path` if a walk from its first node
@@ -404,13 +399,10 @@ pub(crate) async fn authorize(
     user: &str,
     ino: u64,
     write: bool,
-) -> Result<Result<Grant, FsError>, KvError> {
-    let (grant, mut path) = match walk(r, paths, user, ino).await? {
-        Ok(found) => found,
-        Err(e) => return Ok(Err(e)),
-    };
+) -> Result<Grant, TxnError> {
+    let (grant, mut path) = walk(r, paths, user, ino).await?;
     if !write || grant.writable {
-        return Ok(Ok(grant));
+        return Ok(grant);
     }
     // Read-only here: look on up for a read-write grant. Each walk's reads
     // are the operation's, so revoking that grant conflicts with it.
@@ -419,16 +411,19 @@ pub(crate) async fn authorize(
         let Some(above) = parent_of(r, granted).await? else {
             break;
         };
-        match walk(r, paths, user, above).await? {
-            Ok((grant, _)) if grant.writable => return Ok(Ok(grant)),
+        match walk(r, paths, user, above).await {
+            Ok((grant, _)) if grant.writable => return Ok(grant),
             Ok((_, next)) => path = next,
-            Err(_) => break,
+            // No grant above: this one is all there is.
+            Err(TxnError::Fs(_)) => break,
+            Err(e) => return Err(e),
         }
     }
-    Ok(Err(FsError::new(
+    Err(FsError::new(
         errno::EROFS,
         format!("inode {ino} is shared with {user} read-only"),
-    )))
+    )
+    .into())
 }
 
 /// `ino`'s parent, if it has one below the real root.
@@ -451,10 +446,14 @@ pub(crate) async fn covered(
 ) -> Result<Vec<u64>, FsError> {
     let mut covered = Vec::new();
     for grant in grants {
-        if let Some(above) = parent_of(view, grant.ino).await?
-            && walk(view, paths, user, above).await?.is_ok()
-        {
-            covered.push(grant.ino);
+        let Some(above) = parent_of(view, grant.ino).await? else {
+            continue;
+        };
+        match walk(view, paths, user, above).await {
+            Ok(_) => covered.push(grant.ino),
+            // No grant above it.
+            Err(TxnError::Fs(_)) => {}
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(covered)
@@ -465,7 +464,7 @@ pub(crate) async fn covered(
 /// node that is not. A revoked user can still have a stale node's key (see
 /// raft5fs-crypto's `node`). So nothing new can be sealed under the node,
 /// or under anything below it, until it gets a new key.
-pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), FsError>, KvError> {
+pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<(), TxnError> {
     // Each level reads a node's Entry and key record together. A node's key
     // version is what the node below it should be wrapped under, so that
     // check happens one level later, with `below`: the node below, and the
@@ -477,41 +476,38 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
             // The real root has a key record, but no Entry to check it
             // against. Only the node below it needs the comparison.
             let Some(child) = below else {
-                return Ok(Ok(()));
+                return Ok(());
             };
             return Ok(versions_of(cur, r.get(&node_keys_key(cur)).await?)
-                .and_then(|(version, _)| check_wrapped(child, version)));
+                .and_then(|(version, _)| check_wrapped(child, version))?);
         }
         let [entry, keys] = exactly(r.get_many(&[attr_key(cur), node_keys_key(cur)]).await?);
         // The node itself must exist before its key record matters. A
         // parent's key record is checked against its child first, as if
         // each was read in turn.
         if below.is_none() && entry.is_none() {
-            return Ok(Err(FsError::errno(errno::ENOENT)));
+            return Err(FsError::errno(errno::ENOENT).into());
         }
         let (version, wrapped_under) = match versions_of(cur, keys) {
             Ok(versions) => versions,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Err(e.into()),
         };
         if let Some(child) = below
             && let Err(e) = check_wrapped(child, version)
         {
-            return Ok(Err(e));
+            return Err(e.into());
         }
         let Some(bytes) = entry else {
-            return Ok(Err(FsError::errno(errno::ENOENT)));
+            return Err(FsError::errno(errno::ENOENT).into());
         };
         // A volume's root: no parent key wraps it.
         if wrapped_under == 0 {
-            return Ok(Ok(()));
+            return Ok(());
         }
         below = Some((cur, wrapped_under));
         cur = decode_entry(cur, &bytes).parent;
     }
-    Ok(Err(FsError::new(
-        errno::EIO,
-        format!("inode {ino}'s parent links loop"),
-    )))
+    Err(FsError::new(errno::EIO, format!("inode {ino}'s parent links loop")).into())
 }
 
 /// Checks that `child`, wrapped under the given version of its parent's
@@ -682,7 +678,7 @@ pub(crate) async fn key_path(
     user: &str,
     ino: u64,
 ) -> Result<KeyPath, FsError> {
-    let (grant, mut path) = walk(view, paths, user, ino).await??;
+    let (grant, mut path) = walk(view, paths, user, ino).await?;
     path.reverse();
     let records: Vec<Vec<u8>> = path.iter().map(|&node| node_keys_key(node)).collect();
     let mut nodes = Vec::with_capacity(path.len());

@@ -167,16 +167,16 @@ impl FsCore {
 
         let (attr, change, parent) = run_txn(&self.client, move |txn| async move {
             let Some(bytes) = txn.read_one(&attr_key(ino)).await?.value else {
-                return Ok(Err(enoent()));
+                return Err(enoent().into());
             };
             let mut entry = decode_entry(ino, &bytes);
             let before = entry.attr.size as i64;
             // A truncate rewrites the boundary chunk. It must not do that
             // to an inode whose deletion could already have removed it.
             if entry.is_deleted() {
-                return Ok(Err(enoent()));
+                return Err(enoent().into());
             }
-            decide!(self.guard(&txn, caller, ino, true).await?);
+            self.guard(&txn, caller, ino, true).await?;
             if let Some(mode) = changes.mode {
                 entry.attr.perm = (mode & 0o7777) as u16;
             }
@@ -185,13 +185,13 @@ impl FsCore {
                     .check_room(entry.parent, new_size.saturating_sub(entry.attr.size))
                     .await
                 {
-                    return Ok(Err(e));
+                    return Err(e.into());
                 }
                 if new_size < entry.attr.size {
-                    decide!(self.check_cut_short(&txn, ino, new_size).await?);
+                    self.check_cut_short(&txn, ino, new_size).await?;
                 }
                 entry.attr.size = new_size;
-                decide!(self.trim_block(&txn, &entry, new_size).await?);
+                self.trim_block(&txn, &entry, new_size).await?;
             }
             if let Some(atime) = changes.atime {
                 entry.attr.atime = atime.resolve();
@@ -205,9 +205,9 @@ impl FsCore {
                 .await?;
             txn.commit().await?;
             let change = entry.attr.size as i64 - before;
-            Ok(Ok((entry.attr, change, entry.parent)))
+            Ok((entry.attr, change, entry.parent))
         })
-        .await??;
+        .await?;
         if attr.kind == Kind::File {
             self.count(parent, change).await;
             if changes.size.is_some() {
@@ -283,21 +283,21 @@ impl FsCore {
         let value = &dirent_value(ino, &new.sealed_name);
 
         let made = run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, parent, true).await?);
+            self.guard(&txn, caller, parent, true).await?;
             // The new node's key and name are sealed under the parent's
             // key.
-            decide!(self.fresh(&txn, parent).await?);
+            self.fresh(&txn, parent).await?;
             let [dir, taken, record] = exactly(
                 txn.read_many(&[attr_key(parent), dirent.to_vec(), node_keys_key(parent)])
                     .await?,
             );
-            let mut dir = decide!(dir_entry(parent, dir.value));
+            let mut dir = dir_entry(parent, dir.value)?;
             if taken.value.is_some() {
-                return Ok(Err(FsError::errno(errno::EEXIST)));
+                return Err(FsError::errno(errno::EEXIST).into());
             }
-            let (parent_version, _) = decide!(versions_of(parent, record.value));
-            decide!(check_name_version(parent, &new.sealed_name, parent_version));
-            decide!(self.claim(&txn, caller, new, (1, parent_version)).await?);
+            let (parent_version, _) = versions_of(parent, record.value)?;
+            check_name_version(parent, &new.sealed_name, parent_version)?;
+            self.claim(&txn, caller, new, (1, parent_version)).await?;
             let now = SystemTime::now();
             let entry = Entry {
                 attr: Attr {
@@ -326,9 +326,9 @@ impl FsCore {
             txn.write(dirent, Some(value)).await?;
             touch_dir(&txn, &mut dir, now).await?;
             txn.commit().await?;
-            Ok(Ok(entry.attr))
+            Ok(entry.attr)
         })
-        .await?;
+        .await;
         let made = self.release_if_failed(caller, new.ino, made).await;
         if made.is_ok() {
             let name = SealedEntryName {
@@ -427,7 +427,7 @@ impl FsCore {
         caller: &Caller,
         new: &NewNode,
         versions: (u32, u32),
-    ) -> Result<Result<(), FsError>, KvError> {
+    ) -> Result<(), TxnError> {
         let user = caller.user.as_str();
         let [reserved, existing] = exactly(
             txn.read_many(&[reservation_key(new.ino), attr_key(new.ino)])
@@ -439,31 +439,33 @@ impl FsCore {
             .map(|v| grants::reservation_parts(v).0)
             != Some(user.as_bytes())
         {
-            return Ok(Err(FsError::new(
+            return Err(FsError::new(
                 errno::EACCES,
                 format!("inode {} isn't reserved for {user}", new.ino),
-            )));
+            )
+            .into());
         }
         if existing.value.is_some() {
-            return Ok(Err(FsError::errno(errno::EEXIST)));
+            return Err(FsError::errno(errno::EEXIST).into());
         }
         match NodeKeys::versions(&new.keys) {
             Ok(found) if found == versions => {}
             // Most likely a client with an old version of the parent's key.
             // Fetching the key again fixes that.
             _ => {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EKEYEXPIRED,
                     format!(
                         "a new node's key record must be version {} under parent version {}",
                         versions.0, versions.1
                     ),
-                )));
+                )
+                .into());
             }
         }
         txn.write(&reservation_key(new.ino), None).await?;
         grants::put_node_keys(txn, new.ino, Some(&new.keys)).await?;
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Removes a file and returns its inode.
@@ -514,16 +516,16 @@ impl FsCore {
     ) -> Result<(), FsError> {
         let dirent = &dirent_key(parent, name);
         let sealed = run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, guarded, true).await?);
-            let mut dir = decide!(modifiable_dir(&txn, parent).await?);
+            self.guard(&txn, caller, guarded, true).await?;
+            let mut dir = modifiable_dir(&txn, parent).await?;
             let Some(value) = txn.read_one(dirent).await?.value else {
-                return Ok(Err(enoent()));
+                return Err(enoent().into());
             };
             if dirent_ino(&value) != ino {
-                return Ok(Err(enoent()));
+                return Err(enoent().into());
             }
-            let mut entry = decide!(live_entry(&txn, ino).await?);
-            decide!(check_kind(&entry, kind));
+            let mut entry = live_entry(&txn, ino).await?;
+            check_kind(&entry, kind)?;
             let now = SystemTime::now();
             entry.mark_deleted();
             entry.attr.ctime = now;
@@ -531,15 +533,15 @@ impl FsCore {
             // check fails, dropping the transaction undoes it.
             write_entry(&txn, &entry).await?;
             if kind == Kind::Directory && !is_empty_dir(&txn, ino).await? {
-                return Ok(Err(FsError::errno(errno::ENOTEMPTY)));
+                return Err(FsError::errno(errno::ENOTEMPTY).into());
             }
             txn.write(dirent, None).await?;
             txn.write(&tombstone_key(ino), Some(&[1])).await?;
             touch_dir(&txn, &mut dir, now).await?;
             txn.commit().await?;
-            Ok(Ok(dirent_sealed_name(&value).to_vec()))
+            Ok(dirent_sealed_name(&value).to_vec())
         })
-        .await??;
+        .await?;
         let gone = SealedEntryName {
             parent,
             tag: name.as_bytes().to_vec(),
@@ -579,9 +581,9 @@ impl FsCore {
         let from = &dirent_key(parent, name);
         let to = &dirent_key(new_parent, new_name);
         let (replaced, moved) = run_txn(&self.client, move |txn| async move {
-            decide!(self.guard(&txn, caller, parent, true).await?);
+            self.guard(&txn, caller, parent, true).await?;
             if new_parent != parent {
-                decide!(self.guard(&txn, caller, new_parent, true).await?);
+                self.guard(&txn, caller, new_parent, true).await?;
             }
             // Read both directories and both names in one read, then both
             // inodes they name in another. Check them in the order of a
@@ -594,15 +596,15 @@ impl FsCore {
             let mut found = txn.read_many(&keys).await?.into_iter().map(|e| e.value);
             let mut next = move || found.next().expect("a read of every key answers each");
             let (src_dir, from_value, to_value) = (next(), next(), next());
-            let mut src_dir = decide!(dir_entry(parent, src_dir));
+            let mut src_dir = dir_entry(parent, src_dir)?;
             let mut dst_dir = if moves {
-                Some(decide!(dir_entry(new_parent, next())))
+                Some(dir_entry(new_parent, next())?)
             } else {
                 None
             };
 
             let Some(ino) = from_value.as_deref().map(dirent_ino) else {
-                return Ok(Err(enoent()));
+                return Err(enoent().into());
             };
             let target = to_value.map(|b| dirent_ino(&b));
             let victim_ino = target.filter(|&victim| victim != ino);
@@ -610,11 +612,11 @@ impl FsCore {
             keys.extend(victim_ino.map(attr_key));
             let mut found = txn.read_many(&keys).await?.into_iter().map(|e| e.value);
             let mut next = move || found.next().expect("a read of every key answers each");
-            let mut moved = decide!(live(ino, next()).ok_or_else(enoent));
+            let mut moved = live(ino, next()).ok_or_else(enoent)?;
             if target == Some(ino) {
                 // Two names for one inode: POSIX says to do nothing. With
                 // no hard links, only `rename(a, a)` gets here.
-                return Ok(Ok((None, None)));
+                return Ok((None, None));
             }
             let old_sealed = from_value
                 .as_deref()
@@ -625,27 +627,28 @@ impl FsCore {
             let now = SystemTime::now();
             if let Some(victim_ino) = victim_ino {
                 if noreplace {
-                    return Ok(Err(FsError::errno(errno::EEXIST)));
+                    return Err(FsError::errno(errno::EEXIST).into());
                 }
-                decide!(replace_victim(&txn, victim_ino, next(), moved.attr.kind, now).await?);
+                replace_victim(&txn, victim_ino, next(), moved.attr.kind, now).await?;
             }
 
             // The sealed name and key record are for one inode, which must
             // be the inode that moves.
             if sealed.ino != ino {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::ESTALE,
                     "the name moved meanwhile names another inode now",
-                )));
+                )
+                .into());
             }
             // Only now: its answer says what the target holds and what the
             // inode's size is, for someone who may write to both folders.
             if moves && let Err(e) = self.check_move_room(ino, parent, new_parent).await {
-                return Ok(Err(e));
+                return Err(e.into());
             }
-            decide!(self.move_keys(&txn, sealed, ino, new_parent, moves).await?);
+            self.move_keys(&txn, sealed, ino, new_parent, moves).await?;
             if moved.attr.kind == Kind::Directory && new_parent != parent {
-                decide!(check_no_loop(&txn, ino, new_parent).await?);
+                check_no_loop(&txn, ino, new_parent).await?;
             }
             if new_parent != parent {
                 // A file's parent too: see `create_child`.
@@ -661,9 +664,9 @@ impl FsCore {
                 touch_dir(&txn, dst_dir, now).await?;
             }
             txn.commit().await?;
-            Ok(Ok((target, Some((old_sealed, moved.attr.kind)))))
+            Ok((target, Some((old_sealed, moved.attr.kind))))
         })
-        .await??;
+        .await?;
         if let Some((old_sealed, kind)) = moved {
             let from = (parent, name, old_sealed);
             let to = (new_parent, new_name);
@@ -698,32 +701,29 @@ impl FsCore {
         ino: u64,
         new_parent: u64,
         moves: bool,
-    ) -> Result<Result<(), FsError>, KvError> {
-        decide!(self.fresh(txn, new_parent).await?);
-        decide!(self.fresh(txn, ino).await?);
+    ) -> Result<(), TxnError> {
+        self.fresh(txn, new_parent).await?;
+        self.fresh(txn, ino).await?;
         let mut records = vec![node_keys_key(new_parent)];
         if moves {
             records.push(node_keys_key(ino));
         }
         let mut records = txn.get_many(&records).await?.into_iter();
-        let (dst_version, _) = decide!(versions_of(new_parent, records.next().flatten()));
-        decide!(check_name_version(
-            new_parent,
-            &sealed.sealed_name,
-            dst_version
-        ));
+        let (dst_version, _) = versions_of(new_parent, records.next().flatten())?;
+        check_name_version(new_parent, &sealed.sealed_name, dst_version)?;
         if moves {
             let keys = &sealed.node_keys;
-            let (version, _) = decide!(versions_of(ino, records.next().flatten()));
+            let (version, _) = versions_of(ino, records.next().flatten())?;
             if NodeKeys::versions(keys).ok() != Some((version, dst_version)) {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EKEYEXPIRED,
                     "the moved node's key record must keep its version, under the new parent's",
-                )));
+                )
+                .into());
             }
             grants::put_node_keys(txn, ino, Some(keys)).await?;
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Records a rename in the activity log: `from` is the old folder,
@@ -833,34 +833,30 @@ async fn replace_victim(
     value: Option<Vec<u8>>,
     moved_kind: Kind,
     now: SystemTime,
-) -> Result<Result<(), FsError>, KvError> {
-    let mut victim = decide!(live(victim_ino, value).ok_or_else(enoent));
-    decide!(check_kind(&victim, moved_kind));
+) -> Result<(), TxnError> {
+    let mut victim = live(victim_ino, value).ok_or_else(enoent)?;
+    check_kind(&victim, moved_kind)?;
     victim.mark_deleted();
     victim.attr.ctime = now;
     write_entry(txn, &victim).await?;
     if victim.attr.kind == Kind::Directory && !is_empty_dir(txn, victim_ino).await? {
-        return Ok(Err(FsError::errno(errno::ENOTEMPTY)));
+        return Err(FsError::errno(errno::ENOTEMPTY).into());
     }
     txn.write(&tombstone_key(victim_ino), Some(&[1])).await?;
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// Refuses (`EINVAL`) to move directory `ino` below itself, by walking up
 /// from `new_parent`. The walk reads every ancestor in the transaction, so
 /// a rename at the same time that would close a loop the other way (and
 /// writes one of them) conflicts with this one and cannot get past it.
-async fn check_no_loop(
-    txn: &Transaction,
-    ino: u64,
-    new_parent: u64,
-) -> Result<Result<(), FsError>, KvError> {
+async fn check_no_loop(txn: &Transaction, ino: u64, new_parent: u64) -> Result<(), TxnError> {
     let mut cur = new_parent;
     while cur != ROOT_INO {
         if cur == ino {
-            return Ok(Err(FsError::errno(errno::EINVAL)));
+            return Err(FsError::errno(errno::EINVAL).into());
         }
-        cur = decide!(live_entry(txn, cur).await?).parent;
+        cur = live_entry(txn, cur).await?.parent;
     }
-    Ok(Ok(()))
+    Ok(())
 }

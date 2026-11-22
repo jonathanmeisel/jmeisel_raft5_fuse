@@ -377,7 +377,7 @@ impl FsCore {
         changes: &[(u64, i64)],
     ) -> Result<Option<u64>, FsError> {
         let key = &usage_key(owner);
-        Ok(run_txn(&self.client, move |txn| async move {
+        run_txn(&self.client, move |txn| async move {
             let (bytes, at) = txn
                 .read_one(key)
                 .await?
@@ -396,7 +396,7 @@ impl FsCore {
             txn.commit().await?;
             Ok(Some(bytes))
         })
-        .await?)
+        .await
     }
 
     /// Adds `changes` to folder `ino`'s size record; returns what it holds
@@ -404,7 +404,7 @@ impl FsCore {
     /// none: measuring makes it.
     async fn add_to_size(&self, ino: u64, changes: &[(u64, i64)]) -> Result<Option<u64>, FsError> {
         let key = &folder_size_key(ino);
-        Ok(run_txn(&self.client, move |txn| async move {
+        run_txn(&self.client, move |txn| async move {
             let Some((bytes, files, at)) =
                 txn.read_one(key).await?.value.and_then(|v| decode_size(&v))
             else {
@@ -419,7 +419,7 @@ impl FsCore {
             txn.commit().await?;
             Ok(Some(bytes))
         })
-        .await?)
+        .await
     }
 
     /// Refuses (`EDQUOT`) to make a file in folder `dir` `growth` bytes
@@ -625,14 +625,14 @@ impl FsCore {
         run_txn(&self.client, move |txn| async move {
             // Not for a folder whose deletion has begun: its record would
             // stay after it.
-            let entry = decide!(live_entry(&txn, ino).await?);
-            decide!(check_kind(&entry, Kind::Directory));
+            let entry = live_entry(&txn, ino).await?;
+            check_kind(&entry, Kind::Directory)?;
             let value = limit.map(u64::to_be_bytes);
             txn.write(key, value.as_ref().map(|v| &v[..])).await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await??;
+        .await?;
         *self.usage.limited.lock().unwrap() = None;
         self.usage.rooms.lock().unwrap().remove(&Tally::Folder(ino));
         if limit.is_some() {
@@ -648,8 +648,11 @@ impl FsCore {
         let (bytes, files) = folder_sizes(&tree, ino)[&ino];
         let key = &folder_size_key(ino);
         run_txn(&self.client, move |txn| async move {
-            if live_entry(&txn, ino).await?.is_err() {
-                return Ok(());
+            match live_entry(&txn, ino).await {
+                Ok(_) => {}
+                // Removed meanwhile: there is nothing to store.
+                Err(TxnError::Fs(_)) => return Ok(()),
+                Err(e) => return Err(e),
             }
             txn.write(key, Some(&encode_size(bytes, files, started)))
                 .await?;

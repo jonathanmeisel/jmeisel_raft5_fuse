@@ -107,9 +107,9 @@ pub async fn put(
                 .await?;
         }
         txn.commit().await?;
-        Ok(Ok(()))
+        Ok(())
     })
-    .await?
+    .await
 }
 
 /// The introductions left for `recipient`. Removes those too old to keep.
@@ -134,9 +134,9 @@ pub async fn get(client: &Client, recipient: &str) -> Result<Vec<Introduction>, 
             }
         }
         txn.commit().await?;
-        Ok(Ok(found))
+        Ok(found)
     })
-    .await?
+    .await
 }
 
 /// Removes the introductions left for `recipient` of each `(subject,
@@ -162,9 +162,9 @@ pub async fn delete(
                 .await?;
         }
         txn.commit().await?;
-        Ok(Ok(()))
+        Ok(())
     })
-    .await?
+    .await
 }
 
 /// Removes every introduction that names `user`, as recipient, subject or

@@ -47,40 +47,69 @@ pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 const R: u32 = libc::R_OK as u32;
 const W: u32 = libc::W_OK as u32;
 
-/// Runs `attempt`, one whole transaction from its reads to its commit, again
-/// each time the store aborts it, and returns its result (see
-/// `Client::run_transaction`, which decides when to stop).
-///
-/// - An attempt that reaches its own decision ("that name is taken", "no such
-///   inode") returns it inside `Ok`, as `Ok(Err(..))`, so only the store's
-///   aborts are retried.
-/// - An attempt can run more than once, so it must not change anything
-///   outside the transaction.
-/// - If the store keeps aborting it, this gives up, and callers report that
-///   as `EBUSY`.
-///
-/// It takes a closure that returns a new future for each attempt, not an
-/// async closure. The compiler cannot show that an async closure's future
-/// is `Send` for every lifetime, and the server's runtime needs that. So
-/// callers capture only references (which copy) and `move` them into each
-/// attempt.
+/// Why a transaction's attempt stopped: the store refused it (a conflict, a
+/// lost leader), which `run_txn` tries again, or the filesystem refused the
+/// request, which ends it. Either way nothing it wrote is stored.
+#[derive(Debug)]
+pub(crate) enum TxnError {
+    Kv(KvError),
+    Fs(FsError),
+}
+
+impl From<KvError> for TxnError {
+    fn from(e: KvError) -> Self {
+        TxnError::Kv(e)
+    }
+}
+
+impl From<FsError> for TxnError {
+    fn from(e: FsError) -> Self {
+        TxnError::Fs(e)
+    }
+}
+
+/// For a transaction's step used outside one, as on a snapshot's view.
+impl From<TxnError> for FsError {
+    fn from(e: TxnError) -> Self {
+        match e {
+            TxnError::Kv(e) => e.into(),
+            TxnError::Fs(e) => e,
+        }
+    }
+}
+
+/// An attempt's result, as the store's `run_transaction` takes it: only an
+/// `Err` (the store's own) makes it try again. A filesystem error is an
+/// answer, so it comes back inside `Ok`, and is not retried.
+fn settle<T>(tried: Result<T, TxnError>) -> Result<Result<T, FsError>, KvError> {
+    match tried {
+        Ok(value) => Ok(Ok(value)),
+        Err(TxnError::Fs(e)) => Ok(Err(e)),
+        Err(TxnError::Kv(e)) => Err(e),
+    }
+}
+
+/// Runs `attempt` in a store transaction, again for as long as the store
+/// says to retry. `attempt` commits the transaction itself; an attempt that
+/// returns a `TxnError::Fs` stores nothing, and its error is the answer.
 pub(crate) async fn run_txn<T, Fut>(
     client: &Client,
     mut attempt: impl FnMut(Transaction) -> Fut,
-) -> Result<T, KvError>
+) -> Result<T, FsError>
 where
-    Fut: std::future::Future<Output = Result<T, KvError>>,
+    Fut: std::future::Future<Output = Result<T, TxnError>>,
 {
     let mut attempts = 0u32;
     let out = timing::transaction(client.run_transaction(TXN_TTL, |txn| {
         attempts += 1;
-        attempt(txn)
+        let tried = attempt(txn);
+        async move { settle(tried.await) }
     }))
     .await;
     if attempts > 1 {
         tracing::debug!(attempts, "store transaction retried");
     }
-    out
+    out?
 }
 
 /// The most that a sealed name may take. Names are 255 bytes at most on a
@@ -115,19 +144,6 @@ fn check_sealed_grant(key: &[u8], label: &[u8], grantees: &[u8]) -> Result<(), F
 /// create takes moments, so a day leaves room for clocks and slow clients.
 pub(crate) const RESERVATION_AGE: Duration = Duration::from_secs(24 * 3600);
 
-/// In a transaction attempt, unwraps a filesystem decision, or ends the
-/// attempt with it as `Ok(Err(..))`, the form that `run_txn` does not
-/// retry.
-macro_rules! decide {
-    ($result:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(e) => return Ok(Err(e)),
-        }
-    };
-}
-
-// After `decide!`, which they use.
 mod activity;
 mod chunks;
 mod keys;
@@ -139,8 +155,8 @@ pub(crate) mod volumes;
 
 /// `ino`'s Entry as `txn` sees it. It stays locked against changes until
 /// `txn` ends. A missing or deleted inode gives `ENOENT`.
-async fn live_entry(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
-    Ok(live(ino, txn.read_one(&attr_key(ino)).await?.value).ok_or_else(enoent))
+async fn live_entry(txn: &Transaction, ino: u64) -> Result<Entry, TxnError> {
+    Ok(live(ino, txn.read_one(&attr_key(ino)).await?.value).ok_or_else(enoent)?)
 }
 
 /// Decodes directory `ino`'s Entry from the value read for its key, to add
@@ -161,8 +177,8 @@ fn live(ino: u64, value: Option<Vec<u8>>) -> Option<Entry> {
 
 /// Reads directory `ino` to add or remove names. The caller must already
 /// have checked `caller` for a writable grant above it.
-async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsError>, KvError> {
-    Ok(dir_entry(ino, txn.read_one(&attr_key(ino)).await?.value))
+async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Entry, TxnError> {
+    Ok(dir_entry(ino, txn.read_one(&attr_key(ino)).await?.value)?)
 }
 
 /// The inode that a directory entry names, if it exists.
@@ -234,10 +250,10 @@ async fn put_chunks(
     writes: &[ChunkWrite],
     existing: bool,
     size: u64,
-) -> Result<Result<Vec<Dropped>, FsError>, KvError> {
+) -> Result<Vec<Dropped>, TxnError> {
     let ino = entry.attr.ino;
-    decide!(check_writes(core, entry, writes));
-    let (version, _) = decide!(key_versions(txn, ino).await?);
+    check_writes(core, entry, writes)?;
+    let (version, _) = key_versions(txn, ino).await?;
     // Read every inline chunk's seq in one read, and check each one below.
     // Only seqs are compared, so only seqs are read, and they are locked as
     // a value read would lock them. 0 means a chunk with no value. A
@@ -271,18 +287,18 @@ async fn put_chunks(
             w.expected_seq
                 .map(|_| seqs.next().expect("a seq read for every expected one"))
         };
-        decide!(check_sealed_and_seq(ino, w, version, seq, existing));
+        check_sealed_and_seq(ino, w, version, seq, existing)?;
         let key = chunk_key(ino, w.index);
         // After the check above, so that a client racing a truncate hears that
         // the chunk changed.
-        decide!(check_fits(core, txn, ino, w, &key, size, existing).await?);
+        check_fits(core, txn, ino, w, &key, size, existing).await?;
         let value = match &w.body {
             WriteBody::Inline(blob) => blob.clone(),
             WriteBody::Block(block) => encode_pointer(block),
         };
         txn.write(&key, Some(&value)).await?;
     }
-    Ok(Ok(dropped))
+    Ok(dropped)
 }
 
 /// The checks of `put_chunks` that need no reads: each write is in its
@@ -343,24 +359,25 @@ async fn check_fits(
     key: &[u8],
     size: u64,
     existing: bool,
-) -> Result<Result<(), FsError>, KvError> {
+) -> Result<(), TxnError> {
     if fits_in_size(w, size, core.chunk_size) {
-        return Ok(Ok(()));
+        return Ok(());
     }
     let keeps_length = existing
         && txn.read_one(key).await?.value.is_some_and(|stored| {
             stored_len(stored, core.chunk_size) >= write_len(w, core.chunk_size)
         });
     if keeps_length {
-        Ok(Ok(()))
+        Ok(())
     } else {
-        Ok(Err(FsError::new(
+        Err(FsError::new(
             errno::EINVAL,
             format!(
                 "chunk {} of inode {ino} doesn't fit in a file of {size} bytes",
                 w.index
             ),
-        )))
+        )
+        .into())
     }
 }
 
@@ -477,7 +494,7 @@ fn decode_chunk_size(bytes: &[u8]) -> Result<u64, String> {
 /// Gives out inode numbers. A transaction makes the read-increment-write
 /// atomic. The KV store has no other safe counter: with a plain read and
 /// write, two `mkdir`s at the same time could get the same inode.
-async fn allocate_inode(client: &Client) -> Result<u64, KvError> {
+async fn allocate_inode(client: &Client) -> Result<u64, FsError> {
     run_txn(client, move |txn| async move {
         let next = txn
             .read_one(COUNTER_KEY)
@@ -642,7 +659,7 @@ impl FsCore {
     /// create are in one transaction, so several servers can start on a new
     /// filesystem at the same time: the one that commits second finds the
     /// root.
-    async fn ensure_root(&self) -> Result<(), KvError> {
+    async fn ensure_root(&self) -> Result<(), FsError> {
         run_txn(&self.client, move |txn| async move {
             if txn.read_one(&attr_key(ROOT_INO)).await?.value.is_some() {
                 return Ok(());
@@ -685,16 +702,16 @@ impl FsCore {
         caller: &Caller,
         ino: u64,
         write: bool,
-    ) -> Result<Result<(), FsError>, KvError> {
-        Ok(grants::authorize(r, &self.paths, &caller.user, ino, write)
-            .await?
-            .map(|_| ()))
+    ) -> Result<(), TxnError> {
+        grants::authorize(r, &self.paths, &caller.user, ino, write)
+            .await
+            .map(|_| ())
     }
 
     /// Checks that `ino` and everything above it up to its volume are
     /// wrapped under their parents' current keys (see
     /// `grants::check_fresh`).
-    async fn fresh(&self, txn: &Transaction, ino: u64) -> Result<Result<(), FsError>, KvError> {
+    async fn fresh(&self, txn: &Transaction, ino: u64) -> Result<(), TxnError> {
         grants::check_fresh(txn, ino).await
     }
 
@@ -710,7 +727,7 @@ impl FsCore {
         if write && view.is_snapshot() {
             return Err(FsError::new(errno::EROFS, "a snapshot is read-only"));
         }
-        self.guard(view, caller, ino, write).await?
+        Ok(self.guard(view, caller, ino, write).await?)
     }
 
     /// Checks that a new entry's `name` is a tag and comes with its real
@@ -804,6 +821,15 @@ fn operations_are_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filesystem_error_ends_a_transaction_and_a_store_error_retries_it() {
+        let fs = settle::<()>(Err(FsError::errno(errno::ENOENT).into()));
+        assert!(matches!(fs, Ok(Err(e)) if e.errno == errno::ENOENT));
+        let store = settle::<()>(Err(KvError::NoSeeds.into()));
+        assert!(matches!(store, Err(KvError::NoSeeds)));
+        assert!(matches!(settle(Ok(7)), Ok(Ok(7))));
+    }
 
     fn block_write(version: u32, expected_seq: Option<u64>) -> ChunkWrite {
         ChunkWrite {

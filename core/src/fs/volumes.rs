@@ -64,13 +64,10 @@ pub(crate) fn decode_volume(ino: u64, bytes: &[u8]) -> Result<VolumeInfo, FsErro
 
 /// Volume `ino`'s record as `r` sees it, if it has one: `None` for an inode
 /// that isn't a volume, and for a volume from before records.
-pub(crate) async fn volume_of(
-    r: &impl Reads,
-    ino: u64,
-) -> Result<Result<Option<VolumeInfo>, FsError>, KvError> {
+pub(crate) async fn volume_of(r: &impl Reads, ino: u64) -> Result<Option<VolumeInfo>, TxnError> {
     Ok(match r.get(&volume_key(ino)).await? {
-        Some(bytes) => decode_volume(ino, &bytes).map(Some),
-        None => Ok(None),
+        Some(bytes) => Some(decode_volume(ino, &bytes)?),
+        None => None,
     })
 }
 
@@ -82,19 +79,19 @@ pub(crate) async fn check_owner_kept(
     ino: u64,
     user: &str,
     writable: Option<bool>,
-) -> Result<Result<(), FsError>, KvError> {
+) -> Result<(), TxnError> {
     if writable == Some(true) {
-        return Ok(Ok(()));
+        return Ok(());
     }
-    let record = decide!(volume_of(txn, ino).await?);
-    Ok(if record.and_then(|v| v.owner).as_deref() == Some(user) {
-        Err(FsError::new(
+    let record = volume_of(txn, ino).await?;
+    if record.and_then(|v| v.owner).as_deref() == Some(user) {
+        return Err(FsError::new(
             errno::EPERM,
             format!("{user} owns this volume, so keeps read-write access to it: transfer it first"),
-        ))
-    } else {
-        Ok(())
-    })
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Who volume `ino` counts against: its owner while they have a writable
@@ -120,23 +117,20 @@ async fn writes_now(client: &Client, ino: u64, user: &str) -> Result<bool, FsErr
 }
 
 /// Whether `user` has a writable grant of `ino` itself.
-async fn writes_at(
-    txn: &Transaction,
-    ino: u64,
-    user: &str,
-) -> Result<Result<bool, FsError>, KvError> {
+async fn writes_at(txn: &Transaction, ino: u64, user: &str) -> Result<bool, TxnError> {
     Ok(
         match txn.read_one(&grants::grant_key(ino, user)).await?.value {
-            Some(bytes) => grants::decode_grant(ino, &bytes).map(|g| g.writable),
-            None => Ok(false),
+            Some(bytes) => grants::decode_grant(ino, &bytes)?.writable,
+            None => false,
         },
     )
 }
 
 /// Volume `ino`'s record, in `txn`; `EINVAL` if `ino` isn't a volume.
-async fn record_of(txn: &Transaction, ino: u64) -> Result<Result<VolumeInfo, FsError>, KvError> {
-    Ok(decide!(volume_of(txn, ino).await?)
-        .ok_or_else(|| FsError::new(errno::EINVAL, format!("inode {ino} isn't a volume"))))
+async fn record_of(txn: &Transaction, ino: u64) -> Result<VolumeInfo, TxnError> {
+    Ok(volume_of(txn, ino)
+        .await?
+        .ok_or_else(|| FsError::new(errno::EINVAL, format!("inode {ino} isn't a volume")))?)
 }
 
 impl FsCore {
@@ -150,7 +144,7 @@ impl FsCore {
                 format!("inode {ino} isn't a volume"),
             ));
         }
-        Ok(volume_of(&view, ino).await??.unwrap_or_default())
+        Ok(volume_of(&view, ino).await?.unwrap_or_default())
     }
 
     /// Offers volume `ino` to `to`, as its owner. `to` must have
@@ -166,51 +160,52 @@ impl FsCore {
             ));
         }
         run_txn(&self.client, move |txn| async move {
-            let mut record = decide!(record_of(&txn, ino).await?);
+            let mut record = record_of(&txn, ino).await?;
             // The record keeps the name of a removed owner, and someone new
             // can get that name. They must not get the volume with it.
             if record.owner.as_deref() != Some(caller.user.as_str())
-                || !decide!(writes_at(&txn, ino, &caller.user).await?)
+                || !writes_at(&txn, ino, &caller.user).await?
             {
-                return Ok(Err(FsError::new(
-                    errno::EPERM,
-                    "only the volume's owner can give it away",
-                )));
+                return Err(
+                    FsError::new(errno::EPERM, "only the volume's owner can give it away").into(),
+                );
             }
-            if !decide!(writes_at(&txn, ino, to).await?) {
-                return Ok(Err(FsError::new(
+            if !writes_at(&txn, ino, to).await? {
+                return Err(FsError::new(
                     errno::EPERM,
                     format!("{to} needs read-write access to it first: share it with them"),
-                )));
+                )
+                .into());
             }
             record.offer = Some((to.to_string(), raft5fs_proto::clock::now_secs()));
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Withdraws the offer of volume `ino`, as its owner.
     pub async fn withdraw_offer(&self, caller: &Caller, ino: u64) -> Result<(), FsError> {
         run_txn(&self.client, move |txn| async move {
-            let mut record = decide!(record_of(&txn, ino).await?);
+            let mut record = record_of(&txn, ino).await?;
             if record.owner.as_deref() != Some(caller.user.as_str()) {
-                return Ok(Err(FsError::new(
+                return Err(FsError::new(
                     errno::EPERM,
                     "only the volume's owner can withdraw its offer",
-                )));
+                )
+                .into());
             }
             if record.offer.take().is_none() {
-                return Ok(Err(FsError::new(errno::ENOENT, "there is no offer")));
+                return Err(FsError::new(errno::ENOENT, "there is no offer").into());
             }
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await?
+        .await
     }
 
     /// Accepts or declines the offer of volume `ino`, as the user it was
@@ -236,7 +231,7 @@ impl FsCore {
         let size = if accept {
             // Asked first, because the room check's answer says how big the
             // volume is. The transaction below asks again, to be sure.
-            let record = volume_of(&self.live(), ino).await??.unwrap_or_default();
+            let record = volume_of(&self.live(), ino).await?.unwrap_or_default();
             offered_to_caller(&record)?;
             let size = self.moved_size(ino).await?;
             self.check_owner_room(&caller.user, size).await?;
@@ -245,15 +240,16 @@ impl FsCore {
             0
         };
         let old = run_txn(&self.client, move |txn| async move {
-            let mut record = decide!(record_of(&txn, ino).await?);
-            decide!(offered_to_caller(&record));
+            let mut record = record_of(&txn, ino).await?;
+            offered_to_caller(&record)?;
             record.offer = None;
             let old = if accept {
-                if !decide!(writes_at(&txn, ino, &caller.user).await?) {
-                    return Ok(Err(FsError::new(
+                if !writes_at(&txn, ino, &caller.user).await? {
+                    return Err(FsError::new(
                         errno::EPERM,
                         "you need read-write access to it, to own it",
-                    )));
+                    )
+                    .into());
                 }
                 record.owner.replace(caller.user.clone())
             } else {
@@ -262,9 +258,9 @@ impl FsCore {
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(old))
+            Ok(old)
         })
-        .await??;
+        .await?;
         if accept {
             self.count_transfer(ino, old, &caller.user, size);
         }
@@ -371,21 +367,22 @@ impl FsCore {
         let size = self.moved_size(ino).await?;
         let old = acting_owner(&self.client, ino).await?;
         run_txn(&self.client, move |txn| async move {
-            let mut record = decide!(record_of(&txn, ino).await?);
-            if !decide!(writes_at(&txn, ino, user).await?) || user.starts_with(LINK_PREFIX) {
-                return Ok(Err(FsError::new(
+            let mut record = record_of(&txn, ino).await?;
+            if !writes_at(&txn, ino, user).await? || user.starts_with(LINK_PREFIX) {
+                return Err(FsError::new(
                     errno::EPERM,
                     format!("{user} has no read-write access to it, so can't own it"),
-                )));
+                )
+                .into());
             }
             record.owner = Some(user.to_string());
             record.offer = None;
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
             txn.commit().await?;
-            Ok(Ok(()))
+            Ok(())
         })
-        .await??;
+        .await?;
         if old.as_deref() != Some(user) {
             self.count_transfer(ino, old, user, size);
         }

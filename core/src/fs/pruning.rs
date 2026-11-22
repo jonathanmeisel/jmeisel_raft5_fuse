@@ -121,7 +121,7 @@ impl FsCore {
             if !waiting(keys.as_deref()) {
                 txn.write(&unpruned_key(ino), None).await?;
             }
-            txn.commit().await
+            Ok(txn.commit().await?)
         })
         .await;
         if let Err(e) = dropped {
