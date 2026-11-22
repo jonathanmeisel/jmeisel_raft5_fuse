@@ -26,6 +26,7 @@
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
   import { streams } from "../lib/streams.js";
+  import { saveBlob, saveStream } from "../lib/downloads.js";
   import { pathHash, readRoute } from "../lib/route.js";
   import { fileIcon } from "../lib/sharedIcons.js";
   import { pruneHere, setPruneHere } from "../lib/pruneSetting.js";
@@ -288,17 +289,11 @@
 
   async function download(path) {
     const name = nameOf(path);
-    // Streamed straight to disk by the browser, which shows its progress.
-    // Through a hidden frame: a navigation reaches the service worker,
-    // where an <a download> click wouldn't, and the stream's
-    // `Content-Disposition: attachment` makes it a download.
+    // Streamed straight to disk where the service worker can (see
+    // downloads.js); else whole, through memory.
     if (streaming.available()) {
       const { url } = await streaming.open(path, mimeOf(name), { download: true });
-      const frame = document.createElement("iframe");
-      frame.hidden = true;
-      frame.src = url;
-      document.body.append(frame);
-      setTimeout(() => frame.remove(), 60_000);
+      saveStream(url);
       return;
     }
     const { size } = await fs.stat(path);
@@ -308,12 +303,7 @@
     const blob = await transfer("down", nameOf(path), (progress) =>
       fs.download(path, progress, mimeOf(nameOf(path))),
     );
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = nameOf(path);
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    saveBlob(blob, nameOf(path));
   }
 
   // ---------------------------------------------------------- folders
@@ -435,11 +425,7 @@
               },
             );
             const token = url.split("/")[2];
-            const frame = document.createElement("iframe");
-            frame.hidden = true;
-            frame.src = url;
-            document.body.append(frame);
-            setTimeout(() => frame.remove(), 60_000);
+            saveStream(url);
           });
         } else {
           if (total > 1 << 30 && !confirm(
@@ -451,12 +437,7 @@
             if (bytes.byteLength === 0) break;
             parts.push(bytes);
           }
-          const url = URL.createObjectURL(new Blob(parts, { type: "application/zip" }));
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = filename;
-          a.click();
-          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+          saveBlob(new Blob(parts, { type: "application/zip" }), filename);
         }
       } finally {
         const errors = await fs.zipClose(id).catch(() => []);
