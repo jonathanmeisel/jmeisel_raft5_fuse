@@ -22,7 +22,8 @@ use raft5fs_crypto::node::NodeKeys;
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
 
-use super::{Vault, from_hex, to_hex};
+use super::Vault;
+use super::known_keys::{from_hex, to_hex};
 
 /// The end of every refusal here. The web app looks for "restored from a
 /// backup" to offer a reset, and shows what comes before "Only if".
