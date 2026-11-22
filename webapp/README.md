@@ -29,10 +29,10 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   in the card and list views. The Worker learns which folders are shared
   from each volume's grants (one request per volume, kept 30 seconds), so
   only those who can change a volume see its marks; folders shared with
-  this account are marked in the top folder. `SharingBar.svelte`, above
-  the files, says how the open folder is shared: with whom, by public
-  link, and through which folder above it; or, in a folder this account
-  only reads, who shared it.
+  this account are marked in the top folder. The folder menu in the
+  header (`FolderMenu.svelte`) says how the open folder is shared: with
+  whom, by public link, and through which folder above it; or, in a folder
+  this account only reads, who shared it.
 - `src/components/Viewer.svelte`: double-clicking an image, text, a video,
   audio or a PDF opens it here; "Open in new tab" too.
 - `public/sw.js` and `src/lib/streams.js`: a service worker that streams
@@ -42,17 +42,17 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   available (Firefox's private windows, say), files are decrypted whole
   into memory instead, with size limits.
 - The right-click menu keeps to what is used most. **History** opens a
-  file's versions, or a folder's versions and activity as two tabs
-  (`HistoryTabs.svelte`). A folder's **More** opens a panel with Size limit,
-  Show as, Transfer ownership and Prune again. It is a panel, not a submenu,
+  file's versions, or a folder's activity; what was deleted from a folder
+  shows in the folder itself, with **Show deleted** in the folder menu. A
+  folder's **More** opens a panel with Size limit, and for a top-level
+  folder Show as and Transfer ownership. It is a panel, not a submenu,
   because SVAR's submenus open only on hover, which a phone doesn't have.
-- `src/components/Versions.svelte`: **History** on a file or folder
-  lists what it was in each snapshot (the wasm `versions`, one row for each
+- `src/components/Versions.svelte`: **History** on a file lists what it
+  was in each snapshot (the wasm `versions`, one row for each
   distinct version), and opens, downloads or restores one: as a copy beside
   it, or in place of the file. On a cluster, snapshots are hourly for a day
   and daily for a week (`deploy/README.md`).
-- `src/components/Activity.svelte`: the **Activity** tab of a folder's
-  History lists who
+- `src/components/Activity.svelte`: a folder's **History** lists who
   created, edited, renamed, moved or deleted what in it, newest first (the
   wasm `activity`). The servers keep it for 7 days. A name opens its
   versions.
