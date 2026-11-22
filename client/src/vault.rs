@@ -51,7 +51,7 @@ use raft5fs_crypto::identity::{
 };
 use raft5fs_crypto::node::NodeKeys;
 use raft5fs_crypto::password::new_link_credentials;
-use raft5fs_crypto::pins::{PendingInvite, PinEntry, PinList, PinSource, open_pins, seal_pins};
+use raft5fs_crypto::pins::{PendingInvite, PinEntry, PinList, open_pins, seal_pins};
 use raft5fs_proto::errno;
 use raft5fs_proto::os_bytes;
 use raft5fs_proto::types::{
@@ -71,6 +71,7 @@ mod blocks;
 mod data;
 mod keys;
 mod known_keys;
+mod merge;
 mod namespace;
 mod pins;
 mod prune;

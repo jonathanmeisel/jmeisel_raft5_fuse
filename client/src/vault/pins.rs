@@ -44,23 +44,7 @@ impl Vault {
         let local = self.known.all();
         let rollback::PinMemory { floor, base, .. } = self.load_pin_memory();
         let now = raft5fs_proto::clock::now_secs();
-        let changes: Vec<PinEntry> = match &base {
-            None => Vec::new(),
-            Some(base) => base
-                .keys()
-                .chain(local.keys())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .filter(|user| base.get(*user) != local.get(*user))
-                .map(|user| PinEntry {
-                    user: user.clone(),
-                    key: local.get(user).copied(),
-                    at: now,
-                    source: PinSource::Checked,
-                    introducer: false,
-                })
-                .collect(),
-        };
+        let changes = merge::local_changes(base.as_ref(), &local, now);
         let inbox = self.introduction_inbox().await;
         for _ in 0..CHANGE_RETRIES {
             let (version, sealed) = self.remote.get_pins().await?;
@@ -71,73 +55,42 @@ impl Vault {
                     .map_err(|e| FsError::new(errno::EIO, format!("the servers' copy: {e}")))?
             };
             self.check_pin_counter(stored.counter, floor)?;
-            let before: BTreeMap<String, PinEntry> = stored
+            let invites = merge::merge_invites(&stored.invites, invites);
+            let enrollments = self.enrollments_of(&invites).await;
+            // Every user the merge can keep, for the links among them.
+            let users = stored
                 .entries
-                .into_iter()
-                .map(|e| (e.user.clone(), e))
-                .collect();
-            let mut merged = before.clone();
-            for change in &changes {
-                match merged.get(&change.user) {
-                    // Already the same key: keep how it was checked.
-                    Some(e) if e.key == change.key => {}
-                    Some(e) if e.at > change.at => {}
-                    old => {
-                        let mut change = change.clone();
-                        // The same person: their marks stay with a new key.
-                        change.introducer = old.is_some_and(|e| e.introducer);
-                        merged.insert(change.user.clone(), change);
-                    }
-                }
-            }
-            for change in explicit {
-                if merged.get(&change.user).is_none_or(|e| e.at <= change.at) {
-                    merged.insert(change.user.clone(), change.clone());
-                }
-            }
-            if base.is_none() {
-                for (user, key) in &local {
-                    merged.entry(user.clone()).or_insert_with(|| PinEntry {
-                        user: user.clone(),
-                        key: Some(*key),
-                        at: now,
-                        source: PinSource::Checked,
-                        introducer: false,
-                    });
-                }
-            }
-            let mut open_invites = trust::merge_invites(&stored.invites, invites);
-            let mut found = trust::Found::default();
-            self.check_invites(&me, now, &mut merged, &mut open_invites, &mut found)
-                .await;
-            self.take_introductions(&me, now, &inbox, &mut merged, &mut found);
-            // This account pins each public link it makes, to share with it.
-            // Once a link is gone, so is its pin, everywhere. Link names are
-            // random and never reused, so no marker is needed: a device that
-            // still has the pin sends it back, and its next merge drops it.
-            // Here too: another device may have dropped it from the copy.
-            let dead = self
-                .dead_link_pins(merged.keys().chain(local.keys()))
-                .await?;
-            for user in &dead {
-                merged.remove(user);
-            }
-            // A list from before counters has nothing to protect it until
-            // it has one.
-            let uncounted = stored.counter == 0 && !sealed.is_empty();
-            let signed = stored.labels_signed || labels_signed;
-            let mut counter = stored.counter;
-            if merged != before
-                || open_invites != stored.invites
-                || uncounted
-                || signed != stored.labels_signed
-            {
-                counter = stored.counter.max(floor) + 1;
+                .iter()
+                .map(|e| &e.user)
+                .chain(base.iter().flat_map(|b| b.keys()))
+                .chain(local.keys())
+                .chain(explicit.iter().map(|e| &e.user));
+            let dead: HashSet<String> = self.dead_link_pins(users).await?.into_iter().collect();
+            let merged = merge::merge(
+                merge::Inputs {
+                    me: &me,
+                    now,
+                    stored: &stored,
+                    stored_empty: sealed.is_empty(),
+                    floor,
+                    local: &local,
+                    base: base.as_ref(),
+                    explicit,
+                    invites,
+                    labels_signed,
+                    enrollments: &enrollments,
+                    inbox: &inbox,
+                    identity: &self.identity,
+                    dead: &dead,
+                },
+                &changes,
+            );
+            if let Some(counter) = merged.store_as {
                 let list = PinList {
                     counter,
-                    labels_signed: signed,
-                    entries: merged.values().cloned().collect(),
-                    invites: open_invites.clone(),
+                    labels_signed: merged.labels_signed,
+                    entries: merged.entries.values().cloned().collect(),
+                    invites: merged.invites.clone(),
                 };
                 match self
                     .remote
@@ -154,7 +107,7 @@ impl Vault {
             for user in dead.iter().filter(|user| local.contains_key(*user)) {
                 self.known.forget(user).map_err(io)?;
             }
-            for entry in merged.values() {
+            for entry in merged.entries.values() {
                 match &entry.key {
                     Some(key) if local.get(&entry.user) != Some(key) => {
                         self.known.set(&entry.user, key).map_err(io)?;
@@ -168,8 +121,8 @@ impl Vault {
                 }
             }
             self.save_pin_memory(&rollback::PinMemory {
-                floor: counter,
-                labels_signed: signed,
+                floor: merged.store_as.unwrap_or(stored.counter),
+                labels_signed: merged.labels_signed,
                 base: Some(self.known.all()),
             })
             .map_err(io)?;
@@ -177,7 +130,7 @@ impl Vault {
             if changed_here {
                 self.forget_all();
             }
-            self.after_merge(&me, &before, &merged, open_invites, found)
+            self.after_merge(&me, &merged.before, &merged.entries, merged.found)
                 .await;
             return Ok(());
         }

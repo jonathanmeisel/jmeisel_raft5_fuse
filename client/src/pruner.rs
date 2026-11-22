@@ -230,15 +230,10 @@ async fn run(
                 .retain(|ino, _| waiting.iter().any(|w| w.ino == *ino));
             s.waiting = waiting.clone();
         }
-        let now = Instant::now();
-        let due = waiting
-            .iter()
-            .find(|w| w.claim.is_none() && retry.get(&w.ino).is_none_or(|(at, _)| *at <= now));
-        let Some(due) = due else {
+        let Some(ino) = next_due(&waiting, &retry, Instant::now()) else {
             rest(config.poll, &kick).await;
             continue;
         };
-        let ino = due.ino;
         status.lock().unwrap().current = Some((ino, "started".into()));
         let pruned = prune_claimed(&vault, ino, holder, &config, &mut |so_far| {
             status.lock().unwrap().current = Some((ino, describe(so_far)));
@@ -255,10 +250,76 @@ async fn run(
         };
         if let Some(why) = failed {
             s.incomplete.insert(ino, why);
-            let wait = retry
-                .get(&ino)
-                .map_or(config.backoff, |(_, w)| (*w * 2).min(config.max_backoff));
+            let wait = next_backoff(retry.get(&ino).map(|(_, w)| *w), &config);
             retry.insert(ino, (Instant::now() + wait, wait));
         }
+    }
+}
+
+/// The first node in `waiting` that nobody else has claimed, and that is
+/// not waiting out an earlier failure here (`retry`: when to try a node
+/// again, and the wait that led there).
+fn next_due(
+    waiting: &[Unpruned],
+    retry: &HashMap<u64, (Instant, Duration)>,
+    now: Instant,
+) -> Option<u64> {
+    waiting
+        .iter()
+        .find(|w| w.claim.is_none() && retry.get(&w.ino).is_none_or(|(at, _)| *at <= now))
+        .map(|w| w.ino)
+}
+
+/// How long to wait before trying a node again after it failed, given the
+/// wait after its last failure: `backoff` the first time, then double, up
+/// to `max_backoff`.
+fn next_backoff(last: Option<Duration>, config: &PrunerConfig) -> Duration {
+    last.map_or(config.backoff, |w| (w * 2).min(config.max_backoff))
+}
+
+#[cfg(test)]
+mod tests {
+    use raft5fs_proto::types::PruneClaim;
+
+    use super::*;
+
+    fn waiting(ino: u64, claimed: bool) -> Unpruned {
+        Unpruned {
+            ino,
+            claim: claimed.then(|| PruneClaim {
+                user: "bob".into(),
+                expires_ms: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_next_node_is_unclaimed_and_not_waiting_out_a_failure() {
+        let now = Instant::now();
+        let list = [waiting(1, true), waiting(2, false), waiting(3, false)];
+        let mut retry = HashMap::new();
+        assert_eq!(next_due(&list, &retry, now), Some(2));
+        retry.insert(2, (now + Duration::from_secs(5), Duration::from_secs(5)));
+        assert_eq!(next_due(&list, &retry, now), Some(3));
+        // Once its wait is over, it is due again.
+        assert_eq!(
+            next_due(&list, &retry, now + Duration::from_secs(5)),
+            Some(2)
+        );
+        assert_eq!(next_due(&list[..1], &retry, now), None);
+    }
+
+    #[test]
+    fn the_wait_after_a_failure_doubles_up_to_the_most() {
+        let config = PrunerConfig::default();
+        assert_eq!(next_backoff(None, &config), config.backoff);
+        assert_eq!(
+            next_backoff(Some(config.backoff), &config),
+            config.backoff * 2
+        );
+        assert_eq!(
+            next_backoff(Some(config.max_backoff), &config),
+            config.max_backoff
+        );
     }
 }
