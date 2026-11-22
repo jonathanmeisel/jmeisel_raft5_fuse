@@ -4,12 +4,29 @@
 //!   that wins hides the file.
 //! - `Progress` is what the next indexer goes on from: the newest cursor,
 //!   the files still to check again, and the last full walk.
+//! - A search ranks files by keyword (BM25) and, given the query's vector,
+//!   by meaning. The two lists are merged by rank (`rank::fuse`). Only
+//!   chunks embedded by the query's model count for meaning.
 
 use std::collections::HashMap;
 
 use crate::bm25::{Bm25, ChunkRef};
 use crate::manifest::Manifest;
+use crate::rank::fuse;
 use crate::record::{DocKind, Entry, Record};
+use crate::vector::dot;
+
+/// The least cosine for a chunk to match a query by meaning. With
+/// multilingual-e5, text on another subject scores about 0.70 to 0.72, and
+/// text on the query's subject, in any language, 0.81 and up (see
+/// raft5fs-indexer's tests): this is between them.
+pub const MIN_SIMILARITY: f32 = 0.77;
+
+/// A query's embedding, and the model that made it.
+pub struct QueryVector<'a> {
+    pub model: &'a str,
+    pub values: &'a [f32],
+}
 
 /// The newest entry for each inode in `entries`.
 pub fn latest(entries: impl IntoIterator<Item = Entry>) -> HashMap<u64, Entry> {
@@ -110,11 +127,49 @@ impl View {
 
     /// The files that best match `query` by keyword, best first.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        self.keywords
-            .search(query, limit)
+        self.search_with(query, None, limit)
+    }
+
+    /// Whether any file here has vectors from `model`: if none does, a
+    /// query need not be embedded.
+    pub fn has_model(&self, model: &str) -> bool {
+        self.docs.iter().any(|r| r.model == model)
+    }
+
+    /// The files that best match `query`, best first: by keyword and, with
+    /// `vector`, by meaning, merged by rank.
+    pub fn search_with(
+        &self,
+        query: &str,
+        vector: Option<QueryVector<'_>>,
+        limit: usize,
+    ) -> Vec<Hit> {
+        // Each list looks deeper than the result, so a file a little way
+        // down both still rises.
+        let depth = limit.saturating_mul(3).max(10);
+        let keyword: Vec<(usize, Option<usize>)> = self
+            .keywords
+            .search(query, depth)
             .into_iter()
-            .map(|(doc, score, chunk)| {
+            .map(|(doc, _, chunk)| (doc, chunk))
+            .collect();
+        let meaning = vector.map(|q| self.nearest(&q, depth)).unwrap_or_default();
+        // The chunk each list matched, keyword first: its words are what the
+        // user typed.
+        let mut best_chunk: HashMap<usize, Option<usize>> = HashMap::new();
+        for &(doc, chunk) in meaning.iter().chain(&keyword).rev() {
+            best_chunk.insert(doc, chunk);
+        }
+        let lists = [
+            keyword.iter().map(|&(d, _)| d).collect::<Vec<_>>(),
+            meaning.iter().map(|&(d, _)| d).collect(),
+        ];
+        fuse(&lists)
+            .into_iter()
+            .take(limit)
+            .map(|(doc, score)| {
                 let r = &self.docs[doc];
+                let chunk = best_chunk.get(&doc).copied().flatten();
                 let preview = chunk
                     .or(if r.chunks.is_empty() { None } else { Some(0) })
                     .map(|i| r.chunks[i].preview.clone())
@@ -129,6 +184,32 @@ impl View {
             })
             .collect()
     }
+
+    /// The files whose best chunk is nearest `q` in meaning, at least
+    /// `MIN_SIMILARITY`, best first, with that chunk.
+    fn nearest(&self, q: &QueryVector<'_>, limit: usize) -> Vec<(usize, Option<usize>)> {
+        let mut scored: Vec<(usize, usize, f32)> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.model == q.model)
+            .filter_map(|(doc, r)| {
+                r.chunks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| Some((i, dot(c.vector.as_ref()?, q.values))))
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(i, s)| (doc, i, s))
+            })
+            .filter(|&(_, _, s)| s >= MIN_SIMILARITY)
+            .collect();
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        scored.truncate(limit);
+        scored
+            .into_iter()
+            .map(|(doc, i, _)| (doc, Some(i)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +217,52 @@ mod tests {
     use super::*;
     use crate::record::Stamp;
     use crate::text::chunks;
+    use crate::vector::{normalize, quantize};
+
+    /// A record whose one chunk has vector `v`, from model "m".
+    fn embedded(ino: u64, path: &str, text: &str, v: &[f32]) -> Entry {
+        let Entry::Record(mut r) = record(ino, 1, path, text) else {
+            unreachable!()
+        };
+        let mut v = v.to_vec();
+        normalize(&mut v);
+        r.chunks[0].vector = Some(quantize(&v));
+        r.model = "m".into();
+        Entry::Record(r)
+    }
+
+    #[test]
+    fn meaning_finds_what_words_miss_and_both_rank_first() {
+        let view = View::new([
+            embedded(1, "a.txt", "cycling the gap", &[1.0, 0.0, 0.0]),
+            embedded(2, "b.txt", "bike repair notes", &[0.9, 0.1, 0.0]),
+            embedded(3, "c.txt", "tax return", &[0.0, 0.0, 1.0]),
+        ]);
+        let mut q = vec![1.0, 0.05, 0.0];
+        normalize(&mut q);
+        let vector = || QueryVector {
+            model: "m",
+            values: &q,
+        };
+        // "bike" is a word only in b; a matches by meaning too; c by neither.
+        let hits: Vec<u64> = view
+            .search_with("bike", Some(vector()), 10)
+            .iter()
+            .map(|h| h.ino)
+            .collect();
+        assert_eq!(hits, [2, 1]);
+        // With no words matching, meaning alone.
+        let hits = view.search_with("velo", Some(vector()), 10);
+        assert_eq!(hits.iter().map(|h| h.ino).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(hits[0].preview, "cycling the gap");
+        // Another model's vectors don't count.
+        let other = QueryVector {
+            model: "other",
+            values: &q,
+        };
+        assert!(view.search_with("velo", Some(other), 10).is_empty());
+        assert!(view.has_model("m") && !view.has_model("other"));
+    }
 
     fn record(ino: u64, at_ms: u64, path: &str, text: &str) -> Entry {
         Entry::Record(Record {

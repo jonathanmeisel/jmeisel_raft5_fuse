@@ -1,10 +1,14 @@
 //! Search indexing for native clients: `Native` reads everything that
-//! raft5fs-search reads, and PDF too.
+//! raft5fs-search reads, and PDF too; `embed` runs the embedding model.
 //!
 //! PDF parsing is slow and can panic on damaged files, so it runs on a
 //! blocking thread, and a panic there only means "no text".
 
-use raft5fs_client::indexer::{BuiltIn, Extract};
+pub mod embed;
+
+use std::sync::Arc;
+
+use raft5fs_client::indexer::{BuiltIn, Extract, Tools};
 use raft5fs_search::extract::{Extracted, Format};
 use raft5fs_search::record::DocKind;
 
@@ -40,6 +44,15 @@ impl Extract for Native {
                 text,
             })
         })
+    }
+}
+
+/// What mounts, WebDAV servers and the CLI index with: `Native`, and the
+/// embedding model (downloaded on first use).
+pub fn native_tools() -> Tools {
+    Tools {
+        extract: Arc::new(Native),
+        embed: Some(Arc::new(embed::Embedder::cached())),
     }
 }
 

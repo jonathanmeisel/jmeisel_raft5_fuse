@@ -6,8 +6,8 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 use raft5fs_client::indexer::{
-    BuiltIn, IndexerConfig, PassKind, PassStats, index_claimed, indexable_volumes, new_id,
-    read_index,
+    BuiltIn, Embed, IndexerConfig, PassKind, PassStats, Tools, index_claimed, indexable_volumes,
+    new_id, read_index,
 };
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::{Session, SessionConfig};
@@ -59,6 +59,17 @@ fn pass(
     id: IndexerId,
     kind: PassKind,
 ) -> Result<PassStats, raft5fs_proto::types::FsError> {
+    pass_with(backend, vault, volume, id, kind, &Tools::words_only())
+}
+
+fn pass_with(
+    backend: &Backend,
+    vault: &Vault,
+    volume: u64,
+    id: IndexerId,
+    kind: PassKind,
+    tools: &Tools,
+) -> Result<PassStats, raft5fs_proto::types::FsError> {
     backend.runtime.block_on(index_claimed(
         vault,
         volume,
@@ -67,7 +78,7 @@ fn pass(
             pace: std::time::Duration::ZERO,
             ..IndexerConfig::default()
         },
-        &BuiltIn,
+        tools,
         kind,
         &mut |_| {},
     ))
@@ -375,7 +386,7 @@ fn a_session_indexes_in_the_background() {
         device: "test".into(),
         ..IndexerConfig::default()
     };
-    config.index = Some((index, Arc::new(BuiltIn)));
+    config.index = Some((index, Tools::words_only()));
     let session: Arc<Session> = backend.runtime.block_on(Session::open(config)).unwrap();
     let rt = &backend.runtime;
     let v = rt
@@ -406,4 +417,137 @@ fn a_session_indexes_in_the_background() {
     let status = session.index_status().unwrap();
     assert!(status.last.contains_key(&v), "{status:?}");
     rt.block_on(session.shutdown());
+}
+
+/// An embedder for tests: each word sets one of 16 dimensions, so texts
+/// that share words are close. Fails on purpose while `broken` is set.
+struct Fake {
+    model: &'static str,
+    broken: std::sync::atomic::AtomicBool,
+}
+
+impl Fake {
+    fn new(model: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            model,
+            broken: false.into(),
+        })
+    }
+
+    fn vector(text: &str) -> Vec<f32> {
+        let mut v = vec![0f32; 16];
+        for word in raft5fs_search::text::terms(text) {
+            let h = word
+                .bytes()
+                .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
+            v[(h % 16) as usize] += 1.0;
+        }
+        raft5fs_search::vector::normalize(&mut v);
+        v
+    }
+}
+
+type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+impl Embed for Fake {
+    fn model(&self) -> &str {
+        self.model
+    }
+
+    fn passages<'a>(&'a self, texts: Vec<String>) -> Boxed<'a, Result<Vec<Vec<f32>>, String>> {
+        Box::pin(async move {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("the model is broken".into());
+            }
+            Ok(texts.iter().map(|t| Self::vector(t)).collect())
+        })
+    }
+
+    fn query<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<Vec<f32>, String>> {
+        Box::pin(async move { Ok(Self::vector(text)) })
+    }
+}
+
+fn tools(embed: &Arc<Fake>) -> Tools {
+    Tools {
+        extract: Arc::new(BuiltIn),
+        embed: Some(Arc::clone(embed) as Arc<dyn Embed>),
+    }
+}
+
+/// The models named by `volume`'s live records with chunks.
+fn models(backend: &Backend, vault: &Vault, volume: u64) -> Vec<String> {
+    let index = backend
+        .runtime
+        .block_on(read_index(vault, volume))
+        .unwrap()
+        .unwrap();
+    let mut out: Vec<String> = raft5fs_search::view::latest(index.entries)
+        .into_values()
+        .filter_map(|e| match e {
+            raft5fs_search::record::Entry::Record(r) if !r.chunks.is_empty() => Some(r.model),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn chunks_get_vectors_and_a_new_model_embeds_again() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let first = Fake::new("fake@1");
+    let id = new_id();
+    pass_with(&backend, &tester, v, id, PassKind::Auto, &tools(&first)).unwrap();
+    assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
+
+    // Searched by meaning: no word of the query is in the file, but the
+    // fake model puts "receipts tax" next to it.
+    let index = backend
+        .runtime
+        .block_on(read_index(&tester, v))
+        .unwrap()
+        .unwrap();
+    let view = View::new(index.entries);
+    let q = Fake::vector("receipts tax");
+    let hits = view.search_with(
+        "quittungen",
+        Some(raft5fs_search::view::QueryVector {
+            model: "fake@1",
+            values: &q,
+        }),
+        5,
+    );
+    assert_eq!(hits[0].path, "notes/tax.txt");
+
+    // A new model: a walk embeds the two text files again, not the photo.
+    let second = Fake::new("fake@2");
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Full, &tools(&second)).unwrap();
+    assert_eq!(stats.indexed, 2);
+    assert_eq!(models(&backend, &tester, v), ["fake@2", "fake@2"]);
+    // A device with no model leaves the vectors alone.
+    let stats = pass(&backend, &tester, v, new_id(), PassKind::Full).unwrap();
+    assert_eq!(stats.indexed, 0);
+}
+
+#[test]
+fn a_model_that_fails_is_tried_again() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let fake = Fake::new("fake@1");
+    fake.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = new_id();
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &tools(&fake)).unwrap();
+    assert_eq!(stats.failed.len(), 2, "{:?}", stats.failed);
+    // Still found by words.
+    assert_eq!(search(&backend, &tester, v, "tax"), ["notes/tax.txt"]);
+    assert_eq!(models(&backend, &tester, v), ["", ""]);
+    fake.broken
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Full, &tools(&fake)).unwrap();
+    assert_eq!((stats.indexed, stats.failed.len()), (2, 0));
+    assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
 }

@@ -96,6 +96,12 @@ pub fn preview(text: &str) -> String {
 /// The chunks of `text`, with previews and word counts but no vectors.
 /// Text with no words gives no chunks.
 pub fn chunks(text: &str) -> Vec<Chunk> {
+    chunks_with_text(text).into_iter().map(|(c, _)| c).collect()
+}
+
+/// `chunks`, each with its whole text, which an embedding model reads. The
+/// index keeps only the preview.
+pub fn chunks_with_text(text: &str) -> Vec<(Chunk, String)> {
     // Cut on white space, so a preview shows the text as written. Text with
     // no spaces (CJK) is cut by characters, the same number per chunk.
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -114,12 +120,16 @@ pub fn chunks(text: &str) -> Vec<Chunk> {
         .take(MAX_CHUNKS)
         .filter_map(|piece| {
             let t = terms(&piece);
-            (!t.is_empty()).then(|| Chunk {
+            if t.is_empty() {
+                return None;
+            }
+            let chunk = Chunk {
                 preview: preview(&piece),
                 len: t.len() as u32,
                 terms: counted(&t),
                 vector: None,
-            })
+            };
+            Some((chunk, piece))
         })
         .collect()
 }

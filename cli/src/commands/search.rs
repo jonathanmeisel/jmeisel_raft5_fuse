@@ -4,14 +4,17 @@ use std::collections::HashMap;
 
 use clap::Args;
 use raft5fs_client::cli::Context;
+use raft5fs_client::indexer::Embed;
 use raft5fs_client::indexer::{
     IndexerConfig, PassKind, describe, index_claimed, indexable_volumes, new_id, read_index, survey,
 };
 use raft5fs_client::vault::Vault;
-use raft5fs_indexer::Native;
+use raft5fs_indexer::embed::{Embedder, MODEL};
+use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::size_text;
 use raft5fs_search::rank::fuse;
+use raft5fs_search::view::QueryVector;
 use raft5fs_search::view::View;
 use tokio::runtime::Runtime;
 
@@ -158,11 +161,16 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
                     for (format, (files, bytes)) in &s.by_format {
                         println!("  {format}: {files} files, {}", size_text(*bytes));
                     }
+                    // Each chunk's vector: a byte for each of the model's
+                    // 384 dimensions, a scale, and their framing.
+                    let vectors = s.chunks * (384 + 9);
                     println!(
-                        "  {} words of text in {} chunks; the index would be about {}",
+                        "  {} words of text in {} chunks; the index would be about {} \
+                         ({} of it vectors)",
                         s.words,
                         s.chunks,
-                        size_text(s.index_bytes)
+                        size_text(s.index_bytes + vectors),
+                        size_text(vectors)
                     );
                 }
                 Err(e) => {
@@ -184,13 +192,14 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
         PassKind::Auto
     };
     let id = new_id();
+    let tools = native_tools();
     for (label, ino) in volumes {
         let done = runtime.block_on(index_claimed(
             &vault,
             ino,
             id,
             &config,
-            &Native,
+            &tools,
             kind,
             &mut |so_far| eprintln!("{label}: {}", describe(so_far)),
         ));
@@ -222,10 +231,7 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
             .map_err(|e| format!("cannot list what is shared with this account: {e}"))?;
         Ok(grants.into_iter().map(|g| g.ino).collect())
     })?;
-    // Each volume ranks its own hits; the lists are then merged by rank.
-    let mut lists = Vec::new();
-    let mut hits = HashMap::new();
-    let mut searched = 0;
+    let mut views = Vec::new();
     for (label, ino) in &volumes {
         let index = match runtime.block_on(read_index(&vault, *ino)) {
             Ok(Some(index)) => index,
@@ -234,20 +240,41 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
             Err(e) if e.errno == errno::EACCES || e.errno == errno::EINVAL => continue,
             Err(e) => return Err(format!("cannot read the index of {label}: {e}")),
         };
-        searched += 1;
-        let list: Vec<(u64, u64)> = View::new(index.entries)
-            .search(&args.query, args.limit)
+        views.push((label, *ino, View::new(index.entries)));
+    }
+    if views.is_empty() {
+        return Err("no volume here has a search index yet: run `raft5fs index`".into());
+    }
+    // The query's meaning, if any volume has vectors to compare it with.
+    let query_vector = if views.iter().any(|(_, _, v)| v.has_model(MODEL)) {
+        match runtime.block_on(Embedder::cached().query(&args.query)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("warning: searching by words only: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Each volume ranks its own hits; the lists are then merged by rank.
+    let mut lists = Vec::new();
+    let mut hits = HashMap::new();
+    for (label, ino, view) in &views {
+        let vector = query_vector.as_deref().map(|values| QueryVector {
+            model: MODEL,
+            values,
+        });
+        let list: Vec<(u64, u64)> = view
+            .search_with(&args.query, vector, args.limit)
             .into_iter()
             .map(|h| {
                 let key = (*ino, h.ino);
-                hits.insert(key, (label.clone(), h));
+                hits.insert(key, ((*label).clone(), h));
                 key
             })
             .collect();
         lists.push(list);
-    }
-    if searched == 0 {
-        return Err("no volume here has a search index yet: run `raft5fs index`".into());
     }
     let merged = fuse(&lists);
     if merged.is_empty() {

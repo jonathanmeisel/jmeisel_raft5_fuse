@@ -9,6 +9,7 @@
 //! - `text`: words for keyword search, and chunks of text.
 //! - `extract`: the text of a file, from its bytes and name.
 //! - `bm25` and `rank`: keyword ranking, and the merge of ranked lists.
+//! - `vector`: embeddings kept small, and how close two are.
 //! - `view`: every indexer's records for a volume, merged, and searched.
 //!
 //! Nothing here does I/O or runs a model, so the same code runs in native
@@ -21,6 +22,7 @@ pub mod rank;
 pub mod record;
 pub mod segment;
 pub mod text;
+pub mod vector;
 pub mod view;
 
 /// The directory at a volume's root that holds its index. Clients hide it

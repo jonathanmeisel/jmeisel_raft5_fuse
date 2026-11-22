@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
-use crate::indexer::{self, Extract, IndexStatus, Indexer, IndexerConfig};
+use crate::indexer::{self, IndexStatus, Indexer, IndexerConfig, Tools};
 use crate::paths::{DEFAULT_PATH_TTL, Dentries};
 use crate::pruner::{self, PruneStatus, Pruner, PrunerConfig};
 use crate::readahead::ReadAhead;
@@ -71,8 +71,8 @@ pub struct SessionConfig {
     /// servers say waits for a prune (see `pruner`), or `None` not to.
     pub prune: Option<PrunerConfig>,
     /// How to index volumes for search in the background (see `indexer`),
-    /// and how to read files' text, or `None` not to.
-    pub index: Option<(IndexerConfig, Arc<dyn Extract>)>,
+    /// and what to read and embed files with, or `None` not to.
+    pub index: Option<(IndexerConfig, Tools)>,
     /// Whether to buffer small sequential writes into batches.
     pub write_buffering: bool,
     /// Whether to refuse to create the files where macOS keeps its metadata
@@ -274,11 +274,11 @@ impl Session {
             None => None,
         };
         let indexer = match config.index {
-            Some((index_config, extract)) => {
+            Some((index_config, tools)) => {
                 let indexing = Vault::new(Arc::clone(vault.remote()))
                     .map_err(keys)?
                     .with_known_keys(vault.known_keys().duplicate());
-                Some(indexer::spawn(indexing, index_config, extract))
+                Some(indexer::spawn(indexing, index_config, tools))
             }
             None => None,
         };

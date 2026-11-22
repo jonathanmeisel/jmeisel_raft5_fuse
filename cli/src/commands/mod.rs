@@ -27,7 +27,7 @@ use raft5fs_client::pruner::PrunerConfig;
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::SessionConfig;
 use raft5fs_client::vault::Vault;
-use raft5fs_indexer::Native;
+use raft5fs_indexer::native_tools;
 use tokio::runtime::Runtime;
 
 #[derive(Parser)]
@@ -283,7 +283,7 @@ impl SessionArgs {
                 skip,
                 ..IndexerConfig::default()
             };
-            config.index = Some((index, Arc::new(Native)));
+            config.index = Some((index, native_tools()));
         }
         Ok(config)
     }

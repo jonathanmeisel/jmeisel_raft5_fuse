@@ -12,6 +12,10 @@
 //!   any manifest, and indexes what changed. Once a day, or when the log
 //!   can't say what changed (a folder moved), it walks the whole volume
 //!   instead.
+//! - **Meaning.** With an `Embed`, each chunk gets a vector from its model,
+//!   and the record names the model. A record from another model, or from
+//!   none, counts as out of date: the next pass that sees it embeds it
+//!   again.
 //! - **Resumable.** A pass stores what it has every `SEGMENT_ENTRIES`
 //!   files. A pass cut short is finished by whoever claims the volume
 //!   next: files already indexed as they are now are skipped.
@@ -38,9 +42,10 @@ use raft5fs_proto::{clock, errno};
 use raft5fs_search::INDEX_DIR;
 use raft5fs_search::extract::{self, Extracted, Format};
 use raft5fs_search::manifest::{IndexerId, Manifest, decode_manifest, encode_manifest};
-use raft5fs_search::record::{DocKind, Entry, Record, Stamp};
+use raft5fs_search::record::{Chunk, DocKind, Entry, Record, Stamp};
 use raft5fs_search::segment::{decode_segment, encode_segment};
 use raft5fs_search::text;
+use raft5fs_search::vector::quantize;
 use raft5fs_search::view;
 use tokio::sync::Notify;
 
@@ -106,6 +111,46 @@ pub trait Extract: MaybeSend + MaybeSync {
 
     /// The text of file `name`, or `None` if it has none this can read.
     fn extract<'a>(&'a self, name: &'a str, bytes: Vec<u8>) -> BoxFuture<'a, Option<Extracted>>;
+}
+
+/// Turns text into vectors whose dot product says how close two texts are
+/// in meaning. Each client brings its own model runner; all must give the
+/// same vectors for the same `model`.
+pub trait Embed: MaybeSend + MaybeSync {
+    /// The model's name and version, as records keep it.
+    fn model(&self) -> &str;
+
+    /// One unit vector for each of `texts`, which are pieces of files.
+    fn passages<'a>(&'a self, texts: Vec<String>) -> BoxFuture<'a, Result<Vec<Vec<f32>>, String>>;
+
+    /// One unit vector for a query, to compare with passages.
+    fn query<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<Vec<f32>, String>>;
+}
+
+/// How many chunks go to the model at once.
+const EMBED_BATCH: usize = 16;
+
+/// What an indexer reads files and embeds text with.
+#[derive(Clone)]
+pub struct Tools {
+    pub extract: Arc<dyn Extract>,
+    /// `None` to index words only.
+    pub embed: Option<Arc<dyn Embed>>,
+}
+
+impl Tools {
+    /// The formats raft5fs-search reads, and no vectors.
+    pub fn words_only() -> Self {
+        Self {
+            extract: Arc::new(BuiltIn),
+            embed: None,
+        }
+    }
+
+    /// The model records from this indexer name: empty for none.
+    pub fn model(&self) -> &str {
+        self.embed.as_deref().map_or("", |e| e.model())
+    }
 }
 
 /// The formats raft5fs-search reads by itself.
@@ -327,7 +372,7 @@ fn name_text(name: &OsStr) -> String {
 struct Pass<'a> {
     vault: &'a Vault,
     volume: u64,
-    extract: &'a dyn Extract,
+    tools: &'a Tools,
     config: &'a IndexerConfig,
     dir: u64,
     mine: Manifest,
@@ -447,6 +492,42 @@ impl Pass<'_> {
         Ok(())
     }
 
+    /// Whether `old`'s vectors are what this indexer would make: from its
+    /// model, or none for an indexer with none. A record with no chunks
+    /// has nothing to embed.
+    fn embedded_as_now(&self, old: &Record) -> bool {
+        self.tools.embed.is_none() || old.chunks.is_empty() || old.model == self.tools.model()
+    }
+
+    /// `pieces` as chunks, each with its vector if this indexer embeds, and
+    /// the model that made them. If the model fails, the chunks keep no
+    /// vectors and name no model, so a later pass tries again.
+    async fn embed(&mut self, pieces: Vec<(Chunk, String)>, path: &str) -> (Vec<Chunk>, String) {
+        let Some(embed) = self.tools.embed.clone() else {
+            return (pieces.into_iter().map(|(c, _)| c).collect(), String::new());
+        };
+        let (mut chunks, texts): (Vec<Chunk>, Vec<String>) = pieces.into_iter().unzip();
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(EMBED_BATCH) {
+            match embed.passages(batch.to_vec()).await {
+                Ok(v) if v.len() == batch.len() => vectors.extend(v),
+                Ok(v) => {
+                    let why = format!("the model gave {} vectors for {}", v.len(), batch.len());
+                    self.stats.failed.push((path.to_string(), why));
+                    return (chunks, String::new());
+                }
+                Err(e) => {
+                    self.stats.failed.push((path.to_string(), e));
+                    return (chunks, String::new());
+                }
+            }
+        }
+        for (chunk, v) in chunks.iter_mut().zip(&vectors) {
+            chunk.vector = Some(quantize(v));
+        }
+        (chunks, embed.model().to_string())
+    }
+
     /// Indexes file `ino` at `path`, unless the index has it as it is now.
     async fn upsert(&mut self, ino: u64, attr: &Attr, path: String) -> Result<(), FsError> {
         let stamp = stamp_of(attr);
@@ -460,6 +541,7 @@ impl Pass<'_> {
         }
         if let Some(Entry::Record(old)) = self.entries.get(&ino)
             && old.stamp == stamp
+            && self.embedded_as_now(old)
         {
             if old.path != path {
                 let mut moved = old.clone();
@@ -471,10 +553,11 @@ impl Pass<'_> {
             return Ok(());
         }
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-        let most = self.extract.reads(&name);
+        let extract = &self.tools.extract;
+        let most = extract.reads(&name);
         let extracted = if most > 0 && attr.size <= most {
             match read_all(self.vault, ino).await {
-                Ok(bytes) => self.extract.extract(&name, bytes).await,
+                Ok(bytes) => extract.extract(&name, bytes).await,
                 Err(e) if e.errno == errno::ENOENT => return self.gone(ino).await,
                 Err(e) => {
                     self.stats.failed.push((path, e.to_string()));
@@ -484,10 +567,11 @@ impl Pass<'_> {
         } else {
             None
         };
-        let (kind, chunks) = match extracted {
-            Some(ex) => (ex.kind, text::chunks(&ex.text)),
+        let (kind, pieces) = match extracted {
+            Some(ex) => (ex.kind, text::chunks_with_text(&ex.text)),
             None => (DocKind::Opaque, Vec::new()),
         };
+        let (chunks, model) = self.embed(pieces, &path).await;
         self.stats.indexed += 1;
         self.push(Entry::Record(Record {
             ino,
@@ -495,7 +579,7 @@ impl Pass<'_> {
             stamp,
             path,
             kind,
-            model: String::new(),
+            model,
             chunks,
         }))
         .await?;
@@ -617,7 +701,7 @@ async fn run_pass(
     volume: u64,
     id: IndexerId,
     config: &IndexerConfig,
-    extract: &dyn Extract,
+    tools: &Tools,
     kind: PassKind,
     progress: &mut (dyn FnMut(&PassStats) + Send),
 ) -> Result<PassStats, FsError> {
@@ -646,7 +730,7 @@ async fn run_pass(
     let mut pass = Pass {
         vault,
         volume,
-        extract,
+        tools,
         config,
         dir: loaded.dir,
         mine,
@@ -660,6 +744,7 @@ async fn run_pass(
     };
     pass.mine.user = vault.remote().username().to_string();
     pass.mine.device = config.device.clone();
+    pass.mine.model = tools.model().to_string();
     let mut full = kind == PassKind::Full
         || so_far.full_walk_ms == 0
         || started.saturating_sub(so_far.full_walk_ms) > FULL_WALK_EVERY_MS;
@@ -749,7 +834,7 @@ pub async fn index_claimed(
     volume: u64,
     id: IndexerId,
     config: &IndexerConfig,
-    extract: &dyn Extract,
+    tools: &Tools,
     kind: PassKind,
     progress: &mut (dyn FnMut(&PassStats) + Send),
 ) -> Result<PassStats, FsError> {
@@ -757,7 +842,7 @@ pub async fn index_claimed(
     // Servers from before claims can't keep two devices apart. Each device
     // writes only its own files, so two at once is still safe: only slower.
     if remote.protocol() < raft5fs_proto::since::SEARCH_INDEX {
-        return run_pass(vault, volume, id, config, extract, kind, progress).await;
+        return run_pass(vault, volume, id, config, tools, kind, progress).await;
     }
     let claim = remote.claim_index(volume, id, false).await?;
     if !claim.granted {
@@ -769,7 +854,7 @@ pub async fn index_claimed(
             format!("this volume is being indexed elsewhere{by}"),
         ));
     }
-    let pass = std::pin::pin!(run_pass(vault, volume, id, config, extract, kind, progress));
+    let pass = std::pin::pin!(run_pass(vault, volume, id, config, tools, kind, progress));
     // Renews the claim while the pass runs. A failed renewal is tried again
     // at the next: at worst, someone else indexes too, which is safe.
     let renew = std::pin::pin!(async {
@@ -961,13 +1046,13 @@ impl Drop for Indexer {
 
 /// Starts to index, with `vault`, the volumes this account can. Give it its
 /// own vault, as for a pruner. Runs until the `Indexer` drops.
-pub fn spawn(vault: Vault, config: IndexerConfig, extract: Arc<dyn Extract>) -> Indexer {
+pub fn spawn(vault: Vault, config: IndexerConfig, tools: Tools) -> Indexer {
     let kick = Arc::new(Notify::new());
     let status = Arc::new(Mutex::new(IndexStatus::default()));
     let handle = rt::spawn(run(
         vault,
         config,
-        extract,
+        tools,
         Arc::clone(&kick),
         Arc::clone(&status),
     ));
@@ -1026,7 +1111,7 @@ async fn rest(duration: Duration, kick: &Notify) {
 async fn run(
     vault: Vault,
     config: IndexerConfig,
-    extract: Arc<dyn Extract>,
+    tools: Tools,
     kick: Arc<Notify>,
     status: Arc<Mutex<IndexStatus>>,
 ) {
@@ -1085,7 +1170,7 @@ async fn run(
                 volume,
                 id,
                 &config,
-                extract.as_ref(),
+                &tools,
                 PassKind::Auto,
                 &mut |so_far| {
                     status.lock().unwrap().current = Some((volume, describe(so_far)));
