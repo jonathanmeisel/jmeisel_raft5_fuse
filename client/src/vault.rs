@@ -2027,6 +2027,22 @@ impl Vault {
         Ok(named)
     }
 
+    /// Runs `op`. If the servers refuse it because a key on the path to
+    /// `ino` is out of date (`EKEYEXPIRED`), gets new keys there and runs it
+    /// once more.
+    async fn with_fresh_keys<T, Fut>(&self, ino: u64, op: impl Fn() -> Fut) -> Result<T, FsError>
+    where
+        Fut: std::future::Future<Output = Result<T, FsError>>,
+    {
+        match op().await {
+            Err(e) if expired(&e) => {
+                self.freshen(ino).await?;
+                op().await
+            }
+            other => other,
+        }
+    }
+
     /// `readdir` without `.` and `..`: what is in the directory.
     pub async fn children(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         let mut items = self.readdir(ino).await?;
@@ -2035,13 +2051,8 @@ impl Vault {
     }
 
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        match self.mkdir_once(parent, name, perm).await {
-            Err(e) if expired(&e) => {
-                self.freshen(parent).await?;
-                self.mkdir_once(parent, name, perm).await
-            }
-            other => other,
-        }
+        self.with_fresh_keys(parent, || self.mkdir_once(parent, name, perm))
+            .await
     }
 
     async fn mkdir_once(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
@@ -2053,13 +2064,8 @@ impl Vault {
 
     /// Creates a file, as `Remote::create` does.
     pub async fn create(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
-        match self.create_once(parent, name, perm).await {
-            Err(e) if expired(&e) => {
-                self.freshen(parent).await?;
-                self.create_once(parent, name, perm).await
-            }
-            other => other,
-        }
+        self.with_fresh_keys(parent, || self.create_once(parent, name, perm))
+            .await
     }
 
     async fn create_once(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
@@ -3111,13 +3117,8 @@ impl Vault {
     /// Seals the chunk that `new_size` falls in again, without the bytes
     /// after `new_size`.
     async fn truncate(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
-        match self.truncate_once(ino, new_size).await {
-            Err(e) if expired(&e) => {
-                self.freshen(ino).await?;
-                self.truncate_once(ino, new_size).await
-            }
-            other => other,
-        }
+        self.with_fresh_keys(ino, || self.truncate_once(ino, new_size))
+            .await
     }
 
     async fn truncate_once(&self, ino: u64, new_size: u64) -> Result<(), FsError> {
