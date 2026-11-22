@@ -30,6 +30,7 @@ use raft5fs_proto::types::{Caps, FsError, LINK_PREFIX};
 use super::Vault;
 use crate::remote::Introduction;
 use raft5fs_proto::clock;
+use raft5fs_proto::since;
 
 /// How long an invitation stays open: as long as its enrollment code.
 const INVITE_LIFETIME_SECS: u64 = 14 * 24 * 60 * 60;
@@ -115,7 +116,7 @@ impl Vault {
     /// before.
     async fn introduce_in(&self, user: &str, invitation: Option<String>) -> Option<String> {
         let line = invitation?;
-        if self.remote.protocol() < 11 {
+        if self.remote.protocol() < since::INVITE_TRUST {
             return Some(line);
         }
         let Ok(mut invite) = Invite::decode(&line) else {
@@ -226,7 +227,7 @@ impl Vault {
     /// The introductions left for this account, or none on servers older
     /// than protocol 11 or if the servers don't answer: they wait there.
     pub(super) async fn introduction_inbox(&self) -> Vec<Introduction> {
-        if self.remote.protocol() < 11 {
+        if self.remote.protocol() < since::INVITE_TRUST {
             return Vec::new();
         }
         self.remote.get_introductions().await.unwrap_or_default()
@@ -248,7 +249,7 @@ impl Vault {
         invites: &mut [PendingInvite],
         found: &mut Found,
     ) {
-        if self.remote.protocol() < 11 {
+        if self.remote.protocol() < since::INVITE_TRUST {
             return;
         }
         for invite in invites.iter_mut() {
@@ -397,7 +398,7 @@ impl Vault {
             let excess = trust.warnings.len().saturating_sub(MAX_WARNINGS);
             trust.warnings.drain(..excess);
         }
-        if self.remote.protocol() < 11 {
+        if self.remote.protocol() < since::INVITE_TRUST {
             return;
         }
         if !found.done.is_empty()

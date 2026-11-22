@@ -74,6 +74,7 @@ pub use prune::{GrantRoot, PruneStats};
 
 use crate::remote::Remote;
 use crate::store::{MemoryStore, Store};
+use raft5fs_proto::since;
 
 /// The inode number that the kernel uses for a mount's root. This is the
 /// virtual root, not the server's real root.
@@ -829,7 +830,7 @@ impl Vault {
         explicit: &[PinEntry],
         invites: &[PendingInvite],
     ) -> Result<(), FsError> {
-        if self.remote.protocol() < 3 {
+        if self.remote.protocol() < since::PINS {
             return Ok(());
         }
         let me = self.remote.username().to_string();
@@ -1841,7 +1842,7 @@ impl Vault {
     /// link, which only reads, or on servers older than protocol 8.
     pub async fn sign_labels(&self) -> Result<(), FsError> {
         let me = self.remote.username();
-        if self.remote.protocol() < 8 || me.starts_with(LINK_PREFIX) {
+        if self.remote.protocol() < since::SIGNED_LABELS || me.starts_with(LINK_PREFIX) {
             return Ok(());
         }
         let done = self.load_pin_memory().labels_signed;

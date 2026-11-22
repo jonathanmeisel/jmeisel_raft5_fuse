@@ -99,6 +99,7 @@ use crate::timing::Timed;
 
 #[cfg(target_arch = "wasm32")]
 mod web;
+use raft5fs_proto::since;
 #[cfg(target_arch = "wasm32")]
 pub use web::ClientTlsConfig;
 #[cfg(target_arch = "wasm32")]
@@ -466,10 +467,11 @@ impl Remote {
         // Never sent again: the first enrolment uses up the code, so a
         // resend after it was stored would report a false refusal.
         remote
-            .call(Retry::Once, |mut c| {
-                let req = req.clone();
-                async move { c.enrol(req).await }
-            })
+            .call_with(
+                Retry::Once,
+                req,
+                |mut c, req| async move { c.enrol(req).await },
+            )
             .await?
             .into_result()?;
         Ok(identity.public_key())
@@ -500,9 +502,8 @@ impl Remote {
             old_auth,
             keys: Some(keys),
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.change_password(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.change_password(req).await
         })
         .await?
         .into_result()?;
@@ -705,6 +706,19 @@ impl Remote {
         self
     }
 
+    /// `call` with request message `req`: each attempt sends its own copy.
+    async fn call_with<Req: Clone, T, Fut>(
+        &self,
+        retry: Retry,
+        req: Req,
+        send: impl Fn(Client, Req) -> Fut,
+    ) -> Result<T, FsError>
+    where
+        Fut: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.call(retry, |c| send(c, req.clone())).await
+    }
+
     /// Runs `request` on the current server, and moves through the other
     /// servers as `retry` allows. A gRPC status always means that no
     /// filesystem answer came back, because filesystem errors come inside
@@ -778,9 +792,8 @@ impl Remote {
             ino,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.get_attr(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.get_attr(req).await
         })
         .await?
         .into_result()
@@ -795,9 +808,8 @@ impl Remote {
             name: name_bytes(name),
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.lookup(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.lookup(req).await
         })
         .await?
         .into_result()
@@ -810,9 +822,8 @@ impl Remote {
             mask,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.access(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.access(req).await
         })
         .await?
         .into_result()
@@ -823,9 +834,8 @@ impl Remote {
             ino,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.read_dir(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.read_dir(req).await
         })
         .await?
         .into_result()
@@ -864,10 +874,11 @@ impl Remote {
         new: &NewNode,
     ) -> Result<Attr, FsError> {
         let req = Self::create_request(parent, name, perm, new);
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.mkdir(req).await }
-        })
+        self.call_with(
+            Retry::Once,
+            req,
+            |mut c, req| async move { c.mkdir(req).await },
+        )
         .await?
         .into_result()
     }
@@ -881,10 +892,11 @@ impl Remote {
         new: &NewNode,
     ) -> Result<Attr, FsError> {
         let req = Self::create_request(parent, name, perm, new);
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.create(req).await }
-        })
+        self.call_with(
+            Retry::Once,
+            req,
+            |mut c, req| async move { c.create(req).await },
+        )
         .await?
         .into_result()
     }
@@ -896,10 +908,11 @@ impl Remote {
             name: name_bytes(name),
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.unlink(req).await }
-        })
+        self.call_with(
+            Retry::Once,
+            req,
+            |mut c, req| async move { c.unlink(req).await },
+        )
         .await?
         .into_result()
     }
@@ -927,10 +940,11 @@ impl Remote {
             sealed_new_name: sealed.sealed_name.clone(),
         };
         let replaced = self
-            .call(Retry::Once, |mut c| {
-                let req = req.clone();
-                async move { c.rename(req).await }
-            })
+            .call_with(
+                Retry::Once,
+                req,
+                |mut c, req| async move { c.rename(req).await },
+            )
             .await?
             .into_result()?;
         Ok((replaced != 0).then_some(replaced))
@@ -943,10 +957,11 @@ impl Remote {
             name: name_bytes(name),
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.rmdir(req).await }
-        })
+        self.call_with(
+            Retry::Once,
+            req,
+            |mut c, req| async move { c.rmdir(req).await },
+        )
         .await?
         .into_result()
     }
@@ -968,9 +983,8 @@ impl Remote {
             ino,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.get_key_path(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.get_key_path(req).await
         })
         .await?
         .into_result()
@@ -988,9 +1002,8 @@ impl Remote {
         let req = ListGrantsRequest {
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.list_grants(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.list_grants(req).await
         })
         .await?
         .into_parts()
@@ -1010,9 +1023,8 @@ impl Remote {
         let req = PublicKeyRequest {
             username: user.to_string(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.public_key(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.public_key(req).await
         })
         .await?
         .into_result()
@@ -1038,9 +1050,8 @@ impl Remote {
             expected_grantees_seq,
             listed,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.grant(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.grant(req).await
         })
         .await?
         .into_result()
@@ -1063,9 +1074,8 @@ impl Remote {
             sealed_label,
             sealed_grantees,
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.create_volume(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.create_volume(req).await
         })
         .await?
         .into_result()
@@ -1079,15 +1089,14 @@ impl Remote {
         after: &[u8],
         limit: u32,
     ) -> Result<ActivityPage, FsError> {
-        self.needs_protocol(9, "the activity log")?;
+        self.needs_protocol(since::ACTIVITY, "the activity log")?;
         let req = ActivityRequest {
             folder: ino,
             after: after.to_vec(),
             limit,
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.list_activity(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.list_activity(req).await
         })
         .await?
         .into_result()
@@ -1096,7 +1105,7 @@ impl Remote {
     /// The nodes waiting for a prune that this account can write (see the
     /// server's `fs::pruning`), with any claim on each.
     pub async fn list_unpruned(&self) -> Result<Vec<Unpruned>, FsError> {
-        self.needs_protocol(10, "shared pruning")?;
+        self.needs_protocol(since::SHARED_PRUNING, "shared pruning")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_unpruned(NoArgs {}).await
         })
@@ -1112,15 +1121,14 @@ impl Remote {
         holder: [u8; 16],
         release: bool,
     ) -> Result<ClaimOutcome, FsError> {
-        self.needs_protocol(10, "shared pruning")?;
+        self.needs_protocol(since::SHARED_PRUNING, "shared pruning")?;
         let req = ClaimPruneRequest {
             ino,
             holder: holder.to_vec(),
             release,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.claim_prune(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.claim_prune(req).await
         })
         .await?
         .into_result()
@@ -1128,11 +1136,10 @@ impl Remote {
 
     /// Replaces the label of this account's own grant of `ino`.
     pub async fn set_grant_label(&self, ino: u64, sealed_label: Vec<u8>) -> Result<(), FsError> {
-        self.needs_protocol(8, "signed labels")?;
+        self.needs_protocol(since::SIGNED_LABELS, "signed labels")?;
         let req = GrantLabelRequest { ino, sealed_label };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.set_grant_label(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.set_grant_label(req).await
         })
         .await?
         .into_result()
@@ -1144,9 +1151,8 @@ impl Remote {
             ino,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.delete_volume(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.delete_volume(req).await
         })
         .await?
         .into_result()
@@ -1172,9 +1178,8 @@ impl Remote {
             objects_ok: self.objects_ok,
         };
         let read = self
-            .call(Retry::ReadOnly, |mut c| {
-                let req = req.clone();
-                async move { c.read_chunks(req).await }
+            .call_with(Retry::ReadOnly, req, |mut c, req| async move {
+                c.read_chunks(req).await
             })
             .await?
             .into_result()?;
@@ -1199,9 +1204,8 @@ impl Remote {
             chunks: chunks.iter().cloned().map(Into::into).collect(),
             end,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.write_chunks(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.write_chunks(req).await
         })
         .await?
         .into_result()
@@ -1219,9 +1223,8 @@ impl Remote {
             ino,
             blocks: blocks.iter().copied().map(Into::into).collect(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.prepare_uploads(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.prepare_uploads(req).await
         })
         .await?
         .into_result()
@@ -1233,9 +1236,8 @@ impl Remote {
             ino: top,
             snapshot: self.snapshot.clone(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.grants_under(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.grants_under(req).await
         })
         .await?
         .into_result()
@@ -1248,9 +1250,8 @@ impl Remote {
         let req = RotateRequest {
             rotations: rotations.into_iter().map(Into::into).collect(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.rotate(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.rotate(req).await
         })
         .await?
         .into_result()
@@ -1265,9 +1266,8 @@ impl Remote {
             ino,
             chunks: chunks.iter().cloned().map(Into::into).collect(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.reseal_chunks(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.reseal_chunks(req).await
         })
         .await?
         .into_result()
@@ -1281,9 +1281,8 @@ impl Remote {
             dir,
             names: names.iter().cloned().map(Into::into).collect(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.reseal_names(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.reseal_names(req).await
         })
         .await?
         .into_result()
@@ -1303,7 +1302,7 @@ impl Remote {
 
     /// This account's record: its capabilities, and where it came from.
     pub async fn account(&self) -> Result<AccountInfo, FsError> {
-        self.needs_protocol(2, "capabilities")?;
+        self.needs_protocol(since::CAPABILITIES, "capabilities")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.get_account(NoArgs {}).await
         })
@@ -1319,7 +1318,7 @@ impl Remote {
         user: &str,
         caps: Caps,
     ) -> Result<(String, Option<String>), FsError> {
-        self.needs_protocol(2, "invitations")?;
+        self.needs_protocol(since::CAPABILITIES, "invitations")?;
         let req = IssueInviteRequest {
             username: user.to_string(),
             capabilities: caps.bits(),
@@ -1327,9 +1326,8 @@ impl Remote {
         // Not sent again: a resend after it was stored would say the name
         // is taken.
         let issued = self
-            .call(Retry::Once, |mut c| {
-                let req = req.clone();
-                async move { c.issue_invite(req).await }
+            .call_with(Retry::Once, req, |mut c, req| async move {
+                c.issue_invite(req).await
             })
             .await?
             .into_result()?;
@@ -1340,7 +1338,7 @@ impl Remote {
     /// Every account, for an admin: enrolled ones, unused invitations, and
     /// public links.
     pub async fn list_users(&self) -> Result<Vec<UserEntry>, FsError> {
-        self.needs_protocol(4, "user management")?;
+        self.needs_protocol(since::USER_ADMIN, "user management")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_users(NoArgs {}).await
         })
@@ -1356,15 +1354,14 @@ impl Remote {
         on: Caps,
         off: Caps,
     ) -> Result<AccountInfo, FsError> {
-        self.needs_protocol(4, "user management")?;
+        self.needs_protocol(since::USER_ADMIN, "user management")?;
         let req = SetCapabilitiesRequest {
             username: user.to_string(),
             on: on.bits(),
             off: off.bits(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.set_capabilities(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.set_capabilities(req).await
         })
         .await?
         .into_result()
@@ -1373,14 +1370,13 @@ impl Remote {
     /// Sets how much the volumes `user` owns may hold (`None`: no limit),
     /// as an admin.
     pub async fn set_quota(&self, user: &str, quota: Option<u64>) -> Result<(), FsError> {
-        self.needs_protocol(6, "quotas")?;
+        self.needs_protocol(since::VOLUMES, "quotas")?;
         let req = SetQuotaRequest {
             username: user.to_string(),
             quota,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.set_quota(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.set_quota(req).await
         })
         .await?
         .into_result()
@@ -1390,15 +1386,14 @@ impl Remote {
     /// as an admin: the code, and the whole invitation if the servers know
     /// how users reach them.
     pub async fn reissue_invite(&self, user: &str) -> Result<(String, Option<String>), FsError> {
-        self.needs_protocol(4, "user management")?;
+        self.needs_protocol(since::USER_ADMIN, "user management")?;
         let req = UsernameRequest {
             username: user.to_string(),
         };
         // Not sent again: a second code would replace the first.
         let issued = self
-            .call(Retry::Once, |mut c| {
-                let req = req.clone();
-                async move { c.reissue_invite(req).await }
+            .call_with(Retry::Once, req, |mut c, req| async move {
+                c.reissue_invite(req).await
             })
             .await?
             .into_result()?;
@@ -1408,14 +1403,13 @@ impl Remote {
 
     /// Who owns volume `ino`, and any transfer offered.
     pub async fn get_volume(&self, ino: u64) -> Result<VolumeInfo, FsError> {
-        self.needs_protocol(6, "volume owners")?;
+        self.needs_protocol(since::VOLUMES, "volume owners")?;
         let req = InodeRequest {
             ino,
             snapshot: String::new(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.get_volume(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.get_volume(req).await
         })
         .await?
         .into_result()
@@ -1423,7 +1417,7 @@ impl Remote {
 
     /// How much this account's volumes hold.
     pub async fn storage(&self) -> Result<Storage, FsError> {
-        self.needs_protocol(6, "storage use")?;
+        self.needs_protocol(since::VOLUMES, "storage use")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.get_storage(NoArgs {}).await
         })
@@ -1434,13 +1428,12 @@ impl Remote {
     /// The last measured sizes of those of folders `inos` that this account
     /// can read.
     pub async fn folder_sizes(&self, inos: &[u64]) -> Result<Vec<FolderSize>, FsError> {
-        self.needs_protocol(6, "folder sizes")?;
+        self.needs_protocol(since::VOLUMES, "folder sizes")?;
         let req = FolderSizesRequest {
             inos: inos.to_vec(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.folder_sizes(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.folder_sizes(req).await
         })
         .await?
         .into_result()
@@ -1449,7 +1442,7 @@ impl Remote {
     /// `EDQUOT` if `bytes` more in folder `ino` would go over a quota or a
     /// folder limit.
     pub async fn check_room(&self, ino: u64, bytes: u64) -> Result<(), FsError> {
-        self.needs_protocol(6, "quotas")?;
+        self.needs_protocol(since::VOLUMES, "quotas")?;
         let req = CheckRoomRequest { ino, bytes };
         self.call(
             Retry::ReadOnly,
@@ -1462,7 +1455,7 @@ impl Remote {
     /// Sets folder `ino`'s size limit (`None`: no limit), as the owner of
     /// its volume or an admin.
     pub async fn set_folder_limit(&self, ino: u64, limit: Option<u64>) -> Result<(), FsError> {
-        self.needs_protocol(6, "folder size limits")?;
+        self.needs_protocol(since::VOLUMES, "folder size limits")?;
         let req = FolderLimitRequest { ino, limit };
         self.call(Retry::Idempotent, |mut c| async move {
             c.set_folder_limit(req).await
@@ -1474,14 +1467,13 @@ impl Remote {
     /// Offers volume `ino` to `user`, as its owner. They must have
     /// read-write access to it already.
     pub async fn offer_volume(&self, ino: u64, user: &str) -> Result<(), FsError> {
-        self.needs_protocol(6, "volume transfers")?;
+        self.needs_protocol(since::VOLUMES, "volume transfers")?;
         let req = OfferVolumeRequest {
             ino,
             username: user.to_string(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.offer_volume(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.offer_volume(req).await
         })
         .await?
         .into_result()
@@ -1489,14 +1481,13 @@ impl Remote {
 
     /// Withdraws the offer of volume `ino`, as its owner.
     pub async fn withdraw_offer(&self, ino: u64) -> Result<(), FsError> {
-        self.needs_protocol(6, "volume transfers")?;
+        self.needs_protocol(since::VOLUMES, "volume transfers")?;
         let req = InodeRequest {
             ino,
             snapshot: String::new(),
         };
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.withdraw_offer(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.withdraw_offer(req).await
         })
         .await?
         .into_result()
@@ -1504,7 +1495,7 @@ impl Remote {
 
     /// Accepts or declines the offer of volume `ino` to this account.
     pub async fn answer_offer(&self, ino: u64, accept: bool) -> Result<(), FsError> {
-        self.needs_protocol(6, "volume transfers")?;
+        self.needs_protocol(since::VOLUMES, "volume transfers")?;
         let req = AnswerOfferRequest { ino, accept };
         self.call(
             Retry::Once,
@@ -1516,7 +1507,7 @@ impl Remote {
 
     /// The offers made to this account, and by it.
     pub async fn offers(&self) -> Result<Vec<Offer>, FsError> {
-        self.needs_protocol(6, "volume transfers")?;
+        self.needs_protocol(since::VOLUMES, "volume transfers")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_offers(NoArgs {}).await
         })
@@ -1526,7 +1517,7 @@ impl Remote {
 
     /// Every orphaned volume, as an admin.
     pub async fn orphans(&self) -> Result<Vec<Orphan>, FsError> {
-        self.needs_protocol(6, "orphaned volumes")?;
+        self.needs_protocol(since::VOLUMES, "orphaned volumes")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_orphans(NoArgs {}).await
         })
@@ -1537,13 +1528,12 @@ impl Remote {
     /// The volumes that removing `user`, or letting them enroll again,
     /// would orphan, as an admin.
     pub async fn removal_orphans(&self, user: &str) -> Result<Vec<Orphan>, FsError> {
-        self.needs_protocol(6, "orphaned volumes")?;
+        self.needs_protocol(since::VOLUMES, "orphaned volumes")?;
         let req = UsernameRequest {
             username: user.to_string(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.removal_orphans(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.removal_orphans(req).await
         })
         .await?
         .into_result()
@@ -1551,14 +1541,13 @@ impl Remote {
 
     /// Makes `user` the owner of volume `ino`, as an admin.
     pub async fn assign_owner(&self, ino: u64, user: &str) -> Result<(), FsError> {
-        self.needs_protocol(6, "orphaned volumes")?;
+        self.needs_protocol(since::VOLUMES, "orphaned volumes")?;
         let req = AssignOwnerRequest {
             ino,
             username: user.to_string(),
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.assign_owner(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.assign_owner(req).await
         })
         .await?
         .into_result()
@@ -1566,7 +1555,7 @@ impl Remote {
 
     /// Measures every folder and owner now, as an admin.
     pub async fn measure_usage(&self) -> Result<(), FsError> {
-        self.needs_protocol(6, "measuring usage")?;
+        self.needs_protocol(since::VOLUMES, "measuring usage")?;
         self.call(Retry::Idempotent, |mut c| async move {
             c.measure_usage(NoArgs {}).await
         })
@@ -1576,7 +1565,7 @@ impl Remote {
 
     /// Folders and files that no account can reach any more, as an admin.
     pub async fn list_unreachable(&self) -> Result<Vec<Unreachable>, FsError> {
-        self.needs_protocol(5, "finding unreachable folders")?;
+        self.needs_protocol(since::UNREACHABLE, "finding unreachable folders")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_unreachable(NoArgs {}).await
         })
@@ -1586,16 +1575,15 @@ impl Remote {
 
     /// Deletes unreachable part `ino`, with everything in it, as an admin.
     pub async fn delete_unreachable(&self, ino: u64) -> Result<(), FsError> {
-        self.needs_protocol(5, "finding unreachable folders")?;
+        self.needs_protocol(since::UNREACHABLE, "finding unreachable folders")?;
         let req = InodeRequest {
             ino,
             snapshot: String::new(),
         };
         // Not sent again: a resend after it was done would find nothing
         // to remove.
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.delete_unreachable(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.delete_unreachable(req).await
         })
         .await?
         .into_result()
@@ -1604,13 +1592,12 @@ impl Remote {
     /// What removing `user`, or letting them enroll again, would leave that
     /// no account can reach, as an admin.
     pub async fn removal_impact(&self, user: &str) -> Result<Vec<Unreachable>, FsError> {
-        self.needs_protocol(5, "finding unreachable folders")?;
+        self.needs_protocol(since::UNREACHABLE, "finding unreachable folders")?;
         let req = UsernameRequest {
             username: user.to_string(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.removal_impact(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.removal_impact(req).await
         })
         .await?
         .into_result()
@@ -1618,15 +1605,14 @@ impl Remote {
 
     /// Removes `user`, as an admin.
     pub async fn delete_user(&self, user: &str) -> Result<(), FsError> {
-        self.needs_protocol(4, "user management")?;
+        self.needs_protocol(since::USER_ADMIN, "user management")?;
         let req = UsernameRequest {
             username: user.to_string(),
         };
         // Not sent again: a resend after it was done would say there is no
         // such user.
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.delete_user(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.delete_user(req).await
         })
         .await?
         .into_result()
@@ -1643,7 +1629,7 @@ impl Remote {
         folder: u64,
         note: Vec<u8>,
     ) -> Result<[u8; PUBLIC_KEY_LEN], FsError> {
-        self.needs_protocol(2, "public links")?;
+        self.needs_protocol(since::CAPABILITIES, "public links")?;
         let identity = Identity::generate();
         let (keys, _) = account_keys(user, secret, KdfParams::SECRET, &identity).await?;
         let req = CreateLinkAccountRequest {
@@ -1655,9 +1641,8 @@ impl Remote {
         };
         // Not sent again: a resend after it was stored would say the name
         // is taken.
-        self.call(Retry::Once, |mut c| {
-            let req = req.clone();
-            async move { c.create_link_account(req).await }
+        self.call_with(Retry::Once, req, |mut c, req| async move {
+            c.create_link_account(req).await
         })
         .await?
         .into_result()?;
@@ -1667,7 +1652,7 @@ impl Remote {
     /// This account's sealed trusted keys and their version (see
     /// `Vault::sync_pins`): 0 and nothing if there are none yet.
     pub async fn get_pins(&self) -> Result<(u64, Vec<u8>), FsError> {
-        self.needs_protocol(3, "trusted keys on the servers")?;
+        self.needs_protocol(since::PINS, "trusted keys on the servers")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.get_pins(NoArgs {}).await
         })
@@ -1679,15 +1664,14 @@ impl Remote {
     /// version. `EAGAIN` if another device changed them meanwhile, and also
     /// for a resend after it was stored: either way, read them again.
     pub async fn put_pins(&self, expected: u64, sealed: Vec<u8>) -> Result<u64, FsError> {
-        self.needs_protocol(3, "trusted keys on the servers")?;
+        self.needs_protocol(since::PINS, "trusted keys on the servers")?;
         let req = PutPinsRequest {
             expected_version: expected,
             sealed,
         };
         Ok(self
-            .call(Retry::Idempotent, |mut c| {
-                let req = req.clone();
-                async move { c.put_pins(req).await }
+            .call_with(Retry::Idempotent, req, |mut c, req| async move {
+                c.put_pins(req).await
             })
             .await?
             .into_result()?
@@ -1698,13 +1682,12 @@ impl Remote {
     /// from their invitation (empty for none). `ENOENT` if they have not
     /// enrolled.
     pub async fn get_enrollment(&self, user: &str) -> Result<(Vec<u8>, Vec<u8>), FsError> {
-        self.needs_protocol(11, "invitations that check keys")?;
+        self.needs_protocol(since::INVITE_TRUST, "invitations that check keys")?;
         let req = UsernameRequest {
             username: user.to_string(),
         };
-        self.call(Retry::ReadOnly, |mut c| {
-            let req = req.clone();
-            async move { c.get_enrollment(req).await }
+        self.call_with(Retry::ReadOnly, req, |mut c, req| async move {
+            c.get_enrollment(req).await
         })
         .await?
         .into_result()
@@ -1712,11 +1695,10 @@ impl Remote {
 
     /// Leaves `introductions` from this account for their recipients.
     pub async fn put_introductions(&self, introductions: Vec<Introduction>) -> Result<(), FsError> {
-        self.needs_protocol(11, "introductions")?;
+        self.needs_protocol(since::INVITE_TRUST, "introductions")?;
         let req = PutIntroductionsRequest { introductions };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.put_introductions(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.put_introductions(req).await
         })
         .await?
         .into_result()
@@ -1724,7 +1706,7 @@ impl Remote {
 
     /// The introductions left for this account.
     pub async fn get_introductions(&self) -> Result<Vec<Introduction>, FsError> {
-        self.needs_protocol(11, "introductions")?;
+        self.needs_protocol(since::INVITE_TRUST, "introductions")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.get_introductions(NoArgs {}).await
         })
@@ -1735,13 +1717,12 @@ impl Remote {
     /// Removes introductions left for this account, by subject and
     /// introducer.
     pub async fn delete_introductions(&self, which: Vec<Introduction>) -> Result<(), FsError> {
-        self.needs_protocol(11, "introductions")?;
+        self.needs_protocol(since::INVITE_TRUST, "introductions")?;
         let req = DeleteIntroductionsRequest {
             introductions: which,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.delete_introductions(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.delete_introductions(req).await
         })
         .await?
         .into_result()
@@ -1749,7 +1730,7 @@ impl Remote {
 
     /// The public links that this account made.
     pub async fn list_links(&self) -> Result<Vec<LinkAccount>, FsError> {
-        self.needs_protocol(2, "public links")?;
+        self.needs_protocol(since::CAPABILITIES, "public links")?;
         self.call(Retry::ReadOnly, |mut c| async move {
             c.list_links(NoArgs {}).await
         })
@@ -1770,9 +1751,8 @@ impl Remote {
             expected_version,
             node_keys,
         };
-        self.call(Retry::Idempotent, |mut c| {
-            let req = req.clone();
-            async move { c.prune_keys(req).await }
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.prune_keys(req).await
         })
         .await?
         .into_result()
