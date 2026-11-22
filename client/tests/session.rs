@@ -633,3 +633,66 @@ fn deleted_files_come_from_the_snapshots() {
     );
     assert_eq!(errno(s.block(s.session.deleted(b"/"))), libc::EINVAL);
 }
+
+/// A tree with a file at the top and one in a subfolder.
+fn small_tree(s: &Setup) -> u64 {
+    let top = s
+        .block(s.session.mkdir(s.volume, OsStr::new("tree"), 0o755))
+        .unwrap()
+        .ino;
+    let sub = s
+        .block(s.session.mkdir(top, OsStr::new("sub"), 0o755))
+        .unwrap()
+        .ino;
+    for (dir, name, bytes) in [(top, "a", &b"top file"[..]), (sub, "b", &b"deeper"[..])] {
+        let ino = s
+            .block(s.session.create(dir, OsStr::new(name), 0o644))
+            .unwrap()
+            .ino;
+        s.block(s.session.write(ino, 0, bytes)).unwrap();
+        s.block(s.session.flush(ino)).unwrap();
+    }
+    top
+}
+
+fn read_path(s: &Setup, path: &str) -> Vec<u8> {
+    let ino = s.block(s.session.resolve_ino(path.as_bytes())).unwrap();
+    s.block(s.session.read(ino, 0, 1 << 20)).unwrap()
+}
+
+#[test]
+fn a_tree_copies_whole_and_empties_whole() {
+    let s = Setup::new();
+    let top = small_tree(&s);
+    s.block(s.session.copy_tree(top, s.volume, "copy".into()))
+        .unwrap();
+    assert_eq!(read_path(&s, &format!("/{VOLUME}/copy/a")), b"top file");
+    assert_eq!(read_path(&s, &format!("/{VOLUME}/copy/sub/b")), b"deeper");
+    // The original is untouched.
+    assert_eq!(read_path(&s, &format!("/{VOLUME}/tree/sub/b")), b"deeper");
+
+    s.block(s.session.empty_tree(top)).unwrap();
+    assert!(s.block(s.session.children(top)).unwrap().is_empty());
+    s.block(s.session.rmdir(s.volume, OsStr::new("tree")))
+        .unwrap();
+    assert_eq!(read_path(&s, &format!("/{VOLUME}/copy/a")), b"top file");
+}
+
+#[test]
+fn a_path_reaches_its_grant_through_groups() {
+    let s = Setup::new();
+    let vault = s.session.vault();
+    assert_eq!(
+        s.block(vault.grant_at(&[VOLUME, "any", "deeper"])).unwrap(),
+        Some((1, s.volume))
+    );
+    assert_eq!(s.block(vault.grant_at(&[])).unwrap(), None);
+    s.block(vault.relabel(s.volume, OsStr::new("Work/notes")))
+        .unwrap();
+    assert_eq!(s.block(vault.grant_at(&["Work"])).unwrap(), None, "a group");
+    assert_eq!(
+        s.block(vault.grant_at(&["Work", "notes", "x"])).unwrap(),
+        Some((2, s.volume))
+    );
+    assert_eq!(errno(s.block(vault.grant_at(&["nowhere"]))), libc::ENOENT);
+}

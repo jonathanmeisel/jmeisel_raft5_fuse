@@ -861,6 +861,44 @@ impl Session {
         Ok(items)
     }
 
+    /// Copies directory `from` and everything in it to a new directory
+    /// `name` in `parent`. Directories are made with mode 0755.
+    pub fn copy_tree<'a>(
+        &'a self,
+        from: u64,
+        parent: u64,
+        name: std::ffi::OsString,
+    ) -> rt::BoxFuture<'a, Result<(), FsError>> {
+        Box::pin(async move {
+            let to = self.mkdir(parent, &name, 0o755).await?.ino;
+            for item in self.children(from).await? {
+                match item.kind {
+                    Kind::Directory => self.copy_tree(item.ino, to, item.name.clone()).await?,
+                    Kind::File => {
+                        self.copy_file(item.ino, to, &item.name).await?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes everything in directory `ino`, depth first. The directory
+    /// itself stays.
+    pub fn empty_tree<'a>(&'a self, ino: u64) -> rt::BoxFuture<'a, Result<(), FsError>> {
+        Box::pin(async move {
+            for item in self.children(ino).await? {
+                if item.kind == Kind::Directory {
+                    self.empty_tree(item.ino).await?;
+                    self.rmdir(ino, &item.name).await?;
+                } else {
+                    self.unlink(ino, &item.name).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     async fn list(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         if is_snapshot_ino(ino) {
             return self.snapshots.readdir(&self.vault, VIRTUAL_ROOT, ino).await;

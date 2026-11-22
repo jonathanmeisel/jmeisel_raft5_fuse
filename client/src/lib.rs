@@ -9,6 +9,7 @@ mod readahead;
 pub mod remote;
 mod rt;
 pub mod session;
+pub mod sharing;
 mod snapshot_tree;
 pub mod store;
 mod timing;

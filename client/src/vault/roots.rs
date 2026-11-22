@@ -68,6 +68,20 @@ impl Roots {
 }
 
 impl Vault {
+    /// How many of `names`, a path from the root, it takes to reach a
+    /// grant, and that grant's inode. `None` if they never do: they name
+    /// the root or a group. Asks the servers only for a name not known here.
+    pub async fn grant_at(&self, names: &[&str]) -> Result<Option<(usize, u64)>, FsError> {
+        let mut at = VIRTUAL_ROOT;
+        for (i, name) in names.iter().enumerate() {
+            at = self.group_lookup(at, OsStr::new(name)).await?;
+            if !is_group(at) {
+                return Ok(Some((i + 1, at)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Reads this account's grants again, and works out the root from them.
     /// Each grant shows under its label, in the groups the label names, made
     /// unique there. A grant of a folder inside another grant isn't one: it is

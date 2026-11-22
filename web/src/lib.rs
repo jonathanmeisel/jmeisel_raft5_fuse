@@ -22,13 +22,14 @@ use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use futures_util::future::{LocalBoxFuture, join_all};
+use futures_util::future::join_all;
 use js_sys::{Function, Promise, Uint8Array};
 use raft5fs_client::pruner::{self, Pruner, PrunerConfig};
 use raft5fs_client::remote::{ClientTlsConfig, Credentials, Remote, UnlockKeys};
 use raft5fs_client::session::{Session, SessionConfig};
+use raft5fs_client::sharing::{NodeSharing, sharing_of};
 use raft5fs_client::store::Store;
-use raft5fs_client::vault::{KnownKeys, ShareTrust, VIRTUAL_ROOT, Vault, is_group, is_virtual};
+use raft5fs_client::vault::{KnownKeys, ShareTrust, Vault, is_group, is_virtual};
 use raft5fs_crypto::identity::{
     PUBLIC_KEY_LEN, fingerprint, fingerprint_progress, fingerprint_words, grant_sender,
 };
@@ -495,22 +496,6 @@ impl Entry {
 /// `Entry::shared`).
 type Sharing = Rc<HashMap<u64, NodeSharing>>;
 
-/// Whom a node is shared with besides this account, as the server says.
-#[derive(Serialize, Clone)]
-struct NodeSharing {
-    /// Their names, in order; public links aren't among them.
-    people: Vec<String>,
-    /// Whether it has a public link.
-    link: bool,
-}
-
-impl NodeSharing {
-    /// How a folder's mark shows it (see `Entry::shared`).
-    fn mark(&self) -> &'static str {
-        if self.link { "link" } else { "people" }
-    }
-}
-
 /// How a folder is shared, for the bar above the files.
 #[derive(Serialize)]
 struct Here {
@@ -587,20 +572,6 @@ const PATH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 /// How many version paths `Inner::version_paths` keeps before it starts
 /// again.
 const MAX_VERSION_PATHS: usize = 1000;
-
-/// Whom a node with `grantees` is shared with besides `me`, if anyone.
-fn sharing_of(grantees: &[raft5fs_proto::types::Grantee], me: &str) -> Option<NodeSharing> {
-    let link = grantees
-        .iter()
-        .any(|g| g.user.starts_with(raft5fs_proto::types::LINK_PREFIX));
-    let mut people: Vec<String> = grantees
-        .iter()
-        .filter(|g| g.user != me && !g.user.starts_with(raft5fs_proto::types::LINK_PREFIX))
-        .map(|g| g.user.clone())
-        .collect();
-    people.sort();
-    (link || !people.is_empty()).then_some(NodeSharing { people, link })
-}
 
 impl Inner {
     fn vault(&self) -> &Arc<Vault> {
@@ -735,14 +706,7 @@ impl Inner {
     /// `top_depth`, and the inode of the grant it reaches. Asks the servers
     /// only for a name not known here.
     async fn top(&self, names: &[&str]) -> Result<Option<(usize, u64)>, FsError> {
-        let mut at = VIRTUAL_ROOT;
-        for (i, name) in names.iter().enumerate() {
-            at = self.vault().group_lookup(at, OsStr::new(name)).await?;
-            if !is_group(at) {
-                return Ok(Some((i + 1, at)));
-            }
-        }
-        Ok(None)
+        self.vault().grant_at(names).await
     }
 
     /// How folder `path` is shared, for the bar above the files (see
@@ -1003,47 +967,6 @@ impl Inner {
         self.handles.borrow_mut().insert(handle, ino);
         handle
     }
-
-    /// Removes everything below directory `ino`, depth first.
-    fn empty_dir(self: Rc<Self>, ino: u64) -> LocalBoxFuture<'static, Result<(), FsError>> {
-        Box::pin(async move {
-            for item in self.session.children(ino).await? {
-                if item.kind == Kind::Directory {
-                    Rc::clone(&self).empty_dir(item.ino).await?;
-                    self.session.rmdir(ino, &item.name).await?;
-                } else {
-                    self.session.unlink(ino, &item.name).await?;
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Copies directory `from` and everything in it to a new directory
-    /// `name` in `parent`.
-    fn copy_dir(
-        self: Rc<Self>,
-        from: u64,
-        parent: u64,
-        name: std::ffi::OsString,
-    ) -> LocalBoxFuture<'static, Result<(), FsError>> {
-        Box::pin(async move {
-            let to = self.session.mkdir(parent, &name, DIR_MODE).await?.ino;
-            for item in self.session.children(from).await? {
-                match item.kind {
-                    Kind::Directory => {
-                        Rc::clone(&self)
-                            .copy_dir(item.ino, to, item.name.clone())
-                            .await?
-                    }
-                    Kind::File => {
-                        self.session.copy_file(item.ino, to, &item.name).await?;
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
 }
 
 #[wasm_bindgen]
@@ -1181,7 +1104,7 @@ impl Fs {
             }
             let (parent, name) = inner.session.resolve_parent(path.as_bytes()).await?;
             if attr.kind == Kind::Directory {
-                Rc::clone(&inner).empty_dir(attr.ino).await?;
+                inner.session.empty_tree(attr.ino).await?;
                 inner.session.rmdir(parent, &name).await
             } else {
                 inner.session.unlink(parent, &name).await
@@ -1401,7 +1324,7 @@ impl Fs {
             let source = inner.resolve(&from).await?;
             let (parent, name) = inner.session.resolve_parent(to.as_bytes()).await?;
             match source.kind {
-                Kind::Directory => Rc::clone(&inner).copy_dir(source.ino, parent, name).await,
+                Kind::Directory => inner.session.copy_tree(source.ino, parent, name).await,
                 Kind::File => inner
                     .session
                     .copy_file(source.ino, parent, &name)
