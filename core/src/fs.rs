@@ -235,16 +235,7 @@ async fn put_chunks(
     size: u64,
 ) -> Result<Result<Vec<Dropped>, FsError>, KvError> {
     let ino = entry.attr.ino;
-    let now = SystemTime::now();
-    for w in writes {
-        decide!(check_placement(ino, entry.attr.layout, core.grid, w));
-        if let WriteBody::Block(block) = &w.body {
-            let Some(objects) = &core.objects else {
-                return Ok(Err(no_objects()));
-            };
-            decide!(check_minted(block.minted_ms, now, objects.commit_window()));
-        }
-    }
+    decide!(check_writes(core, entry, writes));
     let (version, _) = decide!(key_versions(txn, ino).await?);
     // Read every inline chunk's seq in one read, and check each one below.
     // Only seqs are compared, so only seqs are read, and they are locked as
@@ -279,43 +270,11 @@ async fn put_chunks(
             w.expected_seq
                 .map(|_| seqs.next().expect("a seq read for every expected one"))
         };
-        let sealed_under = match &w.body {
-            WriteBody::Inline(blob) => sealed_version(blob).ok(),
-            WriteBody::Block(block) => Some(block.version),
-        };
-        if sealed_under != Some(version) {
-            return Ok(Err(FsError::new(
-                raft5fs_proto::errno::EKEYEXPIRED,
-                format!("chunks of inode {ino} must be sealed under key version {version}"),
-            )));
-        }
-        if let (Some(expected), Some(seq)) = (w.expected_seq, seq)
-            && (seq != expected || (existing && seq == 0))
-        {
-            return Ok(Err(FsError::new(
-                libc::EAGAIN,
-                format!("chunk {} of inode {ino} changed meanwhile", w.index),
-            )));
-        }
+        decide!(check_sealed_and_seq(ino, w, version, seq, existing));
         let key = chunk_key(ino, w.index);
         // After the check above, so that a client racing a truncate hears that
-        // the chunk changed. A re-seal must still work on a chunk that a race
-        // left longer than the file, or its prune could never finish.
-        if !fits_in_size(w, size, core.chunk_size) {
-            let keeps_length = existing
-                && txn.read_one(&key).await?.value.is_some_and(|stored| {
-                    stored_len(stored, core.chunk_size) >= write_len(w, core.chunk_size)
-                });
-            if !keeps_length {
-                return Ok(Err(FsError::new(
-                    libc::EINVAL,
-                    format!(
-                        "chunk {} of inode {ino} doesn't fit in a file of {size} bytes",
-                        w.index
-                    ),
-                )));
-            }
-        }
+        // the chunk changed.
+        decide!(check_fits(core, txn, ino, w, &key, size, existing).await?);
         let value = match &w.body {
             WriteBody::Inline(blob) => blob.clone(),
             WriteBody::Block(block) => encode_pointer(block),
@@ -323,6 +282,85 @@ async fn put_chunks(
         txn.write(&key, Some(&value)).await?;
     }
     Ok(Ok(dropped))
+}
+
+/// The checks of `put_chunks` that need no reads: each write is in its
+/// right place for the file's layout, and each block was named (minted)
+/// recently enough to commit.
+fn check_writes(core: &FsCore, entry: &Entry, writes: &[ChunkWrite]) -> Result<(), FsError> {
+    let ino = entry.attr.ino;
+    let now = SystemTime::now();
+    for w in writes {
+        check_placement(ino, entry.attr.layout, core.grid, w)?;
+        if let WriteBody::Block(block) = &w.body {
+            let objects = core.objects.as_ref().ok_or_else(no_objects)?;
+            check_minted(block.minted_ms, now, objects.commit_window())?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks that write `w` is sealed under the node's current key `version`,
+/// and, if it expects a seq, that the chunk is still at it: `seq` is the
+/// chunk's seq now (0 for none). With `existing`, the chunk must exist.
+fn check_sealed_and_seq(
+    ino: u64,
+    w: &ChunkWrite,
+    version: u32,
+    seq: Option<u64>,
+    existing: bool,
+) -> Result<(), FsError> {
+    let sealed_under = match &w.body {
+        WriteBody::Inline(blob) => sealed_version(blob).ok(),
+        WriteBody::Block(block) => Some(block.version),
+    };
+    if sealed_under != Some(version) {
+        return Err(FsError::new(
+            raft5fs_proto::errno::EKEYEXPIRED,
+            format!("chunks of inode {ino} must be sealed under key version {version}"),
+        ));
+    }
+    if let (Some(expected), Some(seq)) = (w.expected_seq, seq)
+        && (seq != expected || (existing && seq == 0))
+    {
+        return Err(FsError::new(
+            libc::EAGAIN,
+            format!("chunk {} of inode {ino} changed meanwhile", w.index),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that write `w` stays within a file of `size` bytes. A re-seal
+/// (`existing`) may keep a chunk's stored length past the end, which a race
+/// with a truncate can leave, or its prune could never finish.
+async fn check_fits(
+    core: &FsCore,
+    txn: &Transaction,
+    ino: u64,
+    w: &ChunkWrite,
+    key: &[u8],
+    size: u64,
+    existing: bool,
+) -> Result<Result<(), FsError>, KvError> {
+    if fits_in_size(w, size, core.chunk_size) {
+        return Ok(Ok(()));
+    }
+    let keeps_length = existing
+        && txn.read_one(key).await?.value.is_some_and(|stored| {
+            stored_len(stored, core.chunk_size) >= write_len(w, core.chunk_size)
+        });
+    if keeps_length {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(FsError::new(
+            libc::EINVAL,
+            format!(
+                "chunk {} of inode {ino} doesn't fit in a file of {size} bytes",
+                w.index
+            ),
+        )))
+    }
 }
 
 /// Checks that `sealed_name` is sealed under directory `dir`'s current key
@@ -760,4 +798,67 @@ fn operations_are_send(
     send(core.create_volume(caller, new, 0o755, &[], &[], &[]));
     send(core.delete_volume(caller, 1));
     send(FsCore::connect(core.client.clone(), 4096, None));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_write(version: u32, expected_seq: Option<u64>) -> ChunkWrite {
+        ChunkWrite {
+            index: 4,
+            expected_seq,
+            body: WriteBody::Block(BlockRef {
+                version,
+                minted_ms: 1,
+                random: [0; raft5fs_proto::types::BLOCK_RANDOM_LEN],
+                nseg: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_write_must_be_under_the_current_key_and_at_its_seq() {
+        let errno = |r: Result<(), FsError>| r.map_err(|e| e.errno);
+        assert_eq!(
+            errno(check_sealed_and_seq(
+                7,
+                &block_write(3, None),
+                3,
+                None,
+                false
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            errno(check_sealed_and_seq(
+                7,
+                &block_write(2, None),
+                3,
+                None,
+                false
+            )),
+            Err(raft5fs_proto::errno::EKEYEXPIRED)
+        );
+        // An expected seq must still be the chunk's.
+        let expects = block_write(3, Some(5));
+        assert_eq!(
+            errno(check_sealed_and_seq(7, &expects, 3, Some(5), false)),
+            Ok(())
+        );
+        assert_eq!(
+            errno(check_sealed_and_seq(7, &expects, 3, Some(6), false)),
+            Err(libc::EAGAIN)
+        );
+        // A re-seal needs the chunk to exist; a write expecting none doesn't.
+        let none = block_write(3, Some(0));
+        assert_eq!(
+            errno(check_sealed_and_seq(7, &none, 3, Some(0), false)),
+            Ok(())
+        );
+        assert_eq!(
+            errno(check_sealed_and_seq(7, &none, 3, Some(0), true)),
+            Err(libc::EAGAIN)
+        );
+    }
 }
