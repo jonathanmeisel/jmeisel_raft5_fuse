@@ -53,7 +53,7 @@ use crate::layout::{
     ROOT_INO, attr_key, prune_claim_key, unpruned_key,
 };
 use crate::timing::next_key;
-use crate::view::{ReadKeys, View};
+use crate::view::{ReadKeys, View, exactly};
 
 /// Deeper than any real tree. A longer walk means a loop in the parent
 /// links, which only corruption could make.
@@ -346,7 +346,7 @@ async fn walk(
         }
         // Read the grant with the Entry, so each level is one round trip.
         // The grant counts only if the Entry exists.
-        let [entry, grant] = two(r.get_many(&[attr_key(cur), grant_key(cur, user)]).await?);
+        let [entry, grant] = exactly(r.get_many(&[attr_key(cur), grant_key(cur, user)]).await?);
         let Some(bytes) = entry else {
             return Ok(Err(gone(cur)));
         };
@@ -495,7 +495,7 @@ pub(crate) async fn check_fresh(r: &impl Reads, ino: u64) -> Result<Result<(), F
             return Ok(versions_of(cur, r.get(&node_keys_key(cur)).await?)
                 .and_then(|(version, _)| check_wrapped(child, version)));
         }
-        let [entry, keys] = two(r.get_many(&[attr_key(cur), node_keys_key(cur)]).await?);
+        let [entry, keys] = exactly(r.get_many(&[attr_key(cur), node_keys_key(cur)]).await?);
         // The node itself must exist before its key record matters. A
         // parent's key record is checked against its child first, as if
         // each was read in turn.
@@ -540,11 +540,6 @@ fn check_wrapped((child, wrapped_under): (u64, u32), parent_version: u32) -> Res
             ),
         ))
     }
-}
-
-/// The two values that a read of two keys returned, in order.
-fn two(values: Vec<Option<Vec<u8>>>) -> [Option<Vec<u8>>; 2] {
-    values.try_into().expect("a read of two keys answers both")
 }
 
 /// Every node at or below `top` that is granted to anyone, with the path

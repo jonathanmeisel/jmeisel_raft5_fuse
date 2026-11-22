@@ -37,7 +37,7 @@ use crate::objects::{
 };
 use crate::snapshots;
 use crate::timing::{self, next_key};
-use crate::view::{ReadKeys, View};
+use crate::view::{ReadKeys, View, exactly};
 use raft5fs_proto::clock;
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
@@ -164,13 +164,6 @@ async fn modifiable_dir(txn: &Transaction, ino: u64) -> Result<Result<Entry, FsE
 /// The inode that a directory entry names, if it exists.
 async fn named(txn: &Transaction, dirent: &[u8]) -> Result<Option<u64>, KvError> {
     Ok(txn.read_one(dirent).await?.value.map(|b| dirent_ino(&b)))
-}
-
-/// The entries that a read of a fixed number of keys returned, in order.
-fn each<const N: usize>(entries: Vec<raft5_client::Entry>) -> [raft5_client::Entry; N] {
-    entries
-        .try_into()
-        .expect("a read of every key answers each")
 }
 
 /// The error for a request that needs object storage, when the filesystem
@@ -752,7 +745,7 @@ impl FsCore {
     ) -> Result<(Attr, Vec<u8>), FsError> {
         let view = self.view(at).await?;
         self.guard_now(&view, caller, parent, false).await?;
-        let [dir, dirent] = each(
+        let [dir, dirent] = exactly(
             view.read_many(&[attr_key(parent), dirent_key(parent, name)])
                 .await?,
         );
@@ -998,7 +991,7 @@ impl FsCore {
             // The new node's key and name are sealed under the parent's
             // key.
             decide!(self.fresh(&txn, parent).await?);
-            let [dir, taken, record] = each(
+            let [dir, taken, record] = exactly(
                 txn.read_many(&[attr_key(parent), dirent.to_vec(), node_keys_key(parent)])
                     .await?,
             );
@@ -1141,7 +1134,7 @@ impl FsCore {
         versions: (u32, u32),
     ) -> Result<Result<(), FsError>, KvError> {
         let user = caller.user.as_str();
-        let [reserved, existing] = each(
+        let [reserved, existing] = exactly(
             txn.read_many(&[reservation_key(new.ino), attr_key(new.ino)])
                 .await?,
         );
@@ -2154,7 +2147,7 @@ impl FsCore {
                 let ino = r.ino;
                 decide!(self.guard(&txn, caller, ino, true).await?);
                 let [entry, record] =
-                    each(txn.read_many(&[attr_key(ino), node_keys_key(ino)]).await?);
+                    exactly(txn.read_many(&[attr_key(ino), node_keys_key(ino)]).await?);
                 let entry = decide!(live(ino, entry.value).ok_or_else(enoent));
                 let (version, wrapped_under) = decide!(versions_of(ino, record.value));
                 if version != r.expected_version {

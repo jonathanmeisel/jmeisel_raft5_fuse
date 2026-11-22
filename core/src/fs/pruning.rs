@@ -86,12 +86,11 @@ impl FsCore {
             if found.len() == LIST_LIMIT {
                 break;
             }
-            let [keys, claim] = self
-                .client
-                .get_many(&[node_keys_key(ino), prune_claim_key(ino)])
-                .await?
-                .try_into()
-                .expect("two keys read");
+            let [keys, claim] = exactly(
+                self.client
+                    .get_many(&[node_keys_key(ino), prune_claim_key(ino)])
+                    .await?,
+            );
             if !waiting(keys.as_deref()) {
                 self.drop_stale_row(ino).await;
                 continue;

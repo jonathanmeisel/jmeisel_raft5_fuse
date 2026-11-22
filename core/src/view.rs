@@ -78,14 +78,20 @@ pub(crate) trait ReadKeys: Sync {
     /// Reads one key's entry: its value, and the seq it was written at (0
     /// and no value if it has none).
     fn read_one(&self, key: &[u8]) -> impl Future<Output = Result<Entry, KvError>> + Send {
-        async move { Ok(only(self.read_some(&[key]).await?)) }
+        async move {
+            let [entry] = exactly(self.read_some(&[key]).await?);
+            Ok(entry)
+        }
     }
 }
 
-/// The one entry that a read of one key returns. The client refuses an
-/// empty answer to a read that is not empty, so there is always one.
-fn only<T>(mut entries: Vec<T>) -> T {
-    entries.pop().expect("a read of one key answers it")
+/// The answers to a read of `N` keys, in order. The store answers every
+/// key of a read that fits its limits, so there are always `N`.
+pub(crate) fn exactly<T, const N: usize>(values: Vec<T>) -> [T; N] {
+    let got = values.len();
+    values
+        .try_into()
+        .unwrap_or_else(|_| panic!("a read of {N} keys answered {got}"))
 }
 
 fn seqs(versions: Vec<Version>) -> Vec<u64> {

@@ -44,7 +44,7 @@ use crate::layout::{
     PINS_PREFIX, usage_key,
 };
 use crate::timing::next_key;
-use crate::view::ReadKeys;
+use crate::view::{ReadKeys, exactly};
 use raft5fs_proto::clock;
 use raft5fs_proto::types::{
     AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
@@ -95,7 +95,7 @@ pub const MAX_INVITE_PROOF: usize = 64;
 /// they belong together.
 pub async fn enrollment(client: &Client, user: &str) -> Result<(Vec<u8>, Vec<u8>), FsError> {
     run_txn(client, |txn| async move {
-        let [keys, proof] = two(txn.read_many(&[keys_key(user), proof_key(user)]).await?);
+        let [keys, proof] = exactly(txn.read_many(&[keys_key(user), proof_key(user)]).await?);
         let Some(keys) = keys.value else {
             return Ok(Err(FsError::new(
                 libc::ENOENT,
@@ -106,12 +106,6 @@ pub async fn enrollment(client: &Client, user: &str) -> Result<(Vec<u8>, Vec<u8>
         Ok(Ok((keys.public_key, proof.value.unwrap_or_default())))
     })
     .await?
-}
-
-fn two<T>(values: Vec<T>) -> [T; 2] {
-    values
-        .try_into()
-        .unwrap_or_else(|_| panic!("a read of two keys answers both"))
 }
 
 /// The most that an account's sealed trusted keys may take: some thousands
