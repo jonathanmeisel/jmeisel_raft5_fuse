@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::layout::{ACTIVITY_PREFIX, DELETE_BATCH};
+use raft5fs_proto::clock;
 use raft5fs_proto::types::{Activity, ActivityOp, ActivityPage, LINK_PREFIX, SealedEntryName};
 
 /// The format of an entry's value.
@@ -200,7 +201,7 @@ impl FsCore {
         if self.activity.days == 0 || caller.user.starts_with(LINK_PREFIX) {
             return;
         }
-        activity.at_ms = now_ms();
+        activity.at_ms = clock::now_millis();
         activity.user = caller.user.clone();
         let mut volumes = Vec::new();
         for dir in [
@@ -337,7 +338,7 @@ impl FsCore {
         if self.activity.days == 0 {
             return Ok(0);
         }
-        let oldest = now_ms().saturating_sub(self.activity.days * 86_400_000);
+        let oldest = clock::now_millis().saturating_sub(self.activity.days * 86_400_000);
         let mut old = Vec::new();
         let mut iter = self
             .client
@@ -410,13 +411,6 @@ pub(crate) fn change(
         moved_out: false,
         path: Vec::new(),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

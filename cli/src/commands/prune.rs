@@ -1,7 +1,5 @@
 //! `raft5fs prune`.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use clap::Args;
 use raft5fs_proto::types::{FsError, Kind};
 
@@ -51,9 +49,7 @@ fn report(what: &str, stats: &PruneStats, dry_run: bool) {
 
 /// About how long from now `ms` (milliseconds since the epoch) is.
 fn from_now(ms: u64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
+    let now = raft5fs_proto::clock::now_millis();
     let secs = ms.saturating_sub(now) / 1000;
     match secs {
         0..120 => format!("{secs}s"),

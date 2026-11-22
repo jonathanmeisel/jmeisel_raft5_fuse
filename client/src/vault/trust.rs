@@ -29,6 +29,7 @@ use raft5fs_proto::types::{Caps, FsError, LINK_PREFIX};
 
 use super::Vault;
 use crate::remote::Introduction;
+use raft5fs_proto::clock;
 
 /// How long an invitation stays open: as long as its enrollment code.
 const INVITE_LIFETIME_SECS: u64 = 14 * 24 * 60 * 60;
@@ -59,13 +60,6 @@ pub(super) struct Found {
 pub struct PinDetails {
     pub source: PinSource,
     pub introducer: bool,
-}
-
-fn now_secs() -> u64 {
-    raft5fs_proto::clock::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// The open and closed invitations in `stored`, with `changes` applied:
@@ -131,7 +125,7 @@ impl Vault {
         let open = PendingInvite {
             user: user.to_string(),
             secret: Some(secret),
-            at: now_secs(),
+            at: clock::now_secs(),
         };
         if let Err(e) = self.merge_pins(false, &[], &[open]).await {
             eprintln!("the invitation can't check {user}'s key, so compare safety codes: {e}");
@@ -165,7 +159,7 @@ impl Vault {
         let entry = PinEntry {
             user: intro.inviter.clone(),
             key: Some(served),
-            at: now_secs(),
+            at: clock::now_secs(),
             source: PinSource::Invited,
             introducer: true,
         };
@@ -193,7 +187,7 @@ impl Vault {
         let entry = PinEntry {
             user: user.to_string(),
             key: Some(key),
-            at: now_secs(),
+            at: clock::now_secs(),
             source,
             introducer: on,
         };
@@ -220,7 +214,7 @@ impl Vault {
         let entry = PinEntry {
             user: user.to_string(),
             key: Some(key),
-            at: now_secs(),
+            at: clock::now_secs(),
             source: PinSource::Checked,
             introducer,
         };

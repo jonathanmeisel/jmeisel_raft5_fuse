@@ -15,13 +15,14 @@
 //! - Key records from before the index are added once, by the server that
 //!   measures usage (`index_unpruned`).
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use super::*;
 use crate::layout::{
     NODE_KEYS_PREFIX, UNPRUNED_INDEXED_KEY, UNPRUNED_PREFIX, prune_claim_key, unpruned_key,
 };
 use crate::timing::next_key;
+use raft5fs_proto::clock;
 use raft5fs_proto::types::{ClaimOutcome, PruneClaim, Unpruned};
 
 /// How long a claim on a prune lasts unless renewed.
@@ -33,12 +34,6 @@ const LIST_LIMIT: usize = 200;
 
 /// How many key records each transaction of `index_unpruned` checks.
 const INDEX_BATCH: usize = 100;
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
 
 /// The inode at the end of a key of one byte and an inode.
 fn ino_of(key: &[u8]) -> Option<u64> {
@@ -85,7 +80,7 @@ impl FsCore {
                 inos.push(ino);
             }
         }
-        let now = now_ms();
+        let now = clock::now_millis();
         let mut found = Vec::new();
         for ino in inos {
             if found.len() == LIST_LIMIT {
@@ -152,7 +147,7 @@ impl FsCore {
         let user = caller.user.as_str();
         let outcome = run_txn(&self.client, move |txn| async move {
             let key = prune_claim_key(ino);
-            let now = now_ms();
+            let now = clock::now_millis();
             let held = txn
                 .read_one(&key)
                 .await?

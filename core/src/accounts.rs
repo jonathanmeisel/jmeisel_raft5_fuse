@@ -45,6 +45,7 @@ use crate::layout::{
 };
 use crate::timing::next_key;
 use crate::view::ReadKeys;
+use raft5fs_proto::clock;
 use raft5fs_proto::types::{
     AccountInfo, AccountKeys, AccountKind, Caps, FsError, LINK_PREFIX, LinkAccount, MAX_LINK_NOTE,
     UserEntry,
@@ -268,7 +269,7 @@ const CODE_LIFETIME_SECS: u64 = 14 * 24 * 3600;
 /// How a code is kept: its hash, then when it was issued.
 fn stored_code(code: &str) -> Vec<u8> {
     let mut stored = enrolment_code_hash(code).to_vec();
-    stored.extend_from_slice(&now_secs().to_be_bytes());
+    stored.extend_from_slice(&clock::now_secs().to_be_bytes());
     stored
 }
 
@@ -281,13 +282,6 @@ fn code_expires(stored: &[u8]) -> u64 {
         .map_or(0, |issued| {
             u64::from_be_bytes(issued).saturating_add(CODE_LIFETIME_SECS)
         })
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn put(out: &mut Vec<u8>, field: &[u8]) {
@@ -404,7 +398,7 @@ pub async fn check_login(
     else {
         return Ok(None);
     };
-    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs()) {
+    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(clock::now_secs()) {
         return Ok(None);
     }
     Ok(Some(keys))
@@ -416,7 +410,7 @@ pub async fn active_keys(client: &Client, user: &str) -> Result<Option<AccountKe
     let Some(keys) = get(client, user).await? else {
         return Ok(None);
     };
-    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(now_secs()) {
+    if user.starts_with(LINK_PREFIX) && info(client, user).await?.expired(clock::now_secs()) {
         return Ok(None);
     }
     Ok(Some(keys))
@@ -477,7 +471,7 @@ pub async fn create_link(
     if note.len() > MAX_LINK_NOTE {
         return Err(FsError::new(libc::EINVAL, "the link's note is too long"));
     }
-    let now = now_secs();
+    let now = clock::now_secs();
     if expires.is_some_and(|at| at <= now) {
         return Err(FsError::new(libc::EINVAL, "the link would expire at once"));
     }
@@ -646,7 +640,7 @@ pub async fn add(client: &Client, user: &str, on: Caps, off: Caps) -> Result<Str
         let stored = &stored;
         async move {
             let mut info = decide!(info_in(&txn, user).await?).unwrap_or_else(|| AccountInfo {
-                created: now_secs(),
+                created: clock::now_secs(),
                 ..AccountInfo::default()
             });
             info.caps = (info.caps | on).with(off, false);
@@ -792,7 +786,7 @@ pub async fn issue_invite(
                 caps,
                 kind: AccountKind::Person,
                 invited_by: caller.to_string(),
-                created: now_secs(),
+                created: clock::now_secs(),
                 ..AccountInfo::default()
             };
             txn.write(&code_key(user), Some(stored)).await?;
@@ -955,7 +949,7 @@ pub async fn enrol(
                 )));
             };
             let expires = code_expires(&issued);
-            if expires != 0 && expires < now_secs() {
+            if expires != 0 && expires < clock::now_secs() {
                 return Ok(Err(FsError::new(
                     libc::EACCES,
                     format!("{user}'s invitation has expired: ask an admin for a new one"),

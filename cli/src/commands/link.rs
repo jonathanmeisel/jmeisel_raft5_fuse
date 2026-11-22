@@ -3,13 +3,13 @@
 //! for a person.
 
 use std::ffi::OsStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use raft5fs_client::cli::Context;
 use raft5fs_proto::public_link::PublicLink;
 
 use super::{ConnectArgs, Outcome, log_in, runtime};
+use raft5fs_proto::clock;
 
 #[derive(Subcommand)]
 pub enum LinkCommand {
@@ -47,13 +47,6 @@ pub fn run(connect: &ConnectArgs, command: LinkCommand) -> Outcome {
     }
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Seconds in a span such as `7d`, `12h` or `30m`.
 fn parse_span(span: &str) -> Result<u64, String> {
     let bad = || format!("{span:?} isn't a span such as 7d, 12h or 30m");
@@ -73,7 +66,7 @@ fn parse_span(span: &str) -> Result<u64, String> {
 
 /// How long until `at`, roughly, as people say it.
 fn until(at: u64) -> String {
-    let left = at.saturating_sub(now());
+    let left = at.saturating_sub(clock::now_secs());
     match left {
         0 => "expired".to_string(),
         s if s < 3_600 => format!("expires in {} min", s.div_ceil(60)),
@@ -89,7 +82,7 @@ fn create(connect: &ConnectArgs, args: CreateArgs) -> Outcome {
         .clone()
         .ok_or("a public link names the filesystem by its CA: give --ca")?;
     let expires = match &args.expires {
-        Some(span) => Some(now() + parse_span(span)?),
+        Some(span) => Some(clock::now_secs() + parse_span(span)?),
         None => None,
     };
     let label = args.name.clone().unwrap_or_else(|| {

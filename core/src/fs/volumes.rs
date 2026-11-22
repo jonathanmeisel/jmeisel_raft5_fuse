@@ -194,7 +194,7 @@ impl FsCore {
                     format!("{to} needs read-write access to it first: share it with them"),
                 )));
             }
-            record.offer = Some((to.to_string(), unix_secs(SystemTime::now())));
+            record.offer = Some((to.to_string(), raft5fs_proto::clock::now_secs()));
             txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                 .await?;
             txn.commit().await?;

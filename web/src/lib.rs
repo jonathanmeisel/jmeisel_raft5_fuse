@@ -21,7 +21,6 @@ use std::ffi::OsStr;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
 use futures_util::future::{LocalBoxFuture, join_all};
 use js_sys::{Function, Promise, Uint8Array};
@@ -436,6 +435,11 @@ struct Inner {
 
 /// One entry of a listing.
 /// The bytes that `hex` spells, or `None` if it doesn't.
+/// `t` as JavaScript counts time: milliseconds since the epoch.
+fn js_millis(t: std::time::SystemTime) -> f64 {
+    raft5fs_proto::clock::millis(t) as f64
+}
+
 fn from_hex(hex: &str) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
@@ -478,10 +482,7 @@ impl Entry {
                 Kind::Directory => "folder",
             },
             size: (attr.kind == Kind::File).then_some(attr.size),
-            modified: attr
-                .mtime
-                .duration_since(UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_millis() as f64),
+            modified: js_millis(attr.mtime),
             shared: None,
             group: is_group(attr.ino),
             top: false,
@@ -551,10 +552,7 @@ impl From<&raft5fs_proto::types::Unreachable> for UnreachableJs {
             files: u.files,
             folders: u.folders,
             bytes: u.bytes,
-            modified: u
-                .modified
-                .duration_since(UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_millis() as f64),
+            modified: js_millis(u.modified),
         }
     }
 }
@@ -1311,10 +1309,6 @@ impl Fs {
         promise(async move {
             let path = format!("/{}", path.trim_matches('/'));
             let found = inner.session.versions(path.as_bytes()).await?;
-            let ms = |t: std::time::SystemTime| {
-                t.duration_since(UNIX_EPOCH)
-                    .map_or(0.0, |d| d.as_millis() as f64)
-            };
             let name = OsStr::new(path.rsplit('/').next().unwrap_or_default());
             let versions: Vec<Found> = found
                 .versions
@@ -1326,7 +1320,7 @@ impl Fs {
                     Found {
                         path: at,
                         snapshot: v.snapshot,
-                        taken: ms(v.taken),
+                        taken: js_millis(v.taken),
                         modified: entry.modified,
                         size: entry.size,
                         kind: entry.kind,
@@ -1377,10 +1371,7 @@ impl Fs {
                     let at = format!("/.snapshot/{}{dir}/{}", g.snapshot, entry.name);
                     inner.remember_version(&at, g.attr.ino);
                     GoneJs {
-                        taken: g
-                            .taken
-                            .duration_since(UNIX_EPOCH)
-                            .map_or(0.0, |d| d.as_millis() as f64),
+                        taken: js_millis(g.taken),
                         snapshot: g.snapshot,
                         size: entry.size,
                         modified: entry.modified,

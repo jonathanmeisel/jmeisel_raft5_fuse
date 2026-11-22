@@ -38,6 +38,7 @@ use crate::objects::{
 use crate::snapshots;
 use crate::timing::{self, next_key};
 use crate::view::{ReadKeys, View};
+use raft5fs_proto::clock;
 
 pub(crate) const TXN_TTL: Duration = Duration::from_secs(10);
 
@@ -112,13 +113,6 @@ fn check_sealed_grant(key: &[u8], label: &[u8], grantees: &[u8]) -> Result<(), F
 /// How old a reservation must be for `sweep_reservations` to remove it: a
 /// create takes moments, so a day leaves room for clocks and slow clients.
 pub(crate) const RESERVATION_AGE: Duration = Duration::from_secs(24 * 3600);
-
-/// `t` in whole seconds since the Unix epoch.
-fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 /// In a transaction attempt, unwraps a filesystem decision, or ends the
 /// attempt with it as `Ok(Err(..))`, the form that `run_txn` does not
@@ -969,7 +963,7 @@ impl FsCore {
         crate::accounts::refuse_link(user)?;
         let ino = allocate_inode(&self.client).await?;
         let key = reservation_key(ino);
-        let value = grants::reservation_value(user, unix_secs(SystemTime::now()));
+        let value = grants::reservation_value(user, clock::now_secs());
         let write = self.client.write(&key, Some(&value));
         timing::other("write", write).await?;
         Ok(ino)
@@ -1100,7 +1094,7 @@ impl FsCore {
     /// Reservations from before they had a time count as old. Returns how
     /// many it removed.
     pub async fn sweep_reservations(&self, age: Duration) -> Result<usize, FsError> {
-        let cutoff = unix_secs(SystemTime::now()).saturating_sub(age.as_secs());
+        let cutoff = clock::now_secs().saturating_sub(age.as_secs());
         let mut keys = Vec::new();
         let mut iter = self
             .client

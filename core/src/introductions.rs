@@ -21,6 +21,7 @@ use crate::fs::run_txn;
 use crate::grants::Reads;
 use crate::layout::INTRODUCTIONS_PREFIX;
 use crate::timing::next_key;
+use raft5fs_proto::clock;
 
 /// How long an introduction waits for its recipient: long enough for them
 /// to come back from a trip, and to mark the introducer (see the client's
@@ -64,13 +65,6 @@ fn names_of(key: &[u8]) -> Option<(String, String, String)> {
     parts.next().is_none().then_some(names)
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Leaves `introductions` from `introducer`, replacing any earlier one of
 /// the same subject to the same recipient. Their `introducer` field is
 /// ignored: it is always the caller.
@@ -100,7 +94,7 @@ pub async fn put(
             return Err(FsError::new(libc::EINVAL, "a public link isn't introduced"));
         }
     }
-    let made = now_secs().to_be_bytes();
+    let made = clock::now_secs().to_be_bytes();
     run_txn(client, |txn| async move {
         for i in introductions {
             let mut value = made.to_vec();
@@ -116,7 +110,7 @@ pub async fn put(
 
 /// The introductions left for `recipient`. Removes those too old to keep.
 pub async fn get(client: &Client, recipient: &str) -> Result<Vec<Introduction>, FsError> {
-    let oldest = now_secs().saturating_sub(INTRODUCTION_LIFETIME_SECS);
+    let oldest = clock::now_secs().saturating_sub(INTRODUCTION_LIFETIME_SECS);
     run_txn(client, |txn| async move {
         let mut found = Vec::new();
         for (key, value) in scan(&txn, &prefix_of(recipient)).await? {

@@ -835,10 +835,7 @@ impl Vault {
         let me = self.remote.username().to_string();
         let local = self.known.all();
         let rollback::PinMemory { floor, base, .. } = self.load_pin_memory();
-        let now = raft5fs_proto::clock::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = raft5fs_proto::clock::now_secs();
         let changes: Vec<PinEntry> = match &base {
             None => Vec::new(),
             Some(base) => base

@@ -856,11 +856,7 @@ async fn snapshot_command(a: Args) {
             .map_err(|e| e.to_string())
             .map(|list| {
                 for s in list {
-                    let secs = s
-                        .created
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let secs = raft5fs_proto::clock::secs(s.created);
                     println!("{}\t{secs}", s.name);
                 }
             }),
@@ -962,11 +958,7 @@ async fn backup_command(a: Args) {
         Some("list") => {
             let backup = backup_store(&a, None);
             for b in backup::list(&backup).await.unwrap_or_else(|e| fail(e)) {
-                let secs = b
-                    .created
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let secs = raft5fs_proto::clock::secs(b.created);
                 println!(
                     "{}\t{secs}\t{} objects\t{} object bytes\t{} store bytes",
                     b.name, b.objects, b.object_bytes, b.kv_bytes

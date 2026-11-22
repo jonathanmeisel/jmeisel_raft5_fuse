@@ -42,6 +42,7 @@ use crate::layout::{
     FOLDER_LIMIT_PREFIX, FOLDER_SIZE_PREFIX, ROOT_INO, USAGE_LEASE_KEY, USAGE_PREFIX,
     folder_limit_key, folder_size_key, usage_key,
 };
+use raft5fs_proto::clock;
 use raft5fs_proto::types::{FolderSize, Storage, size_text};
 
 /// How long a volume's owner, a folder's path, or the set of limited
@@ -122,12 +123,6 @@ pub struct MeasureStats {
     pub owners: usize,
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
 /// A folder size record: bytes, files, and when the measuring that set it
 /// started (ms since the Unix epoch).
 fn encode_size(bytes: u64, files: u64, at: u64) -> Vec<u8> {
@@ -201,7 +196,7 @@ impl FsCore {
         let Ok(tallies) = self.tallies_over(dir).await else {
             return;
         };
-        let change = (now_ms(), delta);
+        let change = (clock::now_millis(), delta);
         let mut all = self.usage.tallies.lock().unwrap();
         for tally in tallies {
             all.entry(tally).or_default().push(change);
@@ -315,7 +310,7 @@ impl FsCore {
         let Ok(size) = self.moved_size(moved).await else {
             return;
         };
-        let now = now_ms();
+        let now = clock::now_millis();
         let mut all = self.usage.tallies.lock().unwrap();
         for tally in before.iter().filter(|t| !after.contains(t)) {
             all.entry(tally.clone())
@@ -499,7 +494,7 @@ impl FsCore {
     /// `new` took it over.
     pub(super) fn count_transfer(&self, ino: u64, old: Option<String>, new: &str, size: u64) {
         self.usage.owners.lock().unwrap().remove(&ino);
-        let now = now_ms();
+        let now = clock::now_millis();
         let mut all = self.usage.tallies.lock().unwrap();
         if let Some(old) = old {
             all.entry(Tally::Owner(old))
@@ -656,7 +651,7 @@ impl FsCore {
 
     /// Measures folder `ino` alone, and stores its size.
     async fn measure_folder(&self, ino: u64) -> Result<(), FsError> {
-        let started = now_ms();
+        let started = clock::now_millis();
         let tree = self.load_tree_at(ino).await?;
         let (bytes, files) = folder_sizes(&tree, ino)[&ino];
         let key = &folder_size_key(ino);
@@ -734,7 +729,7 @@ impl FsCore {
 
     async fn measure_held(&self) -> Result<MeasureStats, FsError> {
         // Changes before this are in what the walk finds.
-        let started = now_ms();
+        let started = clock::now_millis();
         let tree = self.load_tree().await?;
         let sizes = folder_sizes(&tree, ROOT_INO);
         let mut stats = MeasureStats {
