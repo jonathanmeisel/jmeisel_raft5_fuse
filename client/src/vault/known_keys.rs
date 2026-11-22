@@ -246,19 +246,11 @@ pub(super) fn read_pins(
     Ok(keys)
 }
 
-pub(super) fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+pub(super) use raft5fs_wire::hex as to_hex;
 
-pub(super) fn from_hex(hex: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
-    if hex.len() != PUBLIC_KEY_LEN * 2 {
-        return None;
-    }
-    let mut out = [0; PUBLIC_KEY_LEN];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
+/// A public key, in hex.
+pub(super) fn from_hex(text: &str) -> Option<[u8; PUBLIC_KEY_LEN]> {
+    raft5fs_wire::from_hex(text)?.try_into().ok()
 }
 
 #[cfg(test)]

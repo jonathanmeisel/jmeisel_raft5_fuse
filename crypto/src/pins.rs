@@ -141,27 +141,27 @@ pub fn open_pins(identity: &Identity, user: &str, sealed: &[u8]) -> Result<PinLi
     }
     let key = identity.derive_key("pins");
     let plain = open(&key, &aad("pins", &[user.as_bytes()]), sealed, what)?;
-    let mut r = Reader(&plain);
+    let mut r = Reader::new(&plain, what);
     let (counter, labels_signed) = if version >= VERSION_2 {
-        let counter = u64::from_be_bytes(r.take(8, what)?.try_into().unwrap());
-        (counter, r.take(1, what)?[0] != 0)
+        let counter = u64::from_be_bytes(r.take(8)?.try_into().unwrap());
+        (counter, r.take(1)?[0] != 0)
     } else {
         (0, false)
     };
-    let count = r.u32(what)?;
+    let count = r.u32()?;
     let mut entries: Vec<PinEntry> = Vec::new();
     for _ in 0..count {
-        let user = std::str::from_utf8(r.bytes(what)?)
+        let user = std::str::from_utf8(r.bytes()?)
             .map_err(|_| Error(what))?
             .to_string();
-        let key = match r.take(1, what)?[0] {
+        let key = match r.take(1)?[0] {
             0 => None,
-            1 => Some(r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap()),
+            1 => Some(r.take(PUBLIC_KEY_LEN)?.try_into().unwrap()),
             _ => return Err(Error(what)),
         };
-        let at = u64::from_be_bytes(r.take(8, what)?.try_into().unwrap());
+        let at = u64::from_be_bytes(r.take(8)?.try_into().unwrap());
         let (source, introducer) = if version >= VERSION {
-            let source = match r.take(1, what)?[0] {
+            let source = match r.take(1)?[0] {
                 0 => PinSource::Checked,
                 1 => PinSource::Invited,
                 2 => PinSource::Introduced {
@@ -186,21 +186,21 @@ pub fn open_pins(identity: &Identity, user: &str, sealed: &[u8]) -> Result<PinLi
     }
     let mut invites: Vec<PendingInvite> = Vec::new();
     if version >= VERSION {
-        for _ in 0..r.u32(what)? {
+        for _ in 0..r.u32()? {
             let user = name(&mut r, what)?;
             let secret = if flag(&mut r, what)? {
-                Some(r.take(INVITE_SECRET_LEN, what)?.try_into().unwrap())
+                Some(r.take(INVITE_SECRET_LEN)?.try_into().unwrap())
             } else {
                 None
             };
-            let at = u64::from_be_bytes(r.take(8, what)?.try_into().unwrap());
+            let at = u64::from_be_bytes(r.take(8)?.try_into().unwrap());
             if invites.iter().any(|i| i.user == user) {
                 return Err(Error(what));
             }
             invites.push(PendingInvite { user, secret, at });
         }
     }
-    r.finish(what)?;
+    r.finish()?;
     Ok(PinList {
         counter,
         labels_signed,
@@ -210,13 +210,13 @@ pub fn open_pins(identity: &Identity, user: &str, sealed: &[u8]) -> Result<PinLi
 }
 
 fn name(r: &mut Reader<'_>, what: &'static str) -> Result<String, Error> {
-    std::str::from_utf8(r.bytes(what)?)
+    std::str::from_utf8(r.bytes()?)
         .map(str::to_string)
         .map_err(|_| Error(what))
 }
 
 fn flag(r: &mut Reader<'_>, what: &'static str) -> Result<bool, Error> {
-    match r.take(1, what)?[0] {
+    match r.take(1)?[0] {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(Error(what)),

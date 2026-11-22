@@ -881,10 +881,6 @@ fn read_key_file(path: &str) -> [u8; BACKUP_KEY_LEN] {
         .unwrap_or_else(|| fail(format!("{path} doesn't hold a backup key")))
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Writes `text` to a new file at `path` that only its owner can read.
 fn write_secret_file(path: &str, text: &str) {
     use std::io::Write;
@@ -911,8 +907,11 @@ async fn backup_command(a: Args) {
         Some("keygen") => {
             let path = arg("file");
             let pair = BackupKeyPair::generate();
-            let public = hex(&pair.public_key());
-            write_secret_file(&path, &format!("{}\n", hex(pair.to_bytes().as_ref())));
+            let public = raft5fs_wire::hex(&pair.public_key());
+            write_secret_file(
+                &path,
+                &format!("{}\n", raft5fs_wire::hex(pair.to_bytes().as_ref())),
+            );
             let public_path = format!("{path}.pub");
             std::fs::write(&public_path, format!("{public}\n"))
                 .unwrap_or_else(|e| fail(format!("cannot write {public_path}: {e}")));

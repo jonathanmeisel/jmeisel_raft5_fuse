@@ -149,9 +149,10 @@ fn decode_grid(bytes: &[u8]) -> Result<ObjectGrid, String> {
             bytes.len()
         )
     })?;
+    let mut r = raft5fs_wire::Reader::new(&bytes, "object grid");
     let grid = ObjectGrid {
-        from_index: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-        per_block: u32::from_be_bytes(bytes[8..].try_into().unwrap()),
+        from_index: r.u64().expect("12 bytes hold a u64"),
+        per_block: r.u32().expect("and then a u32"),
     };
     if grid.per_block == 0 {
         return Err("this filesystem records empty object blocks".into());

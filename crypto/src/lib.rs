@@ -39,6 +39,8 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand_core::{OsRng, RngCore};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use raft5fs_wire::{Reader, put_bytes};
+
 pub const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 /// The bytes that sealing adds to a plaintext: the nonce before it and the
@@ -92,6 +94,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A record that didn't parse is one that didn't open: the same error, with
+/// what was being read.
+impl From<raft5fs_wire::Error> for Error {
+    fn from(e: raft5fs_wire::Error) -> Self {
+        Error(e.what)
+    }
+}
+
 /// Associated data: a purpose label, then the fields that bind a ciphertext
 /// to its place. Each field has a length prefix, so fields cannot be
 /// shifted into each other.
@@ -143,44 +153,6 @@ fn open(key: &Key, aad: &[u8], sealed: &[u8], what: &'static str) -> Result<Vec<
             },
         )
         .map_err(|_| Error(what))
-}
-
-/// A cursor over an encoded record for the decoders. Each step returns an
-/// error on short input, and does not panic.
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], Error> {
-        if self.0.len() < n {
-            return Err(Error(what));
-        }
-        let (head, rest) = self.0.split_at(n);
-        self.0 = rest;
-        Ok(head)
-    }
-
-    fn u32(&mut self, what: &'static str) -> Result<u32, Error> {
-        Ok(u32::from_be_bytes(self.take(4, what)?.try_into().unwrap()))
-    }
-
-    /// Reads a field written by `put_bytes`: its length, then its bytes.
-    fn bytes(&mut self, what: &'static str) -> Result<&'a [u8], Error> {
-        let n = self.u32(what)? as usize;
-        self.take(n, what)
-    }
-
-    fn finish(self, what: &'static str) -> Result<(), Error> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(Error(what))
-        }
-    }
-}
-
-fn put_bytes(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    out.extend_from_slice(field);
 }
 
 #[cfg(test)]

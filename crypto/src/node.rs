@@ -222,19 +222,19 @@ impl NodeKeys {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let what = "a node key record";
-        let mut r = Reader(bytes);
-        let version = r.u32(what)?;
-        let parent_version = r.u32(what)?;
-        let wrapper = r.bytes(what)?.to_vec();
-        let name_key = r.bytes(what)?.to_vec();
-        let count = r.u32(what)?;
+        let mut r = Reader::new(bytes, what);
+        let version = r.u32()?;
+        let parent_version = r.u32()?;
+        let wrapper = r.bytes()?.to_vec();
+        let name_key = r.bytes()?.to_vec();
+        let count = r.u32()?;
         if version == 0 || count >= version {
             return Err(Error(what));
         }
         let history = (0..count)
-            .map(|_| r.bytes(what).map(<[u8]>::to_vec))
+            .map(|_| r.bytes().map(<[u8]>::to_vec))
             .collect::<Result<_, _>>()?;
-        r.finish(what)?;
+        r.finish()?;
         Ok(Self {
             version,
             parent_version,
@@ -248,8 +248,8 @@ impl NodeKeys {
     /// server needs nothing else.
     pub fn versions(bytes: &[u8]) -> Result<(u32, u32), Error> {
         let what = "a node key record";
-        let mut r = Reader(bytes);
-        Ok((r.u32(what)?, r.u32(what)?))
+        let mut r = Reader::new(bytes, what);
+        Ok((r.u32()?, r.u32()?))
     }
 }
 

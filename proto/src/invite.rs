@@ -112,13 +112,13 @@ impl Invite {
             let garbled = r.garbled();
             Some(Introduction {
                 inviter,
-                inviter_key: r.bytes()?.try_into().map_err(|_| garbled.clone())?,
+                inviter_key: r.bytes()?.try_into().map_err(|_| garbled)?,
                 secret: r.bytes()?.try_into().map_err(|_| garbled)?,
             })
         } else {
             None
         };
-        if !r.rest.is_empty() || ca.is_empty() {
+        if !r.is_empty() || ca.is_empty() {
             return Err("the invitation is garbled".to_string());
         }
         crate::types::check_username(&user).map_err(|e| e.message)?;

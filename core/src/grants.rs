@@ -236,46 +236,32 @@ pub(crate) fn check_username(user: &str) -> Result<(), FsError> {
     raft5fs_proto::types::check_username(user)
 }
 
-fn put(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    out.extend_from_slice(field);
-}
-
 pub(crate) fn encode_grant(grant: &Grant) -> Vec<u8> {
     let mut out = vec![u8::from(grant.writable)];
     out.extend_from_slice(&grant.key_version.to_be_bytes());
-    put(&mut out, &grant.sealed_key);
-    put(&mut out, &grant.sealed_label);
+    raft5fs_wire::put_bytes(&mut out, &grant.sealed_key);
+    raft5fs_wire::put_bytes(&mut out, &grant.sealed_label);
     out
 }
 
 pub(crate) fn decode_grant(ino: u64, bytes: &[u8]) -> Result<Grant, FsError> {
-    let garbled = || {
+    let parse = || -> Result<Grant, raft5fs_wire::Error> {
+        let mut r = raft5fs_wire::Reader::new(bytes, "grant row");
+        let grant = Grant {
+            ino,
+            writable: r.u8()? == 1,
+            key_version: r.u32()?,
+            sealed_key: r.bytes()?.to_vec(),
+            sealed_label: r.bytes()?.to_vec(),
+        };
+        r.finish()?;
+        Ok(grant)
+    };
+    parse().map_err(|_| {
         FsError::new(
             errno::EIO,
             format!("the grant row of inode {ino} is garbled"),
         )
-    };
-    let (&writable, rest) = bytes.split_first().ok_or_else(garbled)?;
-    let (version, mut rest) = rest.split_at_checked(4).ok_or_else(garbled)?;
-    let mut field = || -> Result<Vec<u8>, FsError> {
-        let (len, after) = rest.split_at_checked(4).ok_or_else(garbled)?;
-        let n = u32::from_be_bytes(len.try_into().unwrap()) as usize;
-        let (value, after) = after.split_at_checked(n).ok_or_else(garbled)?;
-        rest = after;
-        Ok(value.to_vec())
-    };
-    let sealed_key = field()?;
-    let sealed_label = field()?;
-    if !rest.is_empty() {
-        return Err(garbled());
-    }
-    Ok(Grant {
-        ino,
-        writable: writable == 1,
-        key_version: u32::from_be_bytes(version.try_into().unwrap()),
-        sealed_key,
-        sealed_label,
     })
 }
 

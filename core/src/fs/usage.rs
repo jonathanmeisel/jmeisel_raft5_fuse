@@ -133,12 +133,8 @@ fn encode_size(bytes: u64, files: u64, at: u64) -> Vec<u8> {
 }
 
 fn decode_size(value: &[u8]) -> Option<(u64, u64, u64)> {
-    let n = |i: usize| {
-        Some(u64::from_be_bytes(
-            value.get(i * 8..i * 8 + 8)?.try_into().ok()?,
-        ))
-    };
-    Some((n(0)?, n(1)?, n(2)?))
+    let mut r = raft5fs_wire::Reader::new(value, "folder size");
+    Some((r.u64().ok()?, r.u64().ok()?, r.u64().ok()?))
 }
 
 /// A usage record: bytes, and when the measuring that set it started (ms
@@ -148,12 +144,8 @@ fn encode_usage(bytes: u64, at: u64) -> Vec<u8> {
 }
 
 pub(crate) fn decode_usage(value: &[u8]) -> Option<(u64, u64)> {
-    let n = |i: usize| {
-        Some(u64::from_be_bytes(
-            value.get(i * 8..i * 8 + 8)?.try_into().ok()?,
-        ))
-    };
-    Some((n(0)?, n(1)?))
+    let mut r = raft5fs_wire::Reader::new(value, "usage record");
+    Some((r.u64().ok()?, r.u64().ok()?))
 }
 
 fn decode_limit(value: &[u8]) -> Option<u64> {

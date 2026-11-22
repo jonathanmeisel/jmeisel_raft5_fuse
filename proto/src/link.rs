@@ -91,7 +91,7 @@ impl Link {
         let ca = r.bytes()?.to_vec();
         let count = r.u32()?;
         if count > MAX_PINS {
-            return Err(r.garbled());
+            return Err(r.garbled().into());
         }
         let mut pins = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -100,8 +100,8 @@ impl Link {
             let key: [u8; KEY_LEN] = r.bytes()?.try_into().map_err(|_| r.garbled())?;
             pins.push((pinned, key));
         }
-        if !r.rest.is_empty() || ca.is_empty() {
-            return Err(r.garbled());
+        if !r.is_empty() || ca.is_empty() {
+            return Err(r.garbled().into());
         }
         crate::types::check_username(&user).map_err(|e| e.message)?;
         Ok(Self {

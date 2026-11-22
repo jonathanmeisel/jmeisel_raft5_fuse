@@ -37,40 +37,29 @@ const FORMAT: u8 = 1;
 
 pub(crate) fn encode_volume(v: &VolumeInfo) -> Vec<u8> {
     let mut out = vec![FORMAT];
-    let field = |out: &mut Vec<u8>, s: &str| {
-        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-        out.extend_from_slice(s.as_bytes());
-    };
-    field(&mut out, v.owner.as_deref().unwrap_or(""));
+    raft5fs_wire::put_bytes(&mut out, v.owner.as_deref().unwrap_or("").as_bytes());
     let (to, at) = v.offer.clone().unwrap_or_default();
-    field(&mut out, &to);
-    out.extend_from_slice(&at.to_be_bytes());
+    raft5fs_wire::put_bytes(&mut out, to.as_bytes());
+    raft5fs_wire::put_u64(&mut out, at);
     out
 }
 
 pub(crate) fn decode_volume(ino: u64, bytes: &[u8]) -> Result<VolumeInfo, FsError> {
-    let garbled = || FsError::new(errno::EIO, format!("volume {ino}'s record is garbled"));
-    let mut rest = bytes;
-    let mut take = |n: usize| -> Result<&[u8], FsError> {
-        let (head, tail) = rest.split_at_checked(n).ok_or_else(garbled)?;
-        rest = tail;
-        Ok(head)
+    let parse = || -> Result<VolumeInfo, raft5fs_wire::Error> {
+        let mut r = raft5fs_wire::Reader::new(bytes, "volume record");
+        if r.u8()? != FORMAT {
+            return Err(r.garbled());
+        }
+        let owner = r.string()?;
+        let to = r.string()?;
+        let at = r.u64()?;
+        r.finish()?;
+        Ok(VolumeInfo {
+            owner: (!owner.is_empty()).then_some(owner),
+            offer: (!to.is_empty()).then_some((to, at)),
+        })
     };
-    if take(1)? != [FORMAT] {
-        return Err(garbled());
-    }
-    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
-    let owner = String::from_utf8(take(n)?.to_vec()).map_err(|_| garbled())?;
-    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
-    let to = String::from_utf8(take(n)?.to_vec()).map_err(|_| garbled())?;
-    let at = u64::from_be_bytes(take(8)?.try_into().unwrap());
-    if !rest.is_empty() {
-        return Err(garbled());
-    }
-    Ok(VolumeInfo {
-        owner: (!owner.is_empty()).then_some(owner),
-        offer: (!to.is_empty()).then_some((to, at)),
-    })
+    parse().map_err(|_| FsError::new(errno::EIO, format!("volume {ino}'s record is garbled")))
 }
 
 /// Volume `ino`'s record as `r` sees it, if it has one: `None` for an inode

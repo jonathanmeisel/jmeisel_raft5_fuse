@@ -53,8 +53,8 @@ impl PublicLink {
             user: r.string()?,
             secret: r.string()?,
         };
-        if !r.rest.is_empty() || link.user.is_empty() || link.secret.is_empty() {
-            return Err(r.garbled());
+        if !r.is_empty() || link.user.is_empty() || link.secret.is_empty() {
+            return Err(r.garbled().into());
         }
         Ok(link)
     }

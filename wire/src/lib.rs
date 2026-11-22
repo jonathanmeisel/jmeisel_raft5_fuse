@@ -28,6 +28,13 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// For callers that report errors as text.
+impl From<Error> for String {
+    fn from(e: Error) -> Self {
+        e.to_string()
+    }
+}
+
 pub fn put_u8(out: &mut Vec<u8>, n: u8) {
     out.push(n);
 }

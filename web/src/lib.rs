@@ -441,16 +441,6 @@ fn js_millis(t: std::time::SystemTime) -> f64 {
     raft5fs_proto::clock::millis(t) as f64
 }
 
-fn from_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-        .collect()
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
@@ -1159,7 +1149,7 @@ impl Fs {
                 return Err(FsError::new(errno::EINVAL, "only a folder has a log"));
             }
             let after = match after {
-                Some(hex) => from_hex(&hex)
+                Some(hex) => raft5fs_wire::from_hex(&hex)
                     .ok_or_else(|| FsError::new(errno::EINVAL, "that page can't be read"))?,
                 None => Vec::new(),
             };

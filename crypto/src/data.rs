@@ -44,7 +44,7 @@ pub fn seal_chunk(key: &Key, version: u32, ino: u64, index: u64, plain: &[u8]) -
 
 /// The key version a sealed chunk or name was sealed under.
 pub fn sealed_version(blob: &[u8]) -> Result<u32, Error> {
-    Reader(blob).u32("a sealed version")
+    Ok(Reader::new(blob, "a sealed version").u32()?)
 }
 
 /// Opens a chunk with the file's key at the chunk's version (see

@@ -168,13 +168,14 @@ pub async fn put_pins(
 
 /// A stored pins record: its version, then the sealed list.
 fn decode_pins(user: &str, stored: &[u8]) -> Result<(u64, Vec<u8>), FsError> {
-    let (version, sealed) = stored.split_first_chunk::<8>().ok_or_else(|| {
+    let mut r = raft5fs_wire::Reader::new(stored, "trusted keys");
+    let version = r.u64().map_err(|_| {
         FsError::new(
             errno::EIO,
             format!("the trusted keys stored for {user:?} are garbled"),
         )
     })?;
-    Ok((u64::from_be_bytes(*version), sealed.to_vec()))
+    Ok((version, r.rest().to_vec()))
 }
 
 fn info_key(user: &str) -> Vec<u8> {
@@ -193,12 +194,12 @@ fn encode_info(info: &AccountInfo) -> Vec<u8> {
         AccountKind::Person => 0,
         AccountKind::Link => 1,
     });
-    put(&mut out, info.invited_by.as_bytes());
+    raft5fs_wire::put_bytes(&mut out, info.invited_by.as_bytes());
     out.extend_from_slice(&info.created.to_be_bytes());
-    put(&mut out, info.owner.as_bytes());
+    raft5fs_wire::put_bytes(&mut out, info.owner.as_bytes());
     out.extend_from_slice(&info.expires.unwrap_or(0).to_be_bytes());
     out.extend_from_slice(&info.folder.to_be_bytes());
-    put(&mut out, &info.note);
+    raft5fs_wire::put_bytes(&mut out, &info.note);
     // Added later: a record without it has no quota.
     if let Some(quota) = info.quota {
         out.extend_from_slice(&quota.to_be_bytes());
@@ -207,53 +208,43 @@ fn encode_info(info: &AccountInfo) -> Vec<u8> {
 }
 
 fn decode_info(user: &str, bytes: &[u8]) -> Result<AccountInfo, FsError> {
-    let garbled = || {
+    let parse = || -> Result<AccountInfo, raft5fs_wire::Error> {
+        let mut r = raft5fs_wire::Reader::new(bytes, "account record");
+        if r.u8()? != INFO_VERSION {
+            return Err(r.garbled());
+        }
+        let caps = Caps::from_bits(r.u32()?);
+        let kind = match r.u8()? {
+            0 => AccountKind::Person,
+            1 => AccountKind::Link,
+            _ => return Err(r.garbled()),
+        };
+        let invited_by = r.string()?;
+        let created = r.u64()?;
+        let owner = r.string()?;
+        let expires = r.u64()?;
+        let folder = r.u64()?;
+        let note = r.bytes()?.to_vec();
+        // Added later: older records end here.
+        let quota = if r.is_empty() { None } else { Some(r.u64()?) };
+        r.finish()?;
+        Ok(AccountInfo {
+            caps,
+            kind,
+            invited_by,
+            created,
+            owner,
+            expires: (expires != 0).then_some(expires),
+            folder,
+            note,
+            quota,
+        })
+    };
+    parse().map_err(|_| {
         FsError::new(
             errno::EIO,
             format!("the account record stored for {user:?} is garbled"),
         )
-    };
-    let mut rest = bytes;
-    let mut take = |n: usize| -> Result<&[u8], FsError> {
-        let (head, tail) = rest.split_at_checked(n).ok_or_else(garbled)?;
-        rest = tail;
-        Ok(head)
-    };
-    if take(1)? != [INFO_VERSION] {
-        return Err(garbled());
-    }
-    let caps = Caps::from_bits(u32::from_be_bytes(take(4)?.try_into().unwrap()));
-    let kind = match take(1)? {
-        [0] => AccountKind::Person,
-        [1] => AccountKind::Link,
-        _ => return Err(garbled()),
-    };
-    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
-    let invited_by = String::from_utf8(take(n)?.to_vec()).map_err(|_| garbled())?;
-    let created = u64::from_be_bytes(take(8)?.try_into().unwrap());
-    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
-    let owner = String::from_utf8(take(n)?.to_vec()).map_err(|_| garbled())?;
-    let expires = u64::from_be_bytes(take(8)?.try_into().unwrap());
-    let folder = u64::from_be_bytes(take(8)?.try_into().unwrap());
-    let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
-    let note = take(n)?.to_vec();
-    // Added later: older records end here.
-    let quota = take(8)
-        .ok()
-        .map(|b| u64::from_be_bytes(b.try_into().unwrap()));
-    if !rest.is_empty() {
-        return Err(garbled());
-    }
-    Ok(AccountInfo {
-        caps,
-        kind,
-        invited_by,
-        created,
-        owner,
-        expires: (expires != 0).then_some(expires),
-        folder,
-        note,
-        quota,
     })
 }
 
@@ -279,11 +270,6 @@ fn code_expires(stored: &[u8]) -> u64 {
         })
 }
 
-fn put(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    out.extend_from_slice(field);
-}
-
 fn encode(keys: &AccountKeys) -> Vec<u8> {
     let mut out = Vec::new();
     for field in [
@@ -293,38 +279,31 @@ fn encode(keys: &AccountKeys) -> Vec<u8> {
         &keys.public_key,
         &keys.wrapped_private_key,
     ] {
-        put(&mut out, field);
+        raft5fs_wire::put_bytes(&mut out, field);
     }
     out
 }
 
-fn decode(user: &str, mut bytes: &[u8]) -> Result<AccountKeys, FsError> {
-    let garbled = || {
+fn decode(user: &str, bytes: &[u8]) -> Result<AccountKeys, FsError> {
+    let parse = || -> Result<AccountKeys, raft5fs_wire::Error> {
+        let mut r = raft5fs_wire::Reader::new(bytes, "account keys");
+        let mut field = || r.bytes().map(<[u8]>::to_vec);
+        let keys = AccountKeys {
+            salt: field()?,
+            kdf_params: field()?,
+            verifier: field()?,
+            public_key: field()?,
+            wrapped_private_key: field()?,
+        };
+        r.finish()?;
+        Ok(keys)
+    };
+    parse().map_err(|_| {
         FsError::new(
             errno::EIO,
             format!("the account keys stored for {user:?} are garbled"),
         )
-    };
-    let mut field = || -> Result<Vec<u8>, FsError> {
-        if bytes.len() < 4 {
-            return Err(garbled());
-        }
-        let n = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-        let value = bytes.get(4..4 + n).ok_or_else(garbled)?.to_vec();
-        bytes = &bytes[4 + n..];
-        Ok(value)
-    };
-    let keys = AccountKeys {
-        salt: field()?,
-        kdf_params: field()?,
-        verifier: field()?,
-        public_key: field()?,
-        wrapped_private_key: field()?,
-    };
-    if !bytes.is_empty() {
-        return Err(garbled());
-    }
-    Ok(keys)
+    })
 }
 
 /// Refuses keys that an honest client could not make: wrong sizes, or cost

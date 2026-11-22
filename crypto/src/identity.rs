@@ -92,26 +92,26 @@ impl Identity {
         sealed: &[u8],
     ) -> Result<(u32, Key), Error> {
         let what = "a grant";
-        let mut r = Reader(sealed);
-        let sender = r.bytes(what)?;
-        let nonce = r.take(NONCE_LEN, what)?;
-        let boxed = r.0;
+        let mut r = Reader::new(sealed, what);
+        let sender = r.bytes()?;
+        let nonce = r.take(NONCE_LEN)?;
+        let boxed = r.rest();
         let plain = zeroize::Zeroizing::new(
             ChaChaBox::new(&PublicKey::from_bytes(*sender_key), &self.secret)
                 .decrypt(nonce.into(), boxed)
                 .map_err(|_| Error(what))?,
         );
-        let mut r = Reader(&plain);
-        if r.take(GRANT_DOMAIN.len(), what)? != GRANT_DOMAIN
-            || r.bytes(what)? != sender
-            || r.take(PUBLIC_KEY_LEN, what)? != self.public_key()
-            || r.take(8, what)? != ino.to_be_bytes()
+        let mut r = Reader::new(&plain, what);
+        if r.take(GRANT_DOMAIN.len())? != GRANT_DOMAIN
+            || r.bytes()? != sender
+            || r.take(PUBLIC_KEY_LEN)? != self.public_key()
+            || r.take(8)? != ino.to_be_bytes()
         {
             return Err(Error(what));
         }
-        let version = r.u32(what)?;
-        let key = Key::from_slice(r.take(KEY_LEN, what)?)?;
-        r.finish(what)?;
+        let version = r.u32()?;
+        let key = Key::from_slice(r.take(KEY_LEN)?)?;
+        r.finish()?;
         Ok((version, key))
     }
 
@@ -127,33 +127,33 @@ impl Identity {
         let (&SIGNED_LABEL, sealed) = sealed.split_first().ok_or(Error(what))? else {
             return Err(Error(what));
         };
-        let mut r = Reader(sealed);
-        let signer = r.bytes(what)?;
-        let nonce = r.take(NONCE_LEN, what)?;
-        let boxed = r.0;
+        let mut r = Reader::new(sealed, what);
+        let signer = r.bytes()?;
+        let nonce = r.take(NONCE_LEN)?;
+        let boxed = r.rest();
         let plain = ChaChaBox::new(&PublicKey::from_bytes(*signer_key), &self.secret)
             .decrypt(nonce.into(), boxed)
             .map_err(|_| Error(what))?;
-        let mut r = Reader(&plain);
-        if r.take(LABEL_DOMAIN.len(), what)? != LABEL_DOMAIN
-            || r.bytes(what)? != signer
-            || r.take(PUBLIC_KEY_LEN, what)? != self.public_key()
-            || r.take(8, what)? != ino.to_be_bytes()
+        let mut r = Reader::new(&plain, what);
+        if r.take(LABEL_DOMAIN.len())? != LABEL_DOMAIN
+            || r.bytes()? != signer
+            || r.take(PUBLIC_KEY_LEN)? != self.public_key()
+            || r.take(8)? != ino.to_be_bytes()
         {
             return Err(Error(what));
         }
-        Ok(r.0.to_vec())
+        Ok(r.rest().to_vec())
     }
 
     /// Opens a label sealed with `seal_label`, which anyone could have made.
     pub fn open_label(&self, ino: u64, sealed: &[u8]) -> Result<Vec<u8>, Error> {
         let what = "a grant's name";
         let plain = self.unseal(sealed, what)?;
-        let mut r = Reader(&plain);
-        if r.take(8, what)? != ino.to_be_bytes() {
+        let mut r = Reader::new(&plain, what);
+        if r.take(8)? != ino.to_be_bytes() {
             return Err(Error(what));
         }
-        Ok(r.0.to_vec())
+        Ok(r.rest().to_vec())
     }
 
     fn unseal(&self, sealed: &[u8], what: &'static str) -> Result<Vec<u8>, Error> {
@@ -201,7 +201,7 @@ pub fn seal_grant(
 /// key that opens it. This is not proven until `open_grant` succeeds.
 pub fn grant_sender(sealed: &[u8]) -> Result<&str, Error> {
     let what = "a grant's sender";
-    let name = Reader(sealed).bytes(what)?;
+    let name = Reader::new(sealed, what).bytes()?;
     std::str::from_utf8(name).map_err(|_| Error(what))
 }
 
@@ -279,7 +279,7 @@ pub fn seal_introduction(
 /// `open_introduction` opens it with their key.
 pub fn introducer_of(sealed: &[u8]) -> Result<&str, Error> {
     let what = "an introduction's sender";
-    let name = Reader(sealed).bytes(what)?;
+    let name = Reader::new(sealed, what).bytes()?;
     std::str::from_utf8(name).map_err(|_| Error(what))
 }
 
@@ -292,29 +292,29 @@ impl Identity {
         sealed: &[u8],
     ) -> Result<Introduced, Error> {
         let what = "an introduction";
-        let mut r = Reader(sealed);
-        let introducer = r.bytes(what)?;
-        let nonce = r.take(NONCE_LEN, what)?;
+        let mut r = Reader::new(sealed, what);
+        let introducer = r.bytes()?;
+        let nonce = r.take(NONCE_LEN)?;
         let plain = ChaChaBox::new(&PublicKey::from_bytes(*introducer_key), &self.secret)
-            .decrypt(nonce.into(), r.0)
+            .decrypt(nonce.into(), r.rest())
             .map_err(|_| Error(what))?;
-        let mut r = Reader(&plain);
-        if r.take(INTRODUCTION_DOMAIN.len(), what)? != INTRODUCTION_DOMAIN
-            || r.bytes(what)? != introducer
-            || r.take(PUBLIC_KEY_LEN, what)? != self.public_key()
+        let mut r = Reader::new(&plain, what);
+        if r.take(INTRODUCTION_DOMAIN.len())? != INTRODUCTION_DOMAIN
+            || r.bytes()? != introducer
+            || r.take(PUBLIC_KEY_LEN)? != self.public_key()
         {
             return Err(Error(what));
         }
-        let subject = std::str::from_utf8(r.bytes(what)?)
+        let subject = std::str::from_utf8(r.bytes()?)
             .map_err(|_| Error(what))?
             .to_string();
-        let key = r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap();
-        let replaces = match r.take(1, what)?[0] {
+        let key = r.take(PUBLIC_KEY_LEN)?.try_into().unwrap();
+        let replaces = match r.take(1)?[0] {
             0 => None,
-            1 => Some(r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap()),
+            1 => Some(r.take(PUBLIC_KEY_LEN)?.try_into().unwrap()),
             _ => return Err(Error(what)),
         };
-        r.finish(what)?;
+        r.finish()?;
         Ok(Introduced {
             subject,
             key,
@@ -329,7 +329,7 @@ pub fn label_signer(sealed: &[u8]) -> Option<&str> {
     let (&SIGNED_LABEL, rest) = sealed.split_first()? else {
         return None;
     };
-    std::str::from_utf8(Reader(rest).bytes("a label's signer").ok()?).ok()
+    std::str::from_utf8(Reader::new(rest, "a label's signer").bytes().ok()?).ok()
 }
 
 /// Seals a name for the holder of `public_key`, tied to `ino`. Anyone could

@@ -37,12 +37,10 @@ fn push_time(buf: &mut Vec<u8>, t: SystemTime) {
     buf.extend_from_slice(&d.subsec_nanos().to_be_bytes());
 }
 
-fn take_time(bytes: &[u8]) -> (SystemTime, &[u8]) {
-    let (secs, rest) = bytes.split_at(8);
-    let (nanos, rest) = rest.split_at(4);
-    let secs = u64::from_be_bytes(secs.try_into().unwrap());
-    let nanos = u32::from_be_bytes(nanos.try_into().unwrap());
-    (UNIX_EPOCH + Duration::new(secs, nanos), rest)
+fn take_time(r: &mut raft5fs_wire::Reader<'_>) -> Result<SystemTime, raft5fs_wire::Error> {
+    let secs = r.u64()?;
+    let nanos = r.u32()?;
+    Ok(UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
 pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
@@ -70,38 +68,42 @@ pub(crate) fn encode_entry(entry: &Entry) -> Vec<u8> {
     buf
 }
 
+/// Panics on a record of the wrong length: an Entry is only ever written
+/// by `encode_entry`, so a short one is a broken store.
 pub(crate) fn decode_entry(ino: u64, bytes: &[u8]) -> Entry {
-    let (kind, rest) = bytes.split_at(1);
-    let kind = if kind[0] == 1 {
-        Kind::Directory
-    } else {
-        Kind::File
+    let parse = || -> Result<Entry, raft5fs_wire::Error> {
+        let mut r = raft5fs_wire::Reader::new(bytes, "entry");
+        let kind = match r.u8()? {
+            1 => Kind::Directory,
+            _ => Kind::File,
+        };
+        let perm = r.u16()?;
+        let reserved: [u8; 8] = r.array()?;
+        let layout = match reserved[0] {
+            1 => Layout::Hybrid,
+            _ => Layout::Inline,
+        };
+        let size = r.u64()?;
+        let nlink = r.u32()?;
+        let atime = take_time(&mut r)?;
+        let mtime = take_time(&mut r)?;
+        let ctime = take_time(&mut r)?;
+        let parent = r.u64()?;
+        r.finish()?;
+        let attr = Attr {
+            ino,
+            kind,
+            size,
+            perm,
+            nlink,
+            atime,
+            mtime,
+            ctime,
+            layout,
+        };
+        Ok(Entry { attr, parent })
     };
-    let (perm, rest) = rest.split_at(2);
-    let (reserved, rest) = rest.split_at(8);
-    let layout = match reserved[0] {
-        1 => Layout::Hybrid,
-        _ => Layout::Inline,
-    };
-    let (size, rest) = rest.split_at(8);
-    let (nlink, rest) = rest.split_at(4);
-    let (atime, rest) = take_time(rest);
-    let (mtime, rest) = take_time(rest);
-    let (ctime, rest) = take_time(rest);
-    let parent = u64::from_be_bytes(rest.try_into().unwrap());
-
-    let attr = Attr {
-        ino,
-        kind,
-        size: u64::from_be_bytes(size.try_into().unwrap()),
-        perm: u16::from_be_bytes(perm.try_into().unwrap()),
-        nlink: u32::from_be_bytes(nlink.try_into().unwrap()),
-        atime,
-        mtime,
-        ctime,
-        layout,
-    };
-    Entry { attr, parent }
+    parse().unwrap_or_else(|e| panic!("inode {ino}: {e}"))
 }
 
 #[cfg(test)]

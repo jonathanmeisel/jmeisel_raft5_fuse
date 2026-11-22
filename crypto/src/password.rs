@@ -173,13 +173,13 @@ impl KdfParams {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let what = "KDF parameters";
-        let mut r = Reader(bytes);
+        let mut r = Reader::new(bytes, what);
         let params = Self {
-            memory_kib: r.u32(what)?,
-            iterations: r.u32(what)?,
-            parallelism: r.u32(what)?,
+            memory_kib: r.u32()?,
+            iterations: r.u32()?,
+            parallelism: r.u32()?,
         };
-        r.finish(what)?;
+        r.finish()?;
         Ok(params)
     }
 }

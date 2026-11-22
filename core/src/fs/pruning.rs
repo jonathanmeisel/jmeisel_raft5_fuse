@@ -49,9 +49,10 @@ fn encode_claim(holder: &[u8; 16], expires_ms: u64, user: &str) -> Vec<u8> {
 }
 
 fn decode_claim(value: &[u8]) -> Option<([u8; 16], PruneClaim)> {
-    let holder = value.get(..16)?.try_into().ok()?;
-    let expires_ms = u64::from_be_bytes(value.get(16..24)?.try_into().ok()?);
-    let user = String::from_utf8(value.get(24..)?.to_vec()).ok()?;
+    let mut r = raft5fs_wire::Reader::new(value, "prune claim");
+    let holder = r.array().ok()?;
+    let expires_ms = r.u64().ok()?;
+    let user = String::from_utf8(r.rest().to_vec()).ok()?;
     Some((holder, PruneClaim { user, expires_ms }))
 }
 

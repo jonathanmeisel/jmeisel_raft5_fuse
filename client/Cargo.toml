@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+raft5fs-wire = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 http-body = "1"
 raft5fs-crypto = { workspace = true }

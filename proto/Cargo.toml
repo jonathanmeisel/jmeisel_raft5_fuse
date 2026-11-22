@@ -10,6 +10,7 @@ edition.workspace = true
 raft5 = ["dep:raft5-client"]
 
 [dependencies]
+raft5fs-wire = { workspace = true }
 base64 = "0.22"
 prost = { workspace = true }
 raft5-client = { workspace = true, optional = true }

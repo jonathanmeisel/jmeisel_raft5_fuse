@@ -21,6 +21,7 @@ use super::*;
 use crate::layout::{ACTIVITY_PREFIX, DELETE_BATCH};
 use raft5fs_proto::clock;
 use raft5fs_proto::types::{Activity, ActivityOp, ActivityPage, LINK_PREFIX, SealedEntryName};
+use raft5fs_wire as wire;
 
 /// The format of an entry's value.
 const FORMAT: u8 = 1;
@@ -91,21 +92,28 @@ fn key_time(key: &[u8]) -> Option<u64> {
     Some(u64::MAX - inverted)
 }
 
-fn put(out: &mut Vec<u8>, field: &[u8]) {
-    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
-    out.extend_from_slice(field);
-}
-
 fn put_name(out: &mut Vec<u8>, name: &Option<SealedEntryName>) {
     match name {
-        None => out.push(0),
+        None => wire::put_u8(out, 0),
         Some(n) => {
-            out.push(1);
-            out.extend_from_slice(&n.parent.to_be_bytes());
-            put(out, &n.tag);
-            put(out, &n.sealed);
+            wire::put_u8(out, 1);
+            wire::put_u64(out, n.parent);
+            wire::put_bytes(out, &n.tag);
+            wire::put_bytes(out, &n.sealed);
         }
     }
+}
+
+/// A name that `put_name` wrote.
+fn read_name(r: &mut wire::Reader<'_>) -> Result<Option<SealedEntryName>, wire::Error> {
+    Ok(match r.u8()? {
+        0 => None,
+        _ => Some(SealedEntryName {
+            parent: r.u64()?,
+            tag: r.bytes()?.to_vec(),
+            sealed: r.bytes()?.to_vec(),
+        }),
+    })
 }
 
 fn encode(a: &Activity) -> Vec<u8> {
@@ -114,8 +122,8 @@ fn encode(a: &Activity) -> Vec<u8> {
         u8::from(a.kind == Kind::Directory),
         u8::from(a.replaced),
     ];
-    put(&mut out, a.user.as_bytes());
-    out.extend_from_slice(&a.parent.to_be_bytes());
+    wire::put_bytes(&mut out, a.user.as_bytes());
+    wire::put_u64(&mut out, a.parent);
     put_name(&mut out, &a.name);
     put_name(&mut out, &a.from);
     out
@@ -126,15 +134,15 @@ fn decode(key: &[u8], value: &[u8]) -> Option<Activity> {
     let at_ms = key_time(key)?;
     let ino = u64::from_be_bytes(key.get(17..25)?.try_into().ok()?);
     let op = op_of(*key.get(25)?)?;
-    let mut r = Reader(value);
-    let [format, dir, replaced] = r.take(3)?.try_into().ok()?;
+    let mut r = wire::Reader::new(value, "activity record");
+    let [format, dir, replaced] = r.array().ok()?;
     if format != FORMAT {
         return None;
     }
-    let user = String::from_utf8(r.field()?).ok()?;
-    let parent = r.u64()?;
-    let name = r.name()?;
-    let from = r.name()?;
+    let user = r.string().ok()?;
+    let parent = r.u64().ok()?;
+    let name = read_name(&mut r).ok()?;
+    let from = read_name(&mut r).ok()?;
     Some(Activity {
         at_ms,
         user,
@@ -152,36 +160,6 @@ fn decode(key: &[u8], value: &[u8]) -> Option<Activity> {
         moved_out: false,
         path: Vec::new(),
     })
-}
-
-struct Reader<'a>(&'a [u8]);
-
-impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let (head, tail) = self.0.split_at_checked(n)?;
-        self.0 = tail;
-        Some(head)
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn field(&mut self) -> Option<Vec<u8>> {
-        let len = u32::from_be_bytes(self.take(4)?.try_into().ok()?) as usize;
-        Some(self.take(len)?.to_vec())
-    }
-
-    fn name(&mut self) -> Option<Option<SealedEntryName>> {
-        Some(match self.take(1)?[0] {
-            0 => None,
-            _ => Some(SealedEntryName {
-                parent: self.u64()?,
-                tag: self.field()?,
-                sealed: self.field()?,
-            }),
-        })
-    }
 }
 
 impl FsCore {

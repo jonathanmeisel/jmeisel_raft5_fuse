@@ -74,23 +74,23 @@ pub fn seal_grantees(key: &Key, version: u32, ino: u64, entries: &[GranteeEntry]
 /// user twice, because an honest client does not make such a list.
 pub fn open_grantees(key: &Key, ino: u64, blob: &[u8]) -> Result<Vec<GranteeEntry>, Error> {
     let what = "a grantee list";
-    let mut r = Reader(blob);
-    let version = r.u32(what)?;
-    let plain = open(key, &grantees_aad(ino, version), r.0, what)?;
-    let mut r = Reader(&plain);
-    let count = r.u32(what)?;
+    let mut r = Reader::new(blob, what);
+    let version = r.u32()?;
+    let plain = open(key, &grantees_aad(ino, version), r.rest(), what)?;
+    let mut r = Reader::new(&plain, what);
+    let count = r.u32()?;
     let mut entries: Vec<GranteeEntry> = Vec::new();
     for _ in 0..count {
-        let user = std::str::from_utf8(r.bytes(what)?)
+        let user = std::str::from_utf8(r.bytes()?)
             .map_err(|_| Error(what))?
             .to_string();
-        let public_key = r.take(PUBLIC_KEY_LEN, what)?.try_into().unwrap();
-        let flags = r.take(1, what)?[0];
+        let public_key = r.take(PUBLIC_KEY_LEN)?.try_into().unwrap();
+        let flags = r.take(1)?[0];
         if flags & !(WRITABLE | HAS_LINK_SECRET) != 0 {
             return Err(Error(what));
         }
         let link_secret = if flags & HAS_LINK_SECRET != 0 {
-            let secret = std::str::from_utf8(r.bytes(what)?).map_err(|_| Error(what))?;
+            let secret = std::str::from_utf8(r.bytes()?).map_err(|_| Error(what))?;
             Some(secret.to_string())
         } else {
             None
@@ -105,7 +105,7 @@ pub fn open_grantees(key: &Key, ino: u64, blob: &[u8]) -> Result<Vec<GranteeEntr
             link_secret,
         });
     }
-    r.finish(what)?;
+    r.finish()?;
     Ok(entries)
 }
 
