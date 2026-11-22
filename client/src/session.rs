@@ -266,14 +266,6 @@ impl Session {
         }))
     }
 
-    /// Asks this session's pruner, if it has one, to look for work now, as
-    /// after a revoke.
-    pub fn kick_pruner(&self) {
-        if let Some(pruner) = &*self.pruner.lock().unwrap() {
-            pruner.kick();
-        }
-    }
-
     /// What this session's pruner knows, if it has one.
     pub fn prune_status(&self) -> Option<PruneStatus> {
         self.pruner.lock().unwrap().as_ref().map(Pruner::status)
