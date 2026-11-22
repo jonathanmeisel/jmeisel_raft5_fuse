@@ -848,11 +848,16 @@ impl Session {
     /// needs no round trip.
     pub async fn readdir(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         let items = self.list(ino).await?;
-        for item in &items {
-            if item.name != "." && item.name != ".." {
-                self.dentries.put(ino, &item.name, item.ino);
-            }
+        for item in items.iter().filter(|i| !i.is_dot()) {
+            self.dentries.put(ino, &item.name, item.ino);
         }
+        Ok(items)
+    }
+
+    /// `readdir` without `.` and `..`: what is in the directory.
+    pub async fn children(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        let mut items = self.readdir(ino).await?;
+        items.retain(|i| !i.is_dot());
         Ok(items)
     }
 

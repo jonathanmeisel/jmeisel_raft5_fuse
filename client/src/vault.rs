@@ -1732,7 +1732,7 @@ impl Vault {
             Ok::<_, FsError>(
                 items
                     .into_iter()
-                    .find(|i| i.ino == w[1] && i.name != "." && i.name != "..")
+                    .find(|i| i.ino == w[1] && !i.is_dot())
                     .map(|i| i.name),
             )
         }))
@@ -1999,7 +1999,7 @@ impl Vault {
         for mut item in items {
             if item.sealed_name.is_empty() {
                 // `.` and `..` have no tag.
-                if item.name == "." || item.name == ".." {
+                if item.is_dot() {
                     named.push(item);
                 } else {
                     eprintln!("inode {ino}: an entry with no sealed name; left out");
@@ -2025,6 +2025,13 @@ impl Vault {
             }
         }
         Ok(named)
+    }
+
+    /// `readdir` without `.` and `..`: what is in the directory.
+    pub async fn children(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        let mut items = self.readdir(ino).await?;
+        items.retain(|i| !i.is_dot());
+        Ok(items)
     }
 
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {

@@ -150,6 +150,14 @@ pub struct DirItem {
     pub sealed_name: Vec<u8>,
 }
 
+impl DirItem {
+    /// Whether this is `.` or `..`, which every listing has, and which
+    /// walks over a directory's contents leave out.
+    pub fn is_dot(&self) -> bool {
+        self.name == "." || self.name == ".."
+    }
+}
+
 /// A directory granted to a user: whether they can write below it, its key
 /// at `key_version` sealed to them, and its label in their root, also
 /// sealed to them.

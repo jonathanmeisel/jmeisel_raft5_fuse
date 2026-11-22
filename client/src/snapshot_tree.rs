@@ -252,7 +252,7 @@ impl SnapshotTree {
         let items = snap.vault.readdir(parent).await?;
         Ok(items
             .into_iter()
-            .filter(|i| i.name != "." && i.name != "..")
+            .filter(|i| !i.is_dot())
             .map(|i| {
                 let number = self.number(&snap, i.ino);
                 (i, number)

@@ -211,18 +211,14 @@ async fn list(session: Arc<Session>, path: Vec<u8>) -> Result<Vec<Entry>, FsErro
         return Err(FsError::errno(libc::ENOTDIR));
     }
     let items = session.readdir(dir.ino).await?;
-    let attrs = stream::iter(
-        items
-            .into_iter()
-            .filter(|i| i.name != "." && i.name != ".."),
-    )
-    .map(|item| {
-        let session = Arc::clone(&session);
-        async move { (item.name, session.getattr(item.ino).await) }
-    })
-    .buffered(LISTING_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await;
+    let attrs = stream::iter(items.into_iter().filter(|i| !i.is_dot()))
+        .map(|item| {
+            let session = Arc::clone(&session);
+            async move { (item.name, session.getattr(item.ino).await) }
+        })
+        .buffered(LISTING_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut entries = Vec::with_capacity(attrs.len());
     for (name, attr) in attrs {
         match attr {

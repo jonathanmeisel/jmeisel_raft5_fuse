@@ -1007,10 +1007,7 @@ impl Inner {
     /// Removes everything below directory `ino`, depth first.
     fn empty_dir(self: Rc<Self>, ino: u64) -> LocalBoxFuture<'static, Result<(), FsError>> {
         Box::pin(async move {
-            for item in self.session.readdir(ino).await? {
-                if item.name == "." || item.name == ".." {
-                    continue;
-                }
+            for item in self.session.children(ino).await? {
                 if item.kind == Kind::Directory {
                     Rc::clone(&self).empty_dir(item.ino).await?;
                     self.session.rmdir(ino, &item.name).await?;
@@ -1032,10 +1029,7 @@ impl Inner {
     ) -> LocalBoxFuture<'static, Result<(), FsError>> {
         Box::pin(async move {
             let to = self.session.mkdir(parent, &name, DIR_MODE).await?.ino;
-            for item in self.session.readdir(from).await? {
-                if item.name == "." || item.name == ".." {
-                    continue;
-                }
+            for item in self.session.children(from).await? {
                 match item.kind {
                     Kind::Directory => {
                         Rc::clone(&self)
@@ -1103,10 +1097,7 @@ impl Fs {
                     Ok((ino, session.readdir(ino).await?))
                 })
                 .await?;
-            let items: Vec<_> = items
-                .into_iter()
-                .filter(|i| i.name != "." && i.name != "..")
-                .collect();
+            let items: Vec<_> = items.into_iter().filter(|i| !i.is_dot()).collect();
             let folders: Vec<u64> = items
                 .iter()
                 .filter(|i| i.kind == Kind::Directory && !is_group(i.ino))

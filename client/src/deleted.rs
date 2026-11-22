@@ -195,7 +195,7 @@ impl Session {
         let items = self.readdir(parent).await?;
         Ok(items
             .into_iter()
-            .find(|i| i.ino == child && i.name != "." && i.name != "..")
+            .find(|i| i.ino == child && !i.is_dot())
             .map(|i| i.name))
     }
 }

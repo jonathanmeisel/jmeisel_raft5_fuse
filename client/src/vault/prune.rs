@@ -196,7 +196,7 @@ impl Vault {
                     .readdir(ino)
                     .await?
                     .into_iter()
-                    .filter(|i| i.name != "." && i.name != "..")
+                    .filter(|i| !i.is_dot())
                     .collect();
                 for item in &items {
                     let child = self.node(item.ino).await?;
