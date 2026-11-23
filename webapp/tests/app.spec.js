@@ -2,12 +2,40 @@
 // upload and download (one file large enough for object storage), share
 // with a fingerprint, trust, read as the other user, and revoke, which
 // leaves a prune that the app works through.
-import { test, expect } from "@playwright/test";
+import { test as base, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+// Search indexing is on by default on a computer, and would run the model in
+// every tab of every test. Each new browser context here starts with it off;
+// the search tests turn it back on.
+// Sandboxed frames (the viewer's) have no localStorage: nothing to set there.
+const INDEX_OFF = () => {
+  try {
+    localStorage.setItem("raft5fs:index-here", "off");
+  } catch {}
+};
+const test = base.extend({
+  context: async ({ context }, use) => {
+    await context.addInitScript(INDEX_OFF);
+    await use(context);
+  },
+  browser: [
+    async ({ browser }, use) => {
+      const newContext = browser.newContext.bind(browser);
+      browser.newContext = async (options) => {
+        const context = await newContext(options);
+        await context.addInitScript(INDEX_OFF);
+        return context;
+      };
+      await use(browser);
+    },
+    { scope: "worker" },
+  ],
+});
 
 const invites = () =>
   JSON.parse(readFileSync(new URL("../config/local/invites.json", import.meta.url)));
@@ -1611,6 +1639,175 @@ test("a folder's activity says who changed what", async ({ browser }) => {
   await expect(uma.getByRole("dialog").getByText(/tom\s+created/)).toBeVisible();
 
   expect(problems.flat()).toEqual([]);
+});
+
+/// Types `query` in the header's search box and waits for results.
+async function search(page, query) {
+  const box = page.getByRole("searchbox", { name: "Search" });
+  await box.fill(query);
+  await box.press("Enter");
+  return page.getByRole("listbox", { name: "Search results" });
+}
+
+/// Searches for `query` until `path` is among the results: indexing runs in
+/// the background, a few seconds behind an upload. Each search gets a while
+/// to find it: meaning comes after words.
+async function searchUntil(page, query, path, timeout = 120_000) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const results = await search(page, query);
+    const hit = results.getByRole("option").filter({ hasText: path });
+    try {
+      await hit.first().waitFor({ timeout: 5_000 });
+      return results;
+    } catch {}
+    if (Date.now() > deadline) throw new Error(`${query} never found ${path}`);
+  }
+}
+
+test("files are found by their words and their meaning", async ({ browser }) => {
+  const context = await browser.newContext();
+  await context.addInitScript(() => {
+    try {
+      localStorage.setItem("raft5fs:index-here", "on");
+    } catch {}
+  });
+  const page = await context.newPage();
+  const problems = watch(page);
+  await enrol(page, "kai");
+  await login(page, "kai");
+  await addFolder(page, "notes");
+  await open(page, "notes");
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "taxes.txt", mimeType: "text/plain", buffer: Buffer.from("Keep the receipts for the tax return, due in April.") },
+    { name: "minutes.docx", mimeType: "application/octet-stream", buffer: fixture("minutes.docx") },
+    { name: "page.pdf", mimeType: "application/pdf", buffer: PDF },
+  ]);
+  await expect(item(page, "page.pdf")).toBeVisible(SLOW);
+
+  // Words: in a text file, a Word file, and a PDF.
+  await searchUntil(page, "receipts", "notes/taxes.txt");
+  await searchUntil(page, "tomatoes basil", "notes/minutes.docx");
+  await searchUntil(page, "raft5fs", "notes/page.pdf");
+  // Meaning, in another language, with no word in common.
+  const results = await searchUntil(page, "Steuererklärung Belege", "notes/taxes.txt");
+  await expect(results.getByRole("option").first()).toContainText("notes/taxes.txt");
+  await expect(results).toContainText(/notes: \d+ files, indexed .* by kai on /);
+
+  // A result opens the file.
+  await results.getByRole("option").filter({ hasText: "notes/taxes.txt" }).click();
+  await expect(page.getByText("Keep the receipts for the tax return")).toBeVisible(SLOW);
+  await page.keyboard.press("Escape");
+
+  // What this browser keeps of the index is sealed: no text in the clear.
+  const kept = await page.evaluate(async () => {
+    const db = await new Promise((resolve, reject) => {
+      const r = indexedDB.open("raft5fs");
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+    const all = await new Promise((resolve, reject) => {
+      const r = db.transaction("search").objectStore("search").getAll();
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+    const text = all.map((b) => new TextDecoder("latin1").decode(new Uint8Array(b))).join("");
+    return { pieces: all.length, clear: /receipts|tomatoes|taxes\.txt/.test(text) };
+  });
+  expect(kept.pieces).toBeGreaterThan(0);
+  expect(kept.clear).toBe(false);
+
+  // The owner can turn indexing off, which removes the index.
+  await page.getByText("My files").first().click();
+  await more(page, "notes", "Search indexing");
+  await expect(page.getByText(/are indexed for search/)).toBeVisible(SLOW);
+  await page.getByRole("button", { name: "Turn off…" }).click();
+  await page.getByRole("button", { name: "Turn off and remove the index" }).click();
+  await expect(page.getByText(/Indexing for search is off for notes/)).toBeVisible(SLOW);
+  await page.getByRole("button", { name: "Close" }).last().click();
+  await open(page, "notes");
+  const after = await search(page, "receipts");
+  await expect(after).toContainText("Indexing is off: notes", SLOW);
+  await expect(after).toContainText("Nothing found.");
+
+  expect(problems).toEqual([]);
+});
+
+test("a phone doesn't index for search unless asked", async ({ browser }) => {
+  const context = await browser.newContext({ isMobile: true, hasTouch: true, viewport: { width: 390, height: 800 } });
+  // Not the tests' own setting: the device's default. Chromium's mobile
+  // emulation doesn't say it's mobile in userAgentData, as a phone does.
+  await context.addInitScript(() => {
+    try {
+      localStorage.removeItem("raft5fs:index-here");
+    } catch {}
+    Object.defineProperty(navigator, "userAgentData", { value: { mobile: true }, configurable: true });
+  });
+  const page = await context.newPage();
+  await enrol(page, "lux");
+  await login(page, "lux");
+  await accountButton(page).click();
+  const choice = page.getByRole("menuitem", { name: "Index for search on this device" });
+  await expect(choice.locator(".wxi-empty")).toHaveCount(1);
+});
+
+test("a phone asks before downloading the search model, and finds words meanwhile", async ({ browser }) => {
+  // A computer indexes a folder, with vectors.
+  const computer = await browser.newContext();
+  await computer.addInitScript(() => {
+    try {
+      localStorage.setItem("raft5fs:index-here", "on");
+    } catch {}
+  });
+  const desk = await computer.newPage();
+  await enrol(desk, "mia");
+  await login(desk, "mia");
+  await addFolder(desk, "trips");
+  await open(desk, "trips");
+  const ride = "We rode our bikes on gravel roads through Vermont last summer, all week.";
+  await desk.locator("input[type=file]").setInputFiles([
+    { name: "ride.txt", mimeType: "text/plain", buffer: Buffer.from(ride) },
+  ]);
+  await expect(item(desk, "ride.txt")).toBeVisible(SLOW);
+  await searchUntil(desk, "Fahrradtour", "trips/ride.txt");
+
+  // The same account on a phone, which doesn't index.
+  const phone = await browser.newContext({ isMobile: true, hasTouch: true, viewport: { width: 390, height: 800 } });
+  await phone.addInitScript(() => {
+    Object.defineProperty(navigator, "userAgentData", { value: { mobile: true }, configurable: true });
+  });
+  const page = await phone.newPage();
+  const problems = watch(page);
+  await page.goto("/");
+  // A browser that never enrolled here: the filesystem is chosen by hand.
+  await page.getByLabel("Filesystem").selectOption(localFsId());
+  // Stays unlocked, to come back after a reload.
+  await login(page, "mia", true);
+  await open(page, "trips");
+
+  // Words at once, and a question before the model downloads.
+  const results = await search(page, "gravel");
+  await expect(results.getByRole("option").first()).toContainText("trips/ride.txt", SLOW);
+  await expect(results.getByText(/Also search by meaning/)).toBeVisible(SLOW);
+  await results.getByRole("button", { name: "Not now" }).click();
+  await expect(results.getByText(/Also search by meaning/)).toHaveCount(0);
+  // Asked once only, this visit; a search by meaning alone finds nothing.
+  const words = await search(page, "Fahrradtour");
+  await expect(words.getByText("Nothing found.")).toBeVisible(SLOW);
+  await expect(words.getByText(/Also search by meaning/)).toHaveCount(0);
+
+  // Asked again on another visit; yes downloads it, and finds by meaning.
+  await page.reload();
+  await expect(accountButton(page)).toBeVisible(SLOW);
+  const again = await search(page, "Fahrradtour");
+  await again.getByRole("button", { name: "Download" }).click();
+  await expect(again.getByRole("option").filter({ hasText: "trips/ride.txt" })).toBeVisible(SLOW);
+  // And isn't asked again.
+  const later = await search(page, "Radtour Vermont");
+  await expect(later.getByRole("option").filter({ hasText: "trips/ride.txt" })).toBeVisible(SLOW);
+  await expect(later.getByText(/Also search by meaning/)).toHaveCount(0);
+
+  expect(problems).toEqual([]);
 });
 
 test("the app refuses to run in a frame", async ({ page }) => {

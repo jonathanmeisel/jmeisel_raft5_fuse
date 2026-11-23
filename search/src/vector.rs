@@ -7,6 +7,15 @@
 
 use crate::record::Vector;
 
+/// The model that every client embeds with: multilingual-e5-small, the int8
+/// export at Hugging Face revision 761b726 (see raft5fs-indexer's `embed`
+/// and the web app's `embedWorker.js`). A new export or revision needs a
+/// new name, as vectors from two exports don't compare.
+pub const E5_MODEL: &str = "multilingual-e5-small-int8@761b726";
+
+/// The size of its vectors.
+pub const E5_DIMS: usize = 384;
+
 /// A vector of unit length as one byte per dimension.
 pub fn quantize(v: &[f32]) -> Vector {
     let max = v.iter().fold(0f32, |m, x| m.max(x.abs()));

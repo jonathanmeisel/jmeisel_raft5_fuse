@@ -237,16 +237,32 @@ const LOAD_TRIES: usize = 5;
 /// The index of `volume` as its files are now. Makes `INDEX_DIR` if there
 /// is none and `create` says so; otherwise `None` for no index.
 async fn load(vault: &Vault, volume: u64, create: bool) -> Result<Option<Loaded>, FsError> {
+    load_with(vault, volume, create, None).await
+}
+
+/// `load`, with segments taken from `cache` where it has them, and put
+/// there when they are read.
+async fn load_with(
+    vault: &Vault,
+    volume: u64,
+    create: bool,
+    cache: Option<&dyn SegmentCache>,
+) -> Result<Option<Loaded>, FsError> {
     let mut tries = 0;
     loop {
-        match load_once(vault, volume, create).await {
+        match load_once(vault, volume, create, cache).await {
             Err(e) if e.errno == errno::ENOENT && tries + 1 < LOAD_TRIES => tries += 1,
             other => return other,
         }
     }
 }
 
-async fn load_once(vault: &Vault, volume: u64, create: bool) -> Result<Option<Loaded>, FsError> {
+async fn load_once(
+    vault: &Vault,
+    volume: u64,
+    create: bool,
+    cache: Option<&dyn SegmentCache>,
+) -> Result<Option<Loaded>, FsError> {
     let dir = match vault.lookup(volume, OsStr::new(INDEX_DIR)).await {
         Ok(attr) => attr.ino,
         Err(e) if e.errno == errno::ENOENT && create => {
@@ -291,7 +307,24 @@ async fn load_once(vault: &Vault, volume: u64, create: bool) -> Result<Option<Lo
                 eprintln!("search index: {seg} is missing");
                 continue;
             };
-            match decode_segment(&read_all(vault, ino).await?) {
+            // A segment never changes once a manifest lists it, so a copy
+            // kept under its name and inode is the segment.
+            let key = format!("{volume}/{ino}/{seg}");
+            let kept = match cache {
+                Some(c) => c.get(&key).await,
+                None => None,
+            };
+            let bytes = match kept {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = read_all(vault, ino).await?;
+                    if let Some(c) = cache {
+                        c.put(&key, &bytes).await;
+                    }
+                    bytes
+                }
+            };
+            match decode_segment(&bytes) {
                 Ok(entries) => all.extend(entries),
                 Err(e) => eprintln!("search index: skipped {seg}: {e}"),
             }
@@ -307,10 +340,30 @@ async fn load_once(vault: &Vault, volume: u64, create: bool) -> Result<Option<Lo
 /// Every entry in `volume`'s index, for searching it. `None` if it has
 /// none.
 pub async fn read_index(vault: &Vault, volume: u64) -> Result<Option<IndexSnapshot>, FsError> {
-    Ok(load(vault, volume, false).await?.map(|l| IndexSnapshot {
-        progress: view::progress(&l.manifests),
-        entries: l.entries.into_values().collect(),
-    }))
+    read_index_cached(vault, volume, None).await
+}
+
+/// `read_index`, reading only the segments that `cache` doesn't have.
+pub async fn read_index_cached(
+    vault: &Vault,
+    volume: u64,
+    cache: Option<&dyn SegmentCache>,
+) -> Result<Option<IndexSnapshot>, FsError> {
+    Ok(load_with(vault, volume, false, cache)
+        .await?
+        .map(|l| IndexSnapshot {
+            progress: view::progress(&l.manifests),
+            entries: l.entries.into_values().collect(),
+        }))
+}
+
+/// Where a device keeps the segments it has read, so that reading an index
+/// again fetches only new ones. Keys name a segment, its volume and its
+/// inode. What it keeps is the account's data: seal it
+/// (raft5fs-crypto's `local`).
+pub trait SegmentCache: MaybeSend + MaybeSync {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Option<Vec<u8>>>;
+    fn put<'a>(&'a self, key: &'a str, bytes: &'a [u8]) -> BoxFuture<'a, ()>;
 }
 
 /// A volume's index as read: its entries, and how far indexing got.
@@ -492,10 +545,15 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Whether `old`'s vectors are what this indexer would make: from its
+    /// Whether `old` is what this indexer would make: vectors from its
     /// model, or none for an indexer with none. A record with no chunks
-    /// has nothing to embed.
+    /// has nothing to embed, but one another device couldn't read
+    /// (`Unread`) is read here if it can be.
     fn embedded_as_now(&self, old: &Record) -> bool {
+        let name = old.path.rsplit('/').next().unwrap_or(&old.path);
+        if old.kind == DocKind::Unread && self.tools.extract.reads(name) >= old.stamp.size {
+            return false;
+        }
         self.tools.embed.is_none() || old.chunks.is_empty() || old.model == self.tools.model()
     }
 
@@ -569,6 +627,10 @@ impl Pass<'_> {
         };
         let (kind, pieces) = match extracted {
             Some(ex) => (ex.kind, text::chunks_with_text(&ex.text)),
+            // A format with text, which this device can't read.
+            None if most == 0 && !matches!(Format::of(&name), Format::Other) => {
+                (DocKind::Unread, Vec::new())
+            }
             None => (DocKind::Opaque, Vec::new()),
         };
         let (chunks, model) = self.embed(pieces, &path).await;

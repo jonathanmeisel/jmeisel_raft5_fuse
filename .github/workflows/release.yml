@@ -81,7 +81,7 @@ jobs:
       - name: The client builds for browsers
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo clippy -p raft5fs-client -p raft5fs-web --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy -p raft5fs-client -p raft5fs-web -p raft5fs-pdf-web --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test
 
   build:
@@ -168,6 +168,10 @@ jobs:
           fi
       - run: npm ci
       - run: npm run wasm
+      - name: The search model, served by the site (scripts/fetch-model.sh)
+        run: npm run model
+      - name: The browser's model gives native clients' vectors
+        run: npm run test:parity
       - name: Browser tests
         run: |
           cargo build -p raft5fs-testkit --example web_dev

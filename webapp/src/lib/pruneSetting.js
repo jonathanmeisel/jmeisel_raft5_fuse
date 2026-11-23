@@ -8,7 +8,7 @@ const KEY = "raft5fs:prune-here";
 
 /// Whether this looks like a phone or tablet: the browser says so, or its
 /// only pointer is a finger.
-function mobile() {
+export function mobile() {
   const said = navigator.userAgentData?.mobile;
   if (said != null) return said;
   return matchMedia("(pointer: coarse)").matches && !matchMedia("(any-pointer: fine)").matches;

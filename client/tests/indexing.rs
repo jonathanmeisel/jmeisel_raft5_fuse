@@ -119,7 +119,7 @@ fn volume(backend: &Backend, tester: &Vault) -> (u64, u64) {
         tester,
         notes,
         "tax.txt",
-        b"receipts for the tax return",
+        b"receipts for the tax return, due in April, kept in the blue folder",
     );
     write(backend, tester, v, "ride.gpx", GPX.as_bytes());
     write(backend, tester, v, "photo.jpg", b"\xFF\xD8\xFF not text");
@@ -503,15 +503,15 @@ fn chunks_get_vectors_and_a_new_model_embeds_again() {
     pass_with(&backend, &tester, v, id, PassKind::Auto, &tools(&first)).unwrap();
     assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
 
-    // Searched by meaning: no word of the query is in the file, but the
-    // fake model puts "receipts tax" next to it.
+    // Searched by meaning: the query's words aren't in the file, but its
+    // vector (from the fake model) is the file's.
     let index = backend
         .runtime
         .block_on(read_index(&tester, v))
         .unwrap()
         .unwrap();
     let view = View::new(index.entries);
-    let q = Fake::vector("receipts tax");
+    let q = Fake::vector("receipts for the tax return, due in April, kept in the blue folder");
     let hits = view.search_with(
         "quittungen",
         Some(raft5fs_search::view::QueryVector {
@@ -550,4 +550,120 @@ fn a_model_that_fails_is_tried_again() {
     let stats = pass_with(&backend, &tester, v, id, PassKind::Full, &tools(&fake)).unwrap();
     assert_eq!((stats.indexed, stats.failed.len()), (2, 0));
     assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
+}
+
+/// A segment cache in memory that counts what it is asked.
+#[derive(Default)]
+struct Kept {
+    pieces: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    hits: std::sync::atomic::AtomicUsize,
+}
+
+impl raft5fs_client::indexer::SegmentCache for Kept {
+    fn get<'a>(&'a self, key: &'a str) -> Boxed<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let got = self.pieces.lock().unwrap().get(key).cloned();
+            if got.is_some() {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            got
+        })
+    }
+
+    fn put<'a>(&'a self, key: &'a str, bytes: &'a [u8]) -> Boxed<'a, ()> {
+        Box::pin(async move {
+            self.pieces
+                .lock()
+                .unwrap()
+                .insert(key.into(), bytes.to_vec());
+        })
+    }
+}
+
+#[test]
+fn a_second_read_fetches_only_new_segments() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let kept = Kept::default();
+    let read = |kept: &Kept| {
+        let index = rt
+            .block_on(raft5fs_client::indexer::read_index_cached(
+                &tester,
+                v,
+                Some(kept),
+            ))
+            .unwrap()
+            .unwrap();
+        View::new(index.entries)
+    };
+    read(&kept);
+    let first = kept.pieces.lock().unwrap().len();
+    assert!(first >= 1);
+    assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    write(&backend, &tester, v, "new.txt", b"fresh");
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let view = read(&kept);
+    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
+    // The old segments came from the cache; only the new one was read.
+    assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), first);
+    assert_eq!(kept.pieces.lock().unwrap().len(), first + 1);
+}
+
+/// Reads "PDFs" as plain text, to stand in for a device with a PDF reader.
+struct PdfToo;
+
+impl raft5fs_client::indexer::Extract for PdfToo {
+    fn reads(&self, name: &str) -> u64 {
+        if name.ends_with(".pdf") {
+            1 << 20
+        } else {
+            BuiltIn.reads(name)
+        }
+    }
+
+    fn extract<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
+        Box::pin(async move {
+            if !name.ends_with(".pdf") {
+                return BuiltIn.extract(name, bytes).await;
+            }
+            Some(raft5fs_search::extract::Extracted {
+                kind: raft5fs_search::record::DocKind::Text,
+                text: String::from_utf8(bytes).ok()?,
+            })
+        })
+    }
+}
+
+#[test]
+fn a_file_one_device_could_not_read_is_read_by_one_that_can() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    write(
+        &backend,
+        &tester,
+        v,
+        "scan.pdf",
+        b"insurance policy renewal",
+    );
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    assert!(search(&backend, &tester, v, "insurance").is_empty());
+    // A device that reads PDFs fills it in at its next walk; the rest
+    // stays as it was.
+    let reads_pdf = Tools {
+        extract: Arc::new(PdfToo),
+        embed: None,
+    };
+    let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Full, &reads_pdf).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(search(&backend, &tester, v, "insurance"), ["scan.pdf"]);
 }

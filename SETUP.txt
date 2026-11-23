@@ -1172,7 +1172,10 @@ The model runs on each device that indexes or searches, never on the
 servers. It downloads the first time it is needed (about 135 MB, from
 Hugging Face, which sees only that this machine fetched it), into
 ~/.cache/raft5fs/models, and is checked against a pinned SHA-256 before
-use. Indexing with it takes CPU: about half the cores, at most four,
+use. The web app serves the same files itself (webapp/README.md) and
+keeps them in the browser after the first search. A browser keeps the
+index it has read, sealed to the account, unless "Keep search data on
+this device" is off. Indexing with it takes CPU: about half the cores, at most four,
 while a pass runs.
 
 What is indexed: plain text and source code, HTML, Word, PowerPoint and
@@ -1182,7 +1185,10 @@ distance and climb). Every other file is found by its name only.
 
 Indexing runs by itself. A mount or a WebDAV server indexes, in the
 background, each volume this account can write (on Android only with
---background-index). Devices take turns: one claims a volume on the
+--background-index), and so does the web app, in one tab per account,
+unless its account menu's "Index for search on this device" is off (it
+is off by default on a phone or tablet). In the web app, the search box
+in the header searches the open top-level folder, or every one. Devices take turns: one claims a volume on the
 servers for a while, as with prunes (7.2), and others leave it alone.
 A pass follows the volume's activity log (section 8), so it reads only
 what changed; once a day it walks the whole volume, for anything the

@@ -12,7 +12,11 @@
 //   none of them saves over another's change.
 // - One tab at a time runs the background prune: the one holding the
 //   account's prune lock (a Web Lock). When it closes, the next tab takes
-//   over.
+//   over. Search indexing works the same way, with its own lock.
+// - Search: the embed Worker (embedWorker.js) runs the model and reads
+//   PDFs. IndexedDB's "search" store keeps the index segments this browser
+//   has read, sealed to the account by the wasm client, unless the page's
+//   setting says not to keep them.
 // - With "stay unlocked", it also keeps the account's unlock keys (what a
 //   password gives a login), for one account per filesystem and for
 //   REMEMBER_MS. They are encrypted (AES-GCM) under a key that WebCrypto
@@ -39,11 +43,12 @@ let nextZip = 1;
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("raft5fs", 2);
+    const request = indexedDB.open("raft5fs", 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs");
       if (!db.objectStoreNames.contains("unlock")) db.createObjectStore("unlock");
+      if (!db.objectStoreNames.contains("search")) db.createObjectStore("search");
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -180,17 +185,108 @@ function openChannel(user) {
   return { channel, early };
 }
 
-/// Once the session exists: applies the saves that arrived first, and
-/// waits for the account's prune lock, to run the background prune while
-/// it holds it (until the Worker ends).
+/// Once the session exists: applies the saves that arrived first, gives
+/// search its tools, and waits for the account's prune lock and index
+/// lock, to run the background prune and indexing while it holds them
+/// (until the Worker ends).
 function joined(user, { early }) {
   for (const [name, bytes] of early.splice(0)) fs.storeUpdated(name, bytes);
+  searchPrefix = `${config.fsId}/${user}/`;
+  fs.setSearchTools(embed, readPdf, cacheGet, cachePut);
   navigator.locks.request(`raft5fs:${config.fsId}:${user}:prune`, () => {
     if (!fs) return null;
     prunesHere = true;
     if (pruneWanted) fs.resumePruning();
     return new Promise(() => {});
   });
+  navigator.locks.request(`raft5fs:${config.fsId}:${user}:index`, () => {
+    if (!fs) return null;
+    indexesHere = true;
+    if (indexWanted) startIndexing();
+    return new Promise(() => {});
+  });
+}
+
+// ----------------------------------------------------------------- search
+
+/// Whether this tab holds the account's index lock, and whether this
+/// browser indexes at all (the page's setting, sent after login), with the
+/// volumes it skips and what it calls this browser.
+let indexesHere = false;
+let indexWanted = false;
+let indexSkip = [];
+let device = "a browser";
+/// Whether to keep index segments in IndexedDB (the page's setting).
+let keepSearch = true;
+/// The account's keys in the "search" store start with this.
+let searchPrefix = "";
+
+function startIndexing() {
+  try {
+    fs.startIndexing(device, indexSkip);
+  } catch (e) {
+    postMessage({ event: "storage-error", message: `search indexing: ${e.message}` });
+  }
+}
+
+let embedder = null;
+let nextEmbed = 1;
+const embedCalls = new Map();
+
+/// A call to the embed Worker, started on first use.
+function embedCall(message, transfer = []) {
+  if (!embedder) {
+    embedder = new Worker(new URL("./embedWorker.js", import.meta.url), { type: "module" });
+    embedder.onmessage = ({ data }) => {
+      const call = embedCalls.get(data.id);
+      if (!call) return;
+      embedCalls.delete(data.id);
+      if (data.error) call.reject(new Error(data.error));
+      else call.resolve(data);
+    };
+    embedder.onerror = (e) => {
+      for (const call of embedCalls.values()) call.reject(new Error(e.message || "the search model failed"));
+      embedCalls.clear();
+      embedder = null;
+    };
+  }
+  const id = nextEmbed++;
+  return new Promise((resolve, reject) => {
+    embedCalls.set(id, { resolve, reject });
+    embedder.postMessage({ id, ...message }, transfer);
+  });
+}
+
+/// The vectors of `texts` (an array of strings), as Float32Arrays.
+const embed = async (texts, query) => (await embedCall({ op: "embed", texts, query })).vectors;
+
+/// The text of a PDF, or null.
+const readPdf = async (bytes) => (await embedCall({ op: "pdf", bytes }, [bytes.buffer])).text;
+
+async function cacheGet(key) {
+  if (!keepSearch) return null;
+  try {
+    const kept = await getRecord(await openDb(), "search", searchPrefix + key);
+    return kept ? new Uint8Array(kept) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cachePut(key, bytes) {
+  if (!keepSearch) return;
+  try {
+    await putRecord(await openDb(), "search", searchPrefix + key, bytes.slice().buffer);
+  } catch {
+    // Full or refused: the segment is read again next time.
+  }
+}
+
+/// Removes every segment this browser keeps, for every account.
+async function clearSearch() {
+  const transaction = (await openDb()).transaction("search", "readwrite");
+  transaction.objectStore("search").clear();
+  await done(transaction);
 }
 
 // ----------------------------------------------------------------- reading
@@ -435,6 +531,8 @@ const methods = {
       }
       closing = true;
       await s.close(handle);
+      // Indexed soon, if this tab indexes.
+      s.kickIndexing();
     } catch (e) {
       if (!closing) await s.close(handle).catch(() => {});
       if (!existing) await s.remove(path).catch(() => {});
@@ -647,10 +745,40 @@ const methods = {
   /// another of this browser's tabs.
   pruning: () => (!pruneWanted ? "off" : prunesHere ? "running" : "elsewhere"),
 
+  searchLoad: (path) => session().searchLoad(path),
+  search: (query, volumes, limit, meaning) => session().search(query, volumes, limit, meaning),
+  /// Whether the search model is loaded, loading (and how far), or kept
+  /// in this browser so that loading it downloads nothing.
+  modelState: async () => (await embedCall({ op: "state" })).state,
+  indexStatus: () => session().indexStatus(),
+  volumeIndexing: (path) => session().volumeIndexing(path),
+  setVolumeIndexing: (path, on) => session().setVolumeIndexing(path, on),
+  /// Turns this browser's background indexing on or off (it runs in the
+  /// tab that holds the index lock), with the volumes it skips and what
+  /// it calls this browser.
+  setIndexHere(on, skip, name) {
+    indexWanted = on;
+    indexSkip = skip;
+    device = name;
+    if (!indexesHere) return;
+    session().stopIndexing();
+    if (on) startIndexing();
+  },
+  /// As `pruning`, for indexing.
+  indexing: () => (!indexWanted ? "off" : indexesHere ? "running" : "elsewhere"),
+  /// Whether this browser keeps the index segments it has read. Turning
+  /// it off removes what it kept.
+  async setKeepSearch(on) {
+    keepSearch = on;
+    if (!on) await clearSearch();
+  },
+
   /// Logs out, and forgets the account if this device remembered it.
   async logout() {
     if (fs) await fs.logout();
     fs = null;
+    embedder?.terminate();
+    embedder = null;
     if (config) await putRecord(await openDb(), "unlock", config.fsId, undefined);
   },
 };

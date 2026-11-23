@@ -35,6 +35,10 @@ pub enum DocKind {
     /// A file with no text this indexer can read. Kept, so its name is
     /// still found and the indexer does not try it again until it changes.
     Opaque,
+    /// A file in a format that has text, which the device that indexed it
+    /// couldn't read (a browser, with a PDF): a device that can reads it
+    /// at its next walk.
+    Unread,
 }
 
 impl DocKind {
@@ -44,6 +48,7 @@ impl DocKind {
             DocKind::Track => 1,
             DocKind::Photo => 2,
             DocKind::Opaque => 3,
+            DocKind::Unread => 4,
         }
     }
 
@@ -53,6 +58,7 @@ impl DocKind {
             1 => DocKind::Track,
             2 => DocKind::Photo,
             3 => DocKind::Opaque,
+            4 => DocKind::Unread,
             _ => return None,
         })
     }

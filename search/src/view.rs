@@ -16,11 +16,20 @@ use crate::rank::fuse;
 use crate::record::{DocKind, Entry, Record};
 use crate::vector::dot;
 
-/// The least cosine for a chunk to match a query by meaning. With
-/// multilingual-e5, text on another subject scores about 0.70 to 0.72, and
-/// text on the query's subject, in any language, 0.81 and up (see
-/// raft5fs-indexer's tests): this is between them.
-pub const MIN_SIMILARITY: f32 = 0.77;
+/// How a chunk matches a query by meaning, with multilingual-e5. Its
+/// cosines bunch together, so no one number tells a match from a miss:
+///
+/// - Text on the query's subject scores 0.79 to 0.87, in any language, and
+///   text on another subject 0.70 to 0.78 (raft5fs-indexer's tests, and the
+///   web app's search test).
+/// - Very short text ("the", a single name) scores about 0.80 against
+///   almost any query, so it matches by meaning only with at least
+///   `MIN_MEANING_WORDS` words. It is still found by its words.
+/// - So a chunk matches if it is within `MEANING_MARGIN` of the best match
+///   in the volume, and above `MIN_SIMILARITY` at all.
+pub const MIN_SIMILARITY: f32 = 0.75;
+pub const MEANING_MARGIN: f32 = 0.05;
+pub const MIN_MEANING_WORDS: u32 = 8;
 
 /// A query's embedding, and the model that made it.
 pub struct QueryVector<'a> {
@@ -185,8 +194,8 @@ impl View {
             .collect()
     }
 
-    /// The files whose best chunk is nearest `q` in meaning, at least
-    /// `MIN_SIMILARITY`, best first, with that chunk.
+    /// The files whose best chunk is nearest `q` in meaning (see
+    /// `MIN_SIMILARITY`), best first, with that chunk.
     fn nearest(&self, q: &QueryVector<'_>, limit: usize) -> Vec<(usize, Option<usize>)> {
         let mut scored: Vec<(usize, usize, f32)> = self
             .docs
@@ -197,12 +206,14 @@ impl View {
                 r.chunks
                     .iter()
                     .enumerate()
+                    .filter(|(_, c)| c.len >= MIN_MEANING_WORDS)
                     .filter_map(|(i, c)| Some((i, dot(c.vector.as_ref()?, q.values))))
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, s)| (doc, i, s))
             })
-            .filter(|&(_, _, s)| s >= MIN_SIMILARITY)
             .collect();
+        let best = scored.iter().map(|s| s.2).fold(f32::MIN, f32::max);
+        scored.retain(|&(_, _, s)| s >= MIN_SIMILARITY && s >= best - MEANING_MARGIN);
         scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
         scored.truncate(limit);
         scored
@@ -234,9 +245,24 @@ mod tests {
     #[test]
     fn meaning_finds_what_words_miss_and_both_rank_first() {
         let view = View::new([
-            embedded(1, "a.txt", "cycling the gap", &[1.0, 0.0, 0.0]),
-            embedded(2, "b.txt", "bike repair notes", &[0.9, 0.1, 0.0]),
-            embedded(3, "c.txt", "tax return", &[0.0, 0.0, 1.0]),
+            embedded(
+                1,
+                "a.txt",
+                "cycling over the gap and down to the lake",
+                &[1.0, 0.0, 0.0],
+            ),
+            embedded(
+                2,
+                "b.txt",
+                "bike repair notes: chain, brakes and the gears",
+                &[0.9, 0.1, 0.0],
+            ),
+            embedded(
+                3,
+                "c.txt",
+                "the tax return is due in April this year",
+                &[0.0, 0.0, 1.0],
+            ),
         ]);
         let mut q = vec![1.0, 0.05, 0.0];
         normalize(&mut q);
@@ -254,7 +280,7 @@ mod tests {
         // With no words matching, meaning alone.
         let hits = view.search_with("velo", Some(vector()), 10);
         assert_eq!(hits.iter().map(|h| h.ino).collect::<Vec<_>>(), [1, 2]);
-        assert_eq!(hits[0].preview, "cycling the gap");
+        assert_eq!(hits[0].preview, "cycling over the gap and down to the lake");
         // Another model's vectors don't count.
         let other = QueryVector {
             model: "other",
@@ -335,5 +361,39 @@ mod tests {
         assert_eq!(p.updated_by, Some(("bo".into(), "web".into())));
         assert_eq!(p.recent[&7], 100);
         assert_eq!(p.recent[&8], 5);
+    }
+
+    #[test]
+    fn short_text_and_far_matches_dont_count_by_meaning() {
+        let view = View::new([
+            embedded(
+                1,
+                "best.txt",
+                "a long enough piece of text about the subject",
+                &[1.0, 0.0, 0.0],
+            ),
+            // Pointing the same way, but too short to trust.
+            embedded(2, "short.txt", "raft5fs", &[1.0, 0.0, 0.0]),
+            // Close enough overall, but much further than the best match.
+            embedded(
+                3,
+                "far.txt",
+                "another long enough piece of text, on something else",
+                &[0.85, 0.53, 0.0],
+            ),
+        ]);
+        let q = [1.0, 0.0, 0.0];
+        let vector = QueryVector {
+            model: "m",
+            values: &q,
+        };
+        let hits: Vec<u64> = view
+            .search_with("unrelated", Some(vector), 10)
+            .iter()
+            .map(|h| h.ino)
+            .collect();
+        assert_eq!(hits, [1]);
+        // Found by its words all the same.
+        assert_eq!(view.search("raft5fs", 10)[0].ino, 2);
     }
 }

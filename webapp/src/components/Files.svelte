@@ -22,6 +22,8 @@
   import LimitDialog from "./LimitDialog.svelte";
   import Versions from "./Versions.svelte";
   import Activity from "./Activity.svelte";
+  import Search from "./Search.svelte";
+  import IndexingDialog from "./IndexingDialog.svelte";
   import { sizeText } from "../lib/sizes.js";
   import { onDestroy } from "svelte";
   import { kindOf, mimeOf, previews } from "../lib/previews.js";
@@ -30,6 +32,7 @@
   import { pathHash, readRoute } from "../lib/route.js";
   import { fileIcon } from "../lib/sharedIcons.js";
   import { pruneHere, setPruneHere } from "../lib/pruneSetting.js";
+  import * as searchSetting from "../lib/searchSetting.js";
   import { treeFromEntries, treeFromPicker, uploadTree } from "../lib/folders.js";
 
   let { fs, me, storageError, onlogout } = $props();
@@ -62,6 +65,14 @@
   let pendingCount = $state(0);
   /// Whether this browser re-seals in the background (account menu).
   let reseal = $state(pruneHere());
+  /// Whether this browser indexes for search, and keeps what it has read
+  /// of indexes (account menu; see searchSetting.js).
+  let indexing = $state(searchSetting.indexHere());
+  let keepSearch = $state(searchSetting.keepSearch());
+
+  function sendIndexing() {
+    fs.setIndexHere(indexing, searchSetting.indexSkip(), searchSetting.deviceName()).catch(() => {});
+  }
   /// Whether this tab is re-sealing now, and video or audio is playing.
   let pruning = false;
   let playing = false;
@@ -110,6 +121,8 @@
     }
     if (visitor) return;
     fs.setPruneHere(reseal).catch(() => {});
+    fs.setKeepSearch(keepSearch).catch(() => {});
+    sendIndexing();
     refreshPending();
     refreshOffers();
     refreshStorage();
@@ -824,6 +837,7 @@
         ? [
             { text: "Show as", open: () => (dialog = { kind: "show-as", path: item.id, label: item.id.slice(1) }) },
             { text: "Transfer ownership", open: () => (dialog = { kind: "transfer", path: item.id }) },
+            { text: "Search indexing", open: () => (dialog = { kind: "indexing", path: item.id }) },
           ]
         : []),
     ];
@@ -855,6 +869,8 @@
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
     { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
     { id: "reseal", text: "Re-seal on this device", icon: reseal ? "wxi-check" : "wxi-empty" },
+    { id: "index", text: "Index for search on this device", icon: indexing ? "wxi-check" : "wxi-empty" },
+    { id: "keep-search", text: "Keep search data on this device", icon: keepSearch ? "wxi-check" : "wxi-empty" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
 
@@ -878,6 +894,14 @@
       reseal = !reseal;
       setPruneHere(reseal);
       fs.setPruneHere(reseal).catch(() => {});
+    } else if (id === "index") {
+      indexing = !indexing;
+      searchSetting.setIndexHere(indexing);
+      sendIndexing();
+    } else if (id === "keep-search") {
+      keepSearch = !keepSearch;
+      searchSetting.setKeepSearch(keepSearch);
+      fs.setKeepSearch(keepSearch).catch(() => {});
     } else if (id === "logout") onlogout();
     else dialog = { kind: id };
   }
@@ -911,6 +935,7 @@
           {#if several}<span class="fs">{me.filesystem}</span>{/if}
         </FolderMenu>
       </span>
+      <Search {fs} folder={current} onopen={(path) => goTo(path)} />
       <AccountMenu user={me.user} items={menuItems} onselect={chose} note={storageNote} onopen={refreshStorage} />
     {/if}
   </header>
@@ -1052,6 +1077,8 @@
     </div>
     <p><button onclick={() => (dialog = null)}>Close</button></p>
   </Dialog>
+{:else if dialog?.kind === "indexing"}
+  <IndexingDialog {fs} path={dialog.path} onclose={() => (dialog = null)} />
 {:else if dialog?.kind === "activity"}
   <Activity
     {fs}

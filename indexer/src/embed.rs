@@ -29,7 +29,7 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 /// The name records give this model's vectors. A new revision or export
 /// needs a new name: vectors from two exports must not be compared.
-pub const MODEL: &str = "multilingual-e5-small-int8@761b726";
+pub const MODEL: &str = raft5fs_search::vector::E5_MODEL;
 
 const REPO: &str = "https://huggingface.co/Xenova/multilingual-e5-small/resolve";
 const REVISION: &str = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
@@ -168,6 +168,19 @@ fn download(file: &str, to: &Path, sha: &str) -> Result<(), String> {
     std::fs::rename(&temp, to).map_err(|e| format!("cannot keep {}: {e}", to.display()))
 }
 
+/// ONNX Runtime's environment: one for the whole process, which is all it
+/// allows.
+fn environment() -> Result<ort::environment::Environment, String> {
+    static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::init()
+            .with_name("raft5fs")
+            .build()
+            .map_err(|e| format!("cannot start ONNX Runtime: {e}"))
+    })
+    .clone()
+}
+
 fn load(dir: &Path) -> Result<Model, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     for (file, name, sha) in FILES {
@@ -191,10 +204,7 @@ fn load(dir: &Path) -> Result<Model, String> {
         pad_token: "<pad>".into(),
         ..PaddingParams::default()
     }));
-    let env = ort::init()
-        .with_name("raft5fs")
-        .build()
-        .map_err(|e| format!("cannot start ONNX Runtime: {e}"))?;
+    let env = environment()?;
     // Half the cores, at most four: indexing runs behind the device's
     // own work.
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
@@ -350,6 +360,52 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Writes what the native model gives for a few texts, for the web
+    /// app's parity test (webapp/tests/parity.test.js) to check its own
+    /// against. Run again with --ignored after changing the model.
+    #[test]
+    #[ignore = "needs the model (about 135 MB)"]
+    fn write_the_web_apps_parity_fixture() {
+        let dir = std::env::var_os("RAFT5FS_MODEL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(cache_dir);
+        let e5 = E5::new(dir);
+        let texts = [
+            "passage: We rode our bikes on gravel roads through Vermont last summer.",
+            "passage: Die Steuererklärung ist im April fällig; die Belege aufheben.",
+            "passage: 東京の夏はとても暑いです。",
+            "query: bike routes in vermont",
+        ];
+        let mut out = String::from("{\n  \"model\": \"");
+        out.push_str(MODEL);
+        out.push_str("\",\n  \"cases\": [\n");
+        for (i, text) in texts.iter().enumerate() {
+            let model = e5.loaded().unwrap();
+            let mut model = model.lock().unwrap();
+            let ids = model
+                .tokenizer
+                .encode(*text, true)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            let v = run(&mut model, "", &[text.to_string()]).unwrap().remove(0);
+            let nums: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+            let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
+            out.push_str(&format!(
+                "    {{ \"text\": {text:?}, \"ids\": [{}], \"vector\": [{}] }}{}\n",
+                ids.join(", "),
+                nums.join(", "),
+                if i + 1 < texts.len() { "," } else { "" }
+            ));
+        }
+        out.push_str("  ]\n}\n");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../webapp/tests/fixtures/e5-vectors.json"
+        );
+        std::fs::write(path, out).unwrap();
+    }
+
     /// The real model: set RAFT5FS_MODEL_DIR to a folder with its files (or
     /// one to download them into) and run with --ignored.
     #[test]
@@ -376,9 +432,11 @@ mod tests {
         let scores: Vec<f32> = p.iter().map(|v| cos(v)).collect();
         eprintln!("cosines: {scores:?}");
         assert_eq!(p[0].len(), 384);
-        let floor = raft5fs_search::view::MIN_SIMILARITY;
-        assert!(scores[0] >= floor && scores[1] >= floor, "{scores:?}");
-        assert!(scores[2] < floor && scores[3] < floor, "{scores:?}");
+        // Both rides beat both others by more than the margin search allows
+        // below its best match.
+        let margin = raft5fs_search::view::MEANING_MARGIN;
+        let ride = scores[0].min(scores[1]);
+        assert!(ride - scores[2].max(scores[3]) > margin, "{scores:?}");
         // The same text gives the same vector, batched or not.
         let alone = e5.embed_now("passage: ", &passages[..1]).unwrap();
         let same: f32 = alone[0].iter().zip(&p[0]).map(|(x, y)| x * y).sum();

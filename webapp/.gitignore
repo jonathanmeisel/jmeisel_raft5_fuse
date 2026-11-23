@@ -5,3 +5,4 @@ config/local/
 test-results/
 playwright-report/
 config/prod.json
+public/models/
