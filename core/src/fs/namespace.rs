@@ -778,6 +778,8 @@ impl FsCore {
             txn.write(&attr_key(ino), None).await?;
             txn.write(&tombstone_key(ino), None).await?;
             txn.write(&crate::layout::volume_key(ino), None).await?;
+            txn.write(&crate::layout::index_claim_key(ino), None)
+                .await?;
             txn.write(&crate::layout::folder_size_key(ino), None)
                 .await?;
             txn.write(&crate::layout::folder_limit_key(ino), None)

@@ -747,6 +747,9 @@ They can see:
     app). Its names are sealed as the folders' are. The servers vouch for
     who did what: nothing in it is signed;
   - the names of snapshots, which are chosen in the clear;
+  - which volumes are indexed for search, how big each index is, and
+    which device indexes it when (section 15). The index itself is
+    sealed like any file;
   - the tag each name is filed under. The tag of a name doesn't change
     when the directory's key does, so someone revoked who also got hold
     of the raw store could test guesses at the names of new files in a
@@ -1075,7 +1078,9 @@ is decrypted on the phone, as on a computer; the servers see no more
 than before.
 
 Each release has the binary, raft5fs-android-aarch64 (64-bit ARM, the
-usual kind of phone), built without FUSE.
+usual kind of phone), built without FUSE, and without search indexing
+(section 15): it doesn't index, and `raft5fs search` on it finds files by
+their words, places and dates, not by meaning. Your other devices index.
 
 Setting it up, once:
 
@@ -1143,4 +1148,97 @@ http://, not https://, and that the password matches webdav.pw. If large
 files fail to open while small ones work, the phone can't reach the
 object store: check its network, and that the bucket's address in the
 servers' settings is reachable from outside.
+
+
+-------------------------------------------------------------------------
+15. SEARCH
+-------------------------------------------------------------------------
+
+Each volume can have a search index, so its files can be found by the
+words in them and by what they are about, not only by name. The servers can't read files, so the
+devices build the index, and keep it in the volume itself, as hidden
+files under .raft5fs-search at its root, sealed like every other file
+there. Whoever can read the volume can search it; whoever can write it
+can index it. A share of a folder inside a volume can't be searched yet.
+
+  raft5fs search "tax receipts 2024"        every volume you can read
+  raft5fs search --in photos "lake"         one volume
+
+A search matches words, and also meaning: each piece of text gets a
+vector from a language model (multilingual-e5-small), and so does the
+query, so "bike routes in vermont" finds a German note about cycling in
+Vermont with none of those words. Results that match both ways come
+first.
+
+The model runs on each device that indexes or searches, never on the
+servers. It downloads the first time it is needed (about 135 MB, from
+Hugging Face, which sees only that this machine fetched it), into
+~/.cache/raft5fs/models, and is checked against a pinned SHA-256 before
+use. The web app serves the same files itself (webapp/README.md) and
+keeps them in the browser after the first search. A browser keeps the
+index it has read, sealed to the account, unless "Keep search data on
+this device" is off. Indexing with it takes CPU: about half the cores, at most four,
+while a pass runs.
+
+What is indexed: plain text and source code, HTML, Word, PowerPoint and
+Excel files (docx, pptx, xlsx), OpenDocument files, PDF, chat exports,
+GPS tracks and routes (GPX, TCX: their names, activity, month, distance,
+climb, and the towns, states and countries they go through), and photos
+(JPEG, HEIC, PNG, WebP, TIFF: when, where and with what camera they were
+taken, from their EXIF data). Every other file is found by its name only.
+So "bike routes in vermont" finds rides through Vermont, and "Lisbon 2024"
+finds the photos taken there then.
+
+Places are named offline, from a table every client keeps (from GeoNames,
+CC BY 4.0, and Natural Earth; search/data/README.md): where a photo was
+taken never leaves the device. A point within about 500 m of a border can
+get the state on its other side.
+
+Photos are also found by what they show, in any language ("Strand am
+Meer", "kids at the beach"), with CLIP: on native devices a second model
+(about 225 MB, downloaded as the first is, into the same folder) gives
+each photo a vector, and each query one. The web app doesn't make photos'
+vectors: a device that does fills them in at its next walk. It does
+search them, with CLIP's text side (about 140 MB more, downloaded on the
+first search of a volume whose photos have vectors). Results show each
+photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
+they show without fetching the photos.
+
+Indexing runs by itself. A mount or a WebDAV server indexes, in the
+background, each volume this account can write (not the Android build,
+which doesn't index at all, section 14), and so does the web app, in one tab per account,
+unless its account menu's "Index for search on this device" is off (it
+is off by default on a phone or tablet). In the web app, the search box
+in the header searches the open top-level folder, or every one. Devices take turns: one claims a volume on the
+servers for a while, as with prunes (7.2), and others leave it alone.
+A pass follows the volume's activity log (section 8), so it reads only
+what changed; once a day it walks the whole volume, for anything the
+log missed. To index now, in the foreground:
+
+  raft5fs index                  every volume you can write
+  raft5fs index photos --full    walk the whole volume
+  raft5fs index --status         how far each got, and who did it
+  raft5fs index photos --dry-run read everything, say how big its
+                                 index would be, store nothing
+
+To keep one device off a volume (a laptop and a big photo volume, say),
+give the mount --index-skip photos, or put index_skip = ["photos"] in
+the profile. Other devices still index it, and this one still searches
+it.
+
+A volume's owner can turn indexing off for everyone, which also frees
+the space the index takes:
+
+  raft5fs volume indexing photos              on or off?
+  raft5fs volume indexing photos off --delete-index
+  raft5fs volume indexing photos on           indexes it again, from
+                                              the start
+
+What it costs: the index counts against the volume owner's quota, and
+snapshots keep old parts of it as they keep old files. It holds a short
+preview of each piece of text, the words in it, and its vector (about
+400 bytes), not the whole text; for a photo, a thumbnail and a vector of
+what it shows (about 13 KB). A vector says roughly what its text is
+about, and someone with the index could partly recover the text from
+it, so it is sealed as strongly as the files are.
 

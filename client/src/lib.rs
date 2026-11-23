@@ -3,6 +3,7 @@ mod chunk_cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 pub mod deleted;
+pub mod indexer;
 mod paths;
 pub mod pruner;
 mod readahead;

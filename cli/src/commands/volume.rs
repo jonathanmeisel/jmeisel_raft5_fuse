@@ -26,6 +26,21 @@ pub enum VolumeCommand {
     Decline(PathArg),
     /// Withdraw your offer of a volume.
     Withdraw(PathArg),
+    /// Show whether a volume is indexed for search, or, as its owner, turn
+    /// that on or off for everyone.
+    Indexing(IndexingArgs),
+}
+
+#[derive(Args)]
+pub struct IndexingArgs {
+    /// The volume, as your root shows it.
+    pub path: String,
+    /// `on` or `off`; leave out to show which.
+    #[arg(value_parser = ["on", "off"])]
+    pub state: Option<String>,
+    /// With `off`: also remove the index the volume has, to free its space.
+    #[arg(long)]
+    pub delete_index: bool,
 }
 
 #[derive(Args)]
@@ -137,6 +152,32 @@ pub fn run(connect: &ConnectArgs, command: VolumeCommand) -> Outcome {
                 .block_on(remote.answer_offer(ino, false))
                 .map_err(|e| format!("cannot decline {}: {e}", args.path))?;
             println!("declined {}", args.path);
+        }
+        VolumeCommand::Indexing(args) => {
+            let ino = volume(&args.path)?;
+            let Some(state) = args.state.as_deref() else {
+                let info = runtime
+                    .block_on(remote.get_volume(ino))
+                    .map_err(|e| format!("cannot read {}: {e}", args.path))?;
+                let shown = if info.indexing_off { "off" } else { "on" };
+                println!("search indexing of {}: {shown}", args.path);
+                return Ok(0);
+            };
+            if args.delete_index && state != "off" {
+                return Err("--delete-index is for turning indexing off".into());
+            }
+            runtime
+                .block_on(remote.set_volume_indexing(ino, state == "on"))
+                .map_err(|e| format!("cannot turn indexing of {} {state}: {e}", args.path))?;
+            println!("search indexing of {} is {state}, for everyone", args.path);
+            if args.delete_index {
+                let freed = runtime
+                    .block_on(raft5fs_client::indexer::delete_index(&vault, ino))
+                    .map_err(|e| format!("cannot remove the index of {}: {e}", args.path))?;
+                println!("removed its index ({})", size_text(freed));
+            } else if state == "off" {
+                println!("its index stays until you give --delete-index");
+            }
         }
         VolumeCommand::Withdraw(args) => {
             let ino = volume(&args.path)?;

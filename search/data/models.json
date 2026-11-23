@@ -1,0 +1,87 @@
+{
+  "about": "Every model search uses, pinned: the one place to change one (see search/src/vector.rs, 'Changing a model'). Native clients (raft5fs-indexer) and the web app (embedWorker.js, scripts/fetch-models.mjs) read it. Each file: its role, where it comes from (at a pinned revision), its SHA-256 and size, which clients use it, and for the web app the size of the pieces it is cut into (under GitHub Pages' 100 MB a file; 0 for whole).",
+  "models": {
+    "e5": {
+      "name": "multilingual-e5-small-int8@761b726",
+      "files": [
+        {
+          "role": "model",
+          "local": "model.onnx",
+          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_quantized.onnx",
+          "sha256": "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
+          "size": 118308185,
+          "piece": 60000000,
+          "clients": ["native", "web"]
+        },
+        {
+          "role": "tokenizer",
+          "local": "tokenizer.json",
+          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer.json",
+          "sha256": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+          "size": 17082730,
+          "piece": 0,
+          "clients": ["native", "web"]
+        },
+        {
+          "role": "tokenizerConfig",
+          "local": "tokenizer_config.json",
+          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer_config.json",
+          "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+          "size": 443,
+          "piece": 0,
+          "clients": ["web"]
+        }
+      ]
+    },
+    "clip": {
+      "name": "mclip-vit-b32-int8@58edf8c+6b7c523",
+      "files": [
+        {
+          "role": "model",
+          "local": "text.onnx",
+          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/onnx/model_quint8_avx2.onnx",
+          "sha256": "fbc8fbeaa5237d96bd1bf430057c70d34de8334a463e933a5faa305f6caeed9c",
+          "size": 135377779,
+          "piece": 60000000,
+          "clients": ["native", "web"]
+        },
+        {
+          "role": "tokenizer",
+          "local": "tokenizer.json",
+          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/tokenizer.json",
+          "sha256": "5b4e1a8171c81dfd666ae40265b9530c6e0b3d53923fe8ac493dcc84229adf81",
+          "size": 1961847,
+          "piece": 0,
+          "clients": ["native", "web"]
+        },
+        {
+          "role": "tokenizerConfig",
+          "local": "tokenizer_config.json",
+          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/tokenizer_config.json",
+          "sha256": "8f66d0ad85be46afc77e0bbf48312cff326ddb9e7290926df96a8228d69a814e",
+          "size": 371,
+          "piece": 0,
+          "clients": ["web"]
+        },
+        {
+          "role": "dense",
+          "local": "dense.safetensors",
+          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/2_Dense/model.safetensors",
+          "sha256": "d12568dc7300970a4d3dbb49068ad16cd89b99840b74b026f8e48071e9414f74",
+          "size": 1572984,
+          "piece": 0,
+          "clients": ["native", "web"]
+        },
+        {
+          "role": "vision",
+          "local": "vision.onnx",
+          "url": "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523/onnx/vision_model_quantized.onnx",
+          "sha256": "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299",
+          "size": 89117001,
+          "piece": 0,
+          "clients": ["native"]
+        }
+      ]
+    }
+  }
+}

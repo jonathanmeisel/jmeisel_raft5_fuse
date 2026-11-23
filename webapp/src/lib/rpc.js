@@ -119,6 +119,17 @@ export function connect({ onStorageError } = {}) {
     pruneEstimate: (path) => call("pruneEstimate", [path]),
     setPruneHere: (on) => call("setPruneHere", [!!on]),
     pruning: () => call("pruning", []),
+    searchLoad: (path) => call("searchLoad", [path]),
+    search: (query, volumes, limit, meaning) =>
+      call("search", [query, volumes ?? [], limit ?? 50, !!meaning]),
+    modelState: () => call("modelState", []),
+    indexStatus: () => call("indexStatus", []),
+    searchThumb: (id) => call("searchThumb", [id]),
+    volumeIndexing: (path) => call("volumeIndexing", [path]),
+    setVolumeIndexing: (path, on) => call("setVolumeIndexing", [path, !!on]),
+    setIndexHere: (on, skip, device) => call("setIndexHere", [!!on, skip ?? [], device]),
+    indexing: () => call("indexing", []),
+    setKeepSearch: (on) => call("setKeepSearch", [!!on]),
 
     /// Stores what is buffered, then ends the Worker.
     async end() {

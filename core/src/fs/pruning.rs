@@ -56,6 +56,68 @@ fn decode_claim(value: &[u8]) -> Option<([u8; 16], PruneClaim)> {
     Some((holder, PruneClaim { user, expires_ms }))
 }
 
+/// The 16 bytes that name a claim's holder.
+pub(super) fn holder_of(holder: &[u8]) -> Result<[u8; 16], FsError> {
+    holder
+        .try_into()
+        .map_err(|_| FsError::new(errno::EINVAL, "a claim's holder is named with 16 bytes"))
+}
+
+/// Takes the claim under `key` for `holder` (as `user`) for `CLAIM_TTL`,
+/// renews `holder`'s claim, or with `release` gives it up. A claim that
+/// someone else holds and that hasn't run out stands. Prunes and search
+/// indexing both claim this way.
+pub(super) async fn claim(
+    client: &Client,
+    key: Vec<u8>,
+    holder: [u8; 16],
+    user: &str,
+    release: bool,
+) -> Result<ClaimOutcome, FsError> {
+    let outcome = run_txn(client, move |txn| {
+        let key = key.clone();
+        async move {
+            let now = clock::now_millis();
+            let held = txn
+                .read_one(&key)
+                .await?
+                .value
+                .as_deref()
+                .and_then(decode_claim)
+                .filter(|(_, c)| c.expires_ms > now);
+            let outcome = match held {
+                Some((other, claim)) if other != holder => ClaimOutcome {
+                    granted: false,
+                    claim: Some(claim),
+                },
+                _ if release => {
+                    txn.write(&key, None).await?;
+                    ClaimOutcome {
+                        granted: false,
+                        claim: None,
+                    }
+                }
+                _ => {
+                    let expires_ms = now + CLAIM_TTL.as_millis() as u64;
+                    txn.write(&key, Some(&encode_claim(&holder, expires_ms, user)))
+                        .await?;
+                    ClaimOutcome {
+                        granted: true,
+                        claim: Some(PruneClaim {
+                            user: user.to_string(),
+                            expires_ms,
+                        }),
+                    }
+                }
+            };
+            txn.commit().await?;
+            Ok(outcome)
+        }
+    })
+    .await?;
+    Ok(outcome)
+}
+
 /// Whether key record `value` keeps older versions.
 fn waiting(value: Option<&[u8]>) -> bool {
     value
@@ -140,51 +202,16 @@ impl FsCore {
         release: bool,
     ) -> Result<ClaimOutcome, FsError> {
         crate::accounts::refuse_link(&caller.user)?;
-        let holder: [u8; 16] = holder
-            .try_into()
-            .map_err(|_| FsError::new(errno::EINVAL, "a pruner names itself with 16 bytes"))?;
+        let holder = holder_of(holder)?;
         self.guard_now(&self.live(), caller, ino, true).await?;
-        let user = caller.user.as_str();
-        let outcome = run_txn(&self.client, move |txn| async move {
-            let key = prune_claim_key(ino);
-            let now = clock::now_millis();
-            let held = txn
-                .read_one(&key)
-                .await?
-                .value
-                .as_deref()
-                .and_then(decode_claim)
-                .filter(|(_, c)| c.expires_ms > now);
-            let outcome = match held {
-                Some((other, claim)) if other != holder => ClaimOutcome {
-                    granted: false,
-                    claim: Some(claim),
-                },
-                _ if release => {
-                    txn.write(&key, None).await?;
-                    ClaimOutcome {
-                        granted: false,
-                        claim: None,
-                    }
-                }
-                _ => {
-                    let expires_ms = now + CLAIM_TTL.as_millis() as u64;
-                    txn.write(&key, Some(&encode_claim(&holder, expires_ms, user)))
-                        .await?;
-                    ClaimOutcome {
-                        granted: true,
-                        claim: Some(PruneClaim {
-                            user: user.to_string(),
-                            expires_ms,
-                        }),
-                    }
-                }
-            };
-            txn.commit().await?;
-            Ok(outcome)
-        })
-        .await?;
-        Ok(outcome)
+        claim(
+            &self.client,
+            prune_claim_key(ino),
+            holder,
+            &caller.user,
+            release,
+        )
+        .await
     }
 
     /// Adds every key record with older versions to the prune index, once:

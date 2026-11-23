@@ -1,0 +1,4 @@
+# getrandom 0.3 (which lopdf's rand pulls in, for PDF text in the web app)
+# finds the browser's random numbers only with this flag.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

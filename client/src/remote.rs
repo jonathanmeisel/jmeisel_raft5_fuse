@@ -73,9 +73,10 @@ use raft5fs_proto::pb::{
     RotateRequest, SetAttrRequest, WriteChunksRequest,
 };
 use raft5fs_proto::pb::{
-    ActivityRequest, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, ClaimPruneRequest,
-    CreateLinkAccountRequest, FolderLimitRequest, GrantLabelRequest, OfferVolumeRequest,
-    PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    ActivityRequest, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest, ClaimIndexRequest,
+    ClaimPruneRequest, CreateLinkAccountRequest, FolderLimitRequest, GrantLabelRequest,
+    OfferVolumeRequest, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest, UsernameRequest,
+    VolumeIndexingRequest,
 };
 use raft5fs_proto::pb::{DeleteIntroductionsRequest, PutIntroductionsRequest};
 use raft5fs_proto::types::{
@@ -1129,6 +1130,39 @@ impl Remote {
         };
         self.call_with(Retry::Idempotent, req, |mut c, req| async move {
             c.claim_prune(req).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Claims the search indexing of volume `volume` for `holder` for a
+    /// while, renews its claim, or with `release` gives it up. A claim
+    /// someone else holds stands.
+    pub async fn claim_index(
+        &self,
+        volume: u64,
+        holder: [u8; 16],
+        release: bool,
+    ) -> Result<ClaimOutcome, FsError> {
+        self.needs_protocol(since::SEARCH_INDEX, "search indexing")?;
+        let req = ClaimIndexRequest {
+            volume,
+            holder: holder.to_vec(),
+            release,
+        };
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.claim_index(req).await
+        })
+        .await?
+        .into_result()
+    }
+
+    /// Turns search indexing of volume `volume` on or off, as its owner.
+    pub async fn set_volume_indexing(&self, volume: u64, on: bool) -> Result<(), FsError> {
+        self.needs_protocol(since::SEARCH_INDEX, "search indexing")?;
+        let req = VolumeIndexingRequest { volume, on };
+        self.call_with(Retry::Idempotent, req, |mut c, req| async move {
+            c.set_volume_indexing(req).await
         })
         .await?
         .into_result()

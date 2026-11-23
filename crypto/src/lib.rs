@@ -16,6 +16,7 @@
 //! - `backup`: the store backup file, sealed to an operator key pair.
 //! - `grantees`: the users a node is granted to, sealed under its key. The
 //!   server cannot add a user that a rotation would then seal the key to.
+//! - `local`: what a device keeps for itself, sealed to the account.
 //!
 //! Each ciphertext is bound (as associated data) to its purpose, its inode,
 //! and its versions. So the server cannot use one ciphertext in place of
@@ -27,6 +28,7 @@ pub mod data;
 pub mod grantees;
 pub mod identity;
 pub mod invitation;
+pub mod local;
 pub mod node;
 pub mod password;
 pub mod pins;

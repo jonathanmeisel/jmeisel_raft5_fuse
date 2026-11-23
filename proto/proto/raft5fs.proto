@@ -100,6 +100,14 @@ service Fs {
   // Claims the prune of a node for a while, renews the holder's claim, or
   // gives it up. Needs read-write access to the node. (Protocol 10.)
   rpc ClaimPrune(ClaimPruneRequest) returns (ClaimPruneResponse);
+  // Claims the search indexing of a volume for a while, renews the holder's
+  // claim, or gives it up, as ClaimPrune does for a prune. Needs read-write
+  // access to the volume, and refuses while its owner has indexing off.
+  // (Protocol 12.)
+  rpc ClaimIndex(ClaimIndexRequest) returns (ClaimPruneResponse);
+  // Turns search indexing of a volume on or off, for everyone. Only its
+  // owner can. (Protocol 12.)
+  rpc SetVolumeIndexing(VolumeIndexingRequest) returns (EmptyResponse);
   // Makes a new top-level directory, granted read-write to its creator.
   rpc CreateVolume(CreateVolumeRequest) returns (AttrResponse);
   // Removes an empty volume and every grant of it.
@@ -1069,6 +1077,18 @@ message ClaimPruneRequest {
   bool release = 3;
 }
 
+message ClaimIndexRequest {
+  uint64 volume = 1;
+  // 16 bytes that name the indexer.
+  bytes holder = 2;
+  bool release = 3;
+}
+
+message VolumeIndexingRequest {
+  uint64 volume = 1;
+  bool on = 2;
+}
+
 message ClaimOutcome {
   // Whether `holder` holds the claim now.
   bool granted = 1;
@@ -1221,6 +1241,8 @@ message VolumeInfo {
   // since the Unix epoch). Empty and 0 if none.
   string offer_to = 2;
   uint64 offer_at = 3;
+  // Its owner turned search indexing off. (Protocol 12.)
+  bool indexing_off = 4;
 }
 
 message VolumeResponse {

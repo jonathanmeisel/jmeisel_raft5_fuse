@@ -730,6 +730,7 @@ impl From<Result<VolumeInfo, FsError>> for pb::VolumeResponse {
                         owner: v.owner.unwrap_or_default(),
                         offer_to,
                         offer_at,
+                        indexing_off: v.indexing_off,
                     })
                 }
                 Err(e) => R::Error(e.into()),
@@ -745,6 +746,7 @@ impl pb::VolumeResponse {
             Some(R::Volume(v)) => Ok(VolumeInfo {
                 owner: (!v.owner.is_empty()).then_some(v.owner),
                 offer: (!v.offer_to.is_empty()).then_some((v.offer_to, v.offer_at)),
+                indexing_off: v.indexing_off,
             }),
             Some(R::Error(e)) => Err(e.into()),
             None => Err(malformed("volume")),

@@ -76,6 +76,7 @@ impl Vault {
     /// - A file made and then renamed over another, by one person within
     ///   `TOGETHER_MS`, is how editors save: one "edited" line, with the name
     ///   it took. An edit right after a create is part of the create.
+    /// - The search index's own files (`INDEX_DIR`) are not shown.
     pub async fn activity(
         &self,
         folder: u64,
@@ -92,6 +93,12 @@ impl Vault {
             } else {
                 self.open_logged(&entry.name, entry.ino).await
             };
+            let index_dir = raft5fs_search::INDEX_DIR;
+            if dir.starts_with(&format!("{index_dir}/"))
+                || (dir.is_empty() && name.as_deref() == Some(index_dir))
+            {
+                continue;
+            }
             if entry.op == ActivityOp::Edited {
                 name = self
                     .name_of_edited(entry, &page.entries[i + 1..], &mut listings)

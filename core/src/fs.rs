@@ -146,6 +146,7 @@ pub(crate) const RESERVATION_AGE: Duration = Duration::from_secs(24 * 3600);
 
 mod activity;
 mod chunks;
+mod indexing;
 mod keys;
 mod namespace;
 mod pruning;

@@ -133,6 +133,10 @@ pub fn batch_bytes(chunk_size: u64) -> u64 {
 //   0x0F ++ volume(BE8) ++ (u64::MAX - time in ms)(BE8) ++ ino(BE8) ++ op(1)
 //                                       -> one change in that volume, newest first
 //                                          (`fs::activity`)
+//   0x10 ++ ino(BE8)                    -> marker: this node waits for a prune (`fs::pruning`)
+//   0x11 ++ ino(BE8)                    -> a claim on that node's prune (`fs::pruning`)
+//   0x12 ++ volume(BE8)                 -> a claim on indexing that volume for search
+//                                          (`fs::indexing`)
 //
 // **Deleting an inode** takes several transactions, because its chunks
 // cannot all fit in one. So the deletion is announced first:
@@ -210,6 +214,14 @@ pub(crate) fn unpruned_key(ino: u64) -> Vec<u8> {
 pub(crate) fn prune_claim_key(ino: u64) -> Vec<u8> {
     let mut key = vec![0x11];
     key.extend_from_slice(&ino.to_be_bytes());
+    key
+}
+
+/// A claim on indexing a volume for search, under `0x12`; see
+/// `fs::indexing`.
+pub(crate) fn index_claim_key(volume: u64) -> Vec<u8> {
+    let mut key = vec![0x12];
+    key.extend_from_slice(&volume.to_be_bytes());
     key
 }
 

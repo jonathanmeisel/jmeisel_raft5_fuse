@@ -26,6 +26,10 @@
 //!
 //! A record, under `VOLUME_PREFIX`, is a format byte, the owner (empty for
 //! none), and a pending transfer offer: to whom (empty for none), and when.
+//! Format 2 adds one byte of flags: bit 0 means search indexing is off (see
+//! `fs::indexing`). A record with no flags set is written in format 1, so
+//! that servers from before format 2 can still read it while a cluster is
+//! upgraded.
 
 use super::*;
 use crate::layout::{ROOT_INO, VOLUME_PREFIX, dirent_ino, dirent_prefix, volume_key};
@@ -34,29 +38,38 @@ use raft5fs_proto::types::{LINK_PREFIX, Offer, Orphan, VolumeInfo};
 use super::unreachable::{post_order, stats};
 
 const FORMAT: u8 = 1;
+const FORMAT_FLAGS: u8 = 2;
+const FLAG_INDEXING_OFF: u8 = 1;
 
 pub(crate) fn encode_volume(v: &VolumeInfo) -> Vec<u8> {
-    let mut out = vec![FORMAT];
+    let flags = if v.indexing_off { FLAG_INDEXING_OFF } else { 0 };
+    let mut out = vec![if flags == 0 { FORMAT } else { FORMAT_FLAGS }];
     raft5fs_wire::put_bytes(&mut out, v.owner.as_deref().unwrap_or("").as_bytes());
     let (to, at) = v.offer.clone().unwrap_or_default();
     raft5fs_wire::put_bytes(&mut out, to.as_bytes());
     raft5fs_wire::put_u64(&mut out, at);
+    if flags != 0 {
+        raft5fs_wire::put_u8(&mut out, flags);
+    }
     out
 }
 
 pub(crate) fn decode_volume(ino: u64, bytes: &[u8]) -> Result<VolumeInfo, FsError> {
     let parse = || -> Result<VolumeInfo, raft5fs_wire::Error> {
         let mut r = raft5fs_wire::Reader::new(bytes, "volume record");
-        if r.u8()? != FORMAT {
+        let format = r.u8()?;
+        if format != FORMAT && format != FORMAT_FLAGS {
             return Err(r.garbled());
         }
         let owner = r.string()?;
         let to = r.string()?;
         let at = r.u64()?;
+        let flags = if format == FORMAT_FLAGS { r.u8()? } else { 0 };
         r.finish()?;
         Ok(VolumeInfo {
             owner: (!owner.is_empty()).then_some(owner),
             offer: (!to.is_empty()).then_some((to, at)),
+            indexing_off: flags & FLAG_INDEXING_OFF != 0,
         })
     };
     parse().map_err(|_| FsError::new(errno::EIO, format!("volume {ino}'s record is garbled")))
@@ -420,7 +433,7 @@ impl FsCore {
                 };
                 let record = VolumeInfo {
                     owner: owner.clone(),
-                    offer: None,
+                    ..VolumeInfo::default()
                 };
                 txn.write(&volume_key(ino), Some(&encode_volume(&record)))
                     .await?;
@@ -445,6 +458,12 @@ mod tests {
             VolumeInfo {
                 owner: Some("alice".into()),
                 offer: Some(("bob".into(), 1_800_000_000)),
+                indexing_off: false,
+            },
+            VolumeInfo {
+                owner: Some("alice".into()),
+                offer: None,
+                indexing_off: true,
             },
         ] {
             assert_eq!(decode_volume(9, &encode_volume(&v)).unwrap(), v);
@@ -470,9 +489,23 @@ mod golden {
         let built = VolumeInfo {
             owner: Some("alice".into()),
             offer: Some(("bob".into(), 99)),
+            indexing_off: false,
         };
         assert_eq!(raft5fs_wire::hex(&encode_volume(&built)), golden);
         let back = decode_volume(9, &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
         assert_eq!(raft5fs_wire::hex(&encode_volume(&back)), golden);
+    }
+
+    #[test]
+    fn a_volume_record_with_indexing_off_keeps_its_bytes() {
+        let golden = "0200000005616c69636500000000000000000000000001";
+        let built = VolumeInfo {
+            owner: Some("alice".into()),
+            offer: None,
+            indexing_off: true,
+        };
+        assert_eq!(raft5fs_wire::hex(&encode_volume(&built)), golden);
+        let back = decode_volume(9, &raft5fs_wire::from_hex(golden).unwrap()).unwrap();
+        assert_eq!(back, built);
     }
 }

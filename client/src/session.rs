@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::{Attr, DirItem, FsError, Kind, Layout, SetAttr, WriteError};
 
+use crate::indexer::{self, IndexStatus, Indexer, IndexerConfig, Tools};
 use crate::paths::{DEFAULT_PATH_TTL, Dentries};
 use crate::pruner::{self, PruneStatus, Pruner, PrunerConfig};
 use crate::readahead::ReadAhead;
@@ -69,6 +70,9 @@ pub struct SessionConfig {
     /// How to prune, in the background while the session is open, what the
     /// servers say waits for a prune (see `pruner`), or `None` not to.
     pub prune: Option<PrunerConfig>,
+    /// How to index volumes for search in the background (see `indexer`),
+    /// and what to read and embed files with, or `None` not to.
+    pub index: Option<(IndexerConfig, Tools)>,
     /// Whether to buffer small sequential writes into batches.
     pub write_buffering: bool,
     /// Whether to refuse to create the files where macOS keeps its metadata
@@ -90,6 +94,7 @@ impl SessionConfig {
             cache_bytes: DEFAULT_CACHE_BYTES,
             known_keys: None,
             prune: None,
+            index: None,
             write_buffering: true,
             hide_apple_double: false,
             path_ttl: DEFAULT_PATH_TTL,
@@ -175,6 +180,21 @@ fn direct_write_result(result: Result<Attr, WriteError>, total: usize) -> Result
     }
 }
 
+/// Whether `name` is the folder of a volume's search index. Only the
+/// indexer uses it (`indexer`), so no listing shows it, and no one can
+/// make, open, move or remove anything by that name here.
+fn is_index_dir(name: &OsStr) -> bool {
+    name == OsStr::new(raft5fs_search::INDEX_DIR)
+}
+
+fn index_dir_hidden() -> FsError {
+    FsError::new(errno::ENOENT, "the search index is not shown here")
+}
+
+fn index_dir_kept() -> FsError {
+    FsError::new(errno::EPERM, "that name is kept for the search index")
+}
+
 /// Whether `name` is one of the files where macOS keeps metadata.
 fn is_apple_double(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
@@ -185,6 +205,8 @@ pub struct Session {
     vault: Arc<Vault>,
     /// The background pruner, if this session prunes.
     pruner: Mutex<Option<Pruner>>,
+    /// The background search indexer, if this session indexes.
+    indexer: Mutex<Option<Indexer>>,
     /// The virtual root's timestamps: when the session was opened.
     opened_at: SystemTime,
     /// Buffers of writes that were accepted but not stored, one for each
@@ -251,12 +273,22 @@ impl Session {
             }
             None => None,
         };
+        let indexer = match config.index {
+            Some((index_config, tools)) => {
+                let indexing = Vault::new(Arc::clone(vault.remote()))
+                    .map_err(keys)?
+                    .with_known_keys(vault.known_keys().duplicate());
+                Some(indexer::spawn(indexing, index_config, tools))
+            }
+            None => None,
+        };
         let opened_at = raft5fs_proto::clock::now();
         let readahead = ReadAhead::new(vault.remote().chunk_size(), config.cache_bytes);
         Ok(Arc::new(Self {
             vault: Arc::new(vault),
             readahead,
             pruner: Mutex::new(pruner),
+            indexer: Mutex::new(indexer),
             opened_at,
             write_bufs: Mutex::new(HashMap::new()),
             write_buffering: config.write_buffering,
@@ -264,6 +296,11 @@ impl Session {
             snapshots: SnapshotTree::new(opened_at),
             dentries: Dentries::new(config.path_ttl),
         }))
+    }
+
+    /// What this session's search indexer knows, if it has one.
+    pub fn index_status(&self) -> Option<IndexStatus> {
+        self.indexer.lock().unwrap().as_ref().map(Indexer::status)
     }
 
     /// What this session's pruner knows, if it has one.
@@ -572,8 +609,10 @@ impl Session {
     /// Ends the session. Nothing after this can store what is still
     /// buffered, so it is stored now.
     pub async fn shutdown(&self) {
-        // Anything it was pruning stays listed, for the next pruner.
+        // Anything it was pruning stays listed, for the next pruner. A pass
+        // of the indexer cut short is finished by the next one.
         drop(self.pruner.lock().unwrap().take());
+        drop(self.indexer.lock().unwrap().take());
         let inos: Vec<u64> = self.write_bufs.lock().unwrap().keys().copied().collect();
         for ino in inos {
             if let Err(e) = self.fsync(ino).await {
@@ -583,6 +622,9 @@ impl Session {
     }
 
     pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<Attr, FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_hidden());
+        }
         if parent == VIRTUAL_ROOT && is_snapshot_dir(name) {
             return Ok(self.snapshots.list_attr());
         }
@@ -657,6 +699,9 @@ impl Session {
 
     /// Makes a directory, or in the virtual root, a new volume.
     pub async fn mkdir(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_kept());
+        }
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
@@ -669,6 +714,9 @@ impl Session {
 
     /// Removes an empty directory, or in the virtual root, a volume.
     pub async fn rmdir(&self, parent: u64, name: &OsStr) -> Result<(), FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_hidden());
+        }
         if is_snapshot_ino(parent) || (parent == VIRTUAL_ROOT && is_snapshot_dir(name)) {
             return Err(read_only());
         }
@@ -682,6 +730,9 @@ impl Session {
     }
 
     pub async fn unlink(&self, parent: u64, name: &OsStr) -> Result<(), FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_hidden());
+        }
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
@@ -707,6 +758,12 @@ impl Session {
         new_name: &OsStr,
         noreplace: bool,
     ) -> Result<(), FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_hidden());
+        }
+        if is_index_dir(new_name) {
+            return Err(index_dir_kept());
+        }
         // A move from a snapshot into the live filesystem, or the reverse,
         // is a move between filesystems, which `mv` does as a copy. Inside
         // a snapshot, nothing moves.
@@ -738,6 +795,9 @@ impl Session {
     /// created it is normal (it is how `cp` copies one). Nothing checks the
     /// mode anyway, because grants decide.
     pub async fn create(&self, parent: u64, name: &OsStr, perm: u16) -> Result<Attr, FsError> {
+        if is_index_dir(name) {
+            return Err(index_dir_kept());
+        }
         if is_snapshot_ino(parent) {
             return Err(read_only());
         }
@@ -891,7 +951,14 @@ impl Session {
         })
     }
 
+    /// `ino`'s entries as front ends see them: without the search index.
     async fn list(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
+        let mut items = self.list_all(ino).await?;
+        items.retain(|i| !is_index_dir(&i.name));
+        Ok(items)
+    }
+
+    async fn list_all(&self, ino: u64) -> Result<Vec<DirItem>, FsError> {
         if is_snapshot_ino(ino) {
             return self.snapshots.readdir(&self.vault, VIRTUAL_ROOT, ino).await;
         }

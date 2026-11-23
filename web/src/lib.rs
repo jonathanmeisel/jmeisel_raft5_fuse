@@ -13,6 +13,7 @@
 //!   function (see `store`).
 #![cfg(target_arch = "wasm32")]
 
+mod search;
 mod store;
 
 use std::cell::{Cell, RefCell};
@@ -400,6 +401,7 @@ async fn open(
         sharing: RefCell::new(HashMap::new()),
         grants: RefCell::new(None),
         version_paths: RefCell::new(HashMap::new()),
+        search: search::State::default(),
     })))
 }
 
@@ -432,6 +434,8 @@ struct Inner {
     /// The session's inode for each version path that `versions` gave, so
     /// that a version opens even if its folder had another name then.
     version_paths: RefCell<HashMap<String, u64>>,
+    /// Search's state: its tools, loaded volumes, and the indexer.
+    search: search::State,
 }
 
 /// One entry of a listing.
@@ -2351,6 +2355,7 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             inner.stop_pruner();
+            drop(inner.search_stop());
             inner.handles.borrow_mut().clear();
             inner.session.shutdown().await;
             Ok(())

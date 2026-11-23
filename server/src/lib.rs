@@ -50,11 +50,11 @@ use raft5fs_proto::pb::{
 };
 use raft5fs_proto::pb::{
     ActivityRequest, ActivityResponse, AnswerOfferRequest, AssignOwnerRequest, CheckRoomRequest,
-    ClaimPruneRequest, ClaimPruneResponse, FolderLimitRequest, FolderSizesRequest,
-    FolderSizesResponse, GrantLabelRequest, OfferListResponse, OfferVolumeRequest,
-    OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest, SetQuotaRequest,
-    StorageResponse, UnprunedListResponse, UnreachableListResponse, UserListResponse,
-    UsernameRequest, VolumeResponse,
+    ClaimIndexRequest, ClaimPruneRequest, ClaimPruneResponse, FolderLimitRequest,
+    FolderSizesRequest, FolderSizesResponse, GrantLabelRequest, OfferListResponse,
+    OfferVolumeRequest, OrphanListResponse, PinsResponse, PutPinsRequest, SetCapabilitiesRequest,
+    SetQuotaRequest, StorageResponse, UnprunedListResponse, UnreachableListResponse,
+    UserListResponse, UsernameRequest, VolumeIndexingRequest, VolumeResponse,
 };
 use raft5fs_proto::pb::{
     DeleteIntroductionsRequest, EnrollmentResponse, IntroductionsResponse, PutIntroductionsRequest,
@@ -870,6 +870,27 @@ impl Fs for FsService {
             .claim_prune(&caller, r.ino, &r.holder, r.release)
             .await;
         Ok(Response::new(claimed.into()))
+    }
+
+    async fn claim_index(
+        &self,
+        r: Request<ClaimIndexRequest>,
+    ) -> Result<Response<ClaimPruneResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let claimed = self
+            .core
+            .claim_index(&caller, r.volume, &r.holder, r.release)
+            .await;
+        Ok(Response::new(claimed.into()))
+    }
+
+    async fn set_volume_indexing(
+        &self,
+        r: Request<VolumeIndexingRequest>,
+    ) -> Result<Response<EmptyResponse>, Status> {
+        let (caller, r) = self.caller(r).await?;
+        let set = self.core.set_volume_indexing(&caller, r.volume, r.on).await;
+        Ok(Response::new(set.into()))
     }
 
     async fn set_grant_label(
