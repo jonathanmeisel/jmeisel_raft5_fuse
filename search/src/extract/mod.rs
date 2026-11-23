@@ -5,16 +5,20 @@
 //! - HTML, without its tags, scripts and styles;
 //! - Office Open XML (docx, pptx, xlsx) and OpenDocument (odt, odp, ods);
 //! - GPS tracks and routes (GPX, TCX): their names, descriptions and
-//!   activity.
+//!   activity, and with a places table, where they go;
+//! - photos (JPEG, HEIC, PNG, WebP, TIFF): when, where and with what they
+//!   were taken, from their EXIF data.
 //!
 //! PDF is not here: each client reads it with its own library (see
 //! `Format::Pdf`). A file's format comes from its extension only.
 
 mod markup;
 mod office;
-mod track;
+pub mod photo;
+pub mod track;
 
-use crate::record::DocKind;
+use crate::geo::Places;
+use crate::record::{DocKind, Extra};
 
 /// The formats that the indexer knows, by extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,8 @@ pub enum Format {
     OpenDocument,
     Gpx,
     Tcx,
+    /// JPEG, HEIC, PNG, WebP or TIFF: a photo, by its EXIF data.
+    Photo,
     /// Read by the client's own PDF library, not by this crate.
     Pdf,
     Other,
@@ -55,6 +61,7 @@ impl Format {
             "gpx" => Format::Gpx,
             "tcx" => Format::Tcx,
             "pdf" => Format::Pdf,
+            "jpg" | "jpeg" | "heic" | "heif" | "png" | "webp" | "tif" | "tiff" => Format::Photo,
             e if PLAIN.contains(&e) => Format::Plain,
             _ => Format::Other,
         }
@@ -66,15 +73,40 @@ impl Format {
 pub struct Extracted {
     pub kind: DocKind,
     pub text: String,
+    /// What else the file says: when and where, for a track or a photo.
+    pub extra: Extra,
+    /// A photo's thumbnail (JPEG), which the client makes, not this crate:
+    /// it needs an image decoder (see `THUMB_PX`).
+    pub thumb: Option<Vec<u8>>,
 }
+
+/// The longest side of a photo's thumbnail, in pixels.
+pub const THUMB_PX: u32 = 256;
+
+/// The version of these readers, which records keep (`Extra::reader`).
+/// It goes up when a reader finds more in a file than before, so that
+/// files read by an older one are read again.
+///
+/// - 2: place names in tracks, and photos' dates, cameras and places.
+pub const READER: u32 = 2;
 
 /// The text of file `name`, or `None` if this crate does not read its
 /// format (`Other` and `Pdf`) or the file is damaged.
 pub fn extract(name: &str, bytes: &[u8]) -> Option<Extracted> {
+    extract_with(name, bytes, None)
+}
+
+/// `extract`, with `places` to name where tracks and photos are.
+pub fn extract_with(name: &str, bytes: &[u8], places: Option<&Places>) -> Option<Extracted> {
     let text = |text: String| {
         Some(Extracted {
             kind: DocKind::Text,
             text,
+            extra: Extra {
+                reader: READER,
+                ..Extra::default()
+            },
+            thumb: None,
         })
     };
     match Format::of(name) {
@@ -84,14 +116,9 @@ pub fn extract(name: &str, bytes: &[u8]) -> Option<Extracted> {
         Format::Pptx => text(office::pptx(bytes)?),
         Format::Xlsx => text(office::xlsx(bytes)?),
         Format::OpenDocument => text(office::open_document(bytes)?),
-        Format::Gpx => Some(Extracted {
-            kind: DocKind::Track,
-            text: track::gpx_text(bytes)?,
-        }),
-        Format::Tcx => Some(Extracted {
-            kind: DocKind::Track,
-            text: track::tcx_text(bytes)?,
-        }),
+        Format::Gpx => Some(track::parse_gpx(bytes)?.extracted(places)),
+        Format::Tcx => Some(track::parse_tcx(bytes)?.extracted(places)),
+        Format::Photo => Some(photo::photo_info(bytes).extracted(places)),
         Format::Pdf | Format::Other => None,
     }
 }
@@ -127,7 +154,8 @@ mod tests {
         assert_eq!(Format::of("a.b/report.docx"), Format::Docx);
         assert_eq!(Format::of("ride.gpx"), Format::Gpx);
         assert_eq!(Format::of("scan.pdf"), Format::Pdf);
-        assert_eq!(Format::of("photo.jpg"), Format::Other);
+        assert_eq!(Format::of("photo.JPG"), Format::Photo);
+        assert_eq!(Format::of("clip.mov"), Format::Other);
         assert_eq!(Format::of("Makefile"), Format::Other);
     }
 
@@ -142,7 +170,7 @@ mod tests {
     #[test]
     fn formats_this_crate_does_not_read_give_none() {
         assert!(extract("a.pdf", b"%PDF-1.7").is_none());
-        assert!(extract("a.jpg", b"\xFF\xD8").is_none());
+        assert!(extract("a.mov", b"\x00\x00").is_none());
         assert!(extract("a.docx", b"not a zip").is_none());
     }
 

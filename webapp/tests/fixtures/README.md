@@ -9,3 +9,8 @@ Files the browser tests upload:
 - `e5-vectors.json`: what native clients' model gives for a few texts, for
   the parity test; written by raft5fs-indexer's ignored test
   `write_the_web_apps_parity_fixture`.
+- `clip-vectors.json`: the same, for the photo model's text side; written
+  by raft5fs-indexer's ignored test `write_the_web_apps_clip_fixture`.
+- `lisbon.jpg`: the search crate's `lake.jpg` with EXIF data saying it was
+  taken in Lisbon in June 2024 on an iPhone; written by raft5fs-search's
+  ignored test `write_the_web_apps_photo_fixture`.

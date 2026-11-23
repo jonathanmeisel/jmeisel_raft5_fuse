@@ -42,11 +42,12 @@ use raft5fs_proto::{clock, errno};
 use raft5fs_search::INDEX_DIR;
 use raft5fs_search::extract::{self, Extracted, Format};
 use raft5fs_search::manifest::{IndexerId, Manifest, decode_manifest, encode_manifest};
-use raft5fs_search::record::{Chunk, DocKind, Entry, Record, Stamp};
+use raft5fs_search::record::{Chunk, DocKind, Entry, Extra, Record, Stamp, Thumb};
 use raft5fs_search::segment::{decode_segment, encode_segment};
 use raft5fs_search::text;
 use raft5fs_search::vector::quantize;
 use raft5fs_search::view;
+use raft5fs_search::view::MIN_MEANING_WORDS;
 use tokio::sync::Notify;
 
 use crate::rt::{self, AbortHandle, BoxFuture};
@@ -120,6 +121,15 @@ pub trait Embed: MaybeSend + MaybeSync {
     /// The model's name and version, as records keep it.
     fn model(&self) -> &str;
 
+    /// Whether this model supersedes `older`, a model a record names, so
+    /// that the record is embedded again with this one. A model it doesn't
+    /// know may be newer, from a device updated first: it is left alone,
+    /// so devices on two versions don't undo each other's work.
+    fn replaces(&self, older: &str) -> bool {
+        let _ = older;
+        false
+    }
+
     /// One unit vector for each of `texts`, which are pieces of files.
     fn passages<'a>(&'a self, texts: Vec<String>) -> BoxFuture<'a, Result<Vec<Vec<f32>>, String>>;
 
@@ -127,15 +137,37 @@ pub trait Embed: MaybeSend + MaybeSync {
     fn query<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<Vec<f32>, String>>;
 }
 
+/// Turns photos, and queries, into vectors in one space, so that a query's
+/// vector is near the photos that show what it says (CLIP).
+pub trait ImageEmbed: MaybeSend + MaybeSync {
+    /// The model's name and version, as records keep it.
+    fn model(&self) -> &str;
+
+    /// As `Embed::replaces`, for photos' image vectors.
+    fn replaces(&self, older: &str) -> bool {
+        let _ = older;
+        false
+    }
+
+    /// A photo's unit vector, from its file's bytes; `Ok(None)` for a
+    /// picture this can't decode.
+    fn image<'a>(&'a self, bytes: Vec<u8>) -> BoxFuture<'a, Result<Option<Vec<f32>>, String>>;
+
+    /// A query's unit vector, to compare with photos'.
+    fn query<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<Vec<f32>, String>>;
+}
+
 /// How many chunks go to the model at once.
 const EMBED_BATCH: usize = 16;
 
-/// What an indexer reads files and embeds text with.
+/// What an indexer reads files and embeds text and photos with.
 #[derive(Clone)]
 pub struct Tools {
     pub extract: Arc<dyn Extract>,
     /// `None` to index words only.
     pub embed: Option<Arc<dyn Embed>>,
+    /// `None` to leave photos' image vectors to another device.
+    pub image: Option<Arc<dyn ImageEmbed>>,
 }
 
 impl Tools {
@@ -144,6 +176,7 @@ impl Tools {
         Self {
             extract: Arc::new(BuiltIn),
             embed: None,
+            image: None,
         }
     }
 
@@ -357,6 +390,13 @@ pub async fn read_index_cached(
         }))
 }
 
+/// The bytes of `thumb`, a thumbnail in `volume`'s index.
+pub async fn read_thumb(vault: &Vault, volume: u64, thumb: &Thumb) -> Result<Vec<u8>, FsError> {
+    let dir = vault.lookup(volume, OsStr::new(INDEX_DIR)).await?.ino;
+    let file = vault.lookup(dir, OsStr::new(&thumb.file)).await?.ino;
+    vault.read(file, thumb.offset, thumb.len as usize).await
+}
+
 /// Where a device keeps the segments it has read, so that reading an index
 /// again fetches only new ones. Keys name a segment, its volume and its
 /// inode. What it keeps is the account's data: seal it
@@ -434,6 +474,8 @@ struct Pass<'a> {
     /// another at the same path.
     by_path: HashMap<String, u64>,
     pending: Vec<Entry>,
+    /// The thumbnails of `pending`'s records, one after another.
+    pending_thumbs: Vec<u8>,
     /// Folder listings, by inode: names of what is in each.
     listings: HashMap<u64, Vec<(String, u64, Kind)>>,
     stats: PassStats,
@@ -522,7 +564,13 @@ impl Pass<'_> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let name = Manifest::segment_name(&self.mine.id, self.mine.next_segment);
+        let n = self.mine.next_segment;
+        if !self.pending_thumbs.is_empty() {
+            let thumbs = Manifest::thumbs_name(&self.mine.id, n);
+            write_new(self.vault, self.dir, &thumbs, &self.pending_thumbs).await?;
+            self.pending_thumbs.clear();
+        }
+        let name = Manifest::segment_name(&self.mine.id, n);
         write_new(self.vault, self.dir, &name, &encode_segment(&self.pending)).await?;
         self.pending.clear();
         self.mine.segments.push(name);
@@ -545,16 +593,43 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Whether `old` is what this indexer would make: vectors from its
-    /// model, or none for an indexer with none. A record with no chunks
-    /// has nothing to embed, but one another device couldn't read
-    /// (`Unread`) is read here if it can be.
+    /// Whether `old` is as this indexer would leave it: vectors from its
+    /// model, from a model it doesn't supersede (`Embed::replaces`), or
+    /// none for an indexer with none. A record with no chunk long enough to
+    /// embed has nothing to embed, but one another device couldn't read
+    /// (`Unread`) is read here if it can be, and so is one that older
+    /// readers read (`extract::READER`).
     fn embedded_as_now(&self, old: &Record) -> bool {
         let name = old.path.rsplit('/').next().unwrap_or(&old.path);
         if old.kind == DocKind::Unread && self.tools.extract.reads(name) >= old.stamp.size {
             return false;
         }
-        self.tools.embed.is_none() || old.chunks.is_empty() || old.model == self.tools.model()
+        // A photo with no image vector (another device left it for one that
+        // has the model), or one from a model this one supersedes.
+        if let Some(image) = &self.tools.image
+            && old.kind == DocKind::Photo
+            && match &old.extra.image {
+                None => true,
+                Some((m, _)) => m != image.model() && image.replaces(m),
+            }
+        {
+            return false;
+        }
+        // Read by older readers, which found less in it than these would.
+        if old.extra.reader < extract::READER
+            && !matches!(Format::of(name), Format::Other)
+            && self.tools.extract.reads(name) > 0
+        {
+            return false;
+        }
+        let Some(embed) = &self.tools.embed else {
+            return true;
+        };
+        // Text with no vectors yet (a failed model, or a device with none),
+        // or vectors from a model this one supersedes.
+        !old.chunks.iter().any(|c| c.len >= MIN_MEANING_WORDS)
+            || old.model == embed.model()
+            || !(old.model.is_empty() || embed.replaces(&old.model))
     }
 
     /// `pieces` as chunks, each with its vector if this indexer embeds, and
@@ -565,6 +640,12 @@ impl Pass<'_> {
             return (pieces.into_iter().map(|(c, _)| c).collect(), String::new());
         };
         let (mut chunks, texts): (Vec<Chunk>, Vec<String>) = pieces.into_iter().unzip();
+        // Only chunks long enough to match by meaning are worth the model's
+        // time (`MIN_MEANING_WORDS`): a photo's few words aren't.
+        let worth: Vec<usize> = (0..chunks.len())
+            .filter(|&i| chunks[i].len >= MIN_MEANING_WORDS)
+            .collect();
+        let texts: Vec<String> = worth.iter().map(|&i| texts[i].clone()).collect();
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(EMBED_BATCH) {
             match embed.passages(batch.to_vec()).await {
@@ -580,8 +661,8 @@ impl Pass<'_> {
                 }
             }
         }
-        for (chunk, v) in chunks.iter_mut().zip(&vectors) {
-            chunk.vector = Some(quantize(v));
+        for (&i, v) in worth.iter().zip(&vectors) {
+            chunks[i].vector = Some(quantize(v));
         }
         (chunks, embed.model().to_string())
     }
@@ -613,9 +694,22 @@ impl Pass<'_> {
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let extract = &self.tools.extract;
         let most = extract.reads(&name);
+        let mut image = None;
         let extracted = if most > 0 && attr.size <= most {
             match read_all(self.vault, ino).await {
-                Ok(bytes) => extract.extract(&name, bytes).await,
+                Ok(bytes) => {
+                    // A photo's image vector, from the same bytes.
+                    if let Some(embed) = self.tools.image.clone()
+                        && Format::of(&name) == Format::Photo
+                    {
+                        match embed.image(bytes.clone()).await {
+                            Ok(Some(v)) => image = Some((embed.model().to_string(), quantize(&v))),
+                            Ok(None) => {}
+                            Err(e) => self.stats.failed.push((path.clone(), e)),
+                        }
+                    }
+                    extract.extract(&name, bytes).await
+                }
                 Err(e) if e.errno == errno::ENOENT => return self.gone(ino).await,
                 Err(e) => {
                     self.stats.failed.push((path, e.to_string()));
@@ -625,14 +719,36 @@ impl Pass<'_> {
         } else {
             None
         };
-        let (kind, pieces) = match extracted {
-            Some(ex) => (ex.kind, text::chunks_with_text(&ex.text)),
+        let nothing = Extra {
+            reader: extract::READER,
+            ..Extra::default()
+        };
+        let (kind, pieces, mut extra, thumb) = match extracted {
+            Some(ex) => (
+                ex.kind,
+                text::chunks_with_text(&ex.text),
+                ex.extra,
+                ex.thumb,
+            ),
             // A format with text, which this device can't read.
             None if most == 0 && !matches!(Format::of(&name), Format::Other) => {
-                (DocKind::Unread, Vec::new())
+                (DocKind::Unread, Vec::new(), nothing, None)
             }
-            None => (DocKind::Opaque, Vec::new()),
+            None => (DocKind::Opaque, Vec::new(), nothing, None),
         };
+        if kind == DocKind::Photo {
+            extra.image = image;
+        }
+        // Its thumbnail goes in the thumbnails file of the segment that
+        // will hold this record.
+        if let Some(jpeg) = thumb {
+            extra.thumb = Some(Thumb {
+                file: Manifest::thumbs_name(&self.mine.id, self.mine.next_segment),
+                offset: self.pending_thumbs.len() as u64,
+                len: jpeg.len() as u32,
+            });
+            self.pending_thumbs.extend_from_slice(&jpeg);
+        }
         let (chunks, model) = self.embed(pieces, &path).await;
         self.stats.indexed += 1;
         self.push(Entry::Record(Record {
@@ -643,6 +759,7 @@ impl Pass<'_> {
             kind,
             model,
             chunks,
+            extra,
         }))
         .await?;
         self.tell();
@@ -799,6 +916,7 @@ async fn run_pass(
         entries: loaded.entries,
         by_path,
         pending: Vec::new(),
+        pending_thumbs: Vec::new(),
         listings: HashMap::new(),
         stats: PassStats::default(),
         progress,
@@ -1060,6 +1178,7 @@ pub async fn survey(
                 kind: DocKind::Text,
                 model: String::new(),
                 chunks,
+                extra: Extra::default(),
             });
             s.index_bytes += raft5fs_search::record::encode_entry(&record).len() as u64 + 4;
             if told.elapsed() >= Duration::from_secs(1) {

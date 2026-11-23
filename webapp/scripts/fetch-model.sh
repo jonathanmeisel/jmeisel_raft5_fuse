@@ -1,5 +1,6 @@
 #!/bin/sh
-# Fetches the search model into public/models/<model>/, for the build to
+# Fetches the search model into public/models/<model>/, and copies the
+# places table into public/data/, for the build to
 # serve from the app's own origin (the page's CSP loads nothing from
 # elsewhere). The same files, at the same revision, as native clients use
 # (raft5fs-indexer's `embed`); each is checked against its SHA-256. The
@@ -30,4 +31,25 @@ if [ ! -f "$out/model.onnx.1" ]; then
     split -b 60000000 -d -a 1 "$out/model.onnx" "$out/model.onnx."
     rm "$out/model.onnx"
 fi
+# CLIP's text side, for searching photos by what they show: the same files,
+# at the same revision, as native clients' (raft5fs-indexer's `clip`).
+clip=mclip-vit-b32-int8@58edf8c+6b7c523
+crepo=https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2
+out="public/models/$clip"
+mkdir -p "$out"
+repo=$crepo
+fetch tokenizer.json tokenizer.json 5b4e1a8171c81dfd666ae40265b9530c6e0b3d53923fe8ac493dcc84229adf81
+fetch tokenizer_config.json tokenizer_config.json 8f66d0ad85be46afc77e0bbf48312cff326ddb9e7290926df96a8228d69a814e
+fetch 2_Dense/model.safetensors dense.safetensors d12568dc7300970a4d3dbb49068ad16cd89b99840b74b026f8e48071e9414f74
+if [ ! -f "$out/text.onnx.2" ]; then
+    fetch onnx/model_quint8_avx2.onnx text.onnx fbc8fbeaa5237d96bd1bf430057c70d34de8334a463e933a5faa305f6caeed9c
+    split -b 60000000 -d -a 1 "$out/text.onnx" "$out/text.onnx."
+    rm "$out/text.onnx"
+fi
 ls "$out"
+
+# The places table that tracks and photos are named with (search/data,
+# committed), served beside the model.
+mkdir -p public/data
+cp ../search/data/places.bin public/data/places.bin
+ls public/data

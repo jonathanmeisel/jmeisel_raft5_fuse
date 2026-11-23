@@ -4,11 +4,16 @@
 //! - A GPX `<trk>` and a TCX `<Activity>` are recorded; a GPX `<rte>` and a
 //!   TCX `<Course>` are planned routes.
 //! - The text has the names, descriptions, the kind of track and activity,
-//!   the month it started, its distance and its climbing. Place names from
-//!   the points are not added yet.
+//!   the month it started, its distance and its climbing, and with a
+//!   places table (`geo`), the towns, regions and countries it goes
+//!   through, from a point every `PLACE_EVERY_M`.
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+
+use super::{Extracted, READER};
+use crate::geo::Places;
+use crate::record::{DocKind, Extra};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackKind {
@@ -296,12 +301,109 @@ impl Track {
     }
 }
 
-pub fn gpx_text(bytes: &[u8]) -> Option<String> {
-    Some(parse_gpx(bytes)?.text())
+/// How far apart the points are that `places` looks up.
+const PLACE_EVERY_M: f64 = 2_000.0;
+
+/// Milliseconds since the Unix epoch, from an ISO 8601 time such as
+/// "2024-06-12T09:15:02Z", "2024-06-12T09:15:02.5+02:00", or a date alone
+/// (midnight, UTC). `None` for anything else.
+pub fn iso_ms(iso: &str) -> Option<u64> {
+    let num = |s: &str| -> Option<i64> { s.parse().ok() };
+    let y = num(iso.get(0..4)?)?;
+    let mo = num(iso.get(5..7)?)?;
+    let d = num(iso.get(8..10)?)?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (mut secs, rest) = match iso.get(10..11) {
+        Some("T" | " ") => {
+            let h = num(iso.get(11..13)?)?;
+            let mi = num(iso.get(14..16)?)?;
+            let s = num(iso.get(17..19)?)?;
+            (h * 3600 + mi * 60 + s, iso.get(19..).unwrap_or(""))
+        }
+        _ => (0, ""),
+    };
+    // Days from 1970-01-01 to the date (Howard Hinnant's days_from_civil).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {
+        let h = num(rest.get(1..3)?)?;
+        let m = num(rest.get(rest.len().saturating_sub(2)..)?).unwrap_or(0);
+        let offset = h * 3600 + m * 60;
+        secs -= if sign == '+' { offset } else { -offset };
+    }
+    u64::try_from((days * 86_400 + secs) * 1000).ok()
 }
 
-pub fn tcx_text(bytes: &[u8]) -> Option<String> {
-    Some(parse_tcx(bytes)?.text())
+impl Track {
+    /// The names of where the track goes: its points every
+    /// `PLACE_EVERY_M`, and its start and end, looked up in `places`.
+    /// Towns in the order the track meets them, then regions, then
+    /// countries; each once.
+    pub fn place_names(&self, places: &Places) -> Vec<String> {
+        let mut samples = Vec::new();
+        let mut since = f64::INFINITY;
+        for w in self.points.windows(2) {
+            if since >= PLACE_EVERY_M {
+                samples.push((w[0].0, w[0].1));
+                since = 0.0;
+            }
+            since += haversine((w[0].0, w[0].1), (w[1].0, w[1].1));
+        }
+        if let Some(&(lat, lon, _)) = self.points.last() {
+            samples.push((lat, lon));
+        }
+        let (mut towns, mut regions, mut countries) = (Vec::new(), Vec::new(), Vec::new());
+        let add = |list: &mut Vec<String>, name: Option<String>| {
+            if let Some(n) = name
+                && !list.contains(&n)
+            {
+                list.push(n);
+            }
+        };
+        for (lat, lon) in samples {
+            let p = places.locate(lat, lon);
+            add(&mut towns, p.town);
+            add(&mut regions, p.region);
+            add(&mut regions, p.region_local);
+            add(&mut countries, p.country);
+        }
+        towns.into_iter().chain(regions).chain(countries).collect()
+    }
+
+    /// The track as raft5fs-search indexes it: its text, with its places
+    /// if `places` is given, and its facts.
+    pub fn extracted(&self, places: Option<&Places>) -> Extracted {
+        let mut text = self.text();
+        if let Some(places) = places {
+            let names = self.place_names(places);
+            if !names.is_empty() {
+                text.push_str("\nPlaces: ");
+                text.push_str(&names.join(", "));
+            }
+        }
+        let units = |deg: f64| (deg * 1e4).round() as i32;
+        Extracted {
+            kind: DocKind::Track,
+            text,
+            extra: Extra {
+                reader: READER,
+                when_ms: self.start.as_deref().and_then(iso_ms).unwrap_or(0),
+                at: self.points.first().map(|p| (units(p.0), units(p.1))),
+                distance_m: self.distance_m.round() as u32,
+                climb_m: self.climb_m.round() as u32,
+                ..Extra::default()
+            },
+            thumb: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +506,139 @@ mod tests {
         assert_eq!(activity_words("MountainBiking"), "bike ride cycling");
         assert_eq!(activity_words("Running"), "run running");
         assert_eq!(activity_words("Other"), "");
+    }
+
+    fn real_places() -> Places {
+        Places::decode(include_bytes!("../../data/places.bin")).unwrap()
+    }
+
+    /// A GPX ride along `points` (latitude, longitude), as Ride with GPS
+    /// exports one.
+    fn ride(name: &str, points: &[(f64, f64)]) -> String {
+        let pts: String = points
+            .iter()
+            .map(|(la, lo)| format!(r#"<trkpt lat="{la}" lon="{lo}"><ele>200</ele></trkpt>"#))
+            .collect();
+        format!(
+            r#"<gpx><trk><name>{name}</name><type>cycling</type><trkseg>{pts}</trkseg></trk></gpx>"#
+        )
+    }
+
+    /// Points from `a` to `b`, about every 500 m.
+    fn line(a: (f64, f64), b: (f64, f64)) -> Vec<(f64, f64)> {
+        let n = (haversine(a, b) / 500.0).ceil() as usize;
+        (0..=n)
+            .map(|i| {
+                let t = i as f64 / n as f64;
+                (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_vermont_ride_names_its_towns_and_state() {
+        let places = real_places();
+        // Lyndonville to St. Johnsbury, Vermont.
+        let gpx = ride(
+            "Morning loop",
+            &line((44.5361, -72.0053), (44.4192, -72.0151)),
+        );
+        let got = parse_gpx(gpx.as_bytes()).unwrap().extracted(Some(&places));
+        assert!(got.text.contains("Lyndonville"), "{}", got.text);
+        assert!(
+            got.text.contains("Saint Johnsbury") || got.text.contains("St. Johnsbury"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("Vermont") && got.text.contains("United States"),
+            "{}",
+            got.text
+        );
+        assert!(!got.text.contains("New Hampshire"), "{}", got.text);
+        assert_eq!(got.extra.at, Some((445_361, -720_053)));
+        assert!(
+            (12_000..14_500).contains(&got.extra.distance_m),
+            "{}",
+            got.extra.distance_m
+        );
+    }
+
+    #[test]
+    fn a_route_over_the_border_names_both_states() {
+        let places = real_places();
+        // Norwich, Vermont, over the Connecticut River to Hanover, New
+        // Hampshire.
+        let gpx = ride(
+            "River crossing",
+            &line((43.7153, -72.3079), (43.7022, -72.2896)),
+        );
+        let names = parse_gpx(gpx.as_bytes()).unwrap().place_names(&places);
+        let vt = names.iter().position(|n| n == "Vermont");
+        let nh = names.iter().position(|n| n == "New Hampshire");
+        assert!(vt.is_some() && nh.is_some(), "{names:?}");
+        assert!(vt < nh, "in the order the route meets them: {names:?}");
+    }
+
+    #[test]
+    fn tcx_and_gpx_of_one_ride_name_the_same_places() {
+        let places = real_places();
+        let g = parse_gpx(GPX.as_bytes()).unwrap();
+        let t = parse_tcx(TCX.as_bytes()).unwrap();
+        assert_eq!(g.place_names(&places), t.place_names(&places));
+        assert!(g.place_names(&places).contains(&"Vermont".to_string()));
+        let (ge, te) = (g.extracted(Some(&places)), t.extracted(Some(&places)));
+        assert_eq!(te.extra.when_ms, iso_ms("2024-06-12T09:15:02Z").unwrap());
+        assert_eq!(ge.extra.climb_m, te.extra.climb_m);
+    }
+
+    #[test]
+    fn bike_routes_in_vermont_finds_the_vermont_ride_first() {
+        use crate::record::{Entry, Record, Stamp};
+        use crate::view::View;
+        let places = real_places();
+        let doc = |ino: u64, path: &str, gpx: String| {
+            let ex = parse_gpx(gpx.as_bytes()).unwrap().extracted(Some(&places));
+            Entry::Record(Record {
+                ino,
+                at_ms: 1,
+                stamp: Stamp {
+                    mtime_ns: 1,
+                    size: 1,
+                },
+                path: path.into(),
+                kind: ex.kind,
+                model: String::new(),
+                chunks: crate::text::chunks(&ex.text),
+                extra: ex.extra,
+            })
+        };
+        let view = View::new([
+            doc(
+                1,
+                "rides/a.gpx",
+                ride("Lake loop", &line((44.4759, -73.2121), (44.55, -73.2))),
+            ),
+            doc(
+                2,
+                "rides/b.gpx",
+                ride("Coast ride", &line((41.6, -70.6), (41.7, -70.5))),
+            ),
+        ]);
+        let hits = view.search("bike routes in vermont", 5);
+        assert_eq!(hits.first().map(|h| h.ino), Some(1), "{hits:?}");
+    }
+
+    #[test]
+    fn iso_times_read_with_their_offsets() {
+        assert_eq!(iso_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_ms("2024-06-12T09:15:02Z"), Some(1_718_183_702_000));
+        assert_eq!(
+            iso_ms("2024-06-12T11:15:02.250+02:00"),
+            Some(1_718_183_702_000)
+        );
+        assert_eq!(iso_ms("2024-06-12"), Some(1_718_150_400_000));
+        assert_eq!(iso_ms("June"), None);
+        assert_eq!(iso_ms("2024-13-01"), None);
     }
 }

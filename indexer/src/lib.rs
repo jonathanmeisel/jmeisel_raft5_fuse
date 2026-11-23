@@ -4,16 +4,31 @@
 //! PDF parsing is slow and can panic on damaged files, so it runs on a
 //! blocking thread, and a panic there only means "no text".
 
+pub mod clip;
 pub mod embed;
 
 use std::sync::Arc;
 
 use raft5fs_client::indexer::{BuiltIn, Extract, Tools};
 use raft5fs_search::extract::{Extracted, Format};
+use raft5fs_search::geo::Places;
 use raft5fs_search::record::DocKind;
 
 /// The most bytes of a PDF that are read.
 const PDF_MAX: u64 = 64 << 20;
+
+/// The places table, built into native clients (5 MB; the web app fetches
+/// it apart, only when it indexes).
+static PLACES_BIN: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../search/data/places.bin"
+));
+
+/// The places table, read the first time a track or photo needs it.
+pub fn places() -> &'static Places {
+    static PLACES: std::sync::OnceLock<Places> = std::sync::OnceLock::new();
+    PLACES.get_or_init(|| Places::decode(PLACES_BIN).expect("the built-in places table reads"))
+}
 
 /// The text reader for mounts, WebDAV servers and the CLI.
 pub struct Native;
@@ -32,8 +47,27 @@ impl Extract for Native {
         bytes: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Option<Extracted>> + Send + 'a>> {
         Box::pin(async move {
-            if Format::of(name) != Format::Pdf {
-                return BuiltIn.extract(name, bytes).await;
+            match Format::of(name) {
+                Format::Pdf => {}
+                Format::Gpx | Format::Tcx => {
+                    let places = places();
+                    return raft5fs_search::extract::extract_with(name, &bytes, Some(places));
+                }
+                Format::Photo => {
+                    let name = name.to_string();
+                    // Decoding a photo takes a while: not on the runtime.
+                    return tokio::task::spawn_blocking(move || {
+                        let mut got =
+                            raft5fs_search::extract::extract_with(&name, &bytes, Some(places()))?;
+                        let turned = raft5fs_search::extract::photo::photo_info(&bytes).orientation;
+                        got.thumb = thumbnail(&bytes, turned);
+                        Some(got)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                }
+                _ => return BuiltIn.extract(name, bytes).await,
             }
             let text = tokio::task::spawn_blocking(move || pdf_text(&bytes))
                 .await
@@ -42,18 +76,50 @@ impl Extract for Native {
             Some(Extracted {
                 kind: DocKind::Text,
                 text,
+                extra: raft5fs_search::record::Extra {
+                    reader: raft5fs_search::extract::READER,
+                    ..Default::default()
+                },
+                thumb: None,
             })
         })
     }
 }
 
-/// What mounts, WebDAV servers and the CLI index with: `Native`, and the
-/// embedding model (downloaded on first use).
+/// What mounts, WebDAV servers and the CLI index with: `Native`, the text
+/// model, and CLIP for photos (both downloaded on first use).
 pub fn native_tools() -> Tools {
     Tools {
         extract: Arc::new(Native),
         embed: Some(Arc::new(embed::Embedder::cached())),
+        image: Some(Arc::new(clip::ImageEmbedder::cached())),
     }
+}
+
+/// A photo's thumbnail: at most `THUMB_PX` on its longest side, turned
+/// upright by its EXIF `orientation`, as a JPEG. `None` for a format this
+/// can't decode (HEIC) or a damaged file.
+pub fn thumbnail(bytes: &[u8], orientation: u16) -> Option<Vec<u8>> {
+    use image::imageops::FilterType;
+    let px = raft5fs_search::extract::THUMB_PX;
+    let decoded = std::panic::catch_unwind(|| image::load_from_memory(bytes))
+        .ok()?
+        .ok()?;
+    let small = decoded.resize(px, px, FilterType::Triangle);
+    let upright = match orientation {
+        2 => small.fliph(),
+        3 => small.rotate180(),
+        4 => small.flipv(),
+        5 => small.rotate90().fliph(),
+        6 => small.rotate90(),
+        7 => small.rotate270().fliph(),
+        8 => small.rotate270(),
+        _ => small,
+    };
+    let mut out = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 75);
+    upright.to_rgb8().write_with_encoder(encoder).ok()?;
+    Some(out)
 }
 
 /// The text of a PDF, or `None` if it has none or can't be read.
@@ -121,10 +187,26 @@ mod tests {
         assert!(pdf_text(&cut).is_none());
     }
 
+    /// The search crate's fixture, 320 by 240.
+    const LAKE: &[u8] = include_bytes!("../../search/src/extract/testdata/lake.jpg");
+
+    #[test]
+    fn a_thumbnail_is_small_and_upright() {
+        let thumb = thumbnail(LAKE, 1).unwrap();
+        let img = image::load_from_memory(&thumb).unwrap();
+        assert_eq!((img.width(), img.height()), (256, 192));
+        assert!(thumb.len() < 20_000, "{}", thumb.len());
+        // Orientation 6: the camera was turned, so the picture is too.
+        let img = image::load_from_memory(&thumbnail(LAKE, 6).unwrap()).unwrap();
+        assert_eq!((img.width(), img.height()), (192, 256));
+        assert!(thumbnail(b"not a picture", 1).is_none());
+    }
+
     #[test]
     fn other_formats_go_to_the_built_in_reader() {
         assert_eq!(Native.reads("a.pdf"), PDF_MAX);
-        assert_eq!(Native.reads("a.jpg"), 0);
+        assert_eq!(Native.reads("a.mov"), 0);
+        assert_eq!(Native.reads("a.jpg"), BuiltIn.reads("a.jpg"));
         assert_eq!(Native.reads("a.txt"), BuiltIn.reads("a.txt"));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

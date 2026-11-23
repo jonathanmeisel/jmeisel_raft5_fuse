@@ -31,6 +31,14 @@ pub const MIN_SIMILARITY: f32 = 0.75;
 pub const MEANING_MARGIN: f32 = 0.05;
 pub const MIN_MEANING_WORDS: u32 = 8;
 
+/// How a photo matches a query by what it shows, with CLIP, whose cosines
+/// are lower: a photo of what the query says scores 0.27 to 0.37, in any
+/// language, and others 0.13 to 0.22 (raft5fs-indexer's `clip` tests). As
+/// for text, a photo matches if it is within `IMAGE_MARGIN` of the best
+/// match in the volume, and above `MIN_IMAGE_SIMILARITY`.
+pub const MIN_IMAGE_SIMILARITY: f32 = 0.24;
+pub const IMAGE_MARGIN: f32 = 0.05;
+
 /// A query's embedding, and the model that made it.
 pub struct QueryVector<'a> {
     pub model: &'a str,
@@ -90,6 +98,8 @@ pub struct Hit {
     /// on the path).
     pub preview: String,
     pub score: f32,
+    /// A photo's thumbnail, if it has one.
+    pub thumb: Option<crate::record::Thumb>,
 }
 
 /// The live records of a volume, ready to search.
@@ -136,7 +146,14 @@ impl View {
 
     /// The files that best match `query` by keyword, best first.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        self.search_with(query, None, limit)
+        self.search_with(query, None, None, limit)
+    }
+
+    /// Whether any photo here has an image vector from `model`.
+    pub fn has_image_model(&self, model: &str) -> bool {
+        self.docs
+            .iter()
+            .any(|r| r.extra.image.as_ref().is_some_and(|(m, _)| m == model))
     }
 
     /// Whether any file here has vectors from `model`: if none does, a
@@ -145,12 +162,14 @@ impl View {
         self.docs.iter().any(|r| r.model == model)
     }
 
-    /// The files that best match `query`, best first: by keyword and, with
-    /// `vector`, by meaning, merged by rank.
+    /// The files that best match `query`, best first: by keyword; with
+    /// `vector`, by meaning; and with `image`, photos by what they show;
+    /// merged by rank.
     pub fn search_with(
         &self,
         query: &str,
         vector: Option<QueryVector<'_>>,
+        image: Option<QueryVector<'_>>,
         limit: usize,
     ) -> Vec<Hit> {
         // Each list looks deeper than the result, so a file a little way
@@ -169,9 +188,13 @@ impl View {
         for &(doc, chunk) in meaning.iter().chain(&keyword).rev() {
             best_chunk.insert(doc, chunk);
         }
+        let shown = image
+            .map(|q| self.nearest_images(&q, depth))
+            .unwrap_or_default();
         let lists = [
             keyword.iter().map(|&(d, _)| d).collect::<Vec<_>>(),
             meaning.iter().map(|&(d, _)| d).collect(),
+            shown,
         ];
         fuse(&lists)
             .into_iter()
@@ -189,9 +212,29 @@ impl View {
                     kind: r.kind,
                     preview,
                     score,
+                    thumb: r.extra.thumb.clone(),
                 }
             })
             .collect()
+    }
+
+    /// The photos whose image vector is nearest `q` (see
+    /// `MIN_IMAGE_SIMILARITY`), best first.
+    fn nearest_images(&self, q: &QueryVector<'_>, limit: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, f32)> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(doc, r)| {
+                let (model, v) = r.extra.image.as_ref()?;
+                (model == q.model).then(|| (doc, dot(v, q.values)))
+            })
+            .collect();
+        let best = scored.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+        scored.retain(|&(_, s)| s >= MIN_IMAGE_SIMILARITY && s >= best - IMAGE_MARGIN);
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(limit);
+        scored.into_iter().map(|(doc, _)| doc).collect()
     }
 
     /// The files whose best chunk is nearest `q` in meaning (see
@@ -272,13 +315,13 @@ mod tests {
         };
         // "bike" is a word only in b; a matches by meaning too; c by neither.
         let hits: Vec<u64> = view
-            .search_with("bike", Some(vector()), 10)
+            .search_with("bike", Some(vector()), None, 10)
             .iter()
             .map(|h| h.ino)
             .collect();
         assert_eq!(hits, [2, 1]);
         // With no words matching, meaning alone.
-        let hits = view.search_with("velo", Some(vector()), 10);
+        let hits = view.search_with("velo", Some(vector()), None, 10);
         assert_eq!(hits.iter().map(|h| h.ino).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(hits[0].preview, "cycling over the gap and down to the lake");
         // Another model's vectors don't count.
@@ -286,7 +329,7 @@ mod tests {
             model: "other",
             values: &q,
         };
-        assert!(view.search_with("velo", Some(other), 10).is_empty());
+        assert!(view.search_with("velo", Some(other), None, 10).is_empty());
         assert!(view.has_model("m") && !view.has_model("other"));
     }
 
@@ -302,6 +345,7 @@ mod tests {
             kind: DocKind::Text,
             model: String::new(),
             chunks: chunks(text),
+            extra: Default::default(),
         })
     }
 
@@ -388,12 +432,45 @@ mod tests {
             values: &q,
         };
         let hits: Vec<u64> = view
-            .search_with("unrelated", Some(vector), 10)
+            .search_with("unrelated", Some(vector), None, 10)
             .iter()
             .map(|h| h.ino)
             .collect();
         assert_eq!(hits, [1]);
         // Found by its words all the same.
         assert_eq!(view.search("raft5fs", 10)[0].ino, 2);
+    }
+
+    #[test]
+    fn photos_match_by_what_they_show() {
+        let photo = |ino: u64, path: &str, v: &[f32]| {
+            let Entry::Record(mut r) = record(ino, 1, path, "Photo") else {
+                unreachable!()
+            };
+            r.kind = DocKind::Photo;
+            let mut v = v.to_vec();
+            normalize(&mut v);
+            r.extra.image = Some(("clip".into(), quantize(&v)));
+            Entry::Record(r)
+        };
+        let view = View::new([
+            photo(1, "beach.jpg", &[1.0, 0.0, 0.0]),
+            photo(2, "forest.jpg", &[0.0, 1.0, 0.0]),
+            record(3, 1, "notes.txt", "notes on nothing"),
+        ]);
+        assert!(view.has_image_model("clip") && !view.has_image_model("other"));
+        // A query near the beach's vector (a cosine of 0.3, as CLIP gives).
+        let mut q = vec![0.3, 0.1, (1.0f32 - 0.09 - 0.01).sqrt()];
+        normalize(&mut q);
+        let image = QueryVector {
+            model: "clip",
+            values: &q,
+        };
+        let hits: Vec<u64> = view
+            .search_with("strand", None, Some(image), 10)
+            .iter()
+            .map(|h| h.ino)
+            .collect();
+        assert_eq!(hits, [1]);
     }
 }

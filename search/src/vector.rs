@@ -4,6 +4,20 @@
 //!
 //! Quantizing to one byte loses little: a dot product moves by about 0.01,
 //! much less than what tells a match from a miss.
+//!
+//! **Changing a model** (`E5_MODEL` or `CLIP_MODEL`):
+//!
+//! - Give the new export a new name here, and add the old name to
+//!   `E5_REPLACES` (or `CLIP_REPLACES`). Devices on the new version embed
+//!   the old records again at their next walk; devices still on the old
+//!   version leave the new records alone.
+//! - Pin its files and SHA-256s where clients fetch it: raft5fs-indexer's
+//!   `embed` (or `clip`), the web app's `embedWorker.js` (and the name in
+//!   `e5.js` or `clip.js`), and `scripts/fetch-model.sh`.
+//! - Write the parity fixtures again (raft5fs-indexer's ignored
+//!   `write_the_web_apps_*` tests), and run `npm run test:parity`.
+//! - Measure again what scores tell a match from a miss (the real-model
+//!   tests print them), and set `view`'s floors and margins to fit.
 
 use crate::record::Vector;
 
@@ -15,6 +29,25 @@ pub const E5_MODEL: &str = "multilingual-e5-small-int8@761b726";
 
 /// The size of its vectors.
 pub const E5_DIMS: usize = 384;
+
+/// The text models `E5_MODEL` supersedes: records that name one are
+/// embedded again at a device's next walk. To upgrade the model, add the
+/// old name here; a device still on the old version doesn't know the new
+/// name, so it leaves those records alone.
+pub const E5_REPLACES: &[&str] = &[];
+
+/// The model photos are searched by what they show with: OpenAI's CLIP
+/// ViT-B/32 for images (Xenova's int8 export, revision 6b7c523), and
+/// sentence-transformers' clip-ViT-B-32-multilingual-v1 for text (its
+/// int8 export, revision 58edf8c), which puts text where CLIP puts the
+/// image (see raft5fs-indexer's `clip`).
+pub const CLIP_MODEL: &str = "mclip-vit-b32-int8@58edf8c+6b7c523";
+
+/// The size of its vectors.
+pub const CLIP_DIMS: usize = 512;
+
+/// The photo models `CLIP_MODEL` supersedes, as for `E5_REPLACES`.
+pub const CLIP_REPLACES: &[&str] = &[];
 
 /// A vector of unit length as one byte per dimension.
 pub fn quantize(v: &[f32]) -> Vector {

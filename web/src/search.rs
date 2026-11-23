@@ -2,9 +2,13 @@
 //! words and meaning, and kept up to date by this tab when it holds the
 //! account's index lock.
 //!
-//! - **The app's tools.** The Worker gives `setSearchTools` four functions:
+//! - **The app's tools.** The Worker gives `setSearchTools` functions:
 //!   `embed(texts, query)` (the embed Worker's model), `pdf(bytes)` (the PDF
-//!   module), and `cacheGet(key)` / `cachePut(key, bytes)` (IndexedDB).
+//!   module), `cacheGet(key)` / `cachePut(key, bytes)` (IndexedDB),
+//!   `places()` (the places table, `places.bin`, which the app serves and
+//!   this checks against its pinned SHA-256), `thumb(bytes)` (a photo's
+//!   thumbnail, drawn by the embed Worker), and `clip(text)` (a query's
+//!   vector for searching photos by what they show).
 //!   Indexing and search use them as raft5fs-client's `Embed`, `Extract`
 //!   and `SegmentCache`.
 //! - **The cache** keeps the segments this browser has read, sealed with
@@ -27,14 +31,16 @@ use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
-use raft5fs_search::extract::{Extracted, Format};
+use raft5fs_search::extract::{Extracted, Format, READER, extract_with};
+use raft5fs_search::geo::{PLACES_SHA256, Places};
 use raft5fs_search::rank::fuse;
-use raft5fs_search::record::DocKind;
-use raft5fs_search::vector::E5_MODEL;
+use raft5fs_search::record::{DocKind, Extra, Thumb};
+use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL};
 use raft5fs_search::view::{QueryVector, View};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
 use super::{Fs, Inner, failure, fs_failure, promise};
 
@@ -73,7 +79,30 @@ struct JsTools {
     pdf: Function,
     cache_get: Function,
     cache_put: Function,
+    places: Function,
+    thumb: Function,
+    clip: Function,
+    /// The places table, once fetched.
+    places_table: RefCell<Option<Rc<Places>>>,
     identity: Arc<Identity>,
+}
+
+impl JsTools {
+    /// The places table: fetched and checked the first time, or `None` if
+    /// it can't be had now.
+    async fn places(&self) -> Option<Rc<Places>> {
+        if let Some(p) = self.places_table.borrow().clone() {
+            return Some(p);
+        }
+        let got = call(&self.places, &[]).await.ok()?;
+        let bytes = got.dyn_into::<Uint8Array>().ok()?.to_vec();
+        if raft5fs_wire::hex(&Sha256::digest(&bytes)) != PLACES_SHA256 {
+            return None;
+        }
+        let table = Rc::new(Places::decode(&bytes).ok()?);
+        self.places_table.replace(Some(Rc::clone(&table)));
+        Some(table)
+    }
 }
 
 async fn call(f: &Function, args: &[JsValue]) -> Result<JsValue, String> {
@@ -119,6 +148,10 @@ impl Embed for JsEmbed {
         E5_MODEL
     }
 
+    fn replaces(&self, older: &str) -> bool {
+        raft5fs_search::vector::E5_REPLACES.contains(&older)
+    }
+
     fn passages<'a>(&'a self, texts: Vec<String>) -> Local<'a, Result<Vec<Vec<f32>>, String>> {
         Box::pin(self.vectors(texts, false))
     }
@@ -145,14 +178,37 @@ impl Extract for JsExtract {
 
     fn extract<'a>(&'a self, name: &'a str, bytes: Vec<u8>) -> Local<'a, Option<Extracted>> {
         Box::pin(async move {
-            if Format::of(name) != Format::Pdf {
-                return BuiltIn.extract(name, bytes).await;
+            match Format::of(name) {
+                Format::Pdf => {}
+                Format::Gpx | Format::Tcx | Format::Photo => {
+                    let places = self.0.places().await;
+                    let mut got = extract_with(name, &bytes, places.as_deref())?;
+                    // Without places: read it again once they can be had.
+                    if places.is_none() {
+                        got.extra.reader = READER - 1;
+                    }
+                    if got.kind == DocKind::Photo {
+                        let bytes = Uint8Array::from(bytes.as_slice());
+                        got.thumb = call(&self.0.thumb, &[bytes.into()])
+                            .await
+                            .ok()
+                            .and_then(|t| t.dyn_into::<Uint8Array>().ok())
+                            .map(|t| t.to_vec());
+                    }
+                    return Some(got);
+                }
+                _ => return BuiltIn.extract(name, bytes).await,
             }
             let bytes = Uint8Array::from(bytes.as_slice());
             let text = call(&self.0.pdf, &[bytes.into()]).await.ok()?.as_string()?;
             Some(Extracted {
                 kind: DocKind::Text,
                 text,
+                extra: Extra {
+                    reader: READER,
+                    ..Extra::default()
+                },
+                thumb: None,
             })
         })
     }
@@ -189,6 +245,22 @@ struct HitJs {
     preview: String,
     /// `text`, `track`, `photo`, or `file` (found by its name only).
     kind: &'static str,
+    /// For `searchThumb`, if it has a thumbnail.
+    thumb: Option<String>,
+}
+
+/// A thumbnail's id for JavaScript: its volume, file, offset and length.
+fn thumb_id(volume: u64, t: &Thumb) -> String {
+    format!("{volume}:{}:{}:{}", t.offset, t.len, t.file)
+}
+
+fn parse_thumb_id(id: &str) -> Option<(u64, Thumb)> {
+    let mut parts = id.splitn(4, ':');
+    let volume = parts.next()?.parse().ok()?;
+    let offset = parts.next()?.parse().ok()?;
+    let len = parts.next()?.parse().ok()?;
+    let file = parts.next()?.to_string();
+    Some((volume, Thumb { file, offset, len }))
 }
 
 /// A loaded volume, for JavaScript.
@@ -239,6 +311,9 @@ impl Inner {
         Ok(Tools {
             extract: Arc::new(JsExtract(Rc::clone(&tools))),
             embed: Some(Arc::new(JsEmbed(tools))),
+            // Image vectors take a model too big for a browser: native
+            // devices fill them in.
+            image: None,
         })
     }
 
@@ -329,16 +404,17 @@ fn loaded_js(l: &Loaded) -> LoadedJs {
 
 #[wasm_bindgen]
 impl Fs {
-    /// Gives search the app's functions (see the top of `search`). Until
-    /// then, search works by words only, with no cache.
+    /// Gives search the app's functions: `tools` is an object with
+    /// `embed`, `pdf`, `cacheGet`, `cachePut`, `places`, `thumb` and `clip`
+    /// (see the top of `search`). Until then, search works by words only,
+    /// with no cache.
     #[wasm_bindgen(js_name = setSearchTools)]
-    pub fn set_search_tools(
-        &self,
-        embed: Function,
-        pdf: Function,
-        cache_get: Function,
-        cache_put: Function,
-    ) -> Result<(), JsValue> {
+    pub fn set_search_tools(&self, tools: JsValue) -> Result<(), JsValue> {
+        let get = |name: &str| -> Result<Function, JsValue> {
+            js_sys::Reflect::get(&tools, &name.into())?
+                .dyn_into::<Function>()
+                .map_err(|_| failure("EINVAL", &format!("search tools need a function {name}")))
+        };
         let identity = self
             .0
             .vault()
@@ -346,10 +422,14 @@ impl Fs {
             .identity()
             .ok_or_else(|| failure("EACCES", "not logged in"))?;
         self.0.search.tools.replace(Some(Rc::new(JsTools {
-            embed,
-            pdf,
-            cache_get,
-            cache_put,
+            embed: get("embed")?,
+            pdf: get("pdf")?,
+            cache_get: get("cacheGet")?,
+            cache_put: get("cachePut")?,
+            places: get("places")?,
+            thumb: get("thumb")?,
+            clip: get("clip")?,
+            places_table: RefCell::new(None),
             identity,
         })));
         Ok(())
@@ -392,6 +472,12 @@ impl Fs {
         struct Found {
             hits: Vec<HitJs>,
             meaning: bool,
+            /// Whether files here have text vectors, so that a search with
+            /// `meaning` needs the text model.
+            vectors: bool,
+            /// Whether photos here have image vectors, so that a search
+            /// with `meaning` also needs the CLIP text model.
+            images: bool,
             meaning_error: Option<String>,
         }
         let inner = Rc::clone(&self.0);
@@ -406,10 +492,28 @@ impl Fs {
                 .collect();
             let limit = limit.clamp(1, 200) as usize;
             let has_vectors = views.iter().any(|(_, l)| l.view.has_model(E5_MODEL));
+            let has_images = views
+                .iter()
+                .any(|(_, l)| l.view.has_image_model(CLIP_MODEL));
             let mut meaning_error = None;
             let vector = if meaning && has_vectors {
                 let embedded = match inner.tools() {
                     Ok(tools) => JsEmbed(tools).query(&query).await,
+                    Err(e) => Err(e.message),
+                };
+                embedded.map_err(|e| meaning_error = Some(e)).ok()
+            } else {
+                None
+            };
+            let image_vector = if meaning && has_images {
+                let embedded = match inner.tools() {
+                    Ok(tools) => call(&tools.clip, &[JsValue::from_str(&query)])
+                        .await
+                        .and_then(|v| {
+                            v.dyn_into::<Float32Array>()
+                                .map(|a| a.to_vec())
+                                .map_err(|_| "the photo model gave no vector".to_string())
+                        }),
                     Err(e) => Err(e.message),
                 };
                 embedded.map_err(|e| meaning_error = Some(e)).ok()
@@ -423,9 +527,13 @@ impl Fs {
                     model: E5_MODEL,
                     values,
                 });
+                let image = image_vector.as_deref().map(|values| QueryVector {
+                    model: CLIP_MODEL,
+                    values,
+                });
                 let list: Vec<(u64, u64)> = l
                     .view
-                    .search_with(&query, q, limit)
+                    .search_with(&query, q, image, limit)
                     .into_iter()
                     .map(|h| {
                         let key = (*ino, h.ino);
@@ -435,6 +543,7 @@ impl Fs {
                                 path: format!("{}/{}", l.path, h.path),
                                 preview: h.preview,
                                 kind: kind_name(h.kind),
+                                thumb: h.thumb.as_ref().map(|t| thumb_id(*ino, t)),
                             },
                         );
                         key
@@ -449,9 +558,25 @@ impl Fs {
                 .collect();
             Ok(Found {
                 hits,
-                meaning: has_vectors,
+                meaning: has_vectors || has_images,
+                vectors: has_vectors,
+                images: has_images,
                 meaning_error,
             })
+        })
+    }
+
+    /// A thumbnail that `search` named (a hit's `thumb`): JPEG bytes.
+    #[wasm_bindgen(js_name = searchThumb)]
+    pub fn search_thumb(&self, id: String) -> Promise {
+        let inner = Rc::clone(&self.0);
+        future_to_promise(async move {
+            let (volume, thumb) =
+                parse_thumb_id(&id).ok_or_else(|| failure("EINVAL", "not a thumbnail"))?;
+            let bytes = indexer::read_thumb(inner.vault(), volume, &thumb)
+                .await
+                .map_err(fs_failure)?;
+            Ok(Uint8Array::from(bytes.as_slice()).into())
         })
     }
 

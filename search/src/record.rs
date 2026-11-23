@@ -13,8 +13,10 @@ use raft5fs_wire::{self as wire, Reader};
 
 use crate::Error;
 
-/// The format byte at the start of every entry.
-const FORMAT: u8 = 1;
+/// The format byte at the start of every entry. Format 2 adds `Extra` to
+/// a record; format 1 records read with none.
+const FORMAT: u8 = 2;
+const FORMAT_1: u8 = 1;
 
 /// What the indexer saw of a file: if this changes, the file changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,8 +98,118 @@ pub struct Record {
     /// The embedding model of the chunks' vectors; empty for none.
     pub model: String,
     pub chunks: Vec<Chunk>,
+    pub extra: Extra,
 }
 
+/// What a record knows besides text: from a track or a photo.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Extra {
+    /// The version of the readers that read the file (`extract::READER`):
+    /// a file read by an older one is read again.
+    pub reader: u32,
+    /// When it was taken or recorded (ms since the Unix epoch), or 0.
+    pub when_ms: u64,
+    /// Where (a photo) or where it starts (a track): latitude and
+    /// longitude in 1e-4 degrees.
+    pub at: Option<(i32, i32)>,
+    pub distance_m: u32,
+    pub climb_m: u32,
+    /// A small picture of it, in another index file.
+    pub thumb: Option<Thumb>,
+    /// A photo's image vector, and the model that made it.
+    pub image: Option<(String, Vector)>,
+}
+
+/// Where a thumbnail is: bytes `offset..offset + len` of index file `file`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thumb {
+    pub file: String,
+    pub offset: u64,
+    pub len: u32,
+}
+
+fn put_vector(out: &mut Vec<u8>, v: &Vector) {
+    wire::put_u32(out, v.scale.to_bits());
+    let bytes: Vec<u8> = v.values.iter().map(|&x| x as u8).collect();
+    wire::put_bytes(out, &bytes);
+}
+
+fn read_vector(r: &mut Reader<'_>) -> Result<Vector, Error> {
+    let scale = f32::from_bits(r.u32()?);
+    let values = r.bytes()?.iter().map(|&b| b as i8).collect();
+    Ok(Vector { scale, values })
+}
+
+fn put_extra(out: &mut Vec<u8>, e: &Extra) {
+    wire::put_u32(out, e.reader);
+    wire::put_u64(out, e.when_ms);
+    match e.at {
+        None => wire::put_u8(out, 0),
+        Some((lat, lon)) => {
+            wire::put_u8(out, 1);
+            wire::put_u32(out, lat as u32);
+            wire::put_u32(out, lon as u32);
+        }
+    }
+    wire::put_u32(out, e.distance_m);
+    wire::put_u32(out, e.climb_m);
+    match &e.thumb {
+        None => wire::put_u8(out, 0),
+        Some(t) => {
+            wire::put_u8(out, 1);
+            wire::put_bytes(out, t.file.as_bytes());
+            wire::put_u64(out, t.offset);
+            wire::put_u32(out, t.len);
+        }
+    }
+    match &e.image {
+        None => wire::put_u8(out, 0),
+        Some((model, v)) => {
+            wire::put_u8(out, 1);
+            wire::put_bytes(out, model.as_bytes());
+            put_vector(out, v);
+        }
+    }
+}
+
+fn read_extra(r: &mut Reader<'_>) -> Result<Extra, Error> {
+    let reader = r.u32()?;
+    let when_ms = r.u64()?;
+    let at = match r.u8()? {
+        0 => None,
+        1 => Some((r.u32()? as i32, r.u32()? as i32)),
+        _ => return Err(r.garbled()),
+    };
+    let distance_m = r.u32()?;
+    let climb_m = r.u32()?;
+    let thumb = match r.u8()? {
+        0 => None,
+        1 => Some(Thumb {
+            file: r.string()?,
+            offset: r.u64()?,
+            len: r.u32()?,
+        }),
+        _ => return Err(r.garbled()),
+    };
+    let image = match r.u8()? {
+        0 => None,
+        1 => Some((r.string()?, read_vector(r)?)),
+        _ => return Err(r.garbled()),
+    };
+    Ok(Extra {
+        reader,
+        when_ms,
+        at,
+        distance_m,
+        climb_m,
+        thumb,
+        image,
+    })
+}
+
+// Nearly every entry is a record, so boxing it would only add an
+// allocation to each.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     Record(Record),
@@ -150,12 +262,11 @@ pub fn encode_entry(entry: &Entry) -> Vec<u8> {
                     None => wire::put_u8(&mut out, 0),
                     Some(v) => {
                         wire::put_u8(&mut out, 1);
-                        wire::put_u32(&mut out, v.scale.to_bits());
-                        let bytes: Vec<u8> = v.values.iter().map(|&x| x as u8).collect();
-                        wire::put_bytes(&mut out, &bytes);
+                        put_vector(&mut out, v);
                     }
                 }
             }
+            put_extra(&mut out, &r.extra);
         }
     }
     out
@@ -163,7 +274,8 @@ pub fn encode_entry(entry: &Entry) -> Vec<u8> {
 
 pub fn decode_entry(bytes: &[u8]) -> Result<Entry, Error> {
     let mut r = Reader::new(bytes, "a search index entry");
-    if r.u8()? != FORMAT {
+    let format = r.u8()?;
+    if format != FORMAT && format != FORMAT_1 {
         return Err(r.garbled());
     }
     let tag = r.u8()?;
@@ -192,11 +304,7 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, Error> {
                 }
                 let vector = match r.u8()? {
                     0 => None,
-                    1 => {
-                        let scale = f32::from_bits(r.u32()?);
-                        let values = r.bytes()?.iter().map(|&b| b as i8).collect();
-                        Some(Vector { scale, values })
-                    }
+                    1 => Some(read_vector(&mut r)?),
                     _ => return Err(r.garbled()),
                 };
                 chunks.push(Chunk {
@@ -214,6 +322,11 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, Error> {
                 kind,
                 model,
                 chunks,
+                extra: if format == FORMAT_1 {
+                    Extra::default()
+                } else {
+                    read_extra(&mut r)?
+                },
             })
         }
         _ => return Err(r.garbled()),
@@ -246,13 +359,41 @@ mod tests {
                     values: vec![-1, 2],
                 }),
             }],
+            extra: Extra::default(),
         })
+    }
+
+    /// `sample`, with everything a photo has.
+    fn photo() -> Entry {
+        let Entry::Record(mut r) = sample() else {
+            unreachable!()
+        };
+        r.extra = Extra {
+            reader: 2,
+            when_ms: 3,
+            at: Some((-1, 2)),
+            distance_m: 4,
+            climb_m: 5,
+            thumb: Some(Thumb {
+                file: "t".into(),
+                offset: 6,
+                len: 7,
+            }),
+            image: Some((
+                "c".into(),
+                Vector {
+                    scale: 0.5,
+                    values: vec![1],
+                },
+            )),
+        };
+        Entry::Record(r)
     }
 
     #[test]
     fn entries_round_trip() {
         let gone = Entry::Gone { ino: 3, at_ms: 4 };
-        for e in [sample(), gone] {
+        for e in [sample(), photo(), gone] {
             assert_eq!(decode_entry(&encode_entry(&e)).unwrap(), e);
         }
     }
@@ -270,17 +411,37 @@ mod tests {
     /// The stored layout of an entry, pinned.
     #[test]
     fn an_entry_keeps_its_bytes() {
+        let golden = "0200000000000000000700000000000003e8\
+                      00000000000000050000000000000009\
+                      00000007612f622e74787400000000016d00000001\
+                      0000000268690000000200000001000000026869000201\
+                      3f00000000000002ff02\
+                      00000002000000000000000301ffffffff00000002\
+                      000000040000000501000000017400000000000000060000000701\
+                      00000001633f0000000000000101";
+        assert_eq!(raft5fs_wire::hex(&encode_entry(&photo())), golden);
+        let gone = "0201000000000000000300000000000000\
+                    04";
+        assert_eq!(
+            raft5fs_wire::hex(&encode_entry(&Entry::Gone { ino: 3, at_ms: 4 })),
+            gone
+        );
+    }
+
+    /// Entries from before format 2 still read, with no `Extra`.
+    #[test]
+    fn a_format_1_entry_still_reads() {
         let golden = "0100000000000000000700000000000003e8\
                       00000000000000050000000000000009\
                       00000007612f622e74787400000000016d00000001\
                       0000000268690000000200000001000000026869000201\
                       3f00000000000002ff02";
-        assert_eq!(raft5fs_wire::hex(&encode_entry(&sample())), golden);
-        let gone = "0101000000000000000300000000000000\
-                    04";
+        let bytes = raft5fs_wire::from_hex(golden).unwrap();
+        assert_eq!(decode_entry(&bytes).unwrap(), sample());
+        let gone = raft5fs_wire::from_hex("010100000000000000030000000000000004").unwrap();
         assert_eq!(
-            raft5fs_wire::hex(&encode_entry(&Entry::Gone { ino: 3, at_ms: 4 })),
-            gone
+            decode_entry(&gone).unwrap(),
+            Entry::Gone { ino: 3, at_ms: 4 }
         );
     }
 }

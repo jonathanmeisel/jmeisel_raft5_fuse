@@ -62,6 +62,7 @@ fn a_query_finds_a_file_by_meaning_in_another_language() {
     let tools = Tools {
         extract: Arc::new(BuiltIn),
         embed: Some(Arc::clone(&embedder) as Arc<dyn Embed>),
+        image: None,
     };
     let stats = rt
         .block_on(index_claimed(
@@ -84,6 +85,7 @@ fn a_query_finds_a_file_by_meaning_in_another_language() {
             model: MODEL,
             values: &q,
         }),
+        None,
         5,
     );
     let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -100,11 +102,102 @@ fn a_query_finds_a_file_by_meaning_in_another_language() {
             model: MODEL,
             values: &q,
         };
-        let hits = view.search_with(query, Some(vector), 5);
+        let hits = view.search_with(query, Some(vector), None, 5);
         assert_eq!(
             hits.first().map(|h| h.path.as_str()),
             Some(want),
             "{query}: {hits:?}"
         );
+    }
+}
+
+/// Set RAFT5FS_MODEL_DIR and RAFT5FS_CLIP_DIR as for the models' own
+/// tests, and run with --ignored.
+#[test]
+#[ignore = "needs the models (about 360 MB)"]
+fn photos_are_found_by_what_they_show_with_thumbnails() {
+    use raft5fs_indexer::Native;
+    use raft5fs_indexer::clip::{Clip, ImageEmbedder};
+    use raft5fs_search::vector::CLIP_MODEL;
+    let dir = |var: &str| std::env::var_os(var).map(PathBuf::from);
+    let clip = Arc::new(ImageEmbedder(Arc::new(Clip::new(
+        dir("RAFT5FS_CLIP_DIR").unwrap_or_else(raft5fs_indexer::clip::cache_dir),
+    ))));
+    let e5 = Arc::new(Embedder(Arc::new(E5::new(
+        dir("RAFT5FS_MODEL_DIR").unwrap_or_else(cache_dir),
+    ))));
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let remote = rt
+        .block_on(Remote::connect(
+            &backend.addresses(),
+            credentials(TESTER),
+            Some(fs_tls()),
+        ))
+        .unwrap();
+    let vault = Vault::new(Arc::new(remote)).unwrap();
+    let v = rt
+        .block_on(vault.create_volume(OsStr::new("photos"), 0o755))
+        .unwrap()
+        .ino;
+    let pictures: [(&str, &[u8]); 4] = [
+        ("IMG_1.jpg", include_bytes!("pictures/beach.jpg")),
+        ("IMG_2.jpg", include_bytes!("pictures/forest.jpg")),
+        ("IMG_3.jpg", include_bytes!("pictures/stop.jpg")),
+        ("IMG_4.jpg", include_bytes!("pictures/cake.jpg")),
+    ];
+    for (name, body) in pictures {
+        let ino = rt
+            .block_on(vault.create(v, OsStr::new(name), 0o644))
+            .unwrap()
+            .ino;
+        rt.block_on(vault.write(ino, 0, body)).unwrap();
+    }
+    let tools = Tools {
+        extract: Arc::new(Native),
+        embed: Some(Arc::clone(&e5) as Arc<dyn Embed>),
+        image: Some(Arc::clone(&clip) as Arc<dyn raft5fs_client::indexer::ImageEmbed>),
+    };
+    let stats = rt
+        .block_on(index_claimed(
+            &vault,
+            v,
+            new_id(),
+            &IndexerConfig::default(),
+            &tools,
+            PassKind::Auto,
+            &mut |_| {},
+        ))
+        .unwrap();
+    assert!(stats.failed.is_empty(), "{:?}", stats.failed);
+    let view = View::new(rt.block_on(read_index(&vault, v)).unwrap().unwrap().entries);
+    assert!(view.has_image_model(CLIP_MODEL));
+    for (query, want) in [
+        ("Strand am Meer", "IMG_1.jpg"),
+        ("un bosque", "IMG_2.jpg"),
+        ("a stop sign", "IMG_3.jpg"),
+    ] {
+        let q = rt
+            .block_on(raft5fs_client::indexer::ImageEmbed::query(
+                clip.as_ref(),
+                query,
+            ))
+            .unwrap();
+        let image = QueryVector {
+            model: CLIP_MODEL,
+            values: &q,
+        };
+        let hits = view.search_with(query, None, Some(image), 5);
+        assert_eq!(
+            hits.first().map(|h| h.path.as_str()),
+            Some(want),
+            "{query}: {hits:?}"
+        );
+        // Each has a thumbnail, as a JPEG.
+        let thumb = hits[0].thumb.clone().expect("a thumbnail");
+        let jpeg = rt
+            .block_on(raft5fs_client::indexer::read_thumb(&vault, v, &thumb))
+            .unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
     }
 }

@@ -8,6 +8,7 @@ edition.workspace = true
 raft5fs-client = { workspace = true }
 raft5fs-search = { workspace = true }
 pdf-extract = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff"] }
 tokio = { workspace = true }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-23"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }

@@ -192,7 +192,15 @@ function openChannel(user) {
 function joined(user, { early }) {
   for (const [name, bytes] of early.splice(0)) fs.storeUpdated(name, bytes);
   searchPrefix = `${config.fsId}/${user}/`;
-  fs.setSearchTools(embed, readPdf, cacheGet, cachePut);
+  fs.setSearchTools({
+    embed,
+    pdf: readPdf,
+    cacheGet,
+    cachePut,
+    places: fetchPlaces,
+    thumb: makeThumb,
+    clip: clipQuery,
+  });
   navigator.locks.request(`raft5fs:${config.fsId}:${user}:prune`, () => {
     if (!fs) return null;
     prunesHere = true;
@@ -259,6 +267,20 @@ function embedCall(message, transfer = []) {
 
 /// The vectors of `texts` (an array of strings), as Float32Arrays.
 const embed = async (texts, query) => (await embedCall({ op: "embed", texts, query })).vectors;
+
+/// The places table (search/data/places.bin), which the app serves; the
+/// wasm client checks it.
+async function fetchPlaces() {
+  const response = await fetch(new URL(`${import.meta.env.BASE_URL}data/places.bin`, self.location.origin));
+  if (!response.ok) throw new Error(`no places table on this site (${response.status})`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/// A query's vector for photos (CLIP's text side), as a Float32Array.
+const clipQuery = async (text) => (await embedCall({ op: "clip", text })).vector;
+
+/// A photo's thumbnail (a JPEG), or null.
+const makeThumb = async (bytes) => (await embedCall({ op: "thumb", bytes }, [bytes.buffer])).thumb;
 
 /// The text of a PDF, or null.
 const readPdf = async (bytes) => (await embedCall({ op: "pdf", bytes }, [bytes.buffer])).text;
@@ -751,6 +773,7 @@ const methods = {
   /// in this browser so that loading it downloads nothing.
   modelState: async () => (await embedCall({ op: "state" })).state,
   indexStatus: () => session().indexStatus(),
+  searchThumb: (id) => session().searchThumb(id),
   volumeIndexing: (path) => session().volumeIndexing(path),
   setVolumeIndexing: (path, on) => session().setVolumeIndexing(path, on),
   /// Turns this browser's background indexing on or off (it runs in the

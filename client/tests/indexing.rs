@@ -423,13 +423,20 @@ fn a_session_indexes_in_the_background() {
 /// that share words are close. Fails on purpose while `broken` is set.
 struct Fake {
     model: &'static str,
+    /// The models it supersedes.
+    replaces: &'static [&'static str],
     broken: std::sync::atomic::AtomicBool,
 }
 
 impl Fake {
     fn new(model: &'static str) -> Arc<Self> {
+        Self::replacing(model, &[])
+    }
+
+    fn replacing(model: &'static str, replaces: &'static [&'static str]) -> Arc<Self> {
         Arc::new(Self {
             model,
+            replaces,
             broken: false.into(),
         })
     }
@@ -454,6 +461,10 @@ impl Embed for Fake {
         self.model
     }
 
+    fn replaces(&self, older: &str) -> bool {
+        self.replaces.contains(&older)
+    }
+
     fn passages<'a>(&'a self, texts: Vec<String>) -> Boxed<'a, Result<Vec<Vec<f32>>, String>> {
         Box::pin(async move {
             if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
@@ -472,10 +483,13 @@ fn tools(embed: &Arc<Fake>) -> Tools {
     Tools {
         extract: Arc::new(BuiltIn),
         embed: Some(Arc::clone(embed) as Arc<dyn Embed>),
+
+        image: None,
     }
 }
 
-/// The models named by `volume`'s live records with chunks.
+/// The models named by `volume`'s live records with text long enough to
+/// embed.
 fn models(backend: &Backend, vault: &Vault, volume: u64) -> Vec<String> {
     let index = backend
         .runtime
@@ -485,7 +499,13 @@ fn models(backend: &Backend, vault: &Vault, volume: u64) -> Vec<String> {
     let mut out: Vec<String> = raft5fs_search::view::latest(index.entries)
         .into_values()
         .filter_map(|e| match e {
-            raft5fs_search::record::Entry::Record(r) if !r.chunks.is_empty() => Some(r.model),
+            raft5fs_search::record::Entry::Record(r)
+                if r.chunks
+                    .iter()
+                    .any(|c| c.len >= raft5fs_search::view::MIN_MEANING_WORDS) =>
+            {
+                Some(r.model)
+            }
             _ => None,
         })
         .collect();
@@ -518,15 +538,42 @@ fn chunks_get_vectors_and_a_new_model_embeds_again() {
             model: "fake@1",
             values: &q,
         }),
+        None,
         5,
     );
     assert_eq!(hits[0].path, "notes/tax.txt");
 
-    // A new model: a walk embeds the two text files again, not the photo.
-    let second = Fake::new("fake@2");
+    // A new model that supersedes it: a walk embeds the two text files
+    // again, not the photo.
+    let second = Fake::replacing("fake@2", &["fake@1"]);
     let stats = pass_with(&backend, &tester, v, id, PassKind::Full, &tools(&second)).unwrap();
     assert_eq!(stats.indexed, 2);
     assert_eq!(models(&backend, &tester, v), ["fake@2", "fake@2"]);
+    // A device still on the old model doesn't know the new one: it leaves
+    // those records alone, so the two don't undo each other's work.
+    let stats = pass_with(
+        &backend,
+        &tester,
+        v,
+        new_id(),
+        PassKind::Full,
+        &tools(&first),
+    )
+    .unwrap();
+    assert_eq!(stats.indexed, 0);
+    assert_eq!(models(&backend, &tester, v), ["fake@2", "fake@2"]);
+    // Nor does another model that doesn't say it supersedes this one.
+    let other = Fake::new("other@1");
+    let stats = pass_with(
+        &backend,
+        &tester,
+        v,
+        new_id(),
+        PassKind::Full,
+        &tools(&other),
+    )
+    .unwrap();
+    assert_eq!(stats.indexed, 0);
     // A device with no model leaves the vectors alone.
     let stats = pass(&backend, &tester, v, new_id(), PassKind::Full).unwrap();
     assert_eq!(stats.indexed, 0);
@@ -637,6 +684,11 @@ impl raft5fs_client::indexer::Extract for PdfToo {
             Some(raft5fs_search::extract::Extracted {
                 kind: raft5fs_search::record::DocKind::Text,
                 text: String::from_utf8(bytes).ok()?,
+                extra: raft5fs_search::record::Extra {
+                    reader: raft5fs_search::extract::READER,
+                    ..Default::default()
+                },
+                thumb: None,
             })
         })
     }
@@ -662,8 +714,168 @@ fn a_file_one_device_could_not_read_is_read_by_one_that_can() {
     let reads_pdf = Tools {
         extract: Arc::new(PdfToo),
         embed: None,
+
+        image: None,
     };
     let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Full, &reads_pdf).unwrap();
     assert_eq!(stats.indexed, 1);
     assert_eq!(search(&backend, &tester, v, "insurance"), ["scan.pdf"]);
+}
+
+/// Reads as `BuiltIn` does, but says it is an older reader.
+struct OldReader;
+
+impl raft5fs_client::indexer::Extract for OldReader {
+    fn reads(&self, name: &str) -> u64 {
+        BuiltIn.reads(name)
+    }
+
+    fn extract<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
+        Box::pin(async move {
+            let mut got = BuiltIn.extract(name, bytes).await?;
+            got.extra.reader = 1;
+            Some(got)
+        })
+    }
+}
+
+#[test]
+fn files_read_by_older_readers_are_read_again() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let old = Tools {
+        extract: Arc::new(OldReader),
+        embed: None,
+
+        image: None,
+    };
+    pass_with(&backend, &tester, v, new_id(), PassKind::Auto, &old).unwrap();
+    // The text file, the track and the photo are read again.
+    let stats = pass(&backend, &tester, v, new_id(), PassKind::Full).unwrap();
+    assert_eq!(stats.indexed, 3);
+    // Once read by these readers, not again.
+    let stats = pass(&backend, &tester, v, new_id(), PassKind::Full).unwrap();
+    assert_eq!(stats.indexed, 0);
+}
+
+/// Gives each photo a "thumbnail" that names it.
+struct Thumbs;
+
+impl raft5fs_client::indexer::Extract for Thumbs {
+    fn reads(&self, name: &str) -> u64 {
+        BuiltIn.reads(name)
+    }
+
+    fn extract<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
+        Box::pin(async move {
+            let mut got = BuiltIn.extract(name, bytes).await?;
+            if got.kind == raft5fs_search::record::DocKind::Photo {
+                got.thumb = Some(format!("thumb of {name}").into_bytes());
+            }
+            Some(got)
+        })
+    }
+}
+
+#[test]
+fn thumbnails_are_kept_beside_their_records_and_read_back() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    write(
+        &backend,
+        &tester,
+        v,
+        "beach.jpg",
+        b"\xFF\xD8\xFF also not a picture",
+    );
+    let tools = Tools {
+        extract: Arc::new(Thumbs),
+        embed: None,
+
+        image: None,
+    };
+    let id = new_id();
+    pass_with(&backend, &tester, v, id, PassKind::Auto, &tools).unwrap();
+    let thumb_of = |path: &str| {
+        let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
+        let hit = View::new(index.entries)
+            .search(
+                path.rsplit('/').next().unwrap().split('.').next().unwrap(),
+                5,
+            )
+            .into_iter()
+            .find(|h| h.path == path)
+            .unwrap_or_else(|| panic!("{path} not found"));
+        let thumb = hit.thumb.expect("a photo has a thumbnail");
+        rt.block_on(raft5fs_client::indexer::read_thumb(&tester, v, &thumb))
+            .unwrap()
+    };
+    assert_eq!(thumb_of("photo.jpg"), b"thumb of photo.jpg");
+    assert_eq!(thumb_of("beach.jpg"), b"thumb of beach.jpg");
+    // A rename keeps the thumbnail, without reading the photo again.
+    rt.block_on(tester.rename(
+        v,
+        OsStr::new("beach.jpg"),
+        v,
+        OsStr::new("shore.jpg"),
+        false,
+    ))
+    .unwrap();
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &tools).unwrap();
+    assert_eq!((stats.indexed, stats.moved), (0, 1));
+    assert_eq!(thumb_of("shore.jpg"), b"thumb of beach.jpg");
+}
+
+/// An image model for tests: every picture gets the same vector.
+struct FakeImages;
+
+impl raft5fs_client::indexer::ImageEmbed for FakeImages {
+    fn model(&self) -> &str {
+        "fake-clip@1"
+    }
+
+    fn image<'a>(&'a self, _: Vec<u8>) -> Boxed<'a, Result<Option<Vec<f32>>, String>> {
+        Box::pin(async { Ok(Some(vec![1.0, 0.0])) })
+    }
+
+    fn query<'a>(&'a self, _: &'a str) -> Boxed<'a, Result<Vec<f32>, String>> {
+        Box::pin(async { Ok(vec![1.0, 0.0]) })
+    }
+}
+
+#[test]
+fn a_photo_another_device_indexed_gets_its_image_vector_here() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    // A browser's pass: no image model.
+    pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    let has_vector = || {
+        let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
+        View::new(index.entries).has_image_model("fake-clip@1")
+    };
+    assert!(!has_vector());
+    // A device with one fills it in at its next walk, and only the photo.
+    let tools = Tools {
+        extract: Arc::new(BuiltIn),
+        embed: None,
+        image: Some(Arc::new(FakeImages)),
+    };
+    let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Full, &tools).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert!(has_vector());
+    let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Full, &tools).unwrap();
+    assert_eq!(stats.indexed, 0);
 }

@@ -15,6 +15,8 @@
   //   ones when they come. Where a download is worth asking about (a phone,
   //   Data Saver, a slow connection), it asks first (searchSetting.js).
   import * as searchSetting from "../lib/searchSetting.js";
+  import { onDestroy } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
 
   let { fs, folder, onopen } = $props();
 
@@ -34,6 +36,33 @@
   let download = $state(null);
   /// "Not now", for the rest of this page's life.
   let notNow = false;
+  /// The models the last search needs to search by meaning: "e5" for
+  /// text, "clip" for photos.
+  let needed = $state([]);
+  const neededMB = $derived(
+    (needed.includes("e5") ? searchSetting.MODEL_MB : 0) +
+      (needed.includes("clip") ? searchSetting.PHOTO_MODEL_MB : 0),
+  );
+  /// Photos' thumbnails, by id, as blob: URLs (null while loading or if
+  /// one can't be read).
+  const thumbs = new SvelteMap();
+  onDestroy(() => {
+    for (const url of thumbs.values()) if (url) URL.revokeObjectURL(url);
+  });
+
+  /// Fetches the thumbnails of the results that have one and aren't
+  /// fetched yet. (Not from the markup: rendering mustn't change state.)
+  $effect(() => {
+    for (const hit of results) {
+      const id = hit.thumb;
+      if (!id || thumbs.has(id)) continue;
+      thumbs.set(id, null);
+      fs.searchThumb(id).then(
+        (bytes) => thumbs.set(id, URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }))),
+        () => {},
+      );
+    }
+  });
   let asked = 0;
   let timer = null;
 
@@ -97,6 +126,7 @@
       status = loaded;
       results = found.hits;
       if (!found.meaning) return;
+      needed = [...(found.vectors ? ["e5"] : []), ...(found.images ? ["clip"] : [])];
     } catch (e) {
       if (mine === asked) error = e.message;
       return;
@@ -111,7 +141,7 @@
     const allowed = searchSetting.meaningAllowed();
     const model = await fs.modelState().catch(() => null);
     if (mine !== asked) return;
-    const here = model?.ready || model?.cached;
+    const here = !!model && needed.every((m) => model[m]?.ready || model[m]?.cached);
     if (!here && (allowed === "no" || (allowed === "ask" && notNow))) return;
     if (!here && allowed === "ask") {
       meaning = "asking";
@@ -203,8 +233,8 @@
       {#if meaning === "asking"}
         <div class="ask">
           <span>
-            Also search by meaning, in any language? This downloads the search model once
-            (about {searchSetting.MODEL_MB} MB).
+            Also search by meaning, in any language{needed.includes("clip") ? ", and photos by what they show" : ""}?
+            This downloads the search {needed.length > 1 ? "models" : "model"} once (about {neededMB} MB).
           </span>
           <span>
             <button onclick={() => answer(true)}>Download</button>
@@ -223,8 +253,14 @@
       {/if}
       {#each results as hit (hit.path)}
         <button class="hit" role="option" aria-selected="false" onclick={() => choose(hit)}>
-          <span class="path">{hit.path.slice(1)}</span>
-          {#if hit.preview}<span class="preview">{hit.preview}</span>{/if}
+          {#if hit.thumb}
+            {@const url = thumbs.get(hit.thumb)}
+            {#if url}<img class="thumb" src={url} alt="" />{:else}<span class="thumb"></span>{/if}
+          {/if}
+          <span class="words">
+            <span class="path">{hit.path.slice(1)}</span>
+            {#if hit.preview}<span class="preview">{hit.preview}</span>{/if}
+          </span>
         </button>
       {/each}
       <p class="status">
@@ -259,11 +295,16 @@
     border-radius: var(--wx-radius-major, 6px); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   }
   .hit {
-    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    display: flex; flex-direction: row; align-items: center; gap: 10px;
     padding: 6px 8px; border: none; border-radius: 4px; text-align: left;
     background: none; color: var(--wx-color-font); cursor: pointer;
   }
   .hit:hover, .hit:focus { background: var(--wx-background-alt); }
+  .words { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+  .thumb {
+    flex: none; width: 64px; height: 64px; object-fit: cover; border-radius: 4px;
+    background: var(--wx-background-alt);
+  }
   .path { font-weight: 600; overflow-wrap: anywhere; }
   .preview { opacity: 0.75; font-size: 0.9em; overflow-wrap: anywhere; }
   .note, .error, .status { margin: 4px 8px; }

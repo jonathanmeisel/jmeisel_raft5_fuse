@@ -1810,6 +1810,55 @@ test("a phone asks before downloading the search model, and finds words meanwhil
   expect(problems).toEqual([]);
 });
 
+/// A GPX ride from `a` to `b` (latitude, longitude), a point every few
+/// hundred metres.
+function gpxRide(name, a, b) {
+  const points = [];
+  for (let i = 0; i <= 40; i++) {
+    const t = i / 40;
+    points.push(`<trkpt lat="${a[0] + (b[0] - a[0]) * t}" lon="${a[1] + (b[1] - a[1]) * t}"><ele>200</ele></trkpt>`);
+  }
+  return `<gpx><trk><name>${name}</name><type>cycling</type><trkseg>${points.join("")}</trkseg></trk></gpx>`;
+}
+
+test("photos are found by where and when they were taken, and rides by where they go", async ({ browser }) => {
+  const context = await browser.newContext();
+  await context.addInitScript(() => {
+    try {
+      localStorage.setItem("raft5fs:index-here", "on");
+    } catch {}
+  });
+  const page = await context.newPage();
+  const problems = watch(page);
+  await enrol(page, "ned");
+  await login(page, "ned");
+  await addFolder(page, "trips");
+  await open(page, "trips");
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "IMG_0412.jpg", mimeType: "image/jpeg", buffer: fixture("lisbon.jpg") },
+    // Lyndonville to St. Johnsbury, Vermont; and Cape Cod, Massachusetts.
+    { name: "morning.gpx", mimeType: "application/gpx+xml", buffer: Buffer.from(gpxRide("Morning loop", [44.5361, -72.0053], [44.4192, -72.0151])) },
+    { name: "coast.gpx", mimeType: "application/gpx+xml", buffer: Buffer.from(gpxRide("Coast ride", [41.6, -70.6], [41.7, -70.5])) },
+  ]);
+  await expect(item(page, "coast.gpx")).toBeVisible(SLOW);
+
+  // A photo by its place and month, with its thumbnail.
+  const photos = await searchUntil(page, "Lisbon 2024", "trips/IMG_0412.jpg");
+  const photo = photos.getByRole("option").filter({ hasText: "trips/IMG_0412.jpg" });
+  await expect(photo).toContainText("June 2024");
+  await expect(photo.locator("img.thumb")).toBeVisible(SLOW);
+  expect(await photo.locator("img.thumb").evaluate((img) => img.naturalWidth)).toBe(256);
+  await expect(photos).toContainText(/trips: \d+ files, indexed .* by ned on /);
+  await expect(photos).not.toContainText("Not indexed yet");
+
+  // Rides by the places they go through.
+  const rides = await searchUntil(page, "bike routes in vermont", "trips/morning.gpx");
+  await expect(rides.getByRole("option").first()).toContainText("trips/morning.gpx");
+  await expect(rides.getByRole("option").first()).toContainText(/Lyndonville|Vermont/);
+
+  expect(problems).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

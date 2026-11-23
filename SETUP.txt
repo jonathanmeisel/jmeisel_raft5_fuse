@@ -1180,8 +1180,27 @@ while a pass runs.
 
 What is indexed: plain text and source code, HTML, Word, PowerPoint and
 Excel files (docx, pptx, xlsx), OpenDocument files, PDF, chat exports,
-and GPS tracks and routes (GPX, TCX: their names, activity, month,
-distance and climb). Every other file is found by its name only.
+GPS tracks and routes (GPX, TCX: their names, activity, month, distance,
+climb, and the towns, states and countries they go through), and photos
+(JPEG, HEIC, PNG, WebP, TIFF: when, where and with what camera they were
+taken, from their EXIF data). Every other file is found by its name only.
+So "bike routes in vermont" finds rides through Vermont, and "Lisbon 2024"
+finds the photos taken there then.
+
+Places are named offline, from a table every client keeps (from GeoNames,
+CC BY 4.0, and Natural Earth; search/data/README.md): where a photo was
+taken never leaves the device. A point within about 500 m of a border can
+get the state on its other side.
+
+Photos are also found by what they show, in any language ("Strand am
+Meer", "kids at the beach"), with CLIP: on native devices a second model
+(about 225 MB, downloaded as the first is, into the same folder) gives
+each photo a vector, and each query one. The web app doesn't make photos'
+vectors: a device that does fills them in at its next walk. It does
+search them, with CLIP's text side (about 140 MB more, downloaded on the
+first search of a volume whose photos have vectors). Results show each
+photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
+they show without fetching the photos.
 
 Indexing runs by itself. A mount or a WebDAV server indexes, in the
 background, each volume this account can write (on Android only with
@@ -1216,7 +1235,8 @@ the space the index takes:
 What it costs: the index counts against the volume owner's quota, and
 snapshots keep old parts of it as they keep old files. It holds a short
 preview of each piece of text, the words in it, and its vector (about
-400 bytes), not the whole text. A vector says roughly what its text is
+400 bytes), not the whole text; for a photo, a thumbnail and a vector of
+what it shows (about 13 KB). A vector says roughly what its text is
 about, and someone with the index could partly recover the text from
 it, so it is sealed as strongly as the files are.
 

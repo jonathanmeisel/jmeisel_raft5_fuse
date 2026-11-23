@@ -8,6 +8,7 @@
 //!   indexer writes only its own files.
 //! - `text`: words for keyword search, and chunks of text.
 //! - `extract`: the text of a file, from its bytes and name.
+//! - `geo`: which town, region and country a point is in, offline.
 //! - `bm25` and `rank`: keyword ranking, and the merge of ranked lists.
 //! - `vector`: embeddings kept small, and how close two are.
 //! - `view`: every indexer's records for a volume, merged, and searched.
@@ -17,6 +18,7 @@
 
 pub mod bm25;
 pub mod extract;
+pub mod geo;
 pub mod manifest;
 pub mod rank;
 pub mod record;

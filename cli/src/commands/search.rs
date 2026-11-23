@@ -4,16 +4,18 @@ use std::collections::HashMap;
 
 use clap::Args;
 use raft5fs_client::cli::Context;
-use raft5fs_client::indexer::Embed;
+use raft5fs_client::indexer::{Embed, ImageEmbed};
 use raft5fs_client::indexer::{
     IndexerConfig, PassKind, describe, index_claimed, indexable_volumes, new_id, read_index, survey,
 };
 use raft5fs_client::vault::Vault;
+use raft5fs_indexer::clip::ImageEmbedder;
 use raft5fs_indexer::embed::{Embedder, MODEL};
 use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::size_text;
 use raft5fs_search::rank::fuse;
+use raft5fs_search::vector::CLIP_MODEL;
 use raft5fs_search::view::QueryVector;
 use raft5fs_search::view::View;
 use tokio::runtime::Runtime;
@@ -162,15 +164,19 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
                         println!("  {format}: {files} files, {}", size_text(*bytes));
                     }
                     // Each chunk's vector: a byte for each of the model's
-                    // 384 dimensions, a scale, and their framing.
+                    // 384 dimensions, a scale, and their framing. Each photo's
+                    // image vector (512), and its thumbnail (about 12 KB).
                     let vectors = s.chunks * (384 + 9);
+                    let photos = s.by_format.get("photo").map_or(0, |p| p.0 as u64);
+                    let pictures = photos * (512 + 9 + 12_000);
                     println!(
-                        "  {} words of text in {} chunks; the index would be about {} \
-                         ({} of it vectors)",
+                        "  {} words of text in {} chunks, and {photos} photos; the index would \
+                         be about {} ({} of it vectors, {} thumbnails)",
                         s.words,
                         s.chunks,
-                        size_text(s.index_bytes + vectors),
-                        size_text(vectors)
+                        size_text(s.index_bytes + vectors + pictures),
+                        size_text(vectors + photos * 521),
+                        size_text(photos * 12_000)
                     );
                 }
                 Err(e) => {
@@ -257,6 +263,18 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     } else {
         None
     };
+    // And what photos show, if any volume has photos with image vectors.
+    let image_vector = if views.iter().any(|(_, _, v)| v.has_image_model(CLIP_MODEL)) {
+        match runtime.block_on(ImageEmbedder::cached().query(&args.query)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("warning: photos not searched by what they show: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Each volume ranks its own hits; the lists are then merged by rank.
     let mut lists = Vec::new();
     let mut hits = HashMap::new();
@@ -265,8 +283,12 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
             model: MODEL,
             values,
         });
+        let image = image_vector.as_deref().map(|values| QueryVector {
+            model: CLIP_MODEL,
+            values,
+        });
         let list: Vec<(u64, u64)> = view
-            .search_with(&args.query, vector, args.limit)
+            .search_with(&args.query, vector, image, args.limit)
             .into_iter()
             .map(|h| {
                 let key = (*ino, h.ino);

@@ -137,6 +137,15 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     read, sealed to the account in the wasm client (raft5fs-crypto's
     `local`), so searching again fetches only what is new. **Keep search
     data on this device** off keeps nothing, for a borrowed computer.
+  - Tracks and photos are named with the places table (`search/data/`,
+    served from `public/data/places.bin`, checked against its pinned
+    SHA-256), fetched by the tab that indexes. Photos get thumbnails, drawn
+    on an OffscreenCanvas in the embed Worker; results show them.
+  - Photos are found by what they show with CLIP (`src/lib/clip.js`, its
+    multilingual text side only, served beside the text model): native
+    devices give photos their image vectors, and a search of a folder whose
+    photos have them embeds the query with it too. The download question
+    counts it (about 140 MB more).
   - A top-level folder's **More → Search indexing** (`IndexingDialog.svelte`)
     shows whether it is indexed; its owner can turn that off, which removes
     its index.
@@ -182,9 +191,10 @@ npx playwright test
 ```
 
 `test:parity` runs the app's model code in Node and checks its token ids,
-and its vectors to cosine 0.995, against `tests/fixtures/e5-vectors.json`,
-which native clients wrote (raft5fs-indexer's ignored test
-`write_the_web_apps_parity_fixture`; run it again after changing the
+and its vectors to cosine 0.995, against `tests/fixtures/e5-vectors.json`
+and `tests/fixtures/clip-vectors.json`, which native clients wrote
+(raft5fs-indexer's ignored tests `write_the_web_apps_parity_fixture` and
+`write_the_web_apps_clip_fixture`; run them again after changing a
 model). In the browser tests, indexing is off in every tab except the
 search tests', which upload text, Word and PDF files, find them by their
 words and by meaning in another language, check that what the browser

@@ -115,7 +115,7 @@ impl E5 {
     }
 }
 
-fn file_matches(path: &Path, sha: &str) -> bool {
+pub(crate) fn file_matches(path: &Path, sha: &str) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -135,12 +135,18 @@ fn raft5fs_wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Downloads `file` of the model to `to`, checking it as it comes. Written
-/// beside it first, then renamed, so a cut download is never used.
+/// Downloads `file` of the model to `to`, checking it as it comes.
 fn download(file: &str, to: &Path, sha: &str) -> Result<(), String> {
-    let url = format!("{REPO}/{REVISION}/{file}");
-    eprintln!("search: downloading {file} of {MODEL} (once)");
-    let mut body = ureq::get(&url)
+    download_url(&format!("{REPO}/{REVISION}/{file}"), to, sha, MODEL)
+}
+
+/// Downloads `url` to `to`, checking it as it comes against `sha`. Written
+/// beside it first, then renamed, so a cut download is never used. `model`
+/// names what it is part of, for messages.
+pub(crate) fn download_url(url: &str, to: &Path, sha: &str, model: &str) -> Result<(), String> {
+    let file = url.rsplit('/').next().unwrap_or(url);
+    eprintln!("search: downloading {file} of {model} (once)");
+    let mut body = ureq::get(url)
         .call()
         .map_err(|e| format!("cannot download {url}: {e}"))?
         .into_body();
@@ -163,14 +169,14 @@ fn download(file: &str, to: &Path, sha: &str) -> Result<(), String> {
     }
     if raft5fs_wire_hex(&hasher.finalize()) != sha {
         let _ = std::fs::remove_file(&temp);
-        return Err(format!("{file} of {MODEL} isn't the file it should be"));
+        return Err(format!("{file} of {model} isn't the file it should be"));
     }
     std::fs::rename(&temp, to).map_err(|e| format!("cannot keep {}: {e}", to.display()))
 }
 
 /// ONNX Runtime's environment: one for the whole process, which is all it
 /// allows.
-fn environment() -> Result<ort::environment::Environment, String> {
+pub(crate) fn environment() -> Result<ort::environment::Environment, String> {
     static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
     ENV.get_or_init(|| {
         ort::init()
@@ -316,6 +322,10 @@ async fn blocking(
 impl Embed for Embedder {
     fn model(&self) -> &str {
         MODEL
+    }
+
+    fn replaces(&self, older: &str) -> bool {
+        raft5fs_search::vector::E5_REPLACES.contains(&older)
     }
 
     fn passages<'a>(&'a self, texts: Vec<String>) -> Boxed<'a, Result<Vec<Vec<f32>>, String>> {

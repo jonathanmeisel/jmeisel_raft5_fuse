@@ -58,7 +58,7 @@ mod tests {
     /// The stored layout of a segment, pinned.
     #[test]
     fn a_segment_keeps_its_bytes() {
-        let golden = "7235736701000000010000001201010000000000000001\
+        let golden = "7235736701000000010000001202010000000000000001\
                       0000000000000002";
         let bytes = encode_segment(&[Entry::Gone { ino: 1, at_ms: 2 }]);
         assert_eq!(raft5fs_wire::hex(&bytes), golden);

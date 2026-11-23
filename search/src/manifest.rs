@@ -48,6 +48,13 @@ impl Manifest {
     pub fn segment_name(id: &IndexerId, n: u32) -> String {
         format!("seg-{}-{n}", raft5fs_wire::hex(id))
     }
+
+    /// The file name of the thumbnails that segment `n`'s records show:
+    /// written before the segment, so that every thumbnail a listed
+    /// segment names is there.
+    pub fn thumbs_name(id: &IndexerId, n: u32) -> String {
+        format!("thumbs-{}-{n}", raft5fs_wire::hex(id))
+    }
 }
 
 pub fn encode_manifest(m: &Manifest) -> Vec<u8> {

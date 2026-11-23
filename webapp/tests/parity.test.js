@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import * as ort from "onnxruntime-web/wasm";
 import { MODEL, loadE5 } from "../src/lib/e5.js";
+import { CLIP_MODEL, loadClip } from "../src/lib/clip.js";
 
 const fixture = JSON.parse(readFileSync(new URL("fixtures/e5-vectors.json", import.meta.url)));
 const dir = new URL(`../public/models/${MODEL}/`, import.meta.url);
@@ -28,6 +29,26 @@ test("the browser's model matches the native one", async () => {
   for (const c of fixture.cases) {
     assert.deepEqual(e5.ids(c.text), c.ids, `token ids of ${c.text}`);
     const v = await e5.embed(c.text);
+    const cos = c.vector.reduce((sum, x, i) => sum + x * v[i], 0);
+    console.log(`${cos.toFixed(5)}  ${c.text}`);
+    assert.ok(cos > 0.995, `${c.text}: cosine ${cos}`);
+  }
+});
+
+test("the browser's photo model gives queries native clients' vectors", async () => {
+  const clipFixture = JSON.parse(readFileSync(new URL("fixtures/clip-vectors.json", import.meta.url)));
+  assert.equal(clipFixture.model, CLIP_MODEL, "the fixture is for another model");
+  const at = new URL(`../public/models/${CLIP_MODEL}/`, import.meta.url);
+  const parts = readdirSync(at)
+    .filter((n) => n.startsWith("text.onnx."))
+    .sort();
+  const onnx = Buffer.concat(parts.map((p) => readFileSync(new URL(p, at))));
+  const json = (name) => JSON.parse(readFileSync(new URL(name, at), "utf8"));
+  const dense = new Uint8Array(readFileSync(new URL("dense.safetensors", at)));
+  const clip = await loadClip(ort, new Uint8Array(onnx), json("tokenizer.json"), json("tokenizer_config.json"), dense);
+  for (const c of clipFixture.cases) {
+    assert.deepEqual(clip.ids(c.text), c.ids, `token ids of ${c.text}`);
+    const v = await clip.embed(c.text);
     const cos = c.vector.reduce((sum, x, i) => sum + x * v[i], 0);
     console.log(`${cos.toFixed(5)}  ${c.text}`);
     assert.ok(cos > 0.995, `${c.text}: cosine ${cos}`);
