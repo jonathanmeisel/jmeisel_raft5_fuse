@@ -1078,7 +1078,9 @@ is decrypted on the phone, as on a computer; the servers see no more
 than before.
 
 Each release has the binary, raft5fs-android-aarch64 (64-bit ARM, the
-usual kind of phone), built without FUSE.
+usual kind of phone), built without FUSE, and without search indexing
+(section 15): it doesn't index, and `raft5fs search` on it finds files by
+their words, places and dates, not by meaning. Your other devices index.
 
 Setting it up, once:
 
@@ -1203,8 +1205,8 @@ photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
 they show without fetching the photos.
 
 Indexing runs by itself. A mount or a WebDAV server indexes, in the
-background, each volume this account can write (on Android only with
---background-index), and so does the web app, in one tab per account,
+background, each volume this account can write (not the Android build,
+which doesn't index at all, section 14), and so does the web app, in one tab per account,
 unless its account menu's "Index for search on this device" is off (it
 is off by default on a phone or tablet). In the web app, the search box
 in the header searches the open top-level folder, or every one. Devices take turns: one claims a volume on the

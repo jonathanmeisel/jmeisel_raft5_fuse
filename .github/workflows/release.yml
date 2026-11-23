@@ -7,7 +7,11 @@
 #            tag matches the Cargo version.
 # - build:   only once the tests pass. Each binary is its own workflow
 #            artifact. Linux has FUSE (`mount`) and WebDAV; macOS and
-#            Android have WebDAV only (no FUSE to build against).
+#            Android have WebDAV only (no FUSE to build against). Android
+#            has no search indexing either (the `index` feature): ONNX
+#            Runtime has no prebuilt binaries for it, and a phone shouldn't
+#            spend its battery indexing; it searches what other devices
+#            index, by words.
 # - web:     the web app: its browser tests (headless Chromium, against a
 #            filesystem on the runner), then the site, as a Pages artifact,
 #            for the filesystems in the repository variable WEB_CONFIG
@@ -97,7 +101,7 @@ jobs:
           - name: macos-aarch64
             os: macos-15
             target: aarch64-apple-darwin
-            features: --no-default-features --features webdav
+            features: --no-default-features --features webdav,index
           - name: android-aarch64
             os: ubuntu-24.04
             target: aarch64-linux-android

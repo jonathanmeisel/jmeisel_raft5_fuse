@@ -22,11 +22,13 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use raft5fs_client::cli::{Context, Overrides, parse_size, password_from};
+#[cfg(feature = "index")]
 use raft5fs_client::indexer::IndexerConfig;
 use raft5fs_client::pruner::PrunerConfig;
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::SessionConfig;
 use raft5fs_client::vault::Vault;
+#[cfg(feature = "index")]
 use raft5fs_indexer::native_tools;
 use tokio::runtime::Runtime;
 
@@ -239,15 +241,18 @@ pub struct SessionArgs {
     pub no_background_prune: bool,
     /// Do not index volumes for search in the background (see `raft5fs
     /// index`). On by default, except on Android.
+    #[cfg(feature = "index")]
     #[arg(long, conflicts_with = "background_index")]
     pub no_background_index: bool,
     /// Index volumes for search in the background, where that is off by
     /// default (Android).
+    #[cfg(feature = "index")]
     #[arg(long)]
     pub background_index: bool,
     /// A volume, as your root shows it, that this device does not index
     /// (others still may). Can be given more than once; adds to the
     /// profile's `index_skip`.
+    #[cfg(feature = "index")]
     #[arg(long = "index-skip", value_name = "VOLUME")]
     pub index_skip: Vec<String>,
 }
@@ -273,7 +278,14 @@ impl SessionArgs {
             config.prune = Some(PrunerConfig::default());
         }
         // Indexing reads every file and is slow on a phone, so there it
-        // waits to be asked for.
+        // waits to be asked for. A build without `index` doesn't index.
+        #[cfg(feature = "index")]
+        self.index_into(ctx, &mut config);
+        Ok(config)
+    }
+
+    #[cfg(feature = "index")]
+    fn index_into(&self, ctx: &Context, config: &mut SessionConfig) {
         let by_default = !cfg!(target_os = "android");
         if self.background_index || (by_default && !self.no_background_index) {
             let mut skip = ctx.index_skip.clone();
@@ -285,7 +297,6 @@ impl SessionArgs {
             };
             config.index = Some((index, native_tools()));
         }
-        Ok(config)
     }
 }
 

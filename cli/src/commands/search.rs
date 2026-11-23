@@ -4,18 +4,24 @@ use std::collections::HashMap;
 
 use clap::Args;
 use raft5fs_client::cli::Context;
-use raft5fs_client::indexer::{Embed, ImageEmbed};
+use raft5fs_client::indexer::read_index;
+#[cfg(feature = "index")]
 use raft5fs_client::indexer::{
-    IndexerConfig, PassKind, describe, index_claimed, indexable_volumes, new_id, read_index, survey,
+    Embed, ImageEmbed, IndexerConfig, PassKind, describe, index_claimed, indexable_volumes, new_id,
+    survey,
 };
 use raft5fs_client::vault::Vault;
+#[cfg(feature = "index")]
 use raft5fs_indexer::clip::ImageEmbedder;
-use raft5fs_indexer::embed::{Embedder, MODEL};
+#[cfg(feature = "index")]
+use raft5fs_indexer::embed::Embedder;
+#[cfg(feature = "index")]
 use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
+#[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
 use raft5fs_search::rank::fuse;
-use raft5fs_search::vector::CLIP_MODEL;
+use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
 use raft5fs_search::view::View;
 use tokio::runtime::Runtime;
@@ -56,7 +62,53 @@ pub struct SearchArgs {
     pub limit: usize,
 }
 
+/// The query's vectors: for meaning, if any volume has text vectors, and
+/// for what photos show, if any has photos with image vectors.
+#[cfg(feature = "index")]
+fn query_vectors(
+    runtime: &Runtime,
+    views: &[&View],
+    query: &str,
+) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+    let text = if views.iter().any(|v| v.has_model(MODEL)) {
+        match runtime.block_on(Embedder::cached().query(query)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("warning: searching by words only: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let image = if views.iter().any(|v| v.has_image_model(CLIP_MODEL)) {
+        match runtime.block_on(ImageEmbedder::cached().query(query)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("warning: photos not searched by what they show: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    (text, image)
+}
+
+/// A build without the models: words, places and dates only.
+#[cfg(not(feature = "index"))]
+fn query_vectors(_: &Runtime, views: &[&View], _: &str) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+    if views
+        .iter()
+        .any(|v| v.has_model(MODEL) || v.has_image_model(CLIP_MODEL))
+    {
+        eprintln!("note: this build has no search models: searching by words only");
+    }
+    (None, None)
+}
+
 /// This machine's name, for the status that search shows.
+#[cfg(feature = "index")]
 pub fn device_name() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for its whole length, and gethostname writes
@@ -71,6 +123,7 @@ pub fn device_name() -> String {
 }
 
 /// About how long ago `ms` (milliseconds since the epoch) was.
+#[cfg(feature = "index")]
 fn ago(ms: u64) -> String {
     let secs = raft5fs_proto::clock::now_millis().saturating_sub(ms) / 1000;
     match secs {
@@ -116,6 +169,17 @@ fn chosen(
         .collect()
 }
 
+/// A build without the models (the `index` feature): other devices index.
+#[cfg(not(feature = "index"))]
+pub fn index(_: &ConnectArgs, _: IndexArgs) -> Outcome {
+    Err(
+        "this build of raft5fs doesn't index (it has no search models): your other \
+         devices index, and `raft5fs search` here searches by words, places and dates"
+            .into(),
+    )
+}
+
+#[cfg(feature = "index")]
 pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
@@ -251,30 +315,8 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     if views.is_empty() {
         return Err("no volume here has a search index yet: run `raft5fs index`".into());
     }
-    // The query's meaning, if any volume has vectors to compare it with.
-    let query_vector = if views.iter().any(|(_, _, v)| v.has_model(MODEL)) {
-        match runtime.block_on(Embedder::cached().query(&args.query)) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("warning: searching by words only: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // And what photos show, if any volume has photos with image vectors.
-    let image_vector = if views.iter().any(|(_, _, v)| v.has_image_model(CLIP_MODEL)) {
-        match runtime.block_on(ImageEmbedder::cached().query(&args.query)) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("warning: photos not searched by what they show: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let views_only: Vec<&View> = views.iter().map(|(_, _, v)| v).collect();
+    let (query_vector, image_vector) = query_vectors(&runtime, &views_only, &args.query);
     // Each volume ranks its own hits; the lists are then merged by rank.
     let mut lists = Vec::new();
     let mut hits = HashMap::new();

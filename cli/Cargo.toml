@@ -9,12 +9,17 @@ name = "raft5fs"
 path = "src/main.rs"
 
 [features]
-default = ["fuse", "webdav"]
+default = ["fuse", "webdav", "index"]
 # `raft5fs mount`. Needs FUSE (libfuse, or macFUSE) to build; leave it out
 # where there is none, as on a Mac without macFUSE.
 fuse = ["dep:raft5fs-fuse", "dep:fuser"]
 # `raft5fs webdav`.
 webdav = ["dep:raft5fs-webdav", "tokio/net", "tokio/signal"]
+# Search indexing (`raft5fs index`, and in mounts and WebDAV), and searching
+# by meaning and by what photos show: the models, on ONNX Runtime, which
+# has no prebuilt binaries for every platform. Without it, this device
+# doesn't index (others do), and searches by words, places and dates.
+index = ["dep:raft5fs-indexer"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -25,7 +30,7 @@ raft5fs-crypto = { workspace = true }
 raft5fs-fuse = { workspace = true, optional = true }
 raft5fs-proto = { workspace = true }
 raft5fs-search = { workspace = true }
-raft5fs-indexer = { workspace = true }
+raft5fs-indexer = { workspace = true, optional = true }
 raft5fs-webdav = { workspace = true, optional = true }
 tokio = { workspace = true }
 toml = "1"
