@@ -121,9 +121,11 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     Runtime's WebAssembly backend, one thread) and reads PDFs with the
     PDF module (the `raft5fs-pdf-web` crate, a separate wasm: a PDF that
     crashes it only restarts it). It holds no keys.
-  - The model is served by the app from `public/models/`, which
-    `npm run model` fetches (about 135 MB, checked against pinned SHA-256s,
-    split into pieces under GitHub Pages' 100 MB limit). The embed Worker
+  - The models are served by the app from `public/models/`, which
+    `npm run model` (`scripts/fetch-models.mjs`) fetches as
+    `search/data/models.json` pins them for every client (about 135 MB for
+    text, 140 MB more for photos, checked against their SHA-256s, split
+    into pieces under GitHub Pages' 100 MB limit). The embed Worker
     streams the pieces into one buffer, checks the whole, and keeps it in
     the Cache API.
   - A search shows what matches by words at once, then searches by meaning
@@ -165,7 +167,7 @@ at the version `web/Cargo.toml` pins, and Node.
 ```sh
 npm ci
 npm run wasm                       # the client and the PDF module, into src/wasm
-npm run model                      # the search model, into public/models
+npm run model                      # the search models, into public/models
 cargo run -p raft5fs-testkit --example web_dev   # in another terminal
 npm run dev                        # http://localhost:5173
 ```

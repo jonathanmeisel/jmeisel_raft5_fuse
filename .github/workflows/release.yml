@@ -168,7 +168,7 @@ jobs:
           fi
       - run: npm ci
       - run: npm run wasm
-      - name: The search model, served by the site (scripts/fetch-model.sh)
+      - name: The search models, served by the site (scripts/fetch-models.mjs)
         run: npm run model
       - name: The browser's model gives native clients' vectors
         run: npm run test:parity

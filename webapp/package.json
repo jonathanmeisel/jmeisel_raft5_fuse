@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test:e2e": "playwright test",
     "test:parity": "node --test tests/parity.test.js",
-    "model": "sh scripts/fetch-model.sh"
+    "model": "node scripts/fetch-models.mjs"
   },
   "devDependencies": {
     "@huggingface/tokenizers": "0.2.0",

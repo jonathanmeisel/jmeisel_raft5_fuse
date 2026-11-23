@@ -14,7 +14,7 @@
 //! - Native clients embed images and queries; the web app only queries
 //!   (see the web app's `clip.js`), with the same text model.
 //! - Files download on first use into `cache_dir()`, each checked against
-//!   its SHA-256, as for `embed`.
+//!   its SHA-256, as `search/data/models.json` pins them (see `manifest`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,34 +26,7 @@ use raft5fs_client::indexer::ImageEmbed;
 use raft5fs_search::vector::{CLIP_DIMS, CLIP_MODEL, normalize};
 use tokenizers::{Tokenizer, TruncationParams};
 
-use crate::embed::{download_url, environment, file_matches};
-
-const TEXT_REPO: &str = "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2";
-const VISION_REPO: &str = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523";
-
-/// Each file: where it comes from, the name it is kept under, its SHA-256.
-const FILES: [(&str, &str, &str); 4] = [
-    (
-        "onnx/model_quint8_avx2.onnx",
-        "text.onnx",
-        "fbc8fbeaa5237d96bd1bf430057c70d34de8334a463e933a5faa305f6caeed9c",
-    ),
-    (
-        "tokenizer.json",
-        "tokenizer.json",
-        "5b4e1a8171c81dfd666ae40265b9530c6e0b3d53923fe8ac493dcc84229adf81",
-    ),
-    (
-        "2_Dense/model.safetensors",
-        "dense.safetensors",
-        "d12568dc7300970a4d3dbb49068ad16cd89b99840b74b026f8e48071e9414f74",
-    ),
-    (
-        "onnx/vision_model_quantized.onnx",
-        "vision.onnx",
-        "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299",
-    ),
-];
+use crate::embed::environment;
 
 /// The most tokens the text model reads (sentence-transformers' setting
 /// for it).
@@ -97,19 +70,10 @@ fn read_dense(bytes: &[u8], len: usize) -> Result<Vec<f32>, String> {
 }
 
 fn load(dir: &Path) -> Result<Models, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
-    for (file, name, sha) in FILES {
-        let path = dir.join(name);
-        if !file_matches(&path, sha) {
-            let repo = if name == "vision.onnx" {
-                VISION_REPO
-            } else {
-                TEXT_REPO
-            };
-            download_url(&format!("{repo}/{file}"), &path, sha, CLIP_MODEL)?;
-        }
-    }
-    let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+    let manifest = crate::manifest::model("clip");
+    manifest.fetch(dir)?;
+    let at = |role: &str| dir.join(&manifest.file(role).local);
+    let mut tokenizer = Tokenizer::from_file(at("tokenizer"))
         .map_err(|e| format!("cannot read the CLIP tokenizer: {e}"))?;
     tokenizer
         .with_truncation(Some(TruncationParams {
@@ -118,20 +82,20 @@ fn load(dir: &Path) -> Result<Models, String> {
         }))
         .map_err(|e| format!("cannot set up the CLIP tokenizer: {e}"))?;
     tokenizer.with_padding(None);
-    let dense = std::fs::read(dir.join("dense.safetensors"))
+    let dense = std::fs::read(at("dense"))
         .map_err(|e| format!("cannot read the CLIP text model's last layer: {e}"))
         .and_then(|b| read_dense(&b, CLIP_DIMS * 768))?;
     let env = environment()?;
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
-    let session = |file: &str| {
+    let session = |role: &str| {
         Session::builder(&env)
             .and_then(|b| Ok(b.with_intra_threads(threads)?))
-            .and_then(|mut b| b.commit_from_file(dir.join(file)))
+            .and_then(|mut b| b.commit_from_file(at(role)))
             .map_err(|e| format!("cannot load {CLIP_MODEL}: {e}"))
     };
     Ok(Models {
-        text: session("text.onnx")?,
-        vision: session("vision.onnx")?,
+        text: session("model")?,
+        vision: session("vision")?,
         tokenizer,
         dense,
     })

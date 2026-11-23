@@ -1,10 +1,11 @@
 //! Embeddings on native clients: multilingual-e5-small, run with ONNX
 //! Runtime.
 //!
-//! - **The model** is the int8 export that the web app's transformers.js
-//!   also runs, at a pinned revision, so every client gives the same
-//!   vectors. It downloads on first use into `cache_dir()`, and each file
-//!   is checked against its SHA-256 before it is used.
+//! - **The model** is the int8 export that the web app also runs, at a
+//!   pinned revision (`search/data/models.json`, see `manifest`), so every
+//!   client gives the same vectors. It downloads on first use into
+//!   `cache_dir()`, and each file is checked against its SHA-256 before it
+//!   is used.
 //! - **e5** wants "passage: " before text that is searched and "query: "
 //!   before a query. Its vector is the mean of the last hidden states over
 //!   the real tokens (not padding), made unit length.
@@ -30,24 +31,6 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 /// The name records give this model's vectors. A new revision or export
 /// needs a new name: vectors from two exports must not be compared.
 pub const MODEL: &str = raft5fs_search::vector::E5_MODEL;
-
-const REPO: &str = "https://huggingface.co/Xenova/multilingual-e5-small/resolve";
-const REVISION: &str = "761b726dd34fb83930e26aab4e9ac3899aa1fa78";
-
-/// Each file of the model: where it is in the repository, the name it is
-/// kept under here, and its SHA-256.
-const FILES: [(&str, &str, &str); 2] = [
-    (
-        "onnx/model_quantized.onnx",
-        "model.onnx",
-        "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
-    ),
-    (
-        "tokenizer.json",
-        "tokenizer.json",
-        "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
-    ),
-];
 
 /// The most tokens the model reads of one text; the rest is cut.
 const MAX_TOKENS: usize = 512;
@@ -92,9 +75,7 @@ impl E5 {
     /// Whether the model's files are here already, so that using it
     /// downloads nothing.
     pub fn is_downloaded(&self) -> bool {
-        FILES
-            .iter()
-            .all(|(_, name, sha)| file_matches(&self.dir.join(name), sha))
+        crate::manifest::model("e5").is_in(&self.dir)
     }
 
     fn loaded(&self) -> Result<Arc<Mutex<Model>>, String> {
@@ -133,11 +114,6 @@ pub(crate) fn file_matches(path: &Path, sha: &str) -> bool {
 
 fn raft5fs_wire_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Downloads `file` of the model to `to`, checking it as it comes.
-fn download(file: &str, to: &Path, sha: &str) -> Result<(), String> {
-    download_url(&format!("{REPO}/{REVISION}/{file}"), to, sha, MODEL)
 }
 
 /// Downloads `url` to `to`, checking it as it comes against `sha`. Written
@@ -188,14 +164,9 @@ pub(crate) fn environment() -> Result<ort::environment::Environment, String> {
 }
 
 fn load(dir: &Path) -> Result<Model, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
-    for (file, name, sha) in FILES {
-        let path = dir.join(name);
-        if !file_matches(&path, sha) {
-            download(file, &path, sha)?;
-        }
-    }
-    let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+    let manifest = crate::manifest::model("e5");
+    manifest.fetch(dir)?;
+    let mut tokenizer = Tokenizer::from_file(dir.join(&manifest.file("tokenizer").local))
         .map_err(|e| format!("cannot read the model's tokenizer: {e}"))?;
     let pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1);
     tokenizer
@@ -216,7 +187,7 @@ fn load(dir: &Path) -> Result<Model, String> {
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
     let session = Session::builder(&env)
         .and_then(|b| Ok(b.with_intra_threads(threads)?))
-        .and_then(|mut b| b.commit_from_file(dir.join("model.onnx")))
+        .and_then(|mut b| b.commit_from_file(dir.join(&manifest.file("model").local)))
         .map_err(|e| format!("cannot load {MODEL}: {e}"))?;
     let token_types = session
         .inputs()

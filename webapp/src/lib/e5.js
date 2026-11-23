@@ -11,7 +11,6 @@
 // Node.
 import { Tokenizer } from "@huggingface/tokenizers";
 
-export const MODEL = "multilingual-e5-small-int8@761b726";
 const MAX_TOKENS = 512;
 
 /// The model, ready to embed: `onnx` is the model's bytes, the tokenizer's

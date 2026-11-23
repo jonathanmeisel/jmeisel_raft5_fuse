@@ -103,7 +103,16 @@ export default defineConfig(({ mode, command }) => {
       // No inline data: URLs for scripts or workers; the CSP refuses them.
       assetsInlineLimit: 0,
     },
-    server: command === "serve" ? { port: 5173, strictPort: true } : undefined,
+    server:
+      command === "serve"
+        ? {
+            port: 5173,
+            strictPort: true,
+            // The app, and the model manifest it imports from the search
+            // crate (search/data/models.json).
+            fs: { allow: [".", "../search/data"] },
+          }
+        : undefined,
     preview: { port: 4173, strictPort: true },
   };
 });

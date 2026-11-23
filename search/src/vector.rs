@@ -7,13 +7,13 @@
 //!
 //! **Changing a model** (`E5_MODEL` or `CLIP_MODEL`):
 //!
-//! - Give the new export a new name here, and add the old name to
-//!   `E5_REPLACES` (or `CLIP_REPLACES`). Devices on the new version embed
-//!   the old records again at their next walk; devices still on the old
-//!   version leave the new records alone.
-//! - Pin its files and SHA-256s where clients fetch it: raft5fs-indexer's
-//!   `embed` (or `clip`), the web app's `embedWorker.js` (and the name in
-//!   `e5.js` or `clip.js`), and `scripts/fetch-model.sh`.
+//! - Pin its files in `data/models.json`, which every client reads: each
+//!   file's URL at a revision, SHA-256 and size. Give it a new name there
+//!   and here (raft5fs-indexer's `manifest` tests check they agree).
+//! - Add the old name to `E5_REPLACES` (or `CLIP_REPLACES`). Devices on
+//!   the new version embed the old records again at their next walk;
+//!   devices still on the old version leave the new records alone.
+//! - Fetch it for the web app (`npm run model` in webapp).
 //! - Write the parity fixtures again (raft5fs-indexer's ignored
 //!   `write_the_web_apps_*` tests), and run `npm run test:parity`.
 //! - Measure again what scores tell a match from a miss (the real-model

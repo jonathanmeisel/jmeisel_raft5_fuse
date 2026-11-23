@@ -10,7 +10,6 @@
 // ONNX Runtime is passed in, as for e5.js.
 import { Tokenizer } from "@huggingface/tokenizers";
 
-export const CLIP_MODEL = "mclip-vit-b32-int8@58edf8c+6b7c523";
 const MAX_TOKENS = 128;
 const HIDDEN = 768;
 const DIMS = 512;

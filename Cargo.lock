@@ -3235,6 +3235,8 @@ dependencies = [
  "raft5fs-client",
  "raft5fs-search",
  "raft5fs-testkit",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tokenizers",
  "tokio",

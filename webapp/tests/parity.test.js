@@ -6,13 +6,17 @@
 // passage, 0.9988 for a short query): far less than the 0.07 between a
 // match and a miss (raft5fs-search's MIN_SIMILARITY). A wrong tokenizer or
 // pooling gives much less. Runs in Node, on the files that
-// scripts/fetch-model.sh puts in public/models: npm run test:parity.
+// scripts/fetch-models.mjs puts in public/models: npm run test:parity.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import * as ort from "onnxruntime-web/wasm";
-import { MODEL, loadE5 } from "../src/lib/e5.js";
-import { CLIP_MODEL, loadClip } from "../src/lib/clip.js";
+import { loadE5 } from "../src/lib/e5.js";
+import { loadClip } from "../src/lib/clip.js";
+
+const manifest = JSON.parse(readFileSync(new URL("../../search/data/models.json", import.meta.url)));
+const MODEL = manifest.models.e5.name;
+const CLIP_MODEL = manifest.models.clip.name;
 
 const fixture = JSON.parse(readFileSync(new URL("fixtures/e5-vectors.json", import.meta.url)));
 const dir = new URL(`../public/models/${MODEL}/`, import.meta.url);

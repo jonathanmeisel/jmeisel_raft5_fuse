@@ -4,7 +4,8 @@
 //
 // - The model is multilingual-e5-small, the int8 export that native clients
 //   also run (raft5fs-indexer's `embed`), served by this app from
-//   models/<MODEL>/ (scripts/fetch-model.sh). The model comes in pieces:
+//   models/<name>/ (scripts/fetch-models.mjs), as search/data/models.json
+//   pins it for every client. The model comes in pieces:
 //   they are joined, the whole is checked against its SHA-256, and it is
 //   kept in the Cache API, so it downloads once.
 // - It runs on ONNX Runtime's WebAssembly backend, on one thread, as on a
@@ -31,64 +32,34 @@
 import * as ort from "onnxruntime-web/wasm";
 import ortWasm from "onnxruntime-web/ort-wasm-simd-threaded.wasm?url";
 import ortMjs from "onnxruntime-web/ort-wasm-simd-threaded.mjs?url";
-import { MODEL, loadE5 } from "./e5.js";
-import { CLIP_MODEL, loadClip } from "./clip.js";
+import { loadE5 } from "./e5.js";
+import { loadClip } from "./clip.js";
 import initPdf, { pdfText } from "../wasm/raft5fs_pdf_web.js";
+// Every model, pinned in one place for every client (see its "about").
+import manifest from "../../../search/data/models.json";
 
 /// Where the app serves a model: public/models/<name>/, under its base.
 const base = (name) => new URL(`${import.meta.env.BASE_URL}models/${name}/`, self.location.origin);
 
-/// Each model's files: their pieces and the pieces' sizes, and the whole's
-/// SHA-256 (scripts/fetch-model.sh fetches them).
-const MODELS = {
-  e5: {
-    base: base(MODEL),
-    files: {
-      model: {
-        parts: [
-          ["model.onnx.0", 60_000_000],
-          ["model.onnx.1", 58_308_185],
-        ],
-        sha256: "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
-      },
-      tokenizer: {
-        parts: [["tokenizer.json", 17_082_730]],
-        sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
-      },
-      tokenizerConfig: {
-        parts: [["tokenizer_config.json", 443]],
-        sha256: "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
-      },
-    },
-  },
-  // CLIP's text side only: photos' image vectors are made on native
-  // devices.
-  clip: {
-    base: base(CLIP_MODEL),
-    files: {
-      model: {
-        parts: [
-          ["text.onnx.0", 60_000_000],
-          ["text.onnx.1", 60_000_000],
-          ["text.onnx.2", 15_377_779],
-        ],
-        sha256: "fbc8fbeaa5237d96bd1bf430057c70d34de8334a463e933a5faa305f6caeed9c",
-      },
-      tokenizer: {
-        parts: [["tokenizer.json", 1_961_847]],
-        sha256: "5b4e1a8171c81dfd666ae40265b9530c6e0b3d53923fe8ac493dcc84229adf81",
-      },
-      tokenizerConfig: {
-        parts: [["tokenizer_config.json", 371]],
-        sha256: "8f66d0ad85be46afc77e0bbf48312cff326ddb9e7290926df96a8228d69a814e",
-      },
-      dense: {
-        parts: [["dense.safetensors", 1_572_984]],
-        sha256: "d12568dc7300970a4d3dbb49068ad16cd89b99840b74b026f8e48071e9414f74",
-      },
-    },
-  },
-};
+/// Model `key`'s files that the web app uses, by role: their pieces (as
+/// scripts/fetch-models.mjs cuts them) with the pieces' sizes, and the
+/// whole's SHA-256.
+function webModel(key) {
+  const m = manifest.models[key];
+  const files = {};
+  for (const f of m.files.filter((f) => f.clients.includes("web"))) {
+    const count = f.piece ? Math.ceil(f.size / f.piece) : 1;
+    const parts = f.piece
+      ? Array.from({ length: count }, (_, i) => [`${f.local}.${i}`, Math.min(f.piece, f.size - i * f.piece)])
+      : [[f.local, f.size]];
+    files[f.role] = { parts, sha256: f.sha256 };
+  }
+  return { name: m.name, base: base(m.name), files };
+}
+
+/// The text model, and CLIP's text side only: photos' image vectors are
+/// made on native devices.
+const MODELS = { e5: webModel("e5"), clip: webModel("clip") };
 const CACHE = "raft5fs-models";
 
 /// What a first load of model `name` downloads: every piece of every file.

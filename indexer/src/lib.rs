@@ -6,6 +6,7 @@
 
 pub mod clip;
 pub mod embed;
+pub mod manifest;
 
 use std::sync::Arc;
 
