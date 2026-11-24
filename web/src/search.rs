@@ -2,9 +2,13 @@
 //! words and meaning, and kept up to date by this tab when it holds the
 //! account's index lock.
 //!
+//! - **Indexing here is words only:** text, dates, places and thumbnails.
+//!   Vectors, for text and for photos, come from native devices; the
+//!   models here embed queries only.
 //! - **The app's tools.** The Worker gives `setSearchTools` functions:
 //!   `embed(texts, query)` (the embed Worker's model), `pdf(bytes)` (the PDF
-//!   module), `cacheGet(key)` / `cachePut(key, bytes)` (IndexedDB),
+//!   module), `cacheGet(key)` / `cachePut(key, bytes)` /
+//!   `cacheKeep(volume, keys)` (IndexedDB),
 //!   `places()` (the places table, `places.bin`, which the app serves and
 //!   this checks against its pinned SHA-256), `thumb(bytes)` (a photo's
 //!   thumbnail, drawn by the embed Worker), and `clip(text)` (a query's
@@ -14,18 +18,19 @@
 //! - **The cache** keeps the segments this browser has read, sealed with
 //!   raft5fs-crypto's `local`, so a copy of the browser's files is
 //!   ciphertext without the account. Reading an index again fetches only
-//!   new segments.
+//!   new segments, and adds only their entries to the volume's view.
 //! - **Scope.** A search covers the volumes the app names: the one it is
 //!   in, or all it has loaded.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use js_sys::{Array, Float32Array, Function, Promise, Uint8Array};
 use raft5fs_client::indexer::{
-    self, BuiltIn, Embed, Extract, IndexStatus, Indexer, IndexerConfig, SegmentCache, Tools,
+    self, BuiltIn, Embed, Extract, IndexDelta, IndexStatus, Indexer, IndexerConfig, SegmentCache,
+    Tools,
 };
 use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
@@ -62,6 +67,8 @@ pub(crate) struct State {
 struct Loaded {
     path: String,
     view: View,
+    /// The segments `view` holds, to read only new ones next time.
+    keys: HashSet<String>,
     progress: raft5fs_search::view::Progress,
     /// Whether its owner has turned indexing off.
     off: bool,
@@ -79,6 +86,8 @@ struct JsTools {
     pdf: Function,
     cache_get: Function,
     cache_put: Function,
+    /// Optional: without it, segments compacted away stay in the cache.
+    cache_keep: Option<Function>,
     places: Function,
     thumb: Function,
     clip: Function,
@@ -234,6 +243,16 @@ impl SegmentCache for JsCache {
             let _ = call(&self.0.cache_put, &[key.into(), sealed.into()]).await;
         })
     }
+
+    fn keep_only<'a>(&'a self, volume: u64, keys: &'a [String]) -> Local<'a, ()> {
+        Box::pin(async move {
+            let Some(keep) = &self.0.cache_keep else {
+                return;
+            };
+            let keys: Array = keys.iter().map(|k| JsValue::from_str(k)).collect();
+            let _ = call(keep, &[JsValue::from_f64(volume as f64), keys.into()]).await;
+        })
+    }
 }
 
 /// One search result, for JavaScript.
@@ -313,10 +332,11 @@ impl Inner {
     fn index_tools(&self) -> Result<Tools, FsError> {
         let tools = self.tools()?;
         Ok(Tools {
-            extract: Arc::new(JsExtract(Rc::clone(&tools))),
-            embed: Some(Arc::new(JsEmbed(tools))),
-            // Image vectors take a model too big for a browser: native
-            // devices fill them in.
+            extract: Arc::new(JsExtract(tools)),
+            // A browser indexes words, dates, places and thumbnails only:
+            // text and image vectors are left to native devices, whose
+            // next pass fills them in. The models here only embed queries.
+            embed: None,
             image: None,
         })
     }
@@ -349,19 +369,46 @@ impl Inner {
         let off = self.vault().remote().get_volume(ino).await?.indexing_off;
         let tools = self.tools().ok();
         let cache = tools.map(JsCache);
-        let read = indexer::read_index_cached(
-            self.vault(),
-            ino,
-            cache.as_ref().map(|c| c as &dyn SegmentCache),
-        )
-        .await?;
-        let (view, progress) = match read {
-            Some(index) => (View::new(index.entries), index.progress),
-            None => (View::default(), Default::default()),
+        let cache = cache.as_ref().map(|c| c as &dyn SegmentCache);
+        let known = self
+            .search
+            .views
+            .borrow()
+            .get(&ino)
+            .map(|l| l.keys.clone())
+            .unwrap_or_default();
+        let read = indexer::read_index_since(self.vault(), ino, cache, &known).await?;
+        let old = self.search.views.borrow_mut().remove(&ino);
+        let old = old.and_then(|l| Rc::try_unwrap(l).ok());
+        let whole = |d: IndexDelta| {
+            (
+                View::new(d.entries),
+                d.keys.into_iter().collect(),
+                d.progress,
+            )
+        };
+        let (view, keys, progress) = match read {
+            None => (View::default(), HashSet::new(), Default::default()),
+            Some(d) if d.reset || known.is_empty() => whole(d),
+            Some(d) => match old {
+                Some(mut l) => {
+                    l.view.add(d.entries);
+                    (l.view, d.keys.into_iter().collect(), d.progress)
+                }
+                // A search still holds the old view: read the index whole,
+                // from the cache.
+                None => match indexer::read_index_since(self.vault(), ino, cache, &HashSet::new())
+                    .await?
+                {
+                    Some(d) => whole(d),
+                    None => (View::default(), HashSet::new(), Default::default()),
+                },
+            },
         };
         let loaded = Rc::new(Loaded {
             path,
             view,
+            keys,
             progress,
             off,
             at: now,
@@ -432,6 +479,7 @@ impl Fs {
             pdf: get("pdf")?,
             cache_get: get("cacheGet")?,
             cache_put: get("cachePut")?,
+            cache_keep: get("cacheKeep").ok(),
             places: get("places")?,
             thumb: get("thumb")?,
             clip: get("clip")?,

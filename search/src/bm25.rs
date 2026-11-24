@@ -55,6 +55,16 @@ impl Bm25 {
     /// The documents that match `query`, best first, each with its score and
     /// best chunk. At most `limit`.
     pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, f32, Option<usize>)> {
+        self.search_where(query, limit, |_| true)
+    }
+
+    /// `search`, over only the documents that `live` keeps.
+    pub fn search_where(
+        &self,
+        query: &str,
+        limit: usize,
+        live: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, f32, Option<usize>)> {
         if self.chunks.is_empty() {
             return Vec::new();
         }
@@ -80,6 +90,9 @@ impl Bm25 {
         let mut best: HashMap<usize, (f32, Option<usize>)> = HashMap::new();
         for (id, score) in scores {
             let at = self.chunks[id as usize].0;
+            if !live(at.doc) {
+                continue;
+            }
             let slot = best.entry(at.doc).or_insert((f32::MIN, None));
             // Show a chunk of text rather than the path when they tie.
             if score > slot.0 || (score == slot.0 && slot.1.is_none()) {

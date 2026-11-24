@@ -46,6 +46,8 @@ const localFsId = () =>
 const SLOW = { timeout: 60_000 };
 /// web_dev's port for new invitations: three after its native port.
 const REISSUE = "http://127.0.0.1:27163";
+/// web_dev's native port, for the CLI.
+const NATIVE = "http://127.0.0.1:27160";
 /// A 1x1 PNG.
 const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url));
 const WEBM = fixture("clip.webm");
@@ -1668,7 +1670,35 @@ async function searchUntil(page, query, path, timeout = 120_000) {
   }
 }
 
+/// Indexes `folder` of `user`'s as a desktop does, with the models: the
+/// vectors that browsers search by but don't make. Tries again while a
+/// browser's pass holds the folder's claim.
+/// Needs the CLI built: cargo build -p raft5fs --no-default-features --features index
+async function nativeIndex(user, folder) {
+  const binary = new URL("../../target/debug/raft5fs", import.meta.url).pathname;
+  // No profile, and no pins of the tester's own.
+  const config = mkdtempSync(join(tmpdir(), "raft5fs-cli-"));
+  try {
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      const out = execFileSync(
+        binary,
+        ["--server", NATIVE, "--insecure-plaintext", "--user", user, "index", folder],
+        { env: { ...process.env, XDG_CONFIG_HOME: config, RAFT5FS_PASSWORD: PASSWORD }, encoding: "utf8", timeout: 600_000 },
+      );
+      if (!/skipped:/.test(out)) return out;
+      if (Date.now() > deadline) throw new Error(`${folder} stayed claimed: ${out}`);
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+  } finally {
+    rmSync(config, { recursive: true, force: true });
+  }
+}
+
 test("files are found by their words and their meaning", async ({ browser }) => {
+  // `raft5fs index` may first download its models, and the page reads the
+  // index again only a minute after it last did.
+  test.setTimeout(300_000);
   const context = await browser.newContext();
   await context.addInitScript(() => {
     try {
@@ -1692,7 +1722,9 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   await searchUntil(page, "receipts", "notes/taxes.txt");
   await searchUntil(page, "tomatoes basil", "notes/minutes.docx");
   await searchUntil(page, "raft5fs", "notes/page.pdf");
-  // Meaning, in another language, with no word in common.
+  // Meaning, in another language, with no word in common: from the
+  // vectors a desktop adds.
+  await nativeIndex("kai", "notes");
   const results = await searchUntil(page, "Steuererklärung Belege", "notes/taxes.txt");
   await expect(results.getByRole("option").first()).toContainText("notes/taxes.txt");
   await expect(results).toContainText(/notes: \d+ files, indexed .* by kai on /);
@@ -1755,7 +1787,10 @@ test("a phone doesn't index for search unless asked", async ({ browser }) => {
 });
 
 test("a phone asks before downloading the search model, and finds words meanwhile", async ({ browser }) => {
-  // A computer indexes a folder, with vectors.
+  // `raft5fs index` may first download its models, and the page reads the
+  // index again only a minute after it last did.
+  test.setTimeout(300_000);
+  // A browser indexes a folder's words, and a desktop adds vectors.
   const computer = await browser.newContext();
   await computer.addInitScript(() => {
     try {
@@ -1772,6 +1807,8 @@ test("a phone asks before downloading the search model, and finds words meanwhil
     { name: "ride.txt", mimeType: "text/plain", buffer: Buffer.from(ride) },
   ]);
   await expect(item(desk, "ride.txt")).toBeVisible(SLOW);
+  await searchUntil(desk, "gravel", "trips/ride.txt");
+  await nativeIndex("mia", "trips");
   await searchUntil(desk, "Fahrradtour", "trips/ride.txt");
 
   // The same account on a phone, which doesn't index.

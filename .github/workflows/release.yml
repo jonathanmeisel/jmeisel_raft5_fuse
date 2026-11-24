@@ -176,9 +176,16 @@ jobs:
         run: npm run model
       - name: The browser's model gives native clients' vectors
         run: npm run test:parity
+      # The browser tests run `raft5fs index`, whose models are fetched once
+      # and kept, by the pins in models.json.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/raft5fs
+          key: native-models-${{ hashFiles('search/data/models.json') }}
       - name: Browser tests
         run: |
           cargo build -p raft5fs-testkit --example web_dev
+          cargo build -p raft5fs --no-default-features --features index
           npx playwright install --with-deps chromium
           npx playwright test
       - name: Build the site

@@ -197,6 +197,7 @@ function joined(user, { early }) {
     pdf: readPdf,
     cacheGet,
     cachePut,
+    cacheKeep,
     places: fetchPlaces,
     thumb: makeThumb,
     clip: clipQuery,
@@ -301,6 +302,24 @@ async function cachePut(key, bytes) {
     await putRecord(await openDb(), "search", searchPrefix + key, bytes.slice().buffer);
   } catch {
     // Full or refused: the segment is read again next time.
+  }
+}
+
+/// Removes the segments kept for volume `volume` (an inode) whose keys
+/// aren't in `keys`: segments compacted away.
+async function cacheKeep(volume, keys) {
+  try {
+    const keep = new Set(keys.map((k) => searchPrefix + k));
+    const prefix = `${searchPrefix}${volume}/`;
+    const transaction = (await openDb()).transaction("search", "readwrite");
+    const store = transaction.objectStore("search");
+    const request = store.getAllKeys(IDBKeyRange.bound(prefix, prefix + "\uffff"));
+    request.onsuccess = () => {
+      for (const key of request.result) if (!keep.has(key)) store.delete(key);
+    };
+    await done(transaction);
+  } catch {
+    // Left for next time: it only takes space.
   }
 }
 

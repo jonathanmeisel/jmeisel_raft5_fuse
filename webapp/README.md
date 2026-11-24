@@ -115,12 +115,15 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     re-sealing) indexes in the background, if the account menu's **Index
     for search on this device** is on: by default on a computer, off on a
     phone or tablet (`searchSetting.js`). An upload is indexed a few seconds
-    later.
+    later. A browser indexes words, dates, places and thumbnails only.
+    Vectors come from native devices, which add them to records a
+    browser wrote at their next pass.
   - `src/lib/embedWorker.js` is a Worker of its own, so indexing never holds
-    up the session's calls. It runs the model (`src/lib/e5.js`, on ONNX
-    Runtime's WebAssembly backend, one thread) and reads PDFs with the
-    PDF module (the `raft5fs-pdf-web` crate, a separate wasm: a PDF that
-    crashes it only restarts it). It holds no keys.
+    up the session's calls. It runs the model to embed queries
+    (`src/lib/e5.js`, on ONNX Runtime's WebAssembly backend, one thread),
+    and reads PDFs with the PDF module (the `raft5fs-pdf-web` crate, a
+    separate wasm: a PDF that crashes it only restarts it). It holds no
+    keys.
   - The models are served by the app from `public/models/`, which
     `npm run model` (`scripts/fetch-models.mjs`) fetches as
     `search/data/models.json` pins them for every client (about 135 MB for
@@ -133,12 +136,13 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     download's progress the first time. On a phone or tablet, with Data
     Saver, or on a slow connection, it asks before that download
     (`searchSetting.js`): **Download**, **Not now** (until the page
-    reloads), or **Never on this device**. A browser that indexes needs
-    the model anyway, and doesn't ask.
+    reloads), or **Never on this device**.
   - IndexedDB's `search` store keeps the index segments this browser has
     read, sealed to the account in the wasm client (raft5fs-crypto's
-    `local`), so searching again fetches only what is new. **Keep search
-    data on this device** off keeps nothing, for a borrowed computer.
+    `local`), so searching again fetches only what is new, and adds only
+    that to the volume's view in memory. Segments a compaction removed
+    are dropped from it (`cacheKeep`). **Keep search data on this device**
+    off keeps nothing, for a borrowed computer.
   - Tracks and photos are named with the places table (`search/data/`,
     served from `public/data/places.bin`, checked against its pinned
     SHA-256), fetched by the tab that indexes. Photos get thumbnails, drawn
@@ -186,6 +190,7 @@ The dev server has no Content Security Policy; builds do. To try a build:
 
 ```sh
 cargo build -p raft5fs-testkit --example web_dev
+cargo build -p raft5fs --no-default-features --features index
 npm run wasm
 npm run model
 npm run test:parity                # the model gives native clients' vectors
@@ -199,7 +204,8 @@ and `tests/fixtures/clip-vectors.json`, which native clients wrote
 `write_the_web_apps_clip_fixture`; run them again after changing a
 model). In the browser tests, indexing is off in every tab except the
 search tests', which upload text, Word and PDF files, find them by their
-words and by meaning in another language, check that what the browser
+words, run `raft5fs index` (the CLI, as a desktop would) to add vectors,
+find them by meaning in another language, check that what the browser
 keeps of the index is sealed, and turn indexing off as the owner.
 
 The tests start their own `web_dev`, build the app for it, and drive it in

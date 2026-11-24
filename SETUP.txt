@@ -1180,8 +1180,15 @@ needs glibc 2.28 or newer). To use a copy the system already has, set
 RAFT5FS_ONNXRUNTIME to its libonnxruntime. The web app serves the same files itself (webapp/README.md) and
 keeps them in the browser after the first search. A browser keeps the
 index it has read, sealed to the account, unless "Keep search data on
-this device" is off. Indexing with it takes CPU: about half the cores, at most four,
-while a pass runs.
+this device" is off. Indexing with the models takes CPU: about half the
+cores, at most four, while a pass runs.
+
+Only native devices (a mount, a WebDAV server, raft5fs index) make
+vectors. The web app indexes words, dates, places and thumbnails, and
+uses the models only to search. When a pass on a native device finds
+files that were indexed without vectors, it adds them, whether or not
+the files changed. So a volume that only browsers index is searched
+by words alone, until a native device indexes it once.
 
 What is indexed: plain text and source code, HTML, Word, PowerPoint and
 Excel files (docx, pptx, xlsx), OpenDocument files, PDF, chat exports,
@@ -1201,7 +1208,7 @@ Photos are also found by what they show, in any language ("Strand am
 Meer", "kids at the beach"), with CLIP: on native devices a second model
 (about 225 MB, downloaded as the first is, into the same folder) gives
 each photo a vector, and each query one. The web app doesn't make photos'
-vectors: a device that does fills them in at its next walk. It does
+vectors: a native device fills them in at its next pass. It does
 search them, with CLIP's text side (about 140 MB more, downloaded on the
 first search of a volume whose photos have vectors). Results show each
 photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
@@ -1245,7 +1252,16 @@ What it costs: the index counts against the volume owner's quota, and
 snapshots keep old parts of it as they keep old files. It holds a short
 preview of each piece of text, the words in it, and its vector (about
 400 bytes), not the whole text; for a photo, a thumbnail and a vector of
-what it shows (about 13 KB). A vector says roughly what its text is
+what it shows (about 13 KB). The index is compressed (deflate), with each
+word stored once in a segment. A vector says roughly what its text is
 about, and someone with the index could partly recover the text from
 it, so it is sealed as strongly as the files are.
+
+Each device writes its own index files, and never changes them. So the
+index grows with every change, and a device that holds the claim
+compacts it now and then. It writes all live entries again as a few
+large files of its own, then deletes the rest. This happens when the
+small files outnumber the large ones (and there are more than 16), or
+when more than 30% of the entries are out of date. A browser reads only
+the index files it has not read yet, and adds them to what it has.
 

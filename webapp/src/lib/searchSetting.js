@@ -2,8 +2,9 @@
 //
 // - "Index for search on this device": on by default for a computer, off
 //   for a phone or tablet, as for re-sealing (pruneSetting.js). Indexing
-//   reads every changed file and runs the model; another device that can
-//   write a volume indexes it if this one doesn't.
+//   reads every changed file, for its words only (native devices add
+//   vectors); another device that can write a volume indexes it if this
+//   one doesn't.
 // - Volumes this browser doesn't index (others still may).
 // - "Keep search data on this device": the index segments it has read, so
 //   a search here fetches only what is new. Off for a borrowed computer.
@@ -11,8 +12,7 @@
 //   MB more where photos have image vectors, once) to search by
 //   meaning: on a computer without asking; on a phone or tablet, or with
 //   the browser's Data Saver or a slow connection, only once the person
-//   says yes (`meaningAllowed`). Indexing here counts as yes: it needs the
-//   model anyway.
+//   says yes (`meaningAllowed`).
 import { mobile } from "./pruneSetting.js";
 
 const INDEX = "raft5fs:index-here";
@@ -95,7 +95,6 @@ export function askBeforeModel() {
 export function meaningAllowed() {
   const kept = read(MEANING);
   if (kept === "yes" || kept === "no") return kept;
-  if (indexHere()) return "yes";
   return askBeforeModel() ? "ask" : "yes";
 }
 

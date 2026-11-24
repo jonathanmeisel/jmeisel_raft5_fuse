@@ -9,13 +9,18 @@
 //! The full text is not kept: only a short preview and the word counts of
 //! each chunk. That keeps the index small enough for a browser to cache.
 
+use std::collections::HashMap;
+
 use raft5fs_wire::{self as wire, Reader};
 
 use crate::Error;
 
-/// The format byte at the start of every entry. Format 2 adds `Extra` to
-/// a record; format 1 records read with none.
-const FORMAT: u8 = 2;
+/// The format byte at the start of every entry.
+/// - Format 3 has varints, and words by number in the segment's list.
+/// - Format 2 has fixed-width numbers and words in full.
+/// - Format 1 is format 2 without `Extra`: its records read with none.
+const FORMAT: u8 = 3;
+const FORMAT_2: u8 = 2;
 const FORMAT_1: u8 = 1;
 
 /// What the indexer saw of a file: if this changes, the file changed.
@@ -128,85 +133,6 @@ pub struct Thumb {
     pub len: u32,
 }
 
-fn put_vector(out: &mut Vec<u8>, v: &Vector) {
-    wire::put_u32(out, v.scale.to_bits());
-    let bytes: Vec<u8> = v.values.iter().map(|&x| x as u8).collect();
-    wire::put_bytes(out, &bytes);
-}
-
-fn read_vector(r: &mut Reader<'_>) -> Result<Vector, Error> {
-    let scale = f32::from_bits(r.u32()?);
-    let values = r.bytes()?.iter().map(|&b| b as i8).collect();
-    Ok(Vector { scale, values })
-}
-
-fn put_extra(out: &mut Vec<u8>, e: &Extra) {
-    wire::put_u32(out, e.reader);
-    wire::put_u64(out, e.when_ms);
-    match e.at {
-        None => wire::put_u8(out, 0),
-        Some((lat, lon)) => {
-            wire::put_u8(out, 1);
-            wire::put_u32(out, lat as u32);
-            wire::put_u32(out, lon as u32);
-        }
-    }
-    wire::put_u32(out, e.distance_m);
-    wire::put_u32(out, e.climb_m);
-    match &e.thumb {
-        None => wire::put_u8(out, 0),
-        Some(t) => {
-            wire::put_u8(out, 1);
-            wire::put_bytes(out, t.file.as_bytes());
-            wire::put_u64(out, t.offset);
-            wire::put_u32(out, t.len);
-        }
-    }
-    match &e.image {
-        None => wire::put_u8(out, 0),
-        Some((model, v)) => {
-            wire::put_u8(out, 1);
-            wire::put_bytes(out, model.as_bytes());
-            put_vector(out, v);
-        }
-    }
-}
-
-fn read_extra(r: &mut Reader<'_>) -> Result<Extra, Error> {
-    let reader = r.u32()?;
-    let when_ms = r.u64()?;
-    let at = match r.u8()? {
-        0 => None,
-        1 => Some((r.u32()? as i32, r.u32()? as i32)),
-        _ => return Err(r.garbled()),
-    };
-    let distance_m = r.u32()?;
-    let climb_m = r.u32()?;
-    let thumb = match r.u8()? {
-        0 => None,
-        1 => Some(Thumb {
-            file: r.string()?,
-            offset: r.u64()?,
-            len: r.u32()?,
-        }),
-        _ => return Err(r.garbled()),
-    };
-    let image = match r.u8()? {
-        0 => None,
-        1 => Some((r.string()?, read_vector(r)?)),
-        _ => return Err(r.garbled()),
-    };
-    Ok(Extra {
-        reader,
-        when_ms,
-        at,
-        distance_m,
-        climb_m,
-        thumb,
-        image,
-    })
-}
-
 // Nearly every entry is a record, so boxing it would only add an
 // allocation to each.
 #[allow(clippy::large_enum_variant)]
@@ -232,39 +158,60 @@ impl Entry {
     }
 }
 
-pub fn encode_entry(entry: &Entry) -> Vec<u8> {
+/// The words of one segment's entries, each kept once: an entry names a
+/// word by its number here. Numbers go in the order words are first seen.
+#[derive(Debug, Default)]
+pub struct Words {
+    ids: HashMap<String, u32>,
+    list: Vec<String>,
+}
+
+impl Words {
+    fn id(&mut self, word: &str) -> u32 {
+        if let Some(&id) = self.ids.get(word) {
+            return id;
+        }
+        let id = self.list.len() as u32;
+        self.ids.insert(word.to_owned(), id);
+        self.list.push(word.to_owned());
+        id
+    }
+
+    /// The words, by number.
+    pub fn into_list(self) -> Vec<String> {
+        self.list
+    }
+}
+
+/// Writes `entry` in the current format, with its words as numbers in
+/// `words`. Most numbers are varints: nearly all are small.
+pub fn encode_entry(entry: &Entry, words: &mut Words) -> Vec<u8> {
     let mut out = vec![FORMAT];
     match entry {
         Entry::Gone { ino, at_ms } => {
             wire::put_u8(&mut out, 1);
-            wire::put_u64(&mut out, *ino);
-            wire::put_u64(&mut out, *at_ms);
+            wire::put_varint(&mut out, *ino);
+            wire::put_varint(&mut out, *at_ms);
         }
         Entry::Record(r) => {
             wire::put_u8(&mut out, 0);
-            wire::put_u64(&mut out, r.ino);
-            wire::put_u64(&mut out, r.at_ms);
-            wire::put_u64(&mut out, r.stamp.mtime_ns);
-            wire::put_u64(&mut out, r.stamp.size);
-            wire::put_bytes(&mut out, r.path.as_bytes());
+            wire::put_varint(&mut out, r.ino);
+            wire::put_varint(&mut out, r.at_ms);
+            wire::put_varint(&mut out, r.stamp.mtime_ns);
+            wire::put_varint(&mut out, r.stamp.size);
+            wire::put_short_bytes(&mut out, r.path.as_bytes());
             wire::put_u8(&mut out, r.kind.byte());
-            wire::put_bytes(&mut out, r.model.as_bytes());
-            wire::put_u32(&mut out, r.chunks.len() as u32);
+            wire::put_short_bytes(&mut out, r.model.as_bytes());
+            wire::put_varint(&mut out, r.chunks.len() as u64);
             for c in &r.chunks {
-                wire::put_bytes(&mut out, c.preview.as_bytes());
-                wire::put_u32(&mut out, c.len);
-                wire::put_u32(&mut out, c.terms.len() as u32);
+                wire::put_short_bytes(&mut out, c.preview.as_bytes());
+                wire::put_varint(&mut out, c.len.into());
+                wire::put_varint(&mut out, c.terms.len() as u64);
                 for (term, count) in &c.terms {
-                    wire::put_bytes(&mut out, term.as_bytes());
-                    wire::put_u16(&mut out, *count);
+                    wire::put_varint(&mut out, words.id(term).into());
+                    wire::put_varint(&mut out, (*count).into());
                 }
-                match &c.vector {
-                    None => wire::put_u8(&mut out, 0),
-                    Some(v) => {
-                        wire::put_u8(&mut out, 1);
-                        put_vector(&mut out, v);
-                    }
-                }
+                put_option(&mut out, c.vector.as_ref(), put_vector);
             }
             put_extra(&mut out, &r.extra);
         }
@@ -272,41 +219,195 @@ pub fn encode_entry(entry: &Entry) -> Vec<u8> {
     out
 }
 
-pub fn decode_entry(bytes: &[u8]) -> Result<Entry, Error> {
+fn put_option<T>(out: &mut Vec<u8>, v: Option<&T>, put: impl FnOnce(&mut Vec<u8>, &T)) {
+    match v {
+        None => wire::put_u8(out, 0),
+        Some(v) => {
+            wire::put_u8(out, 1);
+            put(out, v);
+        }
+    }
+}
+
+fn put_vector(out: &mut Vec<u8>, v: &Vector) {
+    wire::put_u32(out, v.scale.to_bits());
+    let bytes: Vec<u8> = v.values.iter().map(|&x| x as u8).collect();
+    wire::put_short_bytes(out, &bytes);
+}
+
+fn put_extra(out: &mut Vec<u8>, e: &Extra) {
+    wire::put_varint(out, e.reader.into());
+    wire::put_varint(out, e.when_ms);
+    put_option(out, e.at.as_ref(), |out, &(lat, lon)| {
+        wire::put_u32(out, lat as u32);
+        wire::put_u32(out, lon as u32);
+    });
+    wire::put_varint(out, e.distance_m.into());
+    wire::put_varint(out, e.climb_m.into());
+    put_option(out, e.thumb.as_ref(), |out, t| {
+        wire::put_short_bytes(out, t.file.as_bytes());
+        wire::put_varint(out, t.offset);
+        wire::put_varint(out, t.len.into());
+    });
+    put_option(out, e.image.as_ref(), |out, (model, v)| {
+        wire::put_short_bytes(out, model.as_bytes());
+        put_vector(out, v);
+    });
+}
+
+/// Reads the fields of an entry in any format: formats 1 and 2 have
+/// fixed-width numbers and words in full, format 3 varints and words by
+/// number.
+struct Fields<'a, 'w> {
+    r: Reader<'a>,
+    compact: bool,
+    words: &'w [String],
+}
+
+impl Fields<'_, '_> {
+    fn n64(&mut self) -> Result<u64, Error> {
+        if self.compact {
+            self.r.varint()
+        } else {
+            self.r.u64()
+        }
+    }
+
+    fn n32(&mut self) -> Result<u32, Error> {
+        if self.compact {
+            let n = self.r.varint()?;
+            u32::try_from(n).map_err(|_| self.r.garbled())
+        } else {
+            self.r.u32()
+        }
+    }
+
+    fn n16(&mut self) -> Result<u16, Error> {
+        if self.compact {
+            let n = self.r.varint()?;
+            u16::try_from(n).map_err(|_| self.r.garbled())
+        } else {
+            self.r.u16()
+        }
+    }
+
+    fn bytes(&mut self) -> Result<&[u8], Error> {
+        if self.compact {
+            self.r.short_bytes()
+        } else {
+            self.r.bytes()
+        }
+    }
+
+    fn string(&mut self) -> Result<String, Error> {
+        if !self.compact {
+            return self.r.string();
+        }
+        let bytes = self.r.short_bytes()?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| self.r.garbled())
+    }
+
+    fn word(&mut self) -> Result<String, Error> {
+        if !self.compact {
+            return self.r.string();
+        }
+        let id = self.r.varint()?;
+        let words = self.words;
+        usize::try_from(id)
+            .ok()
+            .and_then(|id| words.get(id))
+            .cloned()
+            .ok_or_else(|| self.r.garbled())
+    }
+
+    fn flag(&mut self) -> Result<bool, Error> {
+        match self.r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(self.r.garbled()),
+        }
+    }
+
+    fn vector(&mut self) -> Result<Vector, Error> {
+        let scale = f32::from_bits(self.r.u32()?);
+        let values = self.bytes()?.iter().map(|&b| b as i8).collect();
+        Ok(Vector { scale, values })
+    }
+
+    fn extra(&mut self) -> Result<Extra, Error> {
+        let reader = self.n32()?;
+        let when_ms = self.n64()?;
+        let at = if self.flag()? {
+            Some((self.r.u32()? as i32, self.r.u32()? as i32))
+        } else {
+            None
+        };
+        let distance_m = self.n32()?;
+        let climb_m = self.n32()?;
+        let thumb = if self.flag()? {
+            Some(Thumb {
+                file: self.string()?,
+                offset: self.n64()?,
+                len: self.n32()?,
+            })
+        } else {
+            None
+        };
+        let image = if self.flag()? {
+            Some((self.string()?, self.vector()?))
+        } else {
+            None
+        };
+        Ok(Extra {
+            reader,
+            when_ms,
+            at,
+            distance_m,
+            climb_m,
+            thumb,
+            image,
+        })
+    }
+}
+
+/// Reads an entry of any format. `words` are its segment's words, which a
+/// format 3 entry names by number; older formats ignore them.
+pub fn decode_entry(bytes: &[u8], words: &[String]) -> Result<Entry, Error> {
     let mut r = Reader::new(bytes, "a search index entry");
     let format = r.u8()?;
-    if format != FORMAT && format != FORMAT_1 {
+    if ![FORMAT, FORMAT_2, FORMAT_1].contains(&format) {
         return Err(r.garbled());
     }
-    let tag = r.u8()?;
-    let ino = r.u64()?;
-    let at_ms = r.u64()?;
+    let mut f = Fields {
+        r,
+        compact: format == FORMAT,
+        words,
+    };
+    let tag = f.r.u8()?;
+    let ino = f.n64()?;
+    let at_ms = f.n64()?;
     let entry = match tag {
         1 => Entry::Gone { ino, at_ms },
         0 => {
             let stamp = Stamp {
-                mtime_ns: r.u64()?,
-                size: r.u64()?,
+                mtime_ns: f.n64()?,
+                size: f.n64()?,
             };
-            let path = r.string()?;
-            let kind = DocKind::from_byte(r.u8()?).ok_or_else(|| r.garbled())?;
-            let model = r.string()?;
-            let count = r.u32()?;
+            let path = f.string()?;
+            let kind = DocKind::from_byte(f.r.u8()?).ok_or_else(|| f.r.garbled())?;
+            let model = f.string()?;
+            let count = f.n32()?;
             let mut chunks = Vec::new();
             for _ in 0..count {
-                let preview = r.string()?;
-                let len = r.u32()?;
-                let nterms = r.u32()?;
+                let preview = f.string()?;
+                let len = f.n32()?;
+                let nterms = f.n32()?;
                 let mut terms = Vec::new();
                 for _ in 0..nterms {
-                    let term = r.string()?;
-                    terms.push((term, r.u16()?));
+                    let term = f.word()?;
+                    terms.push((term, f.n16()?));
                 }
-                let vector = match r.u8()? {
-                    0 => None,
-                    1 => Some(read_vector(&mut r)?),
-                    _ => return Err(r.garbled()),
-                };
+                let vector = if f.flag()? { Some(f.vector()?) } else { None };
                 chunks.push(Chunk {
                     preview,
                     terms,
@@ -325,13 +426,13 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry, Error> {
                 extra: if format == FORMAT_1 {
                     Extra::default()
                 } else {
-                    read_extra(&mut r)?
+                    f.extra()?
                 },
             })
         }
-        _ => return Err(r.garbled()),
+        _ => return Err(f.r.garbled()),
     };
-    r.finish()?;
+    f.r.finish()?;
     Ok(entry)
 }
 
@@ -390,27 +491,68 @@ mod tests {
         Entry::Record(r)
     }
 
+    fn round_trip(e: &Entry) -> Entry {
+        let mut words = Words::default();
+        let bytes = encode_entry(e, &mut words);
+        decode_entry(&bytes, &words.into_list()).unwrap()
+    }
+
     #[test]
     fn entries_round_trip() {
         let gone = Entry::Gone { ino: 3, at_ms: 4 };
         for e in [sample(), photo(), gone] {
-            assert_eq!(decode_entry(&encode_entry(&e)).unwrap(), e);
+            assert_eq!(round_trip(&e), e);
         }
     }
 
     #[test]
+    fn words_are_kept_once_per_segment() {
+        let mut words = Words::default();
+        let a = encode_entry(&sample(), &mut words);
+        let b = encode_entry(&photo(), &mut words);
+        let list = words.into_list();
+        assert_eq!(list, ["hi"]);
+        assert!(decode_entry(&a, &list).is_ok() && decode_entry(&b, &list).is_ok());
+        assert!(decode_entry(&a, &[]).is_err(), "a word not in the list");
+    }
+
+    #[test]
     fn a_bad_entry_is_refused() {
-        let mut bytes = encode_entry(&sample());
-        assert!(decode_entry(&bytes[..bytes.len() - 1]).is_err());
+        let mut words = Words::default();
+        let mut bytes = encode_entry(&sample(), &mut words);
+        let words = words.into_list();
+        assert!(decode_entry(&bytes[..bytes.len() - 1], &words).is_err());
         bytes.push(0);
-        assert!(decode_entry(&bytes).is_err(), "bytes left over");
+        assert!(decode_entry(&bytes, &words).is_err(), "bytes left over");
         bytes[0] = 9;
-        assert!(decode_entry(&bytes).is_err(), "another format");
+        assert!(decode_entry(&bytes, &words).is_err(), "another format");
     }
 
     /// The stored layout of an entry, pinned.
     #[test]
     fn an_entry_keeps_its_bytes() {
+        let golden = "030007e807050907612f622e74787400016d01\
+                      02686902010002013f00000002ff02\
+                      020301ffffffff0000000204050101740607\
+                      0101633f0000000101";
+        let mut words = Words::default();
+        assert_eq!(
+            raft5fs_wire::hex(&encode_entry(&photo(), &mut words)),
+            golden
+        );
+        assert_eq!(words.into_list(), ["hi"]);
+        assert_eq!(
+            raft5fs_wire::hex(&encode_entry(
+                &Entry::Gone { ino: 3, at_ms: 4 },
+                &mut Words::default()
+            )),
+            "03010304"
+        );
+    }
+
+    /// Entries in format 2 still read.
+    #[test]
+    fn a_format_2_entry_still_reads() {
         let golden = "0200000000000000000700000000000003e8\
                       00000000000000050000000000000009\
                       00000007612f622e74787400000000016d00000001\
@@ -419,12 +561,14 @@ mod tests {
                       00000002000000000000000301ffffffff00000002\
                       000000040000000501000000017400000000000000060000000701\
                       00000001633f0000000000000101";
-        assert_eq!(raft5fs_wire::hex(&encode_entry(&photo())), golden);
+        let bytes = raft5fs_wire::from_hex(golden).unwrap();
+        assert_eq!(decode_entry(&bytes, &[]).unwrap(), photo());
         let gone = "0201000000000000000300000000000000\
                     04";
+        let bytes = raft5fs_wire::from_hex(gone).unwrap();
         assert_eq!(
-            raft5fs_wire::hex(&encode_entry(&Entry::Gone { ino: 3, at_ms: 4 })),
-            gone
+            decode_entry(&bytes, &[]).unwrap(),
+            Entry::Gone { ino: 3, at_ms: 4 }
         );
     }
 
@@ -437,10 +581,10 @@ mod tests {
                       0000000268690000000200000001000000026869000201\
                       3f00000000000002ff02";
         let bytes = raft5fs_wire::from_hex(golden).unwrap();
-        assert_eq!(decode_entry(&bytes).unwrap(), sample());
+        assert_eq!(decode_entry(&bytes, &[]).unwrap(), sample());
         let gone = raft5fs_wire::from_hex("010100000000000000030000000000000004").unwrap();
         assert_eq!(
-            decode_entry(&gone).unwrap(),
+            decode_entry(&gone, &[]).unwrap(),
             Entry::Gone { ino: 3, at_ms: 4 }
         );
     }

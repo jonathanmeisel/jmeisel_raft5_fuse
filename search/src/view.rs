@@ -106,45 +106,120 @@ pub struct Hit {
 }
 
 /// The live records of a volume, ready to search.
+///
+/// A view grows: `add` takes the entries of segments it hasn't seen, so a
+/// client that reads one new segment doesn't build the view again.
+/// - A record that a newer entry replaces stays in the keyword index, as
+///   a dead doc that search skips.
+/// - Past `REBUILD_DEAD` dead docs, the view builds itself again from its
+///   live ones.
 #[derive(Default)]
 pub struct View {
-    docs: Vec<Record>,
+    /// Each doc's record, or `None` once a newer entry replaced it.
+    docs: Vec<Option<Record>>,
     keywords: Bm25,
+    /// For each inode, the time of its newest entry, and its doc if that
+    /// entry is a record.
+    newest: HashMap<u64, (u64, Option<usize>)>,
+    live: usize,
 }
+
+/// The share of dead docs at which a view builds itself again. Dead docs
+/// cost memory and skew keyword statistics a little.
+const REBUILD_DEAD: f32 = 0.25;
 
 impl View {
     /// A view of `entries`: every entry in every segment of the volume.
     pub fn new(entries: impl IntoIterator<Item = Entry>) -> Self {
         let mut view = View::default();
-        let mut live: Vec<Record> = latest(entries)
-            .into_values()
-            .filter_map(|e| match e {
-                Entry::Record(r) => Some(r),
-                Entry::Gone { .. } => None,
-            })
-            .collect();
-        // A fixed order, so equal scores rank the same way each time.
-        live.sort_by_key(|r| r.ino);
-        for (doc, r) in live.iter().enumerate() {
-            view.keywords.add_path(doc, &r.path);
-            for (i, c) in r.chunks.iter().enumerate() {
-                let at = ChunkRef {
-                    doc,
-                    chunk: Some(i),
-                };
-                view.keywords.add(at, &c.terms, c.len);
-            }
-        }
-        view.docs = live;
+        view.add(entries);
         view
     }
 
+    /// Adds `entries`, from segments the view hasn't seen. For each inode
+    /// the newest entry wins, as in `latest`: one older than what the view
+    /// has is left out.
+    pub fn add(&mut self, entries: impl IntoIterator<Item = Entry>) {
+        let mut fresh: Vec<Entry> = latest(entries)
+            .into_values()
+            .filter(|e| {
+                self.newest
+                    .get(&e.ino())
+                    .is_none_or(|&(at, _)| e.at_ms() >= at)
+            })
+            .collect();
+        // A fixed order, so equal scores rank the same way each time.
+        fresh.sort_by_key(|e| e.ino());
+        for e in fresh {
+            if let Some(&(_, Some(doc))) = self.newest.get(&e.ino()) {
+                self.docs[doc] = None;
+                self.live -= 1;
+            }
+            match e {
+                Entry::Record(r) => {
+                    let (ino, at) = (r.ino, r.at_ms);
+                    let doc = self.push(r);
+                    self.newest.insert(ino, (at, Some(doc)));
+                }
+                Entry::Gone { ino, at_ms } => {
+                    self.newest.insert(ino, (at_ms, None));
+                }
+            }
+        }
+        let dead = self.docs.len() - self.live;
+        if dead as f32 > self.docs.len() as f32 * REBUILD_DEAD {
+            self.rebuild();
+        }
+    }
+
+    /// Indexes `r` as a new doc, and gives its number.
+    fn push(&mut self, r: Record) -> usize {
+        let doc = self.docs.len();
+        self.keywords.add_path(doc, &r.path);
+        for (i, c) in r.chunks.iter().enumerate() {
+            let at = ChunkRef {
+                doc,
+                chunk: Some(i),
+            };
+            self.keywords.add(at, &c.terms, c.len);
+        }
+        self.docs.push(Some(r));
+        self.live += 1;
+        doc
+    }
+
+    /// Builds the docs and the keyword index again from the live docs.
+    fn rebuild(&mut self) {
+        let mut live: Vec<Record> = std::mem::take(&mut self.docs)
+            .into_iter()
+            .flatten()
+            .collect();
+        live.sort_by_key(|r| r.ino);
+        self.keywords = Bm25::default();
+        self.live = 0;
+        for r in live {
+            let ino = r.ino;
+            let doc = self.push(r);
+            if let Some(slot) = self.newest.get_mut(&ino) {
+                slot.1 = Some(doc);
+            }
+        }
+    }
+
+    /// The live docs, with their numbers.
+    fn records(&self) -> impl Iterator<Item = (usize, &Record)> + Clone {
+        self.docs
+            .iter()
+            .enumerate()
+            .filter_map(|(doc, r)| Some((doc, r.as_ref()?)))
+    }
+
     pub fn len(&self) -> usize {
-        self.docs.len()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
-        self.docs.is_empty()
+        self.live == 0
     }
 
     /// The files that best match `query` by keyword, best first.
@@ -153,27 +228,36 @@ impl View {
     }
 
     /// How many photos there are here, and how many of them have an image
-    /// vector from `model`, so can be found by what they show.
+    /// vector from `model`, so can be found by what they show. An empty
+    /// vector (a picture the model couldn't decode) doesn't count.
     pub fn photos(&self, model: &str) -> (usize, usize) {
-        let photos = self.docs.iter().filter(|r| r.kind == DocKind::Photo);
+        let photos = self.records().filter(|(_, r)| r.kind == DocKind::Photo);
         let with = photos
             .clone()
-            .filter(|r| r.extra.image.as_ref().is_some_and(|(m, _)| m == model))
+            .filter(|(_, r)| {
+                r.extra
+                    .image
+                    .as_ref()
+                    .is_some_and(|(m, v)| m == model && !v.values.is_empty())
+            })
             .count();
         (photos.count(), with)
     }
 
     /// Whether any photo here has an image vector from `model`.
     pub fn has_image_model(&self, model: &str) -> bool {
-        self.docs
-            .iter()
-            .any(|r| r.extra.image.as_ref().is_some_and(|(m, _)| m == model))
+        self.records().any(|(_, r)| {
+            r.extra
+                .image
+                .as_ref()
+                .is_some_and(|(m, v)| m == model && !v.values.is_empty())
+        })
     }
 
     /// Whether any file here has vectors from `model`: if none does, a
     /// query need not be embedded.
     pub fn has_model(&self, model: &str) -> bool {
-        self.docs.iter().any(|r| r.model == model)
+        self.records().any(|(_, r)| r.model == model)
     }
 
     /// The files that best match `query`, best first: by keyword; with
@@ -191,7 +275,7 @@ impl View {
         let depth = limit.saturating_mul(3).max(10);
         let keyword: Vec<(usize, Option<usize>)> = self
             .keywords
-            .search(query, depth)
+            .search_where(query, depth, |doc| self.docs[doc].is_some())
             .into_iter()
             .map(|(doc, _, chunk)| (doc, chunk))
             .collect();
@@ -214,7 +298,7 @@ impl View {
             .into_iter()
             .take(limit)
             .map(|(doc, score)| {
-                let r = &self.docs[doc];
+                let r = self.docs[doc].as_ref().expect("search finds live docs");
                 let chunk = best_chunk.get(&doc).copied().flatten();
                 let preview = chunk
                     .or(if r.chunks.is_empty() { None } else { Some(0) })
@@ -236,9 +320,7 @@ impl View {
     /// `MIN_IMAGE_SIMILARITY`), best first.
     fn nearest_images(&self, q: &QueryVector<'_>, limit: usize) -> Vec<usize> {
         let mut scored: Vec<(usize, f32)> = self
-            .docs
-            .iter()
-            .enumerate()
+            .records()
             .filter_map(|(doc, r)| {
                 let (model, v) = r.extra.image.as_ref()?;
                 (model == q.model).then(|| (doc, dot(v, q.values)))
@@ -255,9 +337,7 @@ impl View {
     /// `MIN_SIMILARITY`), best first, with that chunk.
     fn nearest(&self, q: &QueryVector<'_>, limit: usize) -> Vec<(usize, Option<usize>)> {
         let mut scored: Vec<(usize, usize, f32)> = self
-            .docs
-            .iter()
-            .enumerate()
+            .records()
             .filter(|(_, r)| r.model == q.model)
             .filter_map(|(doc, r)| {
                 r.chunks
@@ -383,6 +463,54 @@ mod tests {
             .map(|h| h.ino)
             .collect();
         assert_eq!(apples, [3]);
+    }
+
+    fn paths(view: &View, query: &str) -> Vec<String> {
+        view.search(query, 10).into_iter().map(|h| h.path).collect()
+    }
+
+    #[test]
+    fn a_view_grown_in_steps_searches_as_one_built_at_once() {
+        let first = vec![
+            record(1, 1, "a.txt", "apples and pears"),
+            record(2, 1, "b.txt", "pears only"),
+            record(3, 1, "c.txt", "plums"),
+        ];
+        let second = vec![
+            // Newer: replaces 1. Older: ignored. A tombstone hides 3.
+            record(1, 5, "a2.txt", "apples now"),
+            record(2, 0, "old.txt", "pears from before"),
+            Entry::Gone { ino: 3, at_ms: 2 },
+            record(4, 1, "d.txt", "pears and plums"),
+        ];
+        let mut grown = View::new(first.clone());
+        grown.add(second.clone());
+        let whole = View::new(first.into_iter().chain(second));
+        for q in ["pears", "apples", "plums", "before"] {
+            assert_eq!(paths(&grown, q), paths(&whole, q), "{q}");
+        }
+        assert_eq!(paths(&grown, "pears"), ["b.txt", "d.txt"]);
+        assert_eq!(grown.len(), 3);
+        assert_eq!(whole.len(), 3);
+    }
+
+    #[test]
+    fn a_view_with_many_dead_docs_builds_itself_again() {
+        let mut view = View::new((0..8).map(|i| record(i, 1, &format!("{i}.txt"), "pears")));
+        view.add((0..3).map(|i| record(i, 2, &format!("new-{i}.txt"), "plums")));
+        // 3 dead of 11 is past a quarter: only live docs are left.
+        assert_eq!(view.docs.len(), 8);
+        assert!(view.docs.iter().all(Option::is_some));
+        assert_eq!(
+            paths(&view, "plums"),
+            ["new-0.txt", "new-1.txt", "new-2.txt"]
+        );
+        assert_eq!(paths(&view, "pears").len(), 5);
+        view.add([record(0, 3, "last.txt", "plums")]);
+        // Equal scores rank in the order docs came in, so compare sorted.
+        let mut plums = paths(&view, "plums");
+        plums.sort();
+        assert_eq!(plums, ["last.txt", "new-1.txt", "new-2.txt"]);
     }
 
     #[test]

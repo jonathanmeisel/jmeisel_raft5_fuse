@@ -2,6 +2,7 @@
 // for a second, unreachable one (so the app has a choice to make), and
 // serves the build on :4173. Returns the teardown, which stops both.
 // Needs the example built: cargo build -p raft5fs-testkit --example web_dev
+// The search tests also need the CLI: cargo build -p raft5fs --no-default-features --features index
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 

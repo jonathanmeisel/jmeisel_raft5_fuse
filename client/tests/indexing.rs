@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use raft5fs_client::indexer::{
     BuiltIn, Embed, IndexerConfig, PassKind, PassStats, Tools, index_claimed, indexable_volumes,
-    new_id, read_index,
+    new_id, read_index, read_index_since,
 };
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::{Session, SessionConfig};
 use raft5fs_client::vault::{VIRTUAL_ROOT, Vault};
 use raft5fs_proto::errno;
 use raft5fs_search::INDEX_DIR;
-use raft5fs_search::manifest::IndexerId;
+use raft5fs_search::manifest::{IndexerId, Manifest};
 use raft5fs_search::view::View;
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
@@ -588,7 +588,9 @@ fn a_model_that_fails_is_tried_again() {
     fake.broken.store(true, std::sync::atomic::Ordering::SeqCst);
     let id = new_id();
     let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &tools(&fake)).unwrap();
-    assert_eq!(stats.failed.len(), 2, "{:?}", stats.failed);
+    // Asked once: after it fails, the pass stops asking it.
+    assert!(stats.model_failed);
+    assert_eq!(stats.failed.len(), 1, "{:?}", stats.failed);
     // Still found by words.
     assert_eq!(search(&backend, &tester, v, "tax"), ["notes/tax.txt"]);
     assert_eq!(models(&backend, &tester, v), ["", ""]);
@@ -623,6 +625,16 @@ impl raft5fs_client::indexer::SegmentCache for Kept {
                 .lock()
                 .unwrap()
                 .insert(key.into(), bytes.to_vec());
+        })
+    }
+
+    fn keep_only<'a>(&'a self, volume: u64, keys: &'a [String]) -> Boxed<'a, ()> {
+        Box::pin(async move {
+            let prefix = format!("{volume}/");
+            self.pieces
+                .lock()
+                .unwrap()
+                .retain(|k, _| !k.starts_with(&prefix) || keys.contains(k));
         })
     }
 }
@@ -878,4 +890,327 @@ fn a_photo_another_device_indexed_gets_its_image_vector_here() {
     assert!(has_vector());
     let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Full, &tools).unwrap();
     assert_eq!(stats.indexed, 0);
+}
+
+/// An image model that can't decode anything, as with HEIC on a native
+/// device; it counts how often it is asked.
+#[derive(Default)]
+struct BlindImages {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl raft5fs_client::indexer::ImageEmbed for BlindImages {
+    fn model(&self) -> &str {
+        "fake-clip@1"
+    }
+
+    fn image<'a>(&'a self, _: Vec<u8>) -> Boxed<'a, Result<Option<Vec<f32>>, String>> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(None) })
+    }
+
+    fn query<'a>(&'a self, _: &'a str) -> Boxed<'a, Result<Vec<f32>, String>> {
+        Box::pin(async { Ok(vec![1.0, 0.0]) })
+    }
+}
+
+#[test]
+fn a_native_pass_fills_in_what_a_browser_left_out_without_a_walk() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    // The browser's first pass walks the volume, by words only.
+    let first = pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    assert!(first.full);
+    // A native device's next pass: nothing changed, and no walk is due, but
+    // it adds the text and image vectors the browser left out.
+    let native = Tools {
+        extract: Arc::new(BuiltIn),
+        embed: Some(Fake::new("fake@1") as Arc<dyn Embed>),
+        image: Some(Arc::new(FakeImages)),
+    };
+    let id = new_id();
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &native).unwrap();
+    assert!(!stats.full, "no walk was due");
+    assert_eq!(stats.indexed, 3, "the text file, the track and the photo");
+    assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
+    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
+    assert_eq!(View::new(index.entries).photos("fake-clip@1"), (1, 1));
+    // Then there's nothing more to do.
+    let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &native).unwrap();
+    assert_eq!(stats.indexed, 0);
+}
+
+#[test]
+fn a_photo_the_model_cant_decode_is_tried_once() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let blind = Arc::new(BlindImages::default());
+    let tools = Tools {
+        extract: Arc::new(BuiltIn),
+        embed: None,
+        image: Some(Arc::clone(&blind) as Arc<dyn raft5fs_client::indexer::ImageEmbed>),
+    };
+    let id = new_id();
+    pass_with(&backend, &tester, v, id, PassKind::Auto, &tools).unwrap();
+    assert_eq!(blind.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for _ in 0..2 {
+        let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &tools).unwrap();
+        assert_eq!(stats.indexed, 0);
+    }
+    assert_eq!(blind.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // It counts as a photo, not as one searchable by what it shows.
+    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
+    assert_eq!(View::new(index.entries).photos("fake-clip@1"), (1, 0));
+}
+
+#[test]
+fn a_model_that_fails_stops_the_pass_asking_it() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    let fake = Fake::new("fake@1");
+    fake.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+    let stats = pass_with(
+        &backend,
+        &tester,
+        v,
+        new_id(),
+        PassKind::Auto,
+        &tools(&fake),
+    )
+    .unwrap();
+    assert!(stats.model_failed);
+    assert_eq!(
+        stats.failed.len(),
+        1,
+        "asked once, then not again: {:?}",
+        stats.failed
+    );
+}
+
+/// The names of the files in `volume`'s index folder, sorted.
+fn index_files(backend: &Backend, vault: &Vault, volume: u64) -> Vec<String> {
+    let rt = &backend.runtime;
+    let dir = rt
+        .block_on(vault.lookup(volume, OsStr::new(INDEX_DIR)))
+        .unwrap()
+        .ino;
+    let mut names: Vec<String> = rt
+        .block_on(vault.children(dir))
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Puts a file in `volume`'s index folder, as another client might.
+fn put_index_file(backend: &Backend, vault: &Vault, volume: u64, name: &str, body: &[u8]) {
+    let dir = backend
+        .runtime
+        .block_on(vault.lookup(volume, OsStr::new(INDEX_DIR)))
+        .unwrap()
+        .ino;
+    write(backend, vault, dir, name, body);
+}
+
+fn thumbs_tools() -> Tools {
+    Tools {
+        extract: Arc::new(Thumbs),
+        embed: None,
+        image: None,
+    }
+}
+
+fn thumb_of(backend: &Backend, vault: &Vault, volume: u64, path: &str) -> Vec<u8> {
+    let rt = &backend.runtime;
+    let index = rt.block_on(read_index(vault, volume)).unwrap().unwrap();
+    let hit = View::new(index.entries)
+        .search(path.split('.').next().unwrap(), 5)
+        .into_iter()
+        .find(|h| h.path == path)
+        .unwrap_or_else(|| panic!("{path} not found"));
+    let thumb = hit.thumb.expect("a photo has a thumbnail");
+    rt.block_on(raft5fs_client::indexer::read_thumb(vault, volume, &thumb))
+        .unwrap()
+}
+
+#[test]
+fn compaction_leaves_one_indexers_files_and_the_same_index() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    for name in ["p1.jpg", "p2.jpg", "p3.jpg"] {
+        write(&backend, &tester, v, name, b"\xFF\xD8\xFF not a picture");
+    }
+    let tools = thumbs_tools();
+    let (a, b) = (new_id(), new_id());
+    let stats = pass_with(&backend, &tester, v, a, PassKind::Auto, &tools).unwrap();
+    assert!(!stats.compacted);
+    // Another device sees three photos go and one renamed: 4 of 10 entries
+    // are then dead, and the thumbnails file is mostly dead too.
+    for name in ["p1.jpg", "p2.jpg", "p3.jpg"] {
+        rt.block_on(tester.unlink(v, OsStr::new(name))).unwrap();
+    }
+    rt.block_on(tester.rename(
+        v,
+        OsStr::new("photo.jpg"),
+        v,
+        OsStr::new("shore.jpg"),
+        false,
+    ))
+    .unwrap();
+    let stats = pass_with(&backend, &tester, v, b, PassKind::Auto, &tools).unwrap();
+    assert!(stats.compacted, "{stats:?}");
+    assert_eq!(
+        index_files(&backend, &tester, v),
+        [
+            Manifest::file_name(&b),
+            Manifest::segment_name(&b, 2),
+            Manifest::thumbs_name(&b, 1),
+        ]
+    );
+    assert_eq!(search(&backend, &tester, v, "receipts"), ["notes/tax.txt"]);
+    assert_eq!(search(&backend, &tester, v, "kingdom"), ["ride.gpx"]);
+    assert!(search(&backend, &tester, v, "p1").is_empty());
+    assert_eq!(
+        thumb_of(&backend, &tester, v, "shore.jpg"),
+        b"thumb of photo.jpg"
+    );
+    // How far indexing got is kept.
+    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
+    assert!(index.progress.full_walk_ms > 0);
+    // The first device goes on, with a manifest of its own again.
+    write(
+        &backend,
+        &tester,
+        v,
+        "later.txt",
+        b"written after the compaction",
+    );
+    let stats = pass_with(&backend, &tester, v, a, PassKind::Auto, &tools).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(search(&backend, &tester, v, "compaction"), ["later.txt"]);
+    assert_eq!(search(&backend, &tester, v, "receipts"), ["notes/tax.txt"]);
+}
+
+#[test]
+fn a_thumbnails_file_another_record_still_shows_is_kept() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, notes) = volume(&backend, &tester);
+    let tools = thumbs_tools();
+    let (a, b) = (new_id(), new_id());
+    pass_with(&backend, &tester, v, a, PassKind::Auto, &tools).unwrap();
+    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
+        .unwrap();
+    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
+        .unwrap();
+    let stats = pass_with(&backend, &tester, v, b, PassKind::Auto, &tools).unwrap();
+    assert!(stats.compacted, "{stats:?}");
+    assert_eq!(
+        index_files(&backend, &tester, v),
+        [
+            Manifest::file_name(&b),
+            Manifest::segment_name(&b, 1),
+            Manifest::thumbs_name(&a, 0),
+        ]
+    );
+    assert_eq!(
+        thumb_of(&backend, &tester, v, "photo.jpg"),
+        b"thumb of photo.jpg"
+    );
+    assert!(search(&backend, &tester, v, "receipts").is_empty());
+}
+
+#[test]
+fn a_read_since_the_last_gets_only_new_entries_until_a_compaction() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, notes) = volume(&backend, &tester);
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let kept = Kept::default();
+    let since = |known: &std::collections::HashSet<String>| {
+        rt.block_on(read_index_since(&tester, v, Some(&kept), known))
+            .unwrap()
+            .unwrap()
+    };
+    let first = since(&Default::default());
+    assert!(!first.reset);
+    assert_eq!(first.entries.len(), 3);
+    let mut view = View::new(first.entries);
+    write(&backend, &tester, v, "new.txt", b"fresh");
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let second = since(&first.keys.iter().cloned().collect());
+    assert!(!second.reset);
+    assert_eq!(second.entries.len(), 1);
+    view.add(second.entries);
+    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
+    assert_eq!(view.len(), 4);
+    // A compaction takes the known segments away: the next read is whole,
+    // and the cache lets go of what's gone.
+    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
+        .unwrap();
+    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
+        .unwrap();
+    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    assert!(stats.compacted, "{stats:?}");
+    let third = since(&second.keys.iter().cloned().collect());
+    assert!(third.reset);
+    assert_eq!(third.keys.len(), 1);
+    let view = View::new(third.entries);
+    assert_eq!(view.len(), 2);
+    let cached: Vec<String> = kept.pieces.lock().unwrap().keys().cloned().collect();
+    assert_eq!(cached, third.keys);
+}
+
+#[test]
+fn a_segment_a_pass_left_unlisted_is_written_over() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    // A pass cut short after it wrote its next segment, before its manifest.
+    put_index_file(
+        &backend,
+        &tester,
+        v,
+        &Manifest::segment_name(&id, 1),
+        b"half",
+    );
+    write(&backend, &tester, v, "new.txt", b"fresh");
+    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(search(&backend, &tester, v, "fresh"), ["new.txt"]);
+}
+
+#[test]
+fn an_index_with_a_file_it_cant_read_is_not_compacted() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, notes) = volume(&backend, &tester);
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    // A manifest from a newer client, say.
+    let newer = Manifest::file_name(&new_id());
+    put_index_file(&backend, &tester, v, &newer, b"r5mf\x09");
+    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
+        .unwrap();
+    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
+        .unwrap();
+    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    assert!(!stats.compacted);
+    assert!(index_files(&backend, &tester, v).contains(&newer));
 }

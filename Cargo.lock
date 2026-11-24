@@ -3285,6 +3285,7 @@ dependencies = [
 name = "raft5fs-search"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "kamadak-exif",
  "quick-xml",
  "raft5fs-wire",
