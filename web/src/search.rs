@@ -38,10 +38,9 @@ use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
 use raft5fs_search::extract::{Extracted, Format, READER, extract_with};
 use raft5fs_search::geo::{PLACES_SHA256, Places};
-use raft5fs_search::rank::fuse;
 use raft5fs_search::record::{DocKind, Extra, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL};
-use raft5fs_search::view::{QueryVector, View};
+use raft5fs_search::view::{QueryVector, View, search_many};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
@@ -574,41 +573,27 @@ impl Fs {
             } else {
                 None
             };
-            let mut lists = Vec::new();
-            let mut hits = HashMap::new();
-            for (ino, l) in &views {
-                let q = vector.as_deref().map(|values| QueryVector {
-                    model: E5_MODEL,
-                    values,
-                });
-                let image = image_vector.as_deref().map(|values| QueryVector {
-                    model: CLIP_MODEL,
-                    values,
-                });
-                let list: Vec<(u64, u64)> = l
-                    .view
-                    .search_with(&query, q, image, limit)
-                    .into_iter()
-                    .map(|h| {
-                        let key = (*ino, h.ino);
-                        hits.insert(
-                            key,
-                            HitJs {
-                                path: format!("{}/{}", l.path, h.path),
-                                preview: h.preview,
-                                kind: kind_name(h.kind),
-                                thumb: h.thumb.as_ref().map(|t| thumb_id(*ino, t)),
-                            },
-                        );
-                        key
-                    })
-                    .collect();
-                lists.push(list);
-            }
-            let hits = fuse(&lists)
+            let q = vector.as_deref().map(|values| QueryVector {
+                model: E5_MODEL,
+                values,
+            });
+            let image = image_vector.as_deref().map(|values| QueryVector {
+                model: CLIP_MODEL,
+                values,
+            });
+            // All the volumes are ranked as one (`view::search_many`).
+            let all: Vec<&View> = views.iter().map(|(_, l)| &l.view).collect();
+            let hits = search_many(&all, &query, q, image, limit)
                 .into_iter()
-                .take(limit)
-                .filter_map(|(key, _)| hits.remove(&key))
+                .map(|(i, h)| {
+                    let (ino, l) = &views[i];
+                    HitJs {
+                        path: format!("{}/{}", l.path, h.path),
+                        preview: h.preview,
+                        kind: kind_name(h.kind),
+                        thumb: h.thumb.as_ref().map(|t| thumb_id(*ino, t)),
+                    }
+                })
                 .collect();
             Ok(Found {
                 hits,

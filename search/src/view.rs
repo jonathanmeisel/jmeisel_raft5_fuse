@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::bm25::{Bm25, ChunkRef};
+use crate::bm25::{Bm25, ChunkRef, Stats, query_terms};
 use crate::manifest::Manifest;
 use crate::rank::fuse;
 use crate::record::{DocKind, Entry, Record};
@@ -26,7 +26,8 @@ use crate::vector::dot;
 ///   almost any query, so it matches by meaning only with at least
 ///   `MIN_MEANING_WORDS` words. It is still found by its words.
 /// - So a chunk matches if it is within `MEANING_MARGIN` of the best match
-///   in the volume, and above `MIN_SIMILARITY` at all.
+///   in all the volumes searched, above `MIN_SIMILARITY` at all, and
+///   stands out from the other scores (`Cutoff`).
 pub const MIN_SIMILARITY: f32 = 0.75;
 pub const MEANING_MARGIN: f32 = 0.05;
 pub const MIN_MEANING_WORDS: u32 = 8;
@@ -37,8 +38,9 @@ pub const MIN_MEANING_WORDS: u32 = 8;
 /// photo of what the query says scores 0.214 to 0.294, in any language,
 /// and is first for every query; others score 0.18 to 0.225. Drawn test
 /// pictures score higher, which is why they don't set these. A photo
-/// matches if it is within `IMAGE_MARGIN` of the best match in the volume,
-/// and above `MIN_IMAGE_SIMILARITY`; rank decides the rest.
+/// matches if it is within `IMAGE_MARGIN` of the best match in all the
+/// volumes searched, stands out from the others (`Cutoff`),
+/// and is above `MIN_IMAGE_SIMILARITY`; rank decides the rest.
 pub const MIN_IMAGE_SIMILARITY: f32 = 0.215;
 pub const IMAGE_MARGIN: f32 = 0.04;
 
@@ -270,74 +272,16 @@ impl View {
         image: Option<QueryVector<'_>>,
         limit: usize,
     ) -> Vec<Hit> {
-        // Each list looks deeper than the result, so a file a little way
-        // down both still rises.
-        let depth = limit.saturating_mul(3).max(10);
-        let keyword: Vec<(usize, Option<usize>)> = self
-            .keywords
-            .search_where(query, depth, |doc| self.docs[doc].is_some())
+        search_many(&[self], query, vector, image, limit)
             .into_iter()
-            .map(|(doc, _, chunk)| (doc, chunk))
-            .collect();
-        let meaning = vector.map(|q| self.nearest(&q, depth)).unwrap_or_default();
-        // The chunk each list matched, keyword first: its words are what the
-        // user typed.
-        let mut best_chunk: HashMap<usize, Option<usize>> = HashMap::new();
-        for &(doc, chunk) in meaning.iter().chain(&keyword).rev() {
-            best_chunk.insert(doc, chunk);
-        }
-        let shown = image
-            .map(|q| self.nearest_images(&q, depth))
-            .unwrap_or_default();
-        let lists = [
-            keyword.iter().map(|&(d, _)| d).collect::<Vec<_>>(),
-            meaning.iter().map(|&(d, _)| d).collect(),
-            shown,
-        ];
-        fuse(&lists)
-            .into_iter()
-            .take(limit)
-            .map(|(doc, score)| {
-                let r = self.docs[doc].as_ref().expect("search finds live docs");
-                let chunk = best_chunk.get(&doc).copied().flatten();
-                let preview = chunk
-                    .or(if r.chunks.is_empty() { None } else { Some(0) })
-                    .map(|i| r.chunks[i].preview.clone())
-                    .unwrap_or_default();
-                Hit {
-                    ino: r.ino,
-                    path: r.path.clone(),
-                    kind: r.kind,
-                    preview,
-                    score,
-                    thumb: r.extra.thumb.clone(),
-                }
-            })
+            .map(|(_, hit)| hit)
             .collect()
     }
 
-    /// The photos whose image vector is nearest `q` (see
-    /// `MIN_IMAGE_SIMILARITY`), best first.
-    fn nearest_images(&self, q: &QueryVector<'_>, limit: usize) -> Vec<usize> {
-        let mut scored: Vec<(usize, f32)> = self
-            .records()
-            .filter_map(|(doc, r)| {
-                let (model, v) = r.extra.image.as_ref()?;
-                (model == q.model).then(|| (doc, dot(v, q.values)))
-            })
-            .collect();
-        let best = scored.iter().map(|s| s.1).fold(f32::MIN, f32::max);
-        scored.retain(|&(_, s)| s >= MIN_IMAGE_SIMILARITY && s >= best - IMAGE_MARGIN);
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        scored.truncate(limit);
-        scored.into_iter().map(|(doc, _)| doc).collect()
-    }
-
-    /// The files whose best chunk is nearest `q` in meaning (see
-    /// `MIN_SIMILARITY`), best first, with that chunk.
-    fn nearest(&self, q: &QueryVector<'_>, limit: usize) -> Vec<(usize, Option<usize>)> {
-        let mut scored: Vec<(usize, usize, f32)> = self
-            .records()
+    /// Each live doc's best chunk by meaning, and its score: chunks of at
+    /// least `MIN_MEANING_WORDS` words, with vectors from `q`'s model.
+    fn meaning_scores(&self, q: &QueryVector<'_>) -> Vec<(usize, usize, f32)> {
+        self.records()
             .filter(|(_, r)| r.model == q.model)
             .filter_map(|(doc, r)| {
                 r.chunks
@@ -348,16 +292,175 @@ impl View {
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, s)| (doc, i, s))
             })
-            .collect();
-        let best = scored.iter().map(|s| s.2).fold(f32::MIN, f32::max);
-        scored.retain(|&(_, _, s)| s >= MIN_SIMILARITY && s >= best - MEANING_MARGIN);
-        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-        scored.truncate(limit);
-        scored
-            .into_iter()
-            .map(|(doc, i, _)| (doc, Some(i)))
             .collect()
     }
+
+    /// Each photo's score by what it shows, with image vectors from `q`'s
+    /// model. An empty vector (a picture the model couldn't decode) has
+    /// none.
+    fn image_scores(&self, q: &QueryVector<'_>) -> Vec<(usize, f32)> {
+        self.records()
+            .filter_map(|(doc, r)| {
+                let (model, v) = r.extra.image.as_ref()?;
+                (model == q.model && !v.values.is_empty()).then(|| (doc, dot(v, q.values)))
+            })
+            .collect()
+    }
+}
+
+/// Which scores by meaning (or by what a photo shows) count as matches,
+/// out of every file's score in the whole search: all the volumes
+/// searched, not one at a time.
+///
+/// - At least `floor`, and within `margin` of the best match.
+/// - With `MIN_SPREAD_POPULATION` scores or more, also at least `z`
+///   standard deviations above their mean. A match stands out from the
+///   rest; when nothing matches, the best is only a little better than
+///   the others.
+struct Cutoff {
+    floor: f32,
+    margin: f32,
+    z: f32,
+}
+
+/// How far above the mean a match by meaning is, in standard deviations.
+/// These are first estimates, from the score ranges above (matches 0.79
+/// to 0.87 against others at 0.70 to 0.78; photos 0.214 to 0.294 against
+/// 0.18 to 0.225): check them against real volumes.
+pub const MEANING_Z: f32 = 2.0;
+pub const IMAGE_Z: f32 = 1.5;
+
+/// The fewest scores the spread rule (`Cutoff::z`) needs: with fewer, the
+/// mean and deviation say little.
+pub const MIN_SPREAD_POPULATION: usize = 30;
+
+impl Cutoff {
+    fn keeps(&self, scores: &[f32]) -> impl Fn(f32) -> bool + use<> {
+        let best = scores.iter().copied().fold(f32::MIN, f32::max);
+        let mut least = self.floor.max(best - self.margin);
+        if scores.len() >= MIN_SPREAD_POPULATION {
+            let n = scores.len() as f32;
+            let mean = scores.iter().sum::<f32>() / n;
+            let var = scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+            least = least.max(mean + self.z * var.sqrt());
+        }
+        move |s| s >= least
+    }
+}
+
+/// Searches `views` as one, best first. Each hit comes with the index in
+/// `views` of the view it is from.
+///
+/// - Keyword scores use statistics from every view together, so they
+///   compare across views.
+/// - The matches by meaning and by what photos show are chosen from every
+///   view's scores together (`Cutoff`): a view with nothing relevant
+///   gives none, and a view's weak best doesn't count as much as
+///   another's strong one.
+/// - The three lists are merged by rank (`rank::fuse`), once, over all
+///   views.
+pub fn search_many(
+    views: &[&View],
+    query: &str,
+    vector: Option<QueryVector<'_>>,
+    image: Option<QueryVector<'_>>,
+    limit: usize,
+) -> Vec<(usize, Hit)> {
+    // Each list looks deeper than the result, so a file a little way
+    // down both still rises.
+    let depth = limit.saturating_mul(3).max(10);
+    type Key = (usize, usize);
+
+    let terms = query_terms(query);
+    let mut stats = Stats::default();
+    for v in views {
+        v.keywords.add_stats(&terms, &mut stats);
+    }
+    let mut keyword: Vec<(Key, f32, Option<usize>)> = Vec::new();
+    for (i, v) in views.iter().enumerate() {
+        let found = v
+            .keywords
+            .search_with(&terms, &stats, depth, |doc| v.docs[doc].is_some());
+        keyword.extend(found.into_iter().map(|(doc, s, c)| ((i, doc), s, c)));
+    }
+    keyword.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    keyword.truncate(depth);
+
+    let mut meaning: Vec<(Key, usize, f32)> = Vec::new();
+    if let Some(q) = &vector {
+        for (i, v) in views.iter().enumerate() {
+            meaning.extend(
+                v.meaning_scores(q)
+                    .into_iter()
+                    .map(|(d, c, s)| ((i, d), c, s)),
+            );
+        }
+        let scores: Vec<f32> = meaning.iter().map(|m| m.2).collect();
+        let keeps = Cutoff {
+            floor: MIN_SIMILARITY,
+            margin: MEANING_MARGIN,
+            z: MEANING_Z,
+        }
+        .keeps(&scores);
+        meaning.retain(|m| keeps(m.2));
+        meaning.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        meaning.truncate(depth);
+    }
+
+    let mut shown: Vec<(Key, f32)> = Vec::new();
+    if let Some(q) = &image {
+        for (i, v) in views.iter().enumerate() {
+            shown.extend(v.image_scores(q).into_iter().map(|(d, s)| ((i, d), s)));
+        }
+        let scores: Vec<f32> = shown.iter().map(|m| m.1).collect();
+        let keeps = Cutoff {
+            floor: MIN_IMAGE_SIMILARITY,
+            margin: IMAGE_MARGIN,
+            z: IMAGE_Z,
+        }
+        .keeps(&scores);
+        shown.retain(|m| keeps(m.1));
+        shown.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        shown.truncate(depth);
+    }
+
+    // The chunk each list matched, keyword first: its words are what the
+    // user typed.
+    let mut best_chunk: HashMap<Key, Option<usize>> = HashMap::new();
+    for (key, chunk) in meaning
+        .iter()
+        .map(|m| (m.0, Some(m.1)))
+        .chain(keyword.iter().map(|k| (k.0, k.2)))
+        .rev()
+    {
+        best_chunk.insert(key, chunk);
+    }
+    let lists = [
+        keyword.iter().map(|k| k.0).collect::<Vec<_>>(),
+        meaning.iter().map(|m| m.0).collect(),
+        shown.iter().map(|s| s.0).collect(),
+    ];
+    fuse(&lists)
+        .into_iter()
+        .take(limit)
+        .map(|((i, doc), score)| {
+            let r = views[i].docs[doc].as_ref().expect("search finds live docs");
+            let chunk = best_chunk.get(&(i, doc)).copied().flatten();
+            let preview = chunk
+                .or(if r.chunks.is_empty() { None } else { Some(0) })
+                .map(|c| r.chunks[c].preview.clone())
+                .unwrap_or_default();
+            let hit = Hit {
+                ino: r.ino,
+                path: r.path.clone(),
+                kind: r.kind,
+                preview,
+                score,
+                thumb: r.extra.thumb.clone(),
+            };
+            (i, hit)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -511,6 +614,97 @@ mod tests {
         let mut plums = paths(&view, "plums");
         plums.sort();
         assert_eq!(plums, ["last.txt", "new-1.txt", "new-2.txt"]);
+    }
+
+    /// A record whose one chunk scores `cos` against the query `[1, 0, 0]`.
+    fn scoring(ino: u64, path: &str, cos: f32) -> Entry {
+        let text = "some words about a thing that are long enough to embed";
+        embedded(ino, path, text, &[cos, (1.0 - cos * cos).sqrt(), 0.0])
+    }
+
+    fn found(views: &[&View], query: &str, q: Option<QueryVector<'_>>) -> Vec<(usize, String)> {
+        search_many(views, query, q, None, 10)
+            .into_iter()
+            .map(|(i, h)| (i, h.path))
+            .collect()
+    }
+
+    const Q: [f32; 3] = [1.0, 0.0, 0.0];
+
+    #[test]
+    fn a_volume_with_nothing_relevant_gives_nothing_by_meaning() {
+        let strong = View::new([scoring(1, "match.txt", 0.86), scoring(2, "near.txt", 0.83)]);
+        // Its best is over the floor, but far below the other volume's.
+        let weak = View::new([scoring(1, "off.txt", 0.77)]);
+        let q = || {
+            Some(QueryVector {
+                model: "m",
+                values: &Q,
+            })
+        };
+        let hits = found(&[&strong, &weak], "zzz", q());
+        assert_eq!(hits, [(0, "match.txt".into()), (0, "near.txt".into())]);
+        // Alone, it still has its best.
+        assert_eq!(found(&[&weak], "zzz", q()), [(0, "off.txt".into())]);
+    }
+
+    #[test]
+    fn a_strong_match_in_one_volume_ranks_above_a_weak_one_in_another() {
+        let weak = View::new([record(
+            1,
+            1,
+            "weak.txt",
+            "a long note about many things, one of which is a lake, among trees and hills and roads",
+        )]);
+        let strong = View::new([record(1, 1, "strong.txt", "lake lake lake")]);
+        for views in [[&weak, &strong], [&strong, &weak]] {
+            let hits = found(&views, "lake", None);
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].1, "strong.txt");
+        }
+    }
+
+    #[test]
+    fn keyword_statistics_count_every_volume_searched() {
+        // "lake" is in every file of one volume, and rare overall.
+        let lakes = View::new((0..5).map(|i| record(i, 1, &format!("l{i}.txt"), "lake shore")));
+        let mut others: Vec<Entry> = (0..40)
+            .map(|i| record(i, 1, &format!("o{i}.txt"), "hill road"))
+            .collect();
+        others.push(record(99, 1, "one.txt", "lake hill"));
+        let others = View::new(others);
+        let alone = lakes.search("lake", 10)[0].score;
+        let mut stats = Stats::default();
+        let terms = query_terms("lake");
+        lakes.keywords.add_stats(&terms, &mut stats);
+        let within = lakes.keywords.search_with(&terms, &stats, 1, |_| true)[0].1;
+        others.keywords.add_stats(&terms, &mut stats);
+        let together = lakes.keywords.search_with(&terms, &stats, 1, |_| true)[0].1;
+        assert!(together > within, "{together} vs {within}");
+        assert!(alone > 0.0);
+    }
+
+    #[test]
+    fn when_nothing_stands_out_nothing_matches_by_meaning() {
+        // 40 files scoring 0.75 to 0.79: over the floor and close to the
+        // best, but none stands out.
+        let flat =
+            View::new((0..40).map(|i| scoring(i, &format!("{i}.txt"), 0.75 + 0.001 * i as f32)));
+        let q = || {
+            Some(QueryVector {
+                model: "m",
+                values: &Q,
+            })
+        };
+        let hits = found(&[&flat], "zzz", q());
+        assert!(hits.len() <= 3, "{hits:?}");
+        // One that does stand out is kept.
+        let mut entries: Vec<Entry> = (0..40)
+            .map(|i| scoring(i, &format!("{i}.txt"), 0.72 + 0.001 * i as f32))
+            .collect();
+        entries.push(scoring(100, "match.txt", 0.84));
+        let hits = found(&[&View::new(entries)], "zzz", q());
+        assert_eq!(hits, [(0, "match.txt".into())]);
     }
 
     #[test]

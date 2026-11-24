@@ -1168,7 +1168,10 @@ A search matches words, and also meaning: each piece of text gets a
 vector from a language model (multilingual-e5-small), and so does the
 query, so "bike routes in vermont" finds a German note about cycling in
 Vermont with none of those words. Results that match both ways come
-first.
+first. A search of several volumes
+ranks them as one: a strong match in one volume comes before a weak one
+in another, and a volume with nothing on the subject gives nothing by
+meaning.
 
 The model runs on each device that indexes or searches, never on the
 servers. It downloads the first time it is needed (about 135 MB, from
