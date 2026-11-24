@@ -204,9 +204,16 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
                         .updated_by
                         .map(|(user, device)| format!(" by {user} on {device}"))
                         .unwrap_or_default();
-                    let files = View::new(index.entries).len();
+                    let view = View::new(index.entries);
+                    let (photos, seen) = view.photos(CLIP_MODEL);
+                    let pictures = if photos > 0 {
+                        format!(", {photos} photos ({seen} searchable by what they show)")
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{label}: {files} files; last indexed {}{by}",
+                        "{label}: {} files{pictures}; last indexed {}{by}",
+                        view.len(),
                         ago(p.updated_ms)
                     );
                 }

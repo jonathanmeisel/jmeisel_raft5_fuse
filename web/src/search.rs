@@ -278,6 +278,10 @@ struct LoadedJs {
     meaning: bool,
     /// Whether its owner has turned indexing off.
     off: bool,
+    /// How many photos it has, and how many of them can be found by what
+    /// they show (have an image vector, which only a native device makes).
+    photos: usize,
+    photos_seen: usize,
 }
 
 fn kind_name(kind: DocKind) -> &'static str {
@@ -399,6 +403,8 @@ fn loaded_js(l: &Loaded) -> LoadedJs {
             .map(|(user, device)| format!("{user} on {device}")),
         meaning: l.view.has_model(E5_MODEL),
         off: l.off,
+        photos: l.view.photos(CLIP_MODEL).0,
+        photos_seen: l.view.photos(CLIP_MODEL).1,
     }
 }
 

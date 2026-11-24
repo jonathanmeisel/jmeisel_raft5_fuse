@@ -155,7 +155,9 @@ pub(crate) fn download_url(url: &str, to: &Path, sha: &str, model: &str) -> Resu
 pub(crate) fn environment() -> Result<ort::environment::Environment, String> {
     static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
     ENV.get_or_init(|| {
-        ort::init()
+        let library = crate::manifest::runtime_library()?;
+        ort::init_from(&library)
+            .map_err(|e| format!("cannot load ONNX Runtime from {}: {e}", library.display()))?
             .with_name("raft5fs")
             .build()
             .map_err(|e| format!("cannot start ONNX Runtime: {e}"))

@@ -3,7 +3,7 @@
 //! native clients; the web app reads the same file.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -18,6 +18,86 @@ static MODELS_JSON: &str = include_str!(concat!(
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub models: HashMap<String, Model>,
+    pub runtime: Runtime,
+}
+
+/// ONNX Runtime, as native clients load it: from Microsoft's PyPI wheel
+/// for their platform.
+#[derive(Debug, Deserialize)]
+pub struct Runtime {
+    pub version: String,
+    pub platforms: HashMap<String, RuntimeBuild>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeBuild {
+    /// The wheel, its SHA-256 and size.
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    /// The library's path in the wheel, and its own SHA-256.
+    pub member: String,
+    pub library_sha256: String,
+}
+
+/// This platform's name in the manifest's runtime builds.
+fn platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "aarch64") => "macos-aarch64",
+        _ => "",
+    }
+}
+
+/// The ONNX Runtime library to load: `RAFT5FS_ONNXRUNTIME` if set (a copy
+/// the system provides); else the pinned build for this platform, fetched
+/// into the model cache the first time. Only the library is kept, not the
+/// wheel it came in.
+pub fn runtime_library() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("RAFT5FS_ONNXRUNTIME") {
+        return Ok(PathBuf::from(path));
+    }
+    let runtime = &manifest().runtime;
+    let build = runtime.platforms.get(platform()).ok_or_else(|| {
+        format!(
+            "no ONNX Runtime is pinned for this platform ({} {}): set RAFT5FS_ONNXRUNTIME \
+             to a libonnxruntime {} to search by meaning",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            runtime.version
+        )
+    })?;
+    let dir = crate::embed::cache_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!("onnxruntime-{}", runtime.version));
+    let name = build.member.rsplit('/').next().unwrap_or(&build.member);
+    let library = dir.join(name);
+    if file_matches(&library, &build.library_sha256) {
+        return Ok(library);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    let wheel = dir.join("onnxruntime.whl");
+    let what = format!("ONNX Runtime {}", runtime.version);
+    download_url(&build.url, &wheel, &build.sha256, &what)?;
+    let unpacked = (|| -> Result<(), String> {
+        let file = std::fs::File::open(&wheel).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let mut member = zip.by_name(&build.member).map_err(|e| e.to_string())?;
+        let temp = library.with_extension("part");
+        let mut out = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
+        std::io::copy(&mut member, &mut out).map_err(|e| e.to_string())?;
+        if !file_matches(&temp, &build.library_sha256) {
+            let _ = std::fs::remove_file(&temp);
+            return Err("the library in it isn't the one models.json pins".into());
+        }
+        std::fs::rename(&temp, &library).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(&wheel);
+    unpacked.map_err(|e| format!("cannot unpack {what}: {e}"))?;
+    Ok(library)
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +199,11 @@ mod tests {
                 );
                 assert!(f.size > 0 && !f.clients.is_empty(), "{key} {}", f.local);
             }
+        }
+        for (name, b) in &manifest().runtime.platforms {
+            assert_eq!(b.sha256.len(), 64, "{name}");
+            assert_eq!(b.library_sha256.len(), 64, "{name}");
+            assert!(b.url.ends_with(".whl") && b.size > 0, "{name}");
         }
         // What each native loader asks for is there.
         for role in ["model", "tokenizer"] {

@@ -10,6 +10,9 @@
   //   its own yet, so it isn't searched.
   // - Typing searches after a pause; Enter searches at once; Escape closes
   //   the results.
+  // - On a narrow screen it is a button, so the header keeps room for the
+  //   folder menu: the button opens the search bar across the whole header,
+  //   and its own close button shuts it again.
   // - Words first, at once; then meaning, which may need the model loaded
   //   (and the first time, downloaded), so its results replace the first
   //   ones when they come. Where a download is worth asking about (a phone,
@@ -21,6 +24,21 @@
   let { fs, folder, onopen } = $props();
 
   const PAUSE_MS = 300;
+
+  /// On a narrow screen: whether the search bar is open over the header.
+  let expanded = $state(false);
+  let box = $state(null);
+
+  function expand() {
+    expanded = true;
+    // Once the bar shows.
+    setTimeout(() => box?.focus());
+  }
+
+  function collapse() {
+    expanded = false;
+    open = false;
+  }
 
   let query = $state("");
   let everywhere = $state(false);
@@ -183,11 +201,15 @@
 
   function key(event) {
     if (event.key === "Enter") run();
-    if (event.key === "Escape") open = false;
+    if (event.key === "Escape") {
+      if (open) open = false;
+      else expanded = false;
+    }
   }
 
   function choose(hit) {
     open = false;
+    expanded = false;
     onopen(hit.path);
   }
 
@@ -206,11 +228,15 @@
   );
 </script>
 
-<div class="search">
+<div class="search" class:expanded>
+  <button class="opener" aria-label="Open search" onclick={expand}>
+    <i class="wxi-search"></i>
+  </button>
   <input
     type="search"
     aria-label="Search"
     {placeholder}
+    bind:this={box}
     bind:value={query}
     oninput={typed}
     onkeydown={key}
@@ -221,6 +247,9 @@
       <input type="checkbox" bind:checked={everywhere} onchange={run} /> All
     </label>
   {/if}
+  <button class="shut" aria-label="Close search" onclick={collapse}>
+    <i class="wxi-close"></i>
+  </button>
   {#if open && query.trim()}
     <div class="results" role="listbox" aria-label="Search results">
       {#if error}
@@ -266,6 +295,12 @@
       <p class="status">
         {#each status.filter((s) => s.indexed && !s.off) as s (s.volume)}
           <span>{s.volume.slice(1)}: {s.files} files, indexed {ago(s.updatedMs)}{s.by ? ` by ${s.by}` : ""}</span>
+          {#if s.photos > s.photosSeen}
+            <span>
+              {s.photos - s.photosSeen} of its {s.photos} photos can only be found by their dates and places
+              so far: a computer running raft5fs makes them searchable by what they show.
+            </span>
+          {/if}
         {/each}
         {#if notIndexed.length}
           <span>Not indexed yet: {notIndexed.join(", ")}</span>
@@ -316,4 +351,25 @@
     padding: 8px; border-radius: 4px; background: var(--wx-background-alt);
   }
   .ask span:last-child { display: flex; gap: 6px; flex-wrap: wrap; }
+  .opener, .shut {
+    display: none; flex: none; align-items: center; justify-content: center;
+    width: 36px; height: 36px; border: none; border-radius: var(--wx-radius-major, 6px);
+    background: var(--wx-background-alt); color: var(--wx-color-font); font-size: 20px;
+  }
+  /* A phone: a button, which opens the bar across the header (Files.svelte
+     makes the header the bar's container). */
+  @media (max-width: 640px) {
+    .search { flex: none; min-width: 0; position: static; }
+    .search:not(.expanded) > :not(.opener) { display: none; }
+    .search:not(.expanded) > .opener { display: inline-flex; }
+    .search.expanded {
+      position: absolute; inset: 0; z-index: 30;
+      padding: 0 12px; background: var(--wx-background);
+    }
+    .search.expanded > .shut { display: inline-flex; }
+    .results {
+      position: fixed; top: 56px; left: 8px; right: 8px; width: auto;
+      max-height: calc(100vh - 72px);
+    }
+  }
 </style>

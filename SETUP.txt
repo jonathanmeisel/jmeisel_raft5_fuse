@@ -1174,7 +1174,10 @@ The model runs on each device that indexes or searches, never on the
 servers. It downloads the first time it is needed (about 135 MB, from
 Hugging Face, which sees only that this machine fetched it), into
 ~/.cache/raft5fs/models, and is checked against a pinned SHA-256 before
-use. The web app serves the same files itself (webapp/README.md) and
+use. Native clients run it with ONNX Runtime, which also downloads
+then (about 24 MB, Microsoft's build from PyPI, pinned the same way; it
+needs glibc 2.28 or newer). To use a copy the system already has, set
+RAFT5FS_ONNXRUNTIME to its libonnxruntime. The web app serves the same files itself (webapp/README.md) and
 keeps them in the browser after the first search. A browser keeps the
 index it has read, sealed to the account, unless "Keep search data on
 this device" is off. Indexing with it takes CPU: about half the cores, at most four,
@@ -1202,7 +1205,11 @@ vectors: a device that does fills them in at its next walk. It does
 search them, with CLIP's text side (about 140 MB more, downloaded on the
 first search of a volume whose photos have vectors). Results show each
 photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
-they show without fetching the photos.
+they show without fetching the photos. HEIC photos (an iPhone's) get their
+dates and places everywhere, but no thumbnail or image vector on native
+devices yet, which can't decode them. raft5fs index --status, and the
+search panel, say how many of a volume's photos can be found by what they
+show.
 
 Indexing runs by itself. A mount or a WebDAV server indexes, in the
 background, each volume this account can write (not the Android build,

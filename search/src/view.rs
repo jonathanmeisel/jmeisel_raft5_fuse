@@ -32,12 +32,15 @@ pub const MEANING_MARGIN: f32 = 0.05;
 pub const MIN_MEANING_WORDS: u32 = 8;
 
 /// How a photo matches a query by what it shows, with CLIP, whose cosines
-/// are lower: a photo of what the query says scores 0.27 to 0.37, in any
-/// language, and others 0.13 to 0.22 (raft5fs-indexer's `clip` tests). As
-/// for text, a photo matches if it is within `IMAGE_MARGIN` of the best
-/// match in the volume, and above `MIN_IMAGE_SIMILARITY`.
-pub const MIN_IMAGE_SIMILARITY: f32 = 0.24;
-pub const IMAGE_MARGIN: f32 = 0.05;
+/// are low and close together. On real photos (20 from Wikimedia Commons,
+/// ten subjects, scored with raft5fs-indexer's `clip_scores` example), a
+/// photo of what the query says scores 0.214 to 0.294, in any language,
+/// and is first for every query; others score 0.18 to 0.225. Drawn test
+/// pictures score higher, which is why they don't set these. A photo
+/// matches if it is within `IMAGE_MARGIN` of the best match in the volume,
+/// and above `MIN_IMAGE_SIMILARITY`; rank decides the rest.
+pub const MIN_IMAGE_SIMILARITY: f32 = 0.215;
+pub const IMAGE_MARGIN: f32 = 0.04;
 
 /// A query's embedding, and the model that made it.
 pub struct QueryVector<'a> {
@@ -147,6 +150,17 @@ impl View {
     /// The files that best match `query` by keyword, best first.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
         self.search_with(query, None, None, limit)
+    }
+
+    /// How many photos there are here, and how many of them have an image
+    /// vector from `model`, so can be found by what they show.
+    pub fn photos(&self, model: &str) -> (usize, usize) {
+        let photos = self.docs.iter().filter(|r| r.kind == DocKind::Photo);
+        let with = photos
+            .clone()
+            .filter(|r| r.extra.image.as_ref().is_some_and(|(m, _)| m == model))
+            .count();
+        (photos.count(), with)
     }
 
     /// Whether any photo here has an image vector from `model`.
@@ -459,6 +473,8 @@ mod tests {
             record(3, 1, "notes.txt", "notes on nothing"),
         ]);
         assert!(view.has_image_model("clip") && !view.has_image_model("other"));
+        assert_eq!(view.photos("clip"), (2, 2));
+        assert_eq!(view.photos("other"), (2, 0));
         // A query near the beach's vector (a cosine of 0.3, as CLIP gives).
         let mut q = vec![0.3, 0.1, (1.0f32 - 0.09 - 0.01).sqrt()];
         normalize(&mut q);

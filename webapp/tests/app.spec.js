@@ -1643,6 +1643,9 @@ test("a folder's activity says who changed what", async ({ browser }) => {
 
 /// Types `query` in the header's search box and waits for results.
 async function search(page, query) {
+  // On a phone the box is behind a button.
+  const opener = page.getByRole("button", { name: "Open search" });
+  if (await opener.isVisible()) await opener.click();
   const box = page.getByRole("searchbox", { name: "Search" });
   await box.fill(query);
   await box.press("Enter");
@@ -1857,6 +1860,50 @@ test("photos are found by where and when they were taken, and rides by where the
   await expect(rides.getByRole("option").first()).toContainText(/Lyndonville|Vermont/);
 
   expect(problems).toEqual([]);
+});
+
+test("there is one search box, and on a phone it leaves the folder menu room", async ({ browser }) => {
+  const shots = new URL("../test-results/search-layout/", import.meta.url).pathname;
+  const desk = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+  await enrol(desk, "oli");
+  await login(desk, "oli");
+  await addFolder(desk, "notes");
+  await open(desk, "notes");
+  // SVAR's own search box is hidden: only the header's shows.
+  await expect(desk.getByRole("searchbox", { name: "Search" })).toBeVisible();
+  await expect(desk.locator(".wx-filemanager .wx-search-input")).toBeHidden();
+  await expect(desk.locator("input:visible[placeholder*='Search']")).toHaveCount(1);
+  await desk.screenshot({ path: `${shots}desktop.png` });
+
+  const phone = await (
+    await browser.newContext({ viewport: { width: 390, height: 800 }, isMobile: true, hasTouch: true })
+  ).newPage();
+  await phone.goto("/");
+  await phone.getByLabel("Filesystem").selectOption(localFsId());
+  await login(phone, "oli");
+  await open(phone, "notes");
+  // A button, beside the folder menu, not over it.
+  const opener = phone.getByRole("button", { name: "Open search" });
+  const folder = phone.getByRole("button", { name: /^Folder \(/ });
+  await expect(opener).toBeVisible();
+  await expect(folder).toBeVisible();
+  await expect(phone.getByRole("searchbox", { name: "Search" })).toBeHidden();
+  const [a, b] = [await opener.boundingBox(), await folder.boundingBox()];
+  const overlap = a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  expect(overlap).toBe(false);
+  await phone.screenshot({ path: `${shots}phone.png` });
+  // The bar opens across the header, and closes again.
+  await opener.click();
+  const box = phone.getByRole("searchbox", { name: "Search" });
+  await expect(box).toBeFocused();
+  expect((await box.boundingBox()).width).toBeGreaterThan(250);
+  await box.fill("anything");
+  await box.press("Enter");
+  await expect(phone.getByRole("listbox", { name: "Search results" })).toBeVisible(SLOW);
+  await phone.screenshot({ path: `${shots}phone-open.png` });
+  await phone.getByRole("button", { name: "Close search" }).click();
+  await expect(box).toBeHidden();
+  await expect(folder).toBeVisible();
 });
 
 test("the app refuses to run in a frame", async ({ page }) => {

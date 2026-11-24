@@ -17,7 +17,10 @@
 //! - Write the parity fixtures again (raft5fs-indexer's ignored
 //!   `write_the_web_apps_*` tests), and run `npm run test:parity`.
 //! - Measure again what scores tell a match from a miss (the real-model
-//!   tests print them), and set `view`'s floors and margins to fit.
+//!   tests print them), and set `view`'s floors and margins to fit. For
+//!   photos, measure on real photos, not drawings, which score higher:
+//!   raft5fs-indexer's `clip_scores` example scores queries against a
+//!   folder of them.
 
 use crate::record::Vector;
 

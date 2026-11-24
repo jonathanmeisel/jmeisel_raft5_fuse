@@ -10,7 +10,11 @@ raft5fs-search = { workspace = true }
 pdf-extract = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff"] }
 tokio = { workspace = true }
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-23"] }
+# Loads ONNX Runtime at run time (see `manifest::runtime_library`), not
+# linked: its prebuilt static library needs glibc 2.38, and the release is
+# built on an older system so that it runs on older ones.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-23"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 ureq = "3"
 sha2 = "0.10"
