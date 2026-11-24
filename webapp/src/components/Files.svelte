@@ -1164,6 +1164,7 @@
   .layout { display: flex; flex-direction: column; height: 100%; }
   /* In SVAR's colours and sizes, as one bar with its toolbar below. */
   header {
+    position: relative;
     display: flex; align-items: center; gap: 12px;
     height: 52px; padding: 0 12px 0 16px; flex: none;
     background: var(--wx-background); border-bottom: var(--wx-border-medium);
@@ -1198,4 +1199,7 @@
   }
   .fm { flex: 1; min-height: 0; }
   .more { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+  /* SVAR's own search box filters names in the folders already shown. The
+     search in the header does that and more, so there is one search box. */
+  :global(.wx-filemanager .wx-toolbar .wx-search-input) { display: none; }
 </style>

@@ -1,7 +1,5 @@
 //! `raft5fs index` and `raft5fs search`.
 
-use std::collections::HashMap;
-
 use clap::Args;
 use raft5fs_client::cli::Context;
 use raft5fs_client::indexer::read_index;
@@ -20,10 +18,9 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
-use raft5fs_search::rank::fuse;
 use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
-use raft5fs_search::view::View;
+use raft5fs_search::view::{View, search_many};
 use tokio::runtime::Runtime;
 
 use super::{ConnectArgs, Outcome, log_in, runtime};
@@ -204,9 +201,16 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
                         .updated_by
                         .map(|(user, device)| format!(" by {user} on {device}"))
                         .unwrap_or_default();
-                    let files = View::new(index.entries).len();
+                    let view = View::new(index.entries);
+                    let (photos, seen) = view.photos(CLIP_MODEL);
+                    let pictures = if photos > 0 {
+                        format!(", {photos} photos ({seen} searchable by what they show)")
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{label}: {files} files; last indexed {}{by}",
+                        "{label}: {} files{pictures}; last indexed {}{by}",
+                        view.len(),
                         ago(p.updated_ms)
                     );
                 }
@@ -317,36 +321,22 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     }
     let views_only: Vec<&View> = views.iter().map(|(_, _, v)| v).collect();
     let (query_vector, image_vector) = query_vectors(&runtime, &views_only, &args.query);
-    // Each volume ranks its own hits; the lists are then merged by rank.
-    let mut lists = Vec::new();
-    let mut hits = HashMap::new();
-    for (label, ino, view) in &views {
-        let vector = query_vector.as_deref().map(|values| QueryVector {
-            model: MODEL,
-            values,
-        });
-        let image = image_vector.as_deref().map(|values| QueryVector {
-            model: CLIP_MODEL,
-            values,
-        });
-        let list: Vec<(u64, u64)> = view
-            .search_with(&args.query, vector, image, args.limit)
-            .into_iter()
-            .map(|h| {
-                let key = (*ino, h.ino);
-                hits.insert(key, ((*label).clone(), h));
-                key
-            })
-            .collect();
-        lists.push(list);
-    }
-    let merged = fuse(&lists);
+    // All the volumes are ranked as one (`view::search_many`).
+    let vector = query_vector.as_deref().map(|values| QueryVector {
+        model: MODEL,
+        values,
+    });
+    let image = image_vector.as_deref().map(|values| QueryVector {
+        model: CLIP_MODEL,
+        values,
+    });
+    let merged = search_many(&views_only, &args.query, vector, image, args.limit);
     if merged.is_empty() {
         println!("nothing found");
         return Ok(1);
     }
-    for (key, _) in merged.into_iter().take(args.limit) {
-        let (label, hit) = &hits[&key];
+    for (i, hit) in merged {
+        let label = views[i].0;
         println!("/{label}/{}", hit.path);
         if !hit.preview.is_empty() {
             println!("    {}", hit.preview);

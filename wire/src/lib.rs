@@ -57,6 +57,26 @@ pub fn put_bytes(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(field);
 }
 
+/// A number in as few bytes as it needs (LEB128): seven bits a byte, low
+/// bits first, the top bit set on every byte but the last.
+pub fn put_varint(out: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A variable field whose length is a varint (`put_varint`).
+pub fn put_short_bytes(out: &mut Vec<u8>, field: &[u8]) {
+    put_varint(out, field.len() as u64);
+    out.extend_from_slice(field);
+}
+
 /// Reads fields in the order they were put.
 #[derive(Debug, Clone)]
 pub struct Reader<'a> {
@@ -127,6 +147,25 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
 
+    /// What `put_varint` wrote. Fails on more than ten bytes.
+    pub fn varint(&mut self) -> Result<u64, Error> {
+        let mut n = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.u8()?;
+            n |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(n);
+            }
+        }
+        Err(self.garbled())
+    }
+
+    /// What `put_short_bytes` wrote.
+    pub fn short_bytes(&mut self) -> Result<&'a [u8], Error> {
+        let n = usize::try_from(self.varint()?).map_err(|_| self.garbled())?;
+        self.take(n)
+    }
+
     /// A variable field that holds UTF-8 text.
     pub fn string(&mut self) -> Result<String, Error> {
         let garbled = self.garbled();
@@ -162,6 +201,25 @@ pub fn from_hex(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn varints_round_trip_and_stay_short() {
+        let mut out = Vec::new();
+        for n in [0u64, 1, 127, 128, 300, u64::MAX] {
+            put_varint(&mut out, n);
+        }
+        assert_eq!(&out[..5], &[0, 1, 0x7f, 0x80, 0x01]);
+        let mut r = Reader::new(&out, "varints");
+        for n in [0u64, 1, 127, 128, 300, u64::MAX] {
+            assert_eq!(r.varint().unwrap(), n);
+        }
+        r.finish().unwrap();
+        assert!(Reader::new(&[0x80; 11], "too long").varint().is_err());
+        let mut s = Vec::new();
+        put_short_bytes(&mut s, b"word");
+        assert_eq!(s, b"\x04word");
+        assert_eq!(Reader::new(&s, "short").short_bytes().unwrap(), b"word");
+    }
+
     use super::*;
 
     #[test]

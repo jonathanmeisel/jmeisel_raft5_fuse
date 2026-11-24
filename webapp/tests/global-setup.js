@@ -2,6 +2,7 @@
 // for a second, unreachable one (so the app has a choice to make), and
 // serves the build on :4173. Returns the teardown, which stops both.
 // Needs the example built: cargo build -p raft5fs-testkit --example web_dev
+// The search tests also need the CLI: cargo build -p raft5fs --no-default-features --features index
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
@@ -28,7 +29,7 @@ export default async function () {
   if (!existsSync(binary)) {
     throw new Error("build it first: cargo build -p raft5fs-testkit --example web_dev");
   }
-  const users = ["alice", "bob", "carol", "erin", "frank", "gina", "hank", "iris", "jack", "kim", "lena", "mona", "nils", "olga", "pia", "quinn", "rosa", "sam", "tom", "uma", "val", "wes", "xia", "yan", "kai", "lux", "mia", "ned"].flatMap((u) => ["--user", u]);
+  const users = ["alice", "bob", "carol", "erin", "frank", "gina", "hank", "iris", "jack", "kim", "lena", "mona", "nils", "olga", "pia", "quinn", "rosa", "sam", "tom", "uma", "val", "wes", "xia", "yan", "kai", "lux", "mia", "ned", "oli"].flatMap((u) => ["--user", u]);
   const backend = spawn(binary, ["--origin", "http://localhost:4173", "--out", `${app}config/local`, ...users], {
     cwd: root,
   });

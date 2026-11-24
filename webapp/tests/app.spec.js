@@ -46,6 +46,8 @@ const localFsId = () =>
 const SLOW = { timeout: 60_000 };
 /// web_dev's port for new invitations: three after its native port.
 const REISSUE = "http://127.0.0.1:27163";
+/// web_dev's native port, for the CLI.
+const NATIVE = "http://127.0.0.1:27160";
 /// A 1x1 PNG.
 const fixture = (name) => readFileSync(new URL(`fixtures/${name}`, import.meta.url));
 const WEBM = fixture("clip.webm");
@@ -1643,6 +1645,9 @@ test("a folder's activity says who changed what", async ({ browser }) => {
 
 /// Types `query` in the header's search box and waits for results.
 async function search(page, query) {
+  // On a phone the box is behind a button.
+  const opener = page.getByRole("button", { name: "Open search" });
+  if (await opener.isVisible()) await opener.click();
   const box = page.getByRole("searchbox", { name: "Search" });
   await box.fill(query);
   await box.press("Enter");
@@ -1665,7 +1670,35 @@ async function searchUntil(page, query, path, timeout = 120_000) {
   }
 }
 
+/// Indexes `folder` of `user`'s as a desktop does, with the models: the
+/// vectors that browsers search by but don't make. Tries again while a
+/// browser's pass holds the folder's claim.
+/// Needs the CLI built: cargo build -p raft5fs --no-default-features --features index
+async function nativeIndex(user, folder) {
+  const binary = new URL("../../target/debug/raft5fs", import.meta.url).pathname;
+  // No profile, and no pins of the tester's own.
+  const config = mkdtempSync(join(tmpdir(), "raft5fs-cli-"));
+  try {
+    const deadline = Date.now() + 120_000;
+    for (;;) {
+      const out = execFileSync(
+        binary,
+        ["--server", NATIVE, "--insecure-plaintext", "--user", user, "index", folder],
+        { env: { ...process.env, XDG_CONFIG_HOME: config, RAFT5FS_PASSWORD: PASSWORD }, encoding: "utf8", timeout: 600_000 },
+      );
+      if (!/skipped:/.test(out)) return out;
+      if (Date.now() > deadline) throw new Error(`${folder} stayed claimed: ${out}`);
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+  } finally {
+    rmSync(config, { recursive: true, force: true });
+  }
+}
+
 test("files are found by their words and their meaning", async ({ browser }) => {
+  // `raft5fs index` may first download its models, and the page reads the
+  // index again only a minute after it last did.
+  test.setTimeout(300_000);
   const context = await browser.newContext();
   await context.addInitScript(() => {
     try {
@@ -1689,7 +1722,9 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   await searchUntil(page, "receipts", "notes/taxes.txt");
   await searchUntil(page, "tomatoes basil", "notes/minutes.docx");
   await searchUntil(page, "raft5fs", "notes/page.pdf");
-  // Meaning, in another language, with no word in common.
+  // Meaning, in another language, with no word in common: from the
+  // vectors a desktop adds.
+  await nativeIndex("kai", "notes");
   const results = await searchUntil(page, "Steuererklärung Belege", "notes/taxes.txt");
   await expect(results.getByRole("option").first()).toContainText("notes/taxes.txt");
   await expect(results).toContainText(/notes: \d+ files, indexed .* by kai on /);
@@ -1752,7 +1787,10 @@ test("a phone doesn't index for search unless asked", async ({ browser }) => {
 });
 
 test("a phone asks before downloading the search model, and finds words meanwhile", async ({ browser }) => {
-  // A computer indexes a folder, with vectors.
+  // `raft5fs index` may first download its models, and the page reads the
+  // index again only a minute after it last did.
+  test.setTimeout(300_000);
+  // A browser indexes a folder's words, and a desktop adds vectors.
   const computer = await browser.newContext();
   await computer.addInitScript(() => {
     try {
@@ -1769,6 +1807,8 @@ test("a phone asks before downloading the search model, and finds words meanwhil
     { name: "ride.txt", mimeType: "text/plain", buffer: Buffer.from(ride) },
   ]);
   await expect(item(desk, "ride.txt")).toBeVisible(SLOW);
+  await searchUntil(desk, "gravel", "trips/ride.txt");
+  await nativeIndex("mia", "trips");
   await searchUntil(desk, "Fahrradtour", "trips/ride.txt");
 
   // The same account on a phone, which doesn't index.
@@ -1857,6 +1897,50 @@ test("photos are found by where and when they were taken, and rides by where the
   await expect(rides.getByRole("option").first()).toContainText(/Lyndonville|Vermont/);
 
   expect(problems).toEqual([]);
+});
+
+test("there is one search box, and on a phone it leaves the folder menu room", async ({ browser }) => {
+  const shots = new URL("../test-results/search-layout/", import.meta.url).pathname;
+  const desk = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+  await enrol(desk, "oli");
+  await login(desk, "oli");
+  await addFolder(desk, "notes");
+  await open(desk, "notes");
+  // SVAR's own search box is hidden: only the header's shows.
+  await expect(desk.getByRole("searchbox", { name: "Search" })).toBeVisible();
+  await expect(desk.locator(".wx-filemanager .wx-search-input")).toBeHidden();
+  await expect(desk.locator("input:visible[placeholder*='Search']")).toHaveCount(1);
+  await desk.screenshot({ path: `${shots}desktop.png` });
+
+  const phone = await (
+    await browser.newContext({ viewport: { width: 390, height: 800 }, isMobile: true, hasTouch: true })
+  ).newPage();
+  await phone.goto("/");
+  await phone.getByLabel("Filesystem").selectOption(localFsId());
+  await login(phone, "oli");
+  await open(phone, "notes");
+  // A button, beside the folder menu, not over it.
+  const opener = phone.getByRole("button", { name: "Open search" });
+  const folder = phone.getByRole("button", { name: /^Folder \(/ });
+  await expect(opener).toBeVisible();
+  await expect(folder).toBeVisible();
+  await expect(phone.getByRole("searchbox", { name: "Search" })).toBeHidden();
+  const [a, b] = [await opener.boundingBox(), await folder.boundingBox()];
+  const overlap = a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  expect(overlap).toBe(false);
+  await phone.screenshot({ path: `${shots}phone.png` });
+  // The bar opens across the header, and closes again.
+  await opener.click();
+  const box = phone.getByRole("searchbox", { name: "Search" });
+  await expect(box).toBeFocused();
+  expect((await box.boundingBox()).width).toBeGreaterThan(250);
+  await box.fill("anything");
+  await box.press("Enter");
+  await expect(phone.getByRole("listbox", { name: "Search results" })).toBeVisible(SLOW);
+  await phone.screenshot({ path: `${shots}phone-open.png` });
+  await phone.getByRole("button", { name: "Close search" }).click();
+  await expect(box).toBeHidden();
+  await expect(folder).toBeVisible();
 });
 
 test("the app refuses to run in a frame", async ({ page }) => {

@@ -55,20 +55,51 @@ impl Bm25 {
     /// The documents that match `query`, best first, each with its score and
     /// best chunk. At most `limit`.
     pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, f32, Option<usize>)> {
-        if self.chunks.is_empty() {
+        let terms = query_terms(query);
+        let mut stats = Stats::default();
+        self.add_stats(&terms, &mut stats);
+        self.search_with(&terms, &stats, limit, |_| true)
+    }
+
+    /// Adds this index's counts for `terms` to `stats`.
+    pub fn add_stats(&self, terms: &[String], stats: &mut Stats) {
+        stats.chunks += self.chunks.len() as u64;
+        stats.total_len += self.total_len;
+        for term in terms {
+            let df = self.postings.get(term).map_or(0, Vec::len) as u64;
+            *stats.df.entry(term.clone()).or_default() += df;
+        }
+    }
+
+    /// The documents that match `terms` (`query_terms`), scored with
+    /// `stats`, over only the documents that `live` keeps.
+    ///
+    /// With `stats` from several indexes (`add_stats`), scores compare
+    /// across them: a word rare in one small volume but common in the
+    /// others doesn't count for more there.
+    pub fn search_with(
+        &self,
+        terms: &[String],
+        stats: &Stats,
+        limit: usize,
+        live: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, f32, Option<usize>)> {
+        if self.chunks.is_empty() || stats.chunks == 0 {
             return Vec::new();
         }
-        let n = self.chunks.len() as f32;
-        let avg = self.total_len as f32 / n;
+        let n = stats.chunks as f32;
+        let avg = stats.total_len as f32 / n;
         let mut scores: HashMap<u32, f32> = HashMap::new();
-        let mut query_terms = terms(query);
-        query_terms.sort();
-        query_terms.dedup();
-        for term in &query_terms {
+        for term in terms {
             let Some(list) = self.postings.get(term) else {
                 continue;
             };
-            let df = list.len() as f32;
+            let df = stats
+                .df
+                .get(term)
+                .copied()
+                .unwrap_or(0)
+                .max(list.len() as u64) as f32;
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
             for &(id, tf) in list {
                 let len = self.chunks[id as usize].1 as f32;
@@ -80,6 +111,9 @@ impl Bm25 {
         let mut best: HashMap<usize, (f32, Option<usize>)> = HashMap::new();
         for (id, score) in scores {
             let at = self.chunks[id as usize].0;
+            if !live(at.doc) {
+                continue;
+            }
             let slot = best.entry(at.doc).or_insert((f32::MIN, None));
             // Show a chunk of text rather than the path when they tie.
             if score > slot.0 || (score == slot.0 && slot.1.is_none()) {
@@ -91,6 +125,23 @@ impl Bm25 {
         out.truncate(limit);
         out
     }
+}
+
+/// The words of a query, each once.
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut t = terms(query);
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// What BM25 scores by, over one index or several: how many chunks, their
+/// total length, and how many chunks have each query word.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub chunks: u64,
+    pub total_len: u64,
+    pub df: HashMap<String, u64>,
 }
 
 #[cfg(test)]
