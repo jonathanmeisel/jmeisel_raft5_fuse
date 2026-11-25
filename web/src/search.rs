@@ -627,10 +627,17 @@ impl Fs {
         self.0.start_indexer(device, skip).map_err(fs_failure)
     }
 
-    /// Stops indexing here; a pass cut short is finished by the next.
+    /// Stops indexing here, and gives up the claim of the volume it was
+    /// indexing; a pass cut short is finished by the next.
     #[wasm_bindgen(js_name = stopIndexing)]
-    pub fn stop_indexing(&self) {
-        drop(self.0.search.indexer.take());
+    pub fn stop_indexing(&self) -> Promise {
+        let indexer = self.0.search.indexer.take();
+        promise(async move {
+            if let Some(indexer) = indexer {
+                indexer.stop().await;
+            }
+            Ok(())
+        })
     }
 
     /// Asks this tab's indexer to look for changes now, as after an

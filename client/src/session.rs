@@ -610,9 +610,13 @@ impl Session {
     /// buffered, so it is stored now.
     pub async fn shutdown(&self) {
         // Anything it was pruning stays listed, for the next pruner. A pass
-        // of the indexer cut short is finished by the next one.
+        // of the indexer cut short is finished by the next one; its claim is
+        // given up now, so that one needn't wait for it to run out.
         drop(self.pruner.lock().unwrap().take());
-        drop(self.indexer.lock().unwrap().take());
+        let indexer = self.indexer.lock().unwrap().take();
+        if let Some(indexer) = indexer {
+            indexer.stop().await;
+        }
         let inos: Vec<u64> = self.write_bufs.lock().unwrap().keys().copied().collect();
         for ino in inos {
             if let Err(e) = self.fsync(ino).await {

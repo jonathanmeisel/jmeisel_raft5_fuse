@@ -32,6 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -52,6 +53,7 @@ use raft5fs_search::view;
 use raft5fs_search::view::MIN_MEANING_WORDS;
 use tokio::sync::Notify;
 
+use crate::remote::Remote;
 use crate::rt::{self, AbortHandle, BoxFuture};
 pub use crate::rt::{MaybeSend, MaybeSync};
 use crate::vault::Vault;
@@ -101,6 +103,11 @@ pub struct IndexerConfig {
     pub max_backoff: Duration,
     /// How often a claim is renewed while a pass runs.
     pub renew: Duration,
+    /// How long a pass may go without progress (a file checked, a folder
+    /// listed, a batch embedded) before it stops and gives up its claim.
+    /// Long enough for a model's first download on a slow line: that is
+    /// one step.
+    pub stall: Duration,
     /// What this device is called in the status search shows.
     pub device: String,
     /// Volumes this device does not index (others still may), as this
@@ -116,6 +123,7 @@ impl Default for IndexerConfig {
             backoff: Duration::from_secs(30),
             max_backoff: Duration::from_secs(3600),
             renew: Duration::from_secs(180),
+            stall: Duration::from_secs(30 * 60),
             device: String::new(),
             skip: Vec::new(),
         }
@@ -601,6 +609,8 @@ struct Pass<'a> {
     stats: PassStats,
     progress: &'a mut (dyn FnMut(&PassStats) + Send),
     told: Instant,
+    /// When the pass last made progress (ms): see `IndexerConfig::stall`.
+    alive: &'a AtomicU64,
     /// Entries in all listed segments, counting replaced ones, and how many
     /// segments: what tells when to compact.
     read: usize,
@@ -608,6 +618,11 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    /// Notes that the pass is making progress.
+    fn beat(&self) {
+        self.alive.store(clock::now_millis(), Ordering::Relaxed);
+    }
+
     fn tell(&mut self) {
         if self.told.elapsed() >= Duration::from_secs(1) {
             self.told = Instant::now();
@@ -688,6 +703,7 @@ impl Pass<'_> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        self.beat();
         let n = self.mine.next_segment;
         if !self.pending_thumbs.is_empty() {
             let thumbs = Manifest::thumbs_name(&self.mine.id, n);
@@ -776,6 +792,7 @@ impl Pass<'_> {
             let Some(t) = r.extra.thumb.as_mut().filter(|t| copy.contains(&t.file)) else {
                 continue;
             };
+            self.alive.store(clock::now_millis(), Ordering::Relaxed);
             let bytes = self
                 .vault
                 .read(files[&t.file], t.offset, t.len as usize)
@@ -800,6 +817,7 @@ impl Pass<'_> {
         // The segments, then the manifest that lists only them.
         let mut segments = Vec::new();
         for batch in entries.chunks(COMPACT_ENTRIES) {
+            self.beat();
             let name = Manifest::segment_name(&id, next);
             write_fresh(self.vault, self.dir, &name, &encode_segment(batch)).await?;
             segments.push(name);
@@ -848,6 +866,7 @@ impl Pass<'_> {
     }
 
     async fn gone(&mut self, ino: u64) -> Result<(), FsError> {
+        self.beat();
         if matches!(self.entries.get(&ino), Some(Entry::Record(_))) {
             self.stats.gone += 1;
             let at_ms = clock::now_millis();
@@ -916,6 +935,7 @@ impl Pass<'_> {
         let texts: Vec<String> = worth.iter().map(|&i| texts[i].clone()).collect();
         let mut vectors = Vec::with_capacity(texts.len());
         for batch in texts.chunks(EMBED_BATCH) {
+            self.beat();
             match embed.passages(batch.to_vec()).await {
                 Ok(v) if v.len() == batch.len() => vectors.extend(v),
                 Ok(v) => {
@@ -939,6 +959,7 @@ impl Pass<'_> {
 
     /// Indexes file `ino` at `path`, unless the index has it as it is now.
     async fn upsert(&mut self, ino: u64, attr: &Attr, path: String) -> Result<(), FsError> {
+        self.beat();
         let stamp = stamp_of(attr);
         let at_ms = clock::now_millis();
         // Another file that was at this path was replaced by this one (as
@@ -1077,6 +1098,7 @@ impl Pass<'_> {
         let mut seen = HashSet::new();
         let mut todo = vec![(self.volume, String::new())];
         while let Some((dir, prefix)) = todo.pop() {
+            self.beat();
             let items = match self.vault.children(dir).await {
                 Ok(items) => items,
                 // Removed or moved out since its parent was listed.
@@ -1172,6 +1194,7 @@ async fn run_pass(
     tools: &Tools,
     kind: PassKind,
     claimed: bool,
+    alive: &AtomicU64,
     progress: &mut (dyn FnMut(&PassStats) + Send),
 ) -> Result<PassStats, FsError> {
     let started = clock::now_millis();
@@ -1214,6 +1237,7 @@ async fn run_pass(
         told: Instant::now(),
         read: loaded.read,
         segment_files: loaded.keys.len(),
+        alive,
     };
     pass.mine.user = vault.remote().username().to_string();
     pass.mine.device = config.device.clone();
@@ -1339,38 +1363,103 @@ pub async fn index_claimed(
     progress: &mut (dyn FnMut(&PassStats) + Send),
 ) -> Result<PassStats, FsError> {
     let remote = vault.remote();
+    let alive = AtomicU64::new(clock::now_millis());
     // Servers from before claims can't keep two devices apart. Each device
     // writes only its own files, so two at once is still safe: only slower.
     if remote.protocol() < raft5fs_proto::since::SEARCH_INDEX {
-        return run_pass(vault, volume, id, config, tools, kind, false, progress).await;
+        return run_pass(
+            vault, volume, id, config, tools, kind, false, &alive, progress,
+        )
+        .await;
     }
     let claim = remote.claim_index(volume, id, false).await?;
     if !claim.granted {
-        let by = claim
-            .claim
-            .map_or_else(String::new, |c| format!(" by {}", c.user));
         return Err(FsError::new(
             errno::EBUSY,
-            format!("this volume is being indexed elsewhere{by}"),
+            busy_message(claim.claim.as_ref()),
         ));
     }
+    // Gives the claim up however the pass ends: done, failed, or dropped
+    // (a device stopping its indexer, a session ending).
+    let guard = ClaimGuard {
+        remote: Some(Arc::clone(remote)),
+        volume,
+        id,
+    };
     let pass = std::pin::pin!(run_pass(
-        vault, volume, id, config, tools, kind, true, progress
+        vault, volume, id, config, tools, kind, true, &alive, progress
     ));
-    // Renews the claim while the pass runs. A failed renewal is tried again
-    // at the next: at worst, someone else indexes too, which is safe.
+    // Renews the claim while the pass makes progress. A failed renewal is
+    // tried again at the next: at worst, someone else indexes too, which is
+    // safe. A pass stuck for `config.stall` is ended, so it can't keep the
+    // volume from everyone else.
     let renew = std::pin::pin!(async {
         loop {
             rt::sleep(config.renew).await;
+            let quiet = clock::now_millis().saturating_sub(alive.load(Ordering::Relaxed));
+            if quiet > config.stall.as_millis() as u64 {
+                return Err(FsError::new(
+                    errno::ETIMEDOUT,
+                    format!(
+                        "the pass made no progress for {} minutes, so it stopped",
+                        quiet / 60_000
+                    ),
+                ));
+            }
             let _ = remote.claim_index(volume, id, false).await;
         }
     });
     let stats = match futures_util::future::select(pass, renew).await {
         futures_util::future::Either::Left((stats, _)) => stats,
-        futures_util::future::Either::Right((never, _)) => never,
+        futures_util::future::Either::Right((stuck, _)) => stuck,
     };
-    let _ = remote.claim_index(volume, id, true).await;
+    guard.release().await;
     stats
+}
+
+/// Why a volume can't be indexed now: someone else's claim, and when it
+/// runs out if its holder stops renewing it.
+fn busy_message(claim: Option<&raft5fs_proto::types::PruneClaim>) -> String {
+    let Some(c) = claim else {
+        return "this volume is being indexed elsewhere".into();
+    };
+    let left = c.expires_ms.saturating_sub(clock::now_millis());
+    format!(
+        "this volume is being indexed elsewhere by {}; their claim runs out in {} \
+         minutes unless they renew it (a pass renews it while it runs)",
+        c.user,
+        left.div_ceil(60_000).max(1)
+    )
+}
+
+/// A claim on a volume's indexing, given up when it drops. Dropped without
+/// `release` (the pass's future dropped), it gives the claim up in the
+/// background, if it can.
+struct ClaimGuard {
+    /// `None` once given up.
+    remote: Option<Arc<Remote>>,
+    volume: u64,
+    id: IndexerId,
+}
+
+impl ClaimGuard {
+    async fn release(mut self) {
+        if let Some(remote) = self.remote.take() {
+            let _ = remote.claim_index(self.volume, self.id, true).await;
+        }
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let Some(remote) = self.remote.take() else {
+            return;
+        };
+        let (volume, id) = (self.volume, self.id);
+        rt::spawn_if_running(async move {
+            let _ = remote.claim_index(volume, id, true).await;
+        });
+    }
 }
 
 /// The volumes this account can index: those granted to it read-write
@@ -1533,11 +1622,14 @@ pub struct IndexStatus {
     pub error: Option<String>,
 }
 
-/// An indexer running in the background: dropping it stops it.
+/// An indexer running in the background: dropping it stops it, and gives
+/// up its claim in the background; `stop` waits for that.
 pub struct Indexer {
     handle: AbortHandle,
     kick: Arc<Notify>,
     status: Arc<Mutex<IndexStatus>>,
+    remote: Arc<Remote>,
+    id: IndexerId,
 }
 
 impl Indexer {
@@ -1548,6 +1640,17 @@ impl Indexer {
 
     pub fn status(&self) -> IndexStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// Stops it, and gives up the claim of the volume it was indexing, if
+    /// any: before a session ends, so another device needn't wait for the
+    /// claim to run out.
+    pub async fn stop(self) {
+        self.handle.abort();
+        let current = self.status.lock().unwrap().current.as_ref().map(|c| c.0);
+        if let Some(volume) = current {
+            let _ = self.remote.claim_index(volume, self.id, true).await;
+        }
     }
 }
 
@@ -1562,10 +1665,13 @@ impl Drop for Indexer {
 pub fn spawn(vault: Vault, config: IndexerConfig, tools: Tools) -> Indexer {
     let kick = Arc::new(Notify::new());
     let status = Arc::new(Mutex::new(IndexStatus::default()));
+    let remote = Arc::clone(vault.remote());
+    let id = new_id();
     let handle = rt::spawn(run(
         vault,
         config,
         tools,
+        id,
         Arc::clone(&kick),
         Arc::clone(&status),
     ));
@@ -1573,6 +1679,8 @@ pub fn spawn(vault: Vault, config: IndexerConfig, tools: Tools) -> Indexer {
         handle,
         kick,
         status,
+        remote,
+        id,
     }
 }
 
@@ -1625,6 +1733,7 @@ async fn run(
     vault: Vault,
     config: IndexerConfig,
     tools: Tools,
+    id: IndexerId,
     kick: Arc<Notify>,
     status: Arc<Mutex<IndexStatus>>,
 ) {
@@ -1634,7 +1743,6 @@ async fn run(
             Some("the servers are too old to share indexing: update them".into());
         return;
     }
-    let id = new_id();
     // What this device knows of each volume after its last pass: the
     // newest change it saw, when it is next due anyway, and any wait after
     // a failure.

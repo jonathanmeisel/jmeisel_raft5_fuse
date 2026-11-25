@@ -62,6 +62,28 @@ where
     handle
 }
 
+/// Runs `task` in the background if a runtime is running here; else
+/// leaves it. For best-effort work from `Drop`, which may run after the
+/// runtime has stopped.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_if_running<F>(task: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(task);
+    }
+}
+
+/// Runs `task` in the background (a browser always has its event loop).
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_if_running<F>(task: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(task);
+}
+
 /// Waits for `duration`.
 pub async fn sleep(duration: Duration) {
     #[cfg(not(target_arch = "wasm32"))]
