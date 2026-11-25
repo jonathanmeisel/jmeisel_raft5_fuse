@@ -13,11 +13,9 @@
     "model": "node scripts/fetch-models.mjs"
   },
   "devDependencies": {
-    "@huggingface/tokenizers": "0.2.0",
     "@playwright/test": "1.64.1",
     "@svar-ui/svelte-filemanager": "2.6.0",
     "@sveltejs/vite-plugin-svelte": "7.3.1",
-    "onnxruntime-web": "1.31.1",
     "svelte": "5.57.2",
     "vite": "8.3.5"
   }

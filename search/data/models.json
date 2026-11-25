@@ -1,5 +1,5 @@
 {
-  "about": "Every model search uses, pinned: the one place to change one (see search/src/vector.rs, 'Changing a model'). Native clients (raft5fs-indexer) and the web app (embedWorker.js, scripts/fetch-models.mjs) read it, and raft5fs-search turns names, sizes and thresholds into its constants when it builds (search/build.rs). The files are raft5fs-embed's: converted from their sources by its `convert` example (the models workflow checks them) and attached to a release (embed/MODELS-NOTICE.txt gives their sources and licences). Each file: its role, where it comes from, its SHA-256 and size, which clients use it, and for the web app the size of the pieces it is cut into (under GitHub Pages' 100 MB a file; 0 for whole). Each model also gives: its vectors' size (dims); the models it replaces, whose vectors devices make again; what goes before a query and a passage; how its vector is pooled (cls, mean); the most tokens it reads; and how search tells a match from a miss (search: floor, margin from the best match, z: how far above the mean of a query's scores, and for text minWords, the fewest words a chunk needs to be embedded), measured as search/src/view.rs says. Until the web app runs raft5fs-embed too, it embeds queries with the ONNX exports under webText and webClip (onnxruntime-web); their vectors agree with the native models' to about cosine 0.996.",
+  "about": "Every model search uses, pinned: the one place to change one (see search/src/vector.rs, 'Changing a model'). Native clients (raft5fs-indexer) and the web app (embedWorker.js, scripts/fetch-models.mjs) read it, and raft5fs-search turns names, sizes and thresholds into its constants when it builds (search/build.rs). The files are raft5fs-embed's: converted from their sources by its `convert` example (the models workflow checks them) and attached to a release (embed/MODELS-NOTICE.txt gives their sources and licences). Each file: its role, where it comes from, its SHA-256 and size, which clients use it, and for the web app the size of the pieces it is cut into (under GitHub Pages' 100 MB a file; 0 for whole). Each model also gives: its vectors' size (dims); the models it replaces, whose vectors devices make again; what goes before a query and a passage; how its vector is pooled (cls, mean); the most tokens it reads; and how search tells a match from a miss (search: floor, margin from the best match, z: how far above the mean of a query's scores, and for text minWords, the fewest words a chunk needs to be embedded), measured as search/src/view.rs says.",
   "models": {
     "text": {
       "name": "multilingual-e5-small-q8_0@614241f",
@@ -26,7 +26,8 @@
           "size": 23601856,
           "piece": 0,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         },
         {
@@ -37,7 +38,8 @@
           "size": 102015096,
           "piece": 60000000,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         },
         {
@@ -48,7 +50,8 @@
           "size": 5318930,
           "piece": 0,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         }
       ]
@@ -77,7 +80,8 @@
           "size": 48517760,
           "piece": 0,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         },
         {
@@ -88,7 +92,8 @@
           "size": 97550352,
           "piece": 0,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         },
         {
@@ -99,7 +104,8 @@
           "size": 1115099,
           "piece": 0,
           "clients": [
-            "native"
+            "native",
+            "web"
           ]
         },
         {
@@ -108,104 +114,6 @@
           "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/clip-vision.gguf",
           "sha256": "e3dc99164841a24f7b41cd777ab73bf887029d6e9031adeceb2d522d865074d4",
           "size": 100755072,
-          "piece": 0,
-          "clients": [
-            "native"
-          ]
-        }
-      ]
-    },
-    "webText": {
-      "name": "multilingual-e5-small-int8@761b726",
-      "files": [
-        {
-          "role": "model",
-          "local": "model.onnx",
-          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_quantized.onnx",
-          "sha256": "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
-          "size": 118308185,
-          "piece": 60000000,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "tokenizer",
-          "local": "tokenizer.json",
-          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer.json",
-          "sha256": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
-          "size": 17082730,
-          "piece": 0,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "tokenizerConfig",
-          "local": "tokenizer_config.json",
-          "url": "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer_config.json",
-          "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
-          "size": 443,
-          "piece": 0,
-          "clients": [
-            "web"
-          ]
-        }
-      ]
-    },
-    "webClip": {
-      "name": "mclip-vit-b32-int8@58edf8c+6b7c523",
-      "files": [
-        {
-          "role": "model",
-          "local": "text.onnx",
-          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/onnx/model_quint8_avx2.onnx",
-          "sha256": "fbc8fbeaa5237d96bd1bf430057c70d34de8334a463e933a5faa305f6caeed9c",
-          "size": 135377779,
-          "piece": 60000000,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "tokenizer",
-          "local": "tokenizer.json",
-          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/tokenizer.json",
-          "sha256": "5b4e1a8171c81dfd666ae40265b9530c6e0b3d53923fe8ac493dcc84229adf81",
-          "size": 1961847,
-          "piece": 0,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "tokenizerConfig",
-          "local": "tokenizer_config.json",
-          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/tokenizer_config.json",
-          "sha256": "8f66d0ad85be46afc77e0bbf48312cff326ddb9e7290926df96a8228d69a814e",
-          "size": 371,
-          "piece": 0,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "dense",
-          "local": "dense.safetensors",
-          "url": "https://huggingface.co/sentence-transformers/clip-ViT-B-32-multilingual-v1/resolve/58edf8cada9e398793dca955574a48cbb7f18be2/2_Dense/model.safetensors",
-          "sha256": "d12568dc7300970a4d3dbb49068ad16cd89b99840b74b026f8e48071e9414f74",
-          "size": 1572984,
-          "piece": 0,
-          "clients": [
-            "web"
-          ]
-        },
-        {
-          "role": "vision",
-          "local": "vision.onnx",
-          "url": "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/6b7c523703ae26e39be4b03774966f8571c7f523/onnx/vision_model_quantized.onnx",
-          "sha256": "583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299",
-          "size": 89117001,
           "piece": 0,
           "clients": [
             "native"

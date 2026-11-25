@@ -30,6 +30,40 @@ pub trait Rows {
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<()>;
 }
 
+/// No table: for a model whose caller gives the rows with each text
+/// (`TextModel::embed_with`).
+pub struct NoRows;
+
+impl Rows for NoRows {
+    fn read(&self, _: u64, _: &mut [u8]) -> Result<()> {
+        Err(Error::from("this model's table rows come with each text"))
+    }
+}
+
+/// Some rows of a table, by token id: what a text needs, read ahead.
+pub struct GivenRows {
+    /// Ids, sorted, and their rows one after another.
+    pub ids: Vec<u32>,
+    pub bytes: Vec<u8>,
+    pub row: usize,
+}
+
+impl Rows for GivenRows {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
+        let id = (offset / self.row as u64) as u32;
+        let at = self
+            .ids
+            .binary_search(&id)
+            .map_err(|_| Error(format!("no row given for token {id}")))?;
+        out.copy_from_slice(
+            self.bytes
+                .get(at * self.row..at * self.row + out.len())
+                .ok_or_else(|| Error::from("a given row is short"))?,
+        );
+        Ok(())
+    }
+}
+
 /// A table held in memory.
 pub struct MemoryRows(pub Vec<u8>);
 

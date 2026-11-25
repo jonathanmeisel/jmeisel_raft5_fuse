@@ -6,9 +6,9 @@ Files the browser tests upload:
 - `page.pdf`: one page that says "raft5fs", written by hand.
 - `minutes.docx`: a Word file of two paragraphs, made with Python's
   `zipfile` (only `[Content_Types].xml` and `word/document.xml`).
-- `e5-vectors.json`: what native clients' model gives for a few texts, for
-  the parity test; written by raft5fs-indexer's ignored test
-  `write_the_web_apps_parity_fixture`.
+- `text-vectors.json`: what native clients' text model gives for a few
+  texts, with the browser's Q8_0 weights, for the parity test; written by
+  raft5fs-indexer's ignored test `write_the_web_apps_parity_fixture`.
 - `clip-vectors.json`: the same, for the photo model's text side; written
   by raft5fs-indexer's ignored test `write_the_web_apps_clip_fixture`.
 - `lisbon.jpg`: the search crate's `lake.jpg` with EXIF data saying it was

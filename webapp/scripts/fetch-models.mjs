@@ -8,7 +8,8 @@
 // - A file with a `piece` size is cut into pieces under GitHub Pages' 100
 //   MB a file: <local>.0, <local>.1, ...; the embed Worker joins them and
 //   checks the whole again.
-// - What is there already, and checks out, isn't fetched again.
+// - What is there already, and checks out, isn't fetched again; models
+//   no longer pinned are removed.
 //
 // Not committed (see .gitignore). Usage: npm run model.
 import { createHash } from "node:crypto";
@@ -67,6 +68,15 @@ for (const [key, model] of Object.entries(manifest.models)) {
     if (!wanted.has(name)) rmSync(new URL(name, dir));
   }
   console.log(`${model.name}: ${[...wanted].join(", ")}`);
+}
+
+// Models no longer pinned: a build would serve them for nothing.
+const pinned = new Set(Object.values(manifest.models).map((m) => m.name));
+for (const name of readdirSync(new URL("public/models/", app))) {
+  if (!pinned.has(name)) {
+    rmSync(new URL(`public/models/${name}`, app), { recursive: true });
+    console.log(`removed ${name}`);
+  }
 }
 
 // The places table that tracks and photos are named with (search/data,

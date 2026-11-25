@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "client", "core", "crypto", "embed", "fuse", "indexer", "objstore", "pdfweb", "proto", "search", "server", "testkit", "web", "webdav", "wire"]
+members = ["cli", "client", "core", "crypto", "embed", "embedweb", "fuse", "indexer", "objstore", "pdfweb", "proto", "search", "server", "testkit", "web", "webdav", "wire"]
 resolver = "3"
 
 [workspace.package]
@@ -41,6 +41,33 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
+# The search models' maths is far too slow unoptimized: a debug `raft5fs
+# index` (the browser tests run one) would take minutes a file.
+[profile.dev.package.raft5fs-embed]
+opt-level = 3
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.gemm-f32]
+opt-level = 3
+[profile.dev.package.gemm-f64]
+opt-level = 3
+[profile.dev.package.gemm-c32]
+opt-level = 3
+[profile.dev.package.gemm-c64]
+opt-level = 3
+[profile.dev.package.pulp]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
+
 # The web app's wasm (webapp/scripts/build-wasm.sh): smaller, since every
 # visit downloads it.
 [profile.web]
@@ -53,3 +80,10 @@ codegen-units = 1
 opt-level = 3
 [profile.web.package.blake2]
 opt-level = 3
+
+# The search models' module (raft5fs-embed-web): for speed, not size, since
+# its matrix maths is most of a search's time.
+[profile.web-models]
+inherits = "release"
+lto = true
+codegen-units = 1

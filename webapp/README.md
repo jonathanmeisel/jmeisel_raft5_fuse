@@ -119,18 +119,21 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     Vectors come from native devices, which add them to records a
     browser wrote at their next pass.
   - `src/lib/embedWorker.js` is a Worker of its own, so indexing never holds
-    up the session's calls. It runs the model to embed queries
-    (`src/lib/e5.js`, on ONNX Runtime's WebAssembly backend, one thread),
-    and reads PDFs with the PDF module (the `raft5fs-pdf-web` crate, a
-    separate wasm: a PDF that crashes it only restarts it). It holds no
-    keys.
+    up the session's calls. It embeds queries with the search models (the
+    `raft5fs-embed-web` crate: raft5fs-embed, the code native clients run,
+    built with WebAssembly SIMD), and reads PDFs with the PDF module (the
+    `raft5fs-pdf-web` crate: a PDF that crashes it only restarts it). It
+    holds no keys, and ends after a minute without work, giving back the
+    models' memory; the next search loads them again from the browser.
   - The models are served by the app from `public/models/`, which
     `npm run model` (`scripts/fetch-models.mjs`) fetches as
-    `search/data/models.json` pins them for every client (about 135 MB for
-    text, 140 MB more for photos, checked against their SHA-256s, split
-    into pieces under GitHub Pages' 100 MB limit). The embed Worker
-    streams the pieces into one buffer, checks the whole, and keeps it in
-    the Cache API.
+    `search/data/models.json` pins them for every client (about 130 MB for
+    text, 150 MB more for photos, checked against their SHA-256s, split
+    into pieces under GitHub Pages' 100 MB limit). A model's body and
+    tokenizer are kept in the Cache API. Its word table, most of its size,
+    goes to OPFS, checked as it streams in, and each query reads only its
+    tokens' rows from there: in memory, a model is its body (24 MB for
+    text, 49 MB for photos) and its tokenizer.
   - A search shows what matches by words at once, then searches by meaning
     too and shows those results when the model is ready, with the
     download's progress the first time. On a phone or tablet, with Data
@@ -147,11 +150,11 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     served from `public/data/places.bin`, checked against its pinned
     SHA-256), fetched by the tab that indexes. Photos get thumbnails, drawn
     on an OffscreenCanvas in the embed Worker; results show them.
-  - Photos are found by what they show with CLIP (`src/lib/clip.js`, its
-    multilingual text side only, served beside the text model): native
-    devices give photos their image vectors, and a search of a folder whose
-    photos have them embeds the query with it too. The download question
-    counts it (about 140 MB more).
+  - Photos are found by what they show with CLIP (its multilingual text
+    side only, served beside the text model): native devices give photos
+    their image vectors, and a search of a folder whose photos have them
+    embeds the query with it too. The download question counts it (about
+    150 MB more).
   - A top-level folder's **More → Search indexing** (`IndexingDialog.svelte`)
     shows whether it is indexed; its owner can turn that off, which removes
     its index.
@@ -198,9 +201,10 @@ npx playwright test
 MEMORY_TEST=1 npx playwright test -g memory   # what a search holds (10+ min)
 ```
 
-`test:parity` runs the app's model code in Node and checks its token ids,
-and its vectors to cosine 0.995, against `tests/fixtures/e5-vectors.json`
-and `tests/fixtures/clip-vectors.json`, which native clients wrote
+`test:parity` runs the app's models module in Node and checks its token
+ids, and its vectors to cosine 0.999, against
+`tests/fixtures/text-vectors.json` and `tests/fixtures/clip-vectors.json`,
+which native clients wrote
 (raft5fs-indexer's ignored tests `write_the_web_apps_parity_fixture` and
 `write_the_web_apps_clip_fixture`; run them again after changing a
 model). In the browser tests, indexing is off in every tab except the

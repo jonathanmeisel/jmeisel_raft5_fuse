@@ -1,60 +1,79 @@
-// The web app's model gives the vectors native clients give: the same
-// token ids, and vectors within cosine 0.995 of those in
-// fixtures/e5-vectors.json (written by raft5fs-indexer's ignored test
-// `write_the_web_apps_parity_fixture`). Native ONNX Runtime's int8 kernels
-// and its WebAssembly ones round a little differently (0.9998 or more for a
-// passage, 0.9988 for a short query): far less than the 0.07 between a
-// match and a miss (raft5fs-search's MIN_SIMILARITY). A wrong tokenizer or
-// pooling gives much less. Runs in Node, on the files that
-// scripts/fetch-models.mjs puts in public/models: npm run test:parity.
+// The web app's models give the vectors native clients give: the same token
+// ids, and vectors within cosine 0.999 of those in fixtures/text-vectors.json
+// and fixtures/clip-vectors.json (written by raft5fs-indexer's ignored tests
+// `write_the_web_apps_parity_fixture` and `write_the_web_apps_clip_fixture`,
+// with the browser's Q8_0 weights). Both run raft5fs-embed: only the
+// summation order of WebAssembly's SIMD and the CPU's differs. A wrong
+// tokenizer, table read or pooling gives far less. Runs in Node, on the
+// files that scripts/fetch-models.mjs puts in public/models, with the
+// module that scripts/build-wasm.sh builds: npm run test:parity.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
-import * as ort from "onnxruntime-web/wasm";
-import { loadE5 } from "../src/lib/e5.js";
-import { loadClip } from "../src/lib/clip.js";
+import { closeSync, openSync, readFileSync, readSync } from "node:fs";
+import { initSync, Model } from "../src/wasm/raft5fs_embed_web.js";
 
 const manifest = JSON.parse(readFileSync(new URL("../../search/data/models.json", import.meta.url)));
-const MODEL = manifest.models.webText.name;
-const CLIP_MODEL = manifest.models.webClip.name;
+initSync({ module: readFileSync(new URL("../src/wasm/raft5fs_embed_web_bg.wasm", import.meta.url)) });
 
-const fixture = JSON.parse(readFileSync(new URL("fixtures/e5-vectors.json", import.meta.url)));
-const dir = new URL(`../public/models/${MODEL}/`, import.meta.url);
+/// Model `key` as the embed Worker loads it, reading its table's rows from
+/// the served pieces.
+function load(key) {
+  const m = manifest.models[key];
+  const dir = new URL(`../public/models/${m.name}/`, import.meta.url);
+  const role = (r) => m.files.find((f) => f.role === r);
+  const whole = (f) => {
+    if (!f.piece) return [{ path: new URL(f.local, dir), start: 0, size: f.size }];
+    return Array.from({ length: Math.ceil(f.size / f.piece) }, (_, i) => ({
+      path: new URL(`${f.local}.${i}`, dir),
+      start: i * f.piece,
+      size: Math.min(f.piece, f.size - i * f.piece),
+    }));
+  };
+  const read = (parts, start, length) => {
+    const out = new Uint8Array(length);
+    for (const p of parts) {
+      const from = Math.max(start, p.start);
+      const to = Math.min(start + length, p.start + p.size);
+      if (from >= to) continue;
+      const fd = openSync(p.path, "r");
+      readSync(fd, out, from - start, to - from, from - p.start);
+      closeSync(fd);
+    }
+    return out;
+  };
+  const body = whole(role("body"));
+  const model = new Model(
+    read(body, 0, role("body").size),
+    read(whole(role("tokenizer")), 0, role("tokenizer").size),
+    m.pooling,
+    m.maxTokens,
+  );
+  const table = whole(role("table"));
+  const size = model.rowBytes();
+  return {
+    model,
+    embed(text) {
+      const ids = model.rowIds(text);
+      const rows = new Uint8Array(ids.length * size);
+      ids.forEach((id, i) => rows.set(read(table, id * size, size), i * size));
+      return model.embed(text, ids, rows);
+    },
+  };
+}
 
-test("the browser's model matches the native one", async () => {
-  assert.equal(fixture.model, MODEL, "the fixture is for another model");
-  const parts = readdirSync(dir)
-    .filter((n) => n.startsWith("model.onnx."))
-    .sort();
-  const onnx = Buffer.concat(parts.map((p) => readFileSync(new URL(p, dir))));
-  const json = (name) => JSON.parse(readFileSync(new URL(name, dir), "utf8"));
-  ort.env.wasm.numThreads = 1;
-  const e5 = await loadE5(ort, new Uint8Array(onnx), json("tokenizer.json"), json("tokenizer_config.json"));
+function check(key, fixtureFile) {
+  const fixture = JSON.parse(readFileSync(new URL(`fixtures/${fixtureFile}`, import.meta.url)));
+  assert.equal(fixture.model, manifest.models[key].name, "the fixture is for another model");
+  const m = load(key);
   for (const c of fixture.cases) {
-    assert.deepEqual(e5.ids(c.text), c.ids, `token ids of ${c.text}`);
-    const v = await e5.embed(c.text);
+    assert.deepEqual(Array.from(m.model.ids(c.text)), c.ids, `token ids of ${c.text}`);
+    const v = m.embed(c.text);
     const cos = c.vector.reduce((sum, x, i) => sum + x * v[i], 0);
-    console.log(`${cos.toFixed(5)}  ${c.text}`);
-    assert.ok(cos > 0.995, `${c.text}: cosine ${cos}`);
+    console.log(`${cos.toFixed(6)}  ${c.text}`);
+    assert.ok(cos > 0.999, `${c.text}: cosine ${cos}`);
   }
-});
+}
 
-test("the browser's photo model gives queries native clients' vectors", async () => {
-  const clipFixture = JSON.parse(readFileSync(new URL("fixtures/clip-vectors.json", import.meta.url)));
-  assert.equal(clipFixture.model, CLIP_MODEL, "the fixture is for another model");
-  const at = new URL(`../public/models/${CLIP_MODEL}/`, import.meta.url);
-  const parts = readdirSync(at)
-    .filter((n) => n.startsWith("text.onnx."))
-    .sort();
-  const onnx = Buffer.concat(parts.map((p) => readFileSync(new URL(p, at))));
-  const json = (name) => JSON.parse(readFileSync(new URL(name, at), "utf8"));
-  const dense = new Uint8Array(readFileSync(new URL("dense.safetensors", at)));
-  const clip = await loadClip(ort, new Uint8Array(onnx), json("tokenizer.json"), json("tokenizer_config.json"), dense);
-  for (const c of clipFixture.cases) {
-    assert.deepEqual(clip.ids(c.text), c.ids, `token ids of ${c.text}`);
-    const v = await clip.embed(c.text);
-    const cos = c.vector.reduce((sum, x, i) => sum + x * v[i], 0);
-    console.log(`${cos.toFixed(5)}  ${c.text}`);
-    assert.ok(cos > 0.995, `${c.text}: cosine ${cos}`);
-  }
-});
+test("the browser's text model gives native clients' vectors", () => check("text", "text-vectors.json"));
+
+test("the browser's photo model gives queries native clients' vectors", () => check("clip", "clip-vectors.json"));

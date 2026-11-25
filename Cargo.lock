@@ -3467,6 +3467,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "raft5fs-embed-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "raft5fs-embed",
+ "sha2 0.10.9",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "raft5fs-fuse"
 version = "0.1.0"
 dependencies = [

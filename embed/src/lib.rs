@@ -21,7 +21,7 @@ mod tokenize;
 mod vision;
 
 pub use gguf::Body;
-pub use q8::{Rows, quantize_row, row_bytes};
+pub use q8::{GivenRows, NoRows, Rows, quantize_row, row_bytes};
 pub use text::{Pooling, TextModel, TextOptions};
 pub use tokenize::{Tokenizer, write_unigram, write_wordpiece};
 #[cfg(feature = "vision")]

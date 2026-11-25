@@ -54,11 +54,11 @@
   let download = $state(null);
   /// "Not now", for the rest of this page's life.
   let notNow = false;
-  /// The models the last search needs to search by meaning: "e5" for
+  /// The models the last search needs to search by meaning: "text" for
   /// text, "clip" for photos.
   let needed = $state([]);
   const neededMB = $derived(
-    (needed.includes("e5") ? searchSetting.MODEL_MB : 0) +
+    (needed.includes("text") ? searchSetting.MODEL_MB : 0) +
       (needed.includes("clip") ? searchSetting.PHOTO_MODEL_MB : 0),
   );
   /// Photos' thumbnails, by id, as blob: URLs (null while loading or if
@@ -144,7 +144,7 @@
       status = loaded;
       results = found.hits;
       if (!found.meaning) return;
-      needed = [...(found.vectors ? ["e5"] : []), ...(found.images ? ["clip"] : [])];
+      needed = [...(found.vectors ? ["text"] : []), ...(found.images ? ["clip"] : [])];
     } catch (e) {
       if (mine === asked) error = e.message;
       return;

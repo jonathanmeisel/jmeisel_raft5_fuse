@@ -142,8 +142,19 @@ impl TextModel {
         Ok(out)
     }
 
+    /// The bytes of one row of the word table.
+    pub fn row_bytes(&self) -> usize {
+        row_bytes(self.encoder.hidden())
+    }
+
     /// The vectors of `texts`, in one batch, each unit length.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.embed_with(texts, self.rows.as_ref())
+    }
+
+    /// `embed`, with the word table's rows from `rows`: a browser reads
+    /// the rows a text needs before it embeds it (see `GivenRows`).
+    pub fn embed_with(&self, texts: &[&str], rows: &dyn Rows) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -160,7 +171,7 @@ impl TextModel {
                 if id as usize >= vocab {
                     return Err(Error(format!("token {id} isn't in the model's table")));
                 }
-                self.rows.read(u64::from(id) * row as u64, &mut bytes)?;
+                rows.read(u64::from(id) * row as u64, &mut bytes)?;
                 let at = (i * t + j) * h;
                 add_row(&bytes, &mut words[at..at + h]);
             }
@@ -343,6 +354,41 @@ mod tests {
                 assert!(cos(a, b) > 0.9999);
             }
         }
+    }
+
+    #[test]
+    fn rows_given_ahead_give_the_same_vectors() {
+        let m = tiny(false, Pooling::Mean);
+        let text = "the cat sat on the mat";
+        let mut ids = m.ids(text);
+        ids.sort();
+        ids.dedup();
+        let mut bytes = vec![0u8; ids.len() * m.row_bytes()];
+        for (i, &id) in ids.iter().enumerate() {
+            let at = i * m.row_bytes();
+            m.rows
+                .read(
+                    u64::from(id) * m.row_bytes() as u64,
+                    &mut bytes[at..at + m.row_bytes()],
+                )
+                .unwrap();
+        }
+        let given = crate::q8::GivenRows {
+            ids,
+            bytes,
+            row: m.row_bytes(),
+        };
+        assert_eq!(
+            m.embed_with(&[text], &given).unwrap(),
+            m.embed(&[text]).unwrap()
+        );
+        // A row not given is an error, not a wrong vector.
+        let none = crate::q8::GivenRows {
+            ids: vec![],
+            bytes: vec![],
+            row: m.row_bytes(),
+        };
+        assert!(m.embed_with(&[text], &none).is_err());
     }
 
     #[test]

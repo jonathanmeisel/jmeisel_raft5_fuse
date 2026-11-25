@@ -8,7 +8,7 @@
 // - Volumes this browser doesn't index (others still may).
 // - "Keep search data on this device": the index segments it has read, so
 //   a search here fetches only what is new. Off for a borrowed computer.
-// - Whether to download the search models (about 135 MB for text, and 140
+// - Whether to download the search models (about 130 MB for text, and 150
 //   MB more where photos have image vectors, once) to search by
 //   meaning: on a computer without asking; on a phone or tablet, or with
 //   the browser's Data Saver or a slow connection, only once the person
@@ -78,8 +78,8 @@ export function deviceName() {
 
 /// The search models' sizes, as the question about them says: for text,
 /// and for photos (CLIP's text side).
-export const MODEL_MB = 135;
-export const PHOTO_MODEL_MB = 140;
+export const MODEL_MB = 130;
+export const PHOTO_MODEL_MB = 150;
 
 /// Whether a download is worth asking about here: a phone or tablet, Data
 /// Saver, or a slow connection.
