@@ -195,6 +195,7 @@ npm run wasm
 npm run model
 npm run test:parity                # the model gives native clients' vectors
 npx playwright test
+MEMORY_TEST=1 npx playwright test -g memory   # what a search holds (10+ min)
 ```
 
 `test:parity` runs the app's model code in Node and checks its token ids,

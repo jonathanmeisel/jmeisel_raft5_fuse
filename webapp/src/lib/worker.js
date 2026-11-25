@@ -251,6 +251,38 @@ const embedCalls = new Map();
 /// long on a slow line.
 const STUCK_MS = 120_000;
 
+/// How long the embed Worker may go without work before it ends.
+/// WebAssembly memory never shrinks, so ending the Worker is the only way
+/// to give back what its models took; it starts again, and loads them from
+/// the browser's cache, on the next search.
+const IDLE_MS = 60_000;
+/// `IDLE_MS`, unless a browser test shortens it (`setEmbedIdle`).
+let idleMs = IDLE_MS;
+
+/// Calls that ask how things are, and are not work: polling them must
+/// not keep the Worker alive.
+const ASKING = new Set(["state", "memory"]);
+
+/// When the embed Worker last finished work, and the timer that ends it
+/// once it has been idle for `IDLE_MS`.
+let lastWork = 0;
+let idleTimer = 0;
+
+/// Arms the idle timer, if it isn't: when it fires, it ends the Worker if
+/// no work came for `idleMs`, else waits out what is left. Calls don't
+/// re-arm it, so asking the state often doesn't put the end off.
+function armIdle(wait = idleMs) {
+  if (idleTimer) return;
+  idleTimer = setTimeout(() => {
+    idleTimer = 0;
+    if (!embedder) return;
+    const busy = [...embedCalls.values()].some((c) => !c.asking);
+    const quiet = Date.now() - lastWork;
+    if (!busy && quiet >= idleMs) restartEmbedder("the search model was idle");
+    else armIdle(busy ? idleMs : idleMs - quiet);
+  }, wait);
+}
+
 /// Ends the embed Worker, failing every call it hasn't answered.
 function restartEmbedder(why) {
   for (const call of embedCalls.values()) call.reject(new Error(why));
@@ -274,13 +306,17 @@ function embedCall(message, transfer = [], limit = 0) {
     embedder.onerror = (e) => restartEmbedder(e.message || "the search model failed");
   }
   const id = nextEmbed++;
+  const asking = ASKING.has(message.op);
+  if (!asking) lastWork = Date.now();
+  armIdle();
   return new Promise((resolve, reject) => {
     let timer = 0;
     const done = (f) => (value) => {
       clearTimeout(timer);
+      if (!asking) lastWork = Date.now();
       f(value);
     };
-    embedCalls.set(id, { resolve: done(resolve), reject: done(reject) });
+    embedCalls.set(id, { resolve: done(resolve), reject: done(reject), asking });
     embedder.postMessage({ id, ...message }, transfer);
     if (limit) {
       timer = setTimeout(() => {
@@ -816,6 +852,10 @@ const methods = {
   /// in this browser so that loading it downloads nothing.
   modelState: async () => (await embedCall({ op: "state" })).state,
   indexStatus: () => session().indexStatus(),
+  /// For the browser tests only: how long the embed Worker may be idle.
+  setEmbedIdle(ms) {
+    if (import.meta.env.MODE !== "production") idleMs = ms;
+  },
   /// What this Worker and the embed Worker hold, for measuring memory:
   /// bytes of WebAssembly memory, and the loaded indexes' sizes.
   async memoryReport() {

@@ -125,6 +125,7 @@ export function connect({ onStorageError } = {}) {
     modelState: () => call("modelState", []),
     indexStatus: () => call("indexStatus", []),
     memoryReport: () => call("memoryReport", []),
+    setEmbedIdle: (ms) => call("setEmbedIdle", [ms]),
     searchThumb: (id) => call("searchThumb", [id]),
     volumeIndexing: (path) => call("volumeIndexing", [path]),
     setVolumeIndexing: (path, on) => call("setVolumeIndexing", [path, !!on]),

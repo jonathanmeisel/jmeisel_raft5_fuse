@@ -1955,6 +1955,23 @@ test("the app refuses to run in a frame", async ({ page }) => {
   await expect(frame.locator("body")).toContainText("doesn't run inside a frame");
 });
 
+test("the search models' Worker ends once idle, though its state is asked", async ({ page }) => {
+  await enrol(page, "pat");
+  await login(page, "pat");
+  await page.evaluate(() => globalThis.raft5fsTest.setEmbedIdle(1_500));
+  // Asking its state starts the Worker.
+  await page.evaluate(() => globalThis.raft5fsTest.modelState());
+  expect((await page.evaluate(() => globalThis.raft5fsMemory())).embed).not.toBeNull();
+  // Asking again and again isn't work: it ends all the same.
+  const deadline = Date.now() + 6_000;
+  let report;
+  do {
+    await page.waitForTimeout(500);
+    report = await page.evaluate(() => globalThis.raft5fsMemory());
+  } while (report.embed !== null && Date.now() < deadline);
+  expect(report.embed).toBeNull();
+});
+
 /// Words for the memory test's corpus: a fixed, made-up vocabulary, so
 /// files share some words and not others, as real ones do.
 function corpusWords(count) {
@@ -1998,7 +2015,11 @@ async function rendererMemory(browser) {
 /// files and 100 photos, indexed with vectors by `raft5fs index`. Prints
 /// the numbers (and keeps them in test-results/memory.json) to compare
 /// changes by; it checks no budget yet.
+///
+/// It takes over 10 minutes, so it runs only when asked:
+/// MEMORY_TEST=1 npx playwright test -g memory
 test("memory during a search, reported", async ({ browser }) => {
+  test.skip(!process.env.MEMORY_TEST, "set MEMORY_TEST=1 to run it");
   test.setTimeout(20 * 60_000);
   const local = mkdtempSync(join(tmpdir(), "memory-corpus-"));
   const dir = join(local, "corpus");
@@ -2046,6 +2067,8 @@ test("memory during a search, reported", async ({ browser }) => {
     workers: await page.evaluate(() => globalThis.raft5fsMemory()),
     renderers: await rendererMemory(browser),
   };
+  // The embed Worker ends once idle, giving its models' memory back.
+  expect(idle.workers.embed).toBeNull();
   const report = { during, idle };
   console.log(JSON.stringify(report, null, 2));
   mkdirSync(new URL("../test-results/", import.meta.url), { recursive: true });
