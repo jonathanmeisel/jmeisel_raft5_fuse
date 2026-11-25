@@ -1181,7 +1181,12 @@ GitHub releases, which see only that this machine fetched it), into
 SHA-256 before use. Native clients hold the model's word table on disk
 and read only the rows they use. The web app serves the same files
 itself (webapp/README.md) and keeps them in the browser after the first
-search. A browser keeps the
+search: the word tables in the browser's private file storage (OPFS),
+read a few rows a query, so that in memory a model is only its body.
+Searching by meaning in a browser takes about 120 MB more while it runs
+(both models), given back a minute after the last search; it needs a
+browser with WebAssembly SIMD (Chrome or Edge 91, Firefox 89, Safari
+16.4, or later). A browser keeps the
 index it has read, sealed to the account, unless "Keep search data on
 this device" is off. Indexing with the models takes CPU: about half the
 cores, at most four, while a pass runs (CANDLE_NUM_THREADS sets another

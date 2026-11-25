@@ -859,6 +859,9 @@ const methods = {
   /// What this Worker and the embed Worker hold, for measuring memory:
   /// bytes of WebAssembly memory, and the loaded indexes' sizes.
   async memoryReport() {
+    // Garbage isn't what a search holds: collect it first, where the
+    // browser allows (the browser tests start Chromium with --expose-gc).
+    globalThis.gc?.();
     const embed = embedder ? (await embedCall({ op: "memory" }).catch(() => null))?.memory : null;
     return {
       sessionWasm: exports?.memory?.buffer.byteLength ?? 0,

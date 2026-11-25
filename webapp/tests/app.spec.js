@@ -2023,7 +2023,7 @@ async function rendererMemory(browser) {
 /// What a search by meaning costs in memory, on a fixed corpus: 2,000 text
 /// files and 100 photos, indexed with vectors by `raft5fs index`. Prints
 /// the numbers (and keeps them in test-results/memory.json) to compare
-/// changes by; it checks no budget yet.
+/// changes by, and checks budgets that catch regressions.
 ///
 /// It takes over 10 minutes, so it runs only when asked:
 /// MEMORY_TEST=1 npx playwright test -g memory
@@ -2061,27 +2061,39 @@ test("memory during a search, reported", async ({ browser }) => {
   await page.reload();
   await expect(accountButton(page)).toBeVisible(SLOW);
   await open(page, "corpus");
+  // The app open, before a search: what searching adds is the rest.
+  await page.evaluate(() => globalThis.gc?.());
+  const before = { renderers: await rendererMemory(browser) };
   await searchUntil(page, words[3], "corpus/note-");
   await expect
     .poll(async () => (await page.evaluate(() => globalThis.raft5fsMemory()))?.embed?.loaded?.length ?? 0, {
       timeout: 5 * 60_000,
     })
     .toBe(2);
+  await page.evaluate(() => globalThis.gc?.());
   const during = {
     workers: await page.evaluate(() => globalThis.raft5fsMemory()),
     renderers: await rendererMemory(browser),
   };
   // A minute later, with nothing to do.
   await page.waitForTimeout(70_000);
+  await page.evaluate(() => globalThis.gc?.());
   const idle = {
     workers: await page.evaluate(() => globalThis.raft5fsMemory()),
     renderers: await rendererMemory(browser),
   };
   // The embed Worker ends once idle, giving its models' memory back.
   expect(idle.workers.embed).toBeNull();
-  const report = { during, idle };
+  const report = { before, during, idle };
   console.log(JSON.stringify(report, null, 2));
   mkdirSync(new URL("../test-results/", import.meta.url), { recursive: true });
   writeFileSync(new URL("../test-results/memory.json", import.meta.url), JSON.stringify(report, null, 2));
-  expect(during.renderers.length).toBeGreaterThan(0);
+  // Budgets, with headroom over what was measured (2026-11-25: the models
+  // 85 MB, the session's module 16–22 MB, the renderer about 360–400 MB
+  // during a search; before this work, 1,180 MB). A headless renderer's
+  // whole-process numbers move by tens of MB between runs.
+  const mb = (n) => n / 1048576;
+  expect(mb(during.workers.embed.modelWasm)).toBeLessThan(110);
+  expect(mb(during.workers.sessionWasm)).toBeLessThan(40);
+  expect(during.renderers[0].pss).toBeLessThan(480);
 });

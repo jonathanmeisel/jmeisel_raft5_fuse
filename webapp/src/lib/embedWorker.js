@@ -348,6 +348,7 @@ onmessage = ({ data: { id, op, texts, query, text, bytes } }) => {
   }
   // What this Worker holds, for measuring memory, at once.
   if (op === "memory") {
+    globalThis.gc?.();
     postMessage({ id, memory: memory() });
     return;
   }

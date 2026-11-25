@@ -63,7 +63,7 @@
         "mclip-vit-b32-int8@58edf8c+6b7c523"
       ],
       "search": {
-        "floor": 0.215,
+        "floor": 0.205,
         "margin": 0.04,
         "z": 1.5
       },

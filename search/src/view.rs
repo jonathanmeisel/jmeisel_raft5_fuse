@@ -19,9 +19,14 @@ use crate::vector::{self, dot};
 /// How a chunk matches a query by meaning, with multilingual-e5. Its
 /// cosines bunch together, so no one number tells a match from a miss:
 ///
-/// - Text on the query's subject scores 0.79 to 0.87, in any language, and
-///   text on another subject 0.70 to 0.78 (raft5fs-indexer's tests, and the
-///   web app's search test).
+/// - On six topics with English, Spanish and German passages
+///   (raft5fs-indexer's `the_model_puts_like_meanings_close`), the best
+///   text on a query's subject scores 0.78 to 0.87, and text on another
+///   subject up to 0.84.
+/// - The model leans to language over subject: a one- or two-word query in
+///   another language than its match can lose to a miss in its own (12 of
+///   those 18 queries rank a match first). Longer queries, and queries in
+///   the passage's language, do well.
 /// - Very short text ("the", a single name) scores about 0.80 against
 ///   almost any query, so it matches by meaning only with at least
 ///   `MIN_MEANING_WORDS` words. It is still found by its words.
@@ -37,8 +42,9 @@ pub const MIN_MEANING_WORDS: u32 = vector::TEXT_MIN_WORDS;
 /// How a photo matches a query by what it shows, with CLIP, whose cosines
 /// are low and close together. On real photos (20 from Wikimedia Commons,
 /// ten subjects, scored with raft5fs-indexer's `clip_scores` example), a
-/// photo of what the query says scores 0.214 to 0.294, in any language,
-/// and is first for every query; others score 0.18 to 0.225. Drawn test
+/// photo of what the query says scores 0.207 to 0.294, in any language,
+/// and is first for every query; others score 0.17 to 0.242, mostly
+/// pictures much like it (snowy mountains for "mountains"). Drawn test
 /// pictures score higher, which is why they don't set these. A photo
 /// matches if it is within `IMAGE_MARGIN` of the best match in all the
 /// volumes searched, stands out from the others (`Cutoff`),
@@ -377,9 +383,10 @@ struct Cutoff {
 }
 
 /// How far above the mean a match by meaning is, in standard deviations.
-/// These are first estimates, from the score ranges above (matches 0.79
-/// to 0.87 against others at 0.70 to 0.78; photos 0.214 to 0.294 against
-/// 0.18 to 0.225): check them against real volumes.
+/// First estimates: on the tests' few files a match stands 0.8 to 3.2
+/// above the rest, too few to set these by; in a real volume, with many
+/// more unrelated files, matches stand out more. Check them against real
+/// volumes.
 /// In data/models.json too.
 pub const MEANING_Z: f32 = vector::TEXT_Z;
 pub const IMAGE_Z: f32 = vector::CLIP_Z;

@@ -10,6 +10,8 @@ export default defineConfig({
   use: {
     baseURL: "http://localhost:4173",
     acceptDownloads: true,
+    // So that the memory test can collect garbage before it measures.
+    launchOptions: { args: ["--js-flags=--expose-gc"] },
   },
   projects: [{ name: "chromium", use: { browserName: "chromium" } }],
 });
