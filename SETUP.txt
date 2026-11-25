@@ -1228,7 +1228,13 @@ unless its account menu's "Index for search on this device" is off (it
 is off by default on a phone or tablet). In the web app, the search box
 in the header searches the open top-level folder, or every one. Devices take turns: one claims a volume on the
 servers for a while, as with prunes (7.2), and others leave it alone.
-A pass follows the volume's activity log (section 8), so it reads only
+"Being indexed elsewhere" means another device of yours, or a browser
+tab, holds that claim; it says when the claim runs out. A pass renews
+its claim while it makes progress, and gives it up when it ends, or when
+its device stops indexing (a mount or tab closing, Ctrl-C in raft5fs
+index, logging out or locking the web app). A device that vanishes mid-
+pass leaves its claim until it runs out (10 minutes); a pass stuck for
+30 minutes stops and gives its claim up. A pass follows the volume's activity log (section 8), so it reads only
 what changed; once a day it walks the whole volume, for anything the
 log missed. To index now, in the foreground:
 

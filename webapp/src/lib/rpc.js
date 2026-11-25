@@ -140,7 +140,15 @@ export function connect({ onStorageError } = {}) {
         worker = null;
       }
     },
-    /// Ends the Worker at once, as for an idle lock.
+    /// Gives up this tab's indexing claim, waiting at most 2 s, then ends
+    /// the Worker: as for an idle lock, after the screen has locked. Without
+    /// it, another device waits for the claim to run out.
+    async stop() {
+      const gone = new Promise((resolve) => setTimeout(resolve, 2_000));
+      await Promise.race([call("stopIndexing", []).catch(() => {}), gone]);
+      this.kill();
+    },
+    /// Ends the Worker at once.
     kill() {
       worker?.terminate();
       worker = null;

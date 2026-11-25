@@ -242,8 +242,24 @@ let embedder = null;
 let nextEmbed = 1;
 const embedCalls = new Map();
 
-/// A call to the embed Worker, started on first use.
-function embedCall(message, transfer = []) {
+/// How long a PDF or a thumbnail may take in the embed Worker. Past it,
+/// the Worker is taken to be stuck (a PDF that loops, a picture that never
+/// decodes) and is started again, and the call fails, so indexing goes on
+/// to the next file. Model calls have no limit: a first download can take
+/// long on a slow line.
+const STUCK_MS = 120_000;
+
+/// Ends the embed Worker, failing every call it hasn't answered.
+function restartEmbedder(why) {
+  for (const call of embedCalls.values()) call.reject(new Error(why));
+  embedCalls.clear();
+  embedder?.terminate();
+  embedder = null;
+}
+
+/// A call to the embed Worker, started on first use. With `limit` (ms), a
+/// call not answered by then fails, and the Worker starts again.
+function embedCall(message, transfer = [], limit = 0) {
   if (!embedder) {
     embedder = new Worker(new URL("./embedWorker.js", import.meta.url), { type: "module" });
     embedder.onmessage = ({ data }) => {
@@ -253,16 +269,22 @@ function embedCall(message, transfer = []) {
       if (data.error) call.reject(new Error(data.error));
       else call.resolve(data);
     };
-    embedder.onerror = (e) => {
-      for (const call of embedCalls.values()) call.reject(new Error(e.message || "the search model failed"));
-      embedCalls.clear();
-      embedder = null;
-    };
+    embedder.onerror = (e) => restartEmbedder(e.message || "the search model failed");
   }
   const id = nextEmbed++;
   return new Promise((resolve, reject) => {
-    embedCalls.set(id, { resolve, reject });
+    let timer = 0;
+    const done = (f) => (value) => {
+      clearTimeout(timer);
+      f(value);
+    };
+    embedCalls.set(id, { resolve: done(resolve), reject: done(reject) });
     embedder.postMessage({ id, ...message }, transfer);
+    if (limit) {
+      timer = setTimeout(() => {
+        if (embedCalls.has(id)) restartEmbedder(`${message.op} took over ${limit / 1000} s, so it was stopped`);
+      }, limit);
+    }
   });
 }
 
@@ -281,10 +303,10 @@ async function fetchPlaces() {
 const clipQuery = async (text) => (await embedCall({ op: "clip", text })).vector;
 
 /// A photo's thumbnail (a JPEG), or null.
-const makeThumb = async (bytes) => (await embedCall({ op: "thumb", bytes }, [bytes.buffer])).thumb;
+const makeThumb = async (bytes) => (await embedCall({ op: "thumb", bytes }, [bytes.buffer], STUCK_MS)).thumb;
 
 /// The text of a PDF, or null.
-const readPdf = async (bytes) => (await embedCall({ op: "pdf", bytes }, [bytes.buffer])).text;
+const readPdf = async (bytes) => (await embedCall({ op: "pdf", bytes }, [bytes.buffer], STUCK_MS)).text;
 
 async function cacheGet(key) {
   if (!keepSearch) return null;
@@ -798,13 +820,17 @@ const methods = {
   /// Turns this browser's background indexing on or off (it runs in the
   /// tab that holds the index lock), with the volumes it skips and what
   /// it calls this browser.
-  setIndexHere(on, skip, name) {
+  async setIndexHere(on, skip, name) {
     indexWanted = on;
     indexSkip = skip;
     device = name;
     if (!indexesHere) return;
-    session().stopIndexing();
+    await session().stopIndexing();
     if (on) startIndexing();
+  },
+  /// Stops this tab's indexing, giving up its claim (`stop` in rpc.js).
+  stopIndexing: async () => {
+    if (fs) await session().stopIndexing();
   },
   /// As `pruning`, for indexing.
   indexing: () => (!indexWanted ? "off" : indexesHere ? "running" : "elsewhere"),

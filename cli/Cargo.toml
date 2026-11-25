@@ -19,7 +19,7 @@ webdav = ["dep:raft5fs-webdav", "tokio/net", "tokio/signal"]
 # by meaning and by what photos show: the models, on ONNX Runtime, which
 # has no prebuilt binaries for every platform. Without it, this device
 # doesn't index (others do), and searches by words, places and dates.
-index = ["dep:raft5fs-indexer"]
+index = ["dep:raft5fs-indexer", "tokio/signal"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

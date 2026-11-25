@@ -1214,3 +1214,139 @@ fn an_index_with_a_file_it_cant_read_is_not_compacted() {
     assert!(!stats.compacted);
     assert!(index_files(&backend, &tester, v).contains(&newer));
 }
+
+/// An extractor that never finishes a text file: a pass stuck in it.
+struct Hangs;
+
+impl raft5fs_client::indexer::Extract for Hangs {
+    fn reads(&self, name: &str) -> u64 {
+        BuiltIn.reads(name)
+    }
+
+    fn extract<'a>(
+        &'a self,
+        _: &'a str,
+        _: Vec<u8>,
+    ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn hanging() -> Tools {
+    Tools {
+        extract: Arc::new(Hangs),
+        embed: None,
+        image: None,
+    }
+}
+
+/// Whether a device with no claim of its own can claim `volume` now (and
+/// gives the claim back if so).
+fn claimable(backend: &Backend, vault: &Vault, volume: u64) -> bool {
+    let id = new_id();
+    let rt = &backend.runtime;
+    let granted = rt
+        .block_on(vault.remote().claim_index(volume, id, false))
+        .unwrap()
+        .granted;
+    rt.block_on(vault.remote().claim_index(volume, id, true))
+        .unwrap();
+    granted
+}
+
+#[test]
+fn a_pass_dropped_midway_gives_up_its_claim() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let tools = hanging();
+    let config = IndexerConfig::default();
+    let mut told = |_: &PassStats| {};
+    rt.block_on(async {
+        let pass = index_claimed(
+            &tester,
+            v,
+            new_id(),
+            &config,
+            &tools,
+            PassKind::Auto,
+            &mut told,
+        );
+        // Stuck in a file: dropped after a while, as a stopping device does.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), pass)
+                .await
+                .is_err()
+        );
+        // The claim goes back in the background.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    });
+    assert!(claimable(&backend, &tester, v));
+}
+
+#[test]
+fn a_stopped_indexer_gives_up_its_claim() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let indexer = {
+        let _in_runtime = rt.enter();
+        let own = Vault::new(Arc::clone(tester.remote())).unwrap();
+        raft5fs_client::indexer::spawn(own, IndexerConfig::default(), hanging())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while indexer.status().current.is_none() {
+        assert!(std::time::Instant::now() < deadline, "it never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Stuck on a file, so it holds the claim...
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!claimable(&backend, &tester, v));
+    // ...until it stops.
+    rt.block_on(indexer.stop());
+    assert!(claimable(&backend, &tester, v));
+}
+
+#[test]
+fn a_pass_stuck_past_the_stall_limit_ends_and_gives_up_its_claim() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let config = IndexerConfig {
+        renew: std::time::Duration::from_millis(200),
+        stall: std::time::Duration::from_secs(1),
+        ..IndexerConfig::default()
+    };
+    let e = rt
+        .block_on(index_claimed(
+            &tester,
+            v,
+            new_id(),
+            &config,
+            &hanging(),
+            PassKind::Auto,
+            &mut |_| {},
+        ))
+        .unwrap_err();
+    assert_eq!(e.errno, errno::ETIMEDOUT, "{e}");
+    assert!(claimable(&backend, &tester, v));
+}
+
+#[test]
+fn a_busy_volume_says_when_its_claim_runs_out() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let other = new_id();
+    rt.block_on(tester.remote().claim_index(v, other, false))
+        .unwrap();
+    let e = pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap_err();
+    assert_eq!(e.errno, errno::EBUSY);
+    let text = e.to_string();
+    assert!(text.contains(&format!("by {TESTER}")), "{text}");
+    assert!(text.contains("runs out in 10 minutes"), "{text}");
+}

@@ -5,8 +5,8 @@ use raft5fs_client::cli::Context;
 use raft5fs_client::indexer::read_index;
 #[cfg(feature = "index")]
 use raft5fs_client::indexer::{
-    Embed, ImageEmbed, IndexerConfig, PassKind, describe, index_claimed, indexable_volumes, new_id,
-    survey,
+    Embed, ImageEmbed, IndexerConfig, PassKind, PassStats, describe, index_claimed,
+    indexable_volumes, new_id, survey,
 };
 use raft5fs_client::vault::Vault;
 #[cfg(feature = "index")]
@@ -268,15 +268,22 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     let id = new_id();
     let tools = native_tools();
     for (label, ino) in volumes {
-        let done = runtime.block_on(index_claimed(
-            &vault,
-            ino,
-            id,
-            &config,
-            &tools,
-            kind,
-            &mut |so_far| eprintln!("{label}: {}", describe(so_far)),
-        ));
+        // Ctrl-C stops the pass and gives up its claim, so other devices
+        // needn't wait for it to run out. The next pass finishes the work.
+        let mut told = |so_far: &PassStats| eprintln!("{label}: {}", describe(so_far));
+        let done = runtime.block_on(async {
+            tokio::select! {
+                done = index_claimed(&vault, ino, id, &config, &tools, kind, &mut told) => Some(done),
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = vault.remote().claim_index(ino, id, true).await;
+                    None
+                }
+            }
+        });
+        let Some(done) = done else {
+            println!("{label}: stopped; the next pass goes on from here");
+            return Ok(130);
+        };
         match done {
             Ok(stats) => {
                 println!("{label}: {}", describe(&stats));

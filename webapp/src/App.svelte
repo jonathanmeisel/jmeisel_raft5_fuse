@@ -56,7 +56,7 @@
     // A shared computer's address bar shouldn't keep showing folder names.
     clearRoute();
     if (ending) {
-      if (why) ending.kill();
+      if (why) await ending.stop();
       else await ending.end().catch(() => ending.kill());
     }
   }
