@@ -1674,7 +1674,7 @@ async function searchUntil(page, query, path, timeout = 120_000) {
 /// vectors that browsers search by but don't make. Tries again while a
 /// browser's pass holds the folder's claim.
 /// Needs the CLI built: cargo build -p raft5fs --no-default-features --features index
-async function nativeIndex(user, folder) {
+async function nativeIndex(user, folder, { timeout = 600_000, threads } = {}) {
   const binary = new URL("../../target/debug/raft5fs", import.meta.url).pathname;
   // No profile, and no pins of the tester's own.
   const config = mkdtempSync(join(tmpdir(), "raft5fs-cli-"));
@@ -1684,7 +1684,16 @@ async function nativeIndex(user, folder) {
       const out = execFileSync(
         binary,
         ["--server", NATIVE, "--insecure-plaintext", "--user", user, "index", folder],
-        { env: { ...process.env, XDG_CONFIG_HOME: config, RAFT5FS_PASSWORD: PASSWORD }, encoding: "utf8", timeout: 600_000 },
+        {
+          env: {
+            ...process.env,
+            XDG_CONFIG_HOME: config,
+            RAFT5FS_PASSWORD: PASSWORD,
+            ...(threads ? { CANDLE_NUM_THREADS: String(threads) } : {}),
+          },
+          encoding: "utf8",
+          timeout,
+        },
       );
       if (!/skipped:/.test(out)) return out;
       if (Date.now() > deadline) throw new Error(`${folder} stayed claimed: ${out}`);
@@ -2020,7 +2029,7 @@ async function rendererMemory(browser) {
 /// MEMORY_TEST=1 npx playwright test -g memory
 test("memory during a search, reported", async ({ browser }) => {
   test.skip(!process.env.MEMORY_TEST, "set MEMORY_TEST=1 to run it");
-  test.setTimeout(20 * 60_000);
+  test.setTimeout(60 * 60_000);
   const local = mkdtempSync(join(tmpdir(), "memory-corpus-"));
   const dir = join(local, "corpus");
   mkdirSync(dir);
@@ -2045,7 +2054,8 @@ test("memory during a search, reported", async ({ browser }) => {
   await (await chooser).setFiles(dir);
   await expect(page.getByText("Uploaded 2100 files.")).toBeVisible({ timeout: 10 * 60_000 });
   rmSync(local, { recursive: true, force: true });
-  await nativeIndex("max", "corpus");
+  // 4,000 passages and 100 photos: minutes of model time.
+  await nativeIndex("max", "corpus", { timeout: 40 * 60_000, threads: 8 });
 
   // A search by words and meaning, with photos: both models load.
   await page.reload();

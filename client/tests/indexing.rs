@@ -1405,3 +1405,50 @@ fn reading_a_segment_at_a_time_gives_the_same_index_and_stops_at_a_compaction() 
     assert!(after.reset);
     assert!(batches.is_empty());
 }
+
+/// A model that notes how many passages each call gives it.
+#[derive(Default)]
+struct Batches(std::sync::Mutex<Vec<usize>>);
+
+impl Embed for Batches {
+    fn model(&self) -> &str {
+        "batched@1"
+    }
+
+    fn passages<'a>(&'a self, texts: Vec<String>) -> Boxed<'a, Result<Vec<Vec<f32>>, String>> {
+        self.0.lock().unwrap().push(texts.len());
+        Box::pin(async move { Ok(texts.iter().map(|t| Fake::vector(t)).collect()) })
+    }
+
+    fn query<'a>(&'a self, text: &'a str) -> Boxed<'a, Result<Vec<f32>, String>> {
+        Box::pin(async move { Ok(Fake::vector(text)) })
+    }
+}
+
+#[test]
+fn passages_from_several_files_are_embedded_together() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let v = rt
+        .block_on(tester.create_volume(OsStr::new("v"), 0o755))
+        .unwrap()
+        .ino;
+    for i in 0..20 {
+        let text = format!("note {i}: we rode our bikes along the lake and then home again");
+        write(&backend, &tester, v, &format!("n{i}.txt"), text.as_bytes());
+    }
+    let batches = Arc::new(Batches::default());
+    let tools = Tools {
+        extract: Arc::new(BuiltIn),
+        embed: Some(Arc::clone(&batches) as Arc<dyn Embed>),
+        image: None,
+    };
+    let stats = pass_with(&backend, &tester, v, new_id(), PassKind::Auto, &tools).unwrap();
+    assert_eq!((stats.indexed, stats.failed.len()), (20, 0));
+    // One call for the first 16 or more passages, and one for the rest.
+    let calls = batches.0.lock().unwrap().clone();
+    assert!(calls.len() <= 2 && calls[0] >= 16, "{calls:?}");
+    assert_eq!(calls.iter().sum::<usize>(), 20);
+    assert_eq!(models(&backend, &tester, v), vec!["batched@1"; 20]);
+}

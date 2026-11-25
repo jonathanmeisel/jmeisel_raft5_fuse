@@ -659,6 +659,9 @@ struct Pass<'a> {
     pending: Vec<Entry>,
     /// The thumbnails of `pending`'s records, one after another.
     pending_thumbs: Vec<u8>,
+    /// Records waiting for their chunks' vectors, with the chunks' texts
+    /// (`queue`).
+    queued: Vec<(Record, Vec<String>)>,
     /// Folder listings, by inode: names of what is in each.
     listings: HashMap<u64, Vec<(String, u64, Kind)>>,
     stats: PassStats,
@@ -805,6 +808,7 @@ impl Pass<'_> {
     /// - Progress from every manifest (cursor, files to check again, last
     ///   walk) goes into this indexer's.
     async fn compact(&mut self, full_walk_ms: u64) -> Result<(), FsError> {
+        self.flush().await?;
         self.store().await?;
         let id = self.mine.id;
         let files: HashMap<String, u64> = self
@@ -972,44 +976,94 @@ impl Pass<'_> {
     /// `pieces` as chunks, each with its vector if this indexer embeds, and
     /// the model that made them. If the model fails, the chunks keep no
     /// vectors and name no model, so a later pass tries again.
-    async fn embed(&mut self, pieces: Vec<(Chunk, String)>, path: &str) -> (Vec<Chunk>, String) {
-        let Some(embed) = self
-            .tools
-            .embed
-            .clone()
-            .filter(|_| !self.stats.model_failed)
-        else {
-            return (pieces.into_iter().map(|(c, _)| c).collect(), String::new());
+    /// Stores `record`, whose chunks have the texts `texts`, once its
+    /// chunks have vectors: records wait until `EMBED_BATCH` passages from
+    /// any files are waiting, so the model runs on a batch (much faster
+    /// than one file's chunks at a time), or until the pass ends (`flush`).
+    async fn queue(&mut self, record: Record, texts: Vec<String>) -> Result<(), FsError> {
+        let worth = record
+            .chunks
+            .iter()
+            .filter(|c| c.len >= MIN_MEANING_WORDS)
+            .count();
+        if self.tools.embed.is_none() || self.stats.model_failed || worth == 0 {
+            return self.push(Entry::Record(record)).await;
+        }
+        self.queued.retain(|(r, _)| r.ino != record.ino);
+        self.queued.push((record, texts));
+        let waiting: usize = self
+            .queued
+            .iter()
+            .map(|(r, _)| {
+                r.chunks
+                    .iter()
+                    .filter(|c| c.len >= MIN_MEANING_WORDS)
+                    .count()
+            })
+            .sum();
+        if waiting >= EMBED_BATCH {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Embeds the waiting records' chunks, in one call, and stores them.
+    /// Only chunks long enough to match by meaning are worth the model's
+    /// time (`MIN_MEANING_WORDS`): a photo's few words aren't. If the model
+    /// fails, the records keep no vectors and name no model, so a later
+    /// pass tries again.
+    async fn flush(&mut self) -> Result<(), FsError> {
+        let mut queued = std::mem::take(&mut self.queued);
+        if queued.is_empty() {
+            return Ok(());
+        }
+        let Some(embed) = self.tools.embed.clone() else {
+            return Ok(());
         };
-        let (mut chunks, texts): (Vec<Chunk>, Vec<String>) = pieces.into_iter().unzip();
-        // Only chunks long enough to match by meaning are worth the model's
-        // time (`MIN_MEANING_WORDS`): a photo's few words aren't.
-        let worth: Vec<usize> = (0..chunks.len())
-            .filter(|&i| chunks[i].len >= MIN_MEANING_WORDS)
-            .collect();
-        let texts: Vec<String> = worth.iter().map(|&i| texts[i].clone()).collect();
-        let mut vectors = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(EMBED_BATCH) {
-            self.beat();
-            match embed.passages(batch.to_vec()).await {
-                Ok(v) if v.len() == batch.len() => vectors.extend(v),
-                Ok(v) => {
-                    let why = format!("the model gave {} vectors for {}", v.len(), batch.len());
-                    self.stats.failed.push((path.to_string(), why));
-                    self.stats.model_failed = true;
-                    return (chunks, String::new());
-                }
-                Err(e) => {
-                    self.stats.failed.push((path.to_string(), e));
-                    self.stats.model_failed = true;
-                    return (chunks, String::new());
+        let mut at = Vec::new();
+        let mut texts = Vec::new();
+        for (r, (record, chunk_texts)) in queued.iter().enumerate() {
+            for (c, chunk) in record.chunks.iter().enumerate() {
+                if chunk.len >= MIN_MEANING_WORDS {
+                    at.push((r, c));
+                    texts.push(chunk_texts[c].clone());
                 }
             }
         }
-        for (&i, v) in worth.iter().zip(&vectors) {
-            chunks[i].vector = Some(quantize(v));
+        self.beat();
+        let got = if self.stats.model_failed {
+            Err(String::new())
+        } else {
+            match embed.passages(texts).await {
+                Ok(v) if v.len() == at.len() => Ok(v),
+                Ok(v) => Err(format!(
+                    "the model gave {} vectors for {}",
+                    v.len(),
+                    at.len()
+                )),
+                Err(e) => Err(e),
+            }
+        };
+        match got {
+            Ok(vectors) => {
+                for (&(r, c), v) in at.iter().zip(&vectors) {
+                    queued[r].0.chunks[c].vector = Some(quantize(v));
+                }
+                for (record, _) in &mut queued {
+                    record.model = embed.model().to_string();
+                }
+            }
+            Err(why) => {
+                if !self.stats.model_failed {
+                    self.stats.failed.push((queued[0].0.path.clone(), why));
+                    self.stats.model_failed = true;
+                }
+            }
         }
-        (chunks, embed.model().to_string())
+        for (record, _) in queued {
+            self.push(Entry::Record(record)).await?;
+        }
+        Ok(())
     }
 
     /// Indexes file `ino` at `path`, unless the index has it as it is now.
@@ -1111,19 +1165,19 @@ impl Pass<'_> {
             });
             self.pending_thumbs.extend_from_slice(&jpeg);
         }
-        let (chunks, model) = self.embed(pieces, &path).await;
+        let (chunks, texts): (Vec<Chunk>, Vec<String>) = pieces.into_iter().unzip();
         self.stats.indexed += 1;
-        self.push(Entry::Record(Record {
+        let record = Record {
             ino,
             at_ms,
             stamp,
             path,
             kind,
-            model,
+            model: String::new(),
             chunks,
             extra,
-        }))
-        .await?;
+        };
+        self.queue(record, texts).await?;
         self.tell();
         rt::sleep(self.config.pace).await;
         Ok(())
@@ -1286,6 +1340,7 @@ async fn run_pass(
         by_path,
         pending: Vec::new(),
         pending_thumbs: Vec::new(),
+        queued: Vec::new(),
         listings: HashMap::new(),
         stats: PassStats::default(),
         progress,
@@ -1382,6 +1437,7 @@ async fn run_pass(
         cursor = cursor.max(started);
         pass.mine.full_walk_ms = started;
     }
+    pass.flush().await?;
     pass.store().await?;
     let now = clock::now_millis();
     recent.retain(|_, until| *until > now);
