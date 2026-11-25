@@ -6,6 +6,7 @@
 //! - `--compare`: one volume and four, side by side.
 //! - `--limit N`: results per search (default 50, as the web app asks).
 //! - `--report FILE`: also write the measures as JSON.
+//! - `recall` (first): result recall of clustered search, text and photos.
 use std::path::PathBuf;
 
 use raft5fs_eval::corpus::Corpus;
@@ -16,7 +17,8 @@ fn main() {
     let mut volumes = vec![1usize];
     let mut limit = 50;
     let mut report: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    let recall = args.next_if(|a| a == "recall").is_some();
     while let Some(a) = args.next() {
         let mut value = || {
             args.next()
@@ -42,6 +44,10 @@ fn main() {
         corpus.text_model,
         corpus.clip_model
     );
+    if recall {
+        raft5fs_eval::recall::report(&corpus);
+        return;
+    }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut json = serde_json::Map::new();
     for n in volumes {

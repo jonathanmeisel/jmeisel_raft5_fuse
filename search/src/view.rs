@@ -376,10 +376,10 @@ impl View {
 ///   standard deviations above their mean. A match stands out from the
 ///   rest; when nothing matches, the best is only a little better than
 ///   the others.
-struct Cutoff {
-    floor: f32,
-    margin: f32,
-    z: f32,
+pub struct Cutoff {
+    pub floor: f32,
+    pub margin: f32,
+    pub z: f32,
 }
 
 /// How far above the mean a match by meaning is, in standard deviations.
@@ -396,7 +396,7 @@ pub const IMAGE_Z: f32 = vector::CLIP_Z;
 pub const MIN_SPREAD_POPULATION: usize = 30;
 
 impl Cutoff {
-    fn keeps(&self, scores: &[f32]) -> impl Fn(f32) -> bool + use<> {
+    pub fn keeps(&self, scores: &[f32]) -> impl Fn(f32) -> bool + use<> {
         let best = scores.iter().copied().fold(f32::MIN, f32::max);
         let mut least = self.floor.max(best - self.margin);
         if scores.len() >= MIN_SPREAD_POPULATION {

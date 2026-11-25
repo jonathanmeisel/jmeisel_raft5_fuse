@@ -11,6 +11,7 @@
 
 pub mod corpus;
 pub mod metrics;
+pub mod recall;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;

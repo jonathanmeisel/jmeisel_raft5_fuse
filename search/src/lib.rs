@@ -17,6 +17,7 @@
 //! clients and in the browser.
 
 pub mod bm25;
+pub mod cluster;
 pub mod extract;
 pub mod geo;
 pub mod manifest;
