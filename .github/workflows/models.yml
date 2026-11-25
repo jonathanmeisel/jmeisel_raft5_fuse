@@ -1,0 +1,51 @@
+# Converts the search models from their sources (raft5fs-embed's
+# `convert` example), checks the files against the SHA-256s that
+# search/data/models.json pins, and, if asked, attaches them to a release.
+# Run by hand (Actions → models → Run workflow) after changing a model:
+# never part of a build, since every client must use the very bytes pinned.
+#
+# - With `upload` off: proves the pinned files come from their sources.
+# - With `upload` on: attaches the files to the release `tag` (made if
+#   need be). Pin their SHA-256s in models.json first, from a local run of
+#   the converter; this checks them before uploading.
+name: models
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release to attach the files to"
+        required: true
+        default: "models-YYYY-MM-DD"
+      upload:
+        description: "Attach the files to the release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: models
+      - name: The sources, at their pinned revisions (about 1.6 GB)
+        run: embed/fetch-sources.sh "$RUNNER_TEMP/src"
+      - name: Convert
+        run: cargo run --release -p raft5fs-embed --example convert -- "$RUNNER_TEMP/src" "$RUNNER_TEMP/out"
+      - name: The files are the ones models.json pins
+        run: python3 -I .github/check-models.py "$RUNNER_TEMP/out" search/data/models.json "$RUNNER_TEMP/assets"
+      - name: Attach to the release
+        if: inputs.upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Search models, converted by the models workflow (search/data/models.json pins them)."
+          gh release upload "$TAG" "$RUNNER_TEMP"/assets/* --clobber
