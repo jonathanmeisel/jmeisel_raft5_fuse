@@ -1,0 +1,21 @@
+[package]
+name = "raft5fs-eval"
+description = "Measures search quality on a fixed public corpus (MIRACL passages, XM3600 photos, generated path and place queries): nDCG, reciprocal rank and how often weak results show, over one volume or several."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+raft5fs-search = { workspace = true }
+raft5fs-wire = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = "3"
+
+# The corpus builder (examples/build_corpus.rs) embeds with the real models.
+[dev-dependencies]
+raft5fs-indexer = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
