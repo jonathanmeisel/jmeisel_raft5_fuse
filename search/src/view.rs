@@ -107,6 +107,21 @@ pub struct Hit {
     pub thumb: Option<crate::record::Thumb>,
 }
 
+/// How big a view is (`View::stats`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewStats {
+    /// Docs, counting those a newer entry replaced, and live ones.
+    pub docs: usize,
+    pub live: usize,
+    /// Live chunks, the words their records keep, and their vectors.
+    pub chunks: usize,
+    pub chunk_words: usize,
+    pub vectors: usize,
+    /// Distinct words in the keyword index, and its postings.
+    pub words: usize,
+    pub postings: usize,
+}
+
 /// The live records of a volume, ready to search.
 ///
 /// A view grows: `add` takes the entries of segments it hasn't seen, so a
@@ -218,6 +233,24 @@ impl View {
 
     pub fn len(&self) -> usize {
         self.live
+    }
+
+    /// How big the view is, for measuring its memory.
+    pub fn stats(&self) -> ViewStats {
+        let (words, postings) = self.keywords.size();
+        let mut s = ViewStats {
+            docs: self.docs.len(),
+            live: self.live,
+            words,
+            postings,
+            ..ViewStats::default()
+        };
+        for (_, r) in self.records() {
+            s.chunks += r.chunks.len();
+            s.chunk_words += r.chunks.iter().map(|c| c.terms.len()).sum::<usize>();
+            s.vectors += r.chunks.iter().filter(|c| c.vector.is_some()).count();
+        }
+        s
     }
 
     pub fn is_empty(&self) -> bool {

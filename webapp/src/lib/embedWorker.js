@@ -232,9 +232,11 @@ async function makeThumb(bytes) {
 }
 
 let pdfReady = null;
+/// The PDF module's exports, once loaded (for `memory`).
+let pdfExports = null;
 
 async function readPdf(bytes) {
-  pdfReady ??= initPdf();
+  pdfReady ??= initPdf().then((e) => (pdfExports = e));
   await pdfReady;
   try {
     return pdfText(bytes) ?? null;
@@ -245,6 +247,17 @@ async function readPdf(bytes) {
   }
 }
 
+/// Bytes of WebAssembly memory this Worker holds that it can see (the PDF
+/// module's; ONNX Runtime keeps its own out of reach), and which models
+/// are loaded.
+function memory() {
+  return {
+    pdfWasm: pdfExports?.memory?.buffer.byteLength ?? 0,
+    modelWasm: null,
+    loaded: Object.keys(ready).filter((m) => ready[m]),
+  };
+}
+
 /// Work runs one message at a time, so a query waits at most one
 /// passage.
 let queue = Promise.resolve();
@@ -253,6 +266,11 @@ onmessage = ({ data: { id, op, texts, query, text, bytes } }) => {
   // How the models are: answered at once, not after queued work.
   if (op === "state") {
     state().then((s) => postMessage({ id, state: s }));
+    return;
+  }
+  // What this Worker holds, for measuring memory, at once.
+  if (op === "memory") {
+    postMessage({ id, memory: memory() });
     return;
   }
   queue = queue.then(async () => {

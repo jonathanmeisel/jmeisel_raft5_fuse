@@ -34,6 +34,8 @@
 
   async function loggedIn(session, who) {
     fs = session;
+    // For the browser tests' memory report; never in a production build.
+    if (import.meta.env.MODE !== "production") globalThis.raft5fsMemory = () => session.memoryReport();
     me = who;
     notice = "";
     screen = "files";

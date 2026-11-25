@@ -655,6 +655,38 @@ impl Fs {
         self.0.search.indexer.borrow().is_some()
     }
 
+    /// How big the loaded indexes are, for measuring memory: `{volumes,
+    /// docs, live, chunks, chunkWords, vectors, words, postings}`, summed
+    /// over the loaded volumes.
+    #[wasm_bindgen(js_name = searchMemory)]
+    pub fn search_memory(&self) -> JsValue {
+        #[derive(Serialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct Sizes {
+            volumes: usize,
+            docs: usize,
+            live: usize,
+            chunks: usize,
+            chunk_words: usize,
+            vectors: usize,
+            words: usize,
+            postings: usize,
+        }
+        let mut out = Sizes::default();
+        for l in self.0.search.views.borrow().values() {
+            let s = l.view.stats();
+            out.volumes += 1;
+            out.docs += s.docs;
+            out.live += s.live;
+            out.chunks += s.chunks;
+            out.chunk_words += s.chunk_words;
+            out.vectors += s.vectors;
+            out.words += s.words;
+            out.postings += s.postings;
+        }
+        serde_wasm_bindgen::to_value(&out).unwrap_or(JsValue::NULL)
+    }
+
     /// What this tab's indexer is doing: `{current: {volume, detail} or
     /// null, last: [{volume, detail}], error}`, or null if it doesn't
     /// index.

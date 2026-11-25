@@ -32,6 +32,8 @@ let config = null;
 const PIECE = 4 << 20;
 const REMEMBER_MS = 7 * 24 * 60 * 60 * 1000;
 let ready = null;
+/// The client module's exports, once loaded (for `memoryReport`).
+let exports = null;
 let fs = null;
 /// Uploads told to stop (see `uploadTree`), by key.
 const cancelledUploads = new Set();
@@ -814,6 +816,16 @@ const methods = {
   /// in this browser so that loading it downloads nothing.
   modelState: async () => (await embedCall({ op: "state" })).state,
   indexStatus: () => session().indexStatus(),
+  /// What this Worker and the embed Worker hold, for measuring memory:
+  /// bytes of WebAssembly memory, and the loaded indexes' sizes.
+  async memoryReport() {
+    const embed = embedder ? (await embedCall({ op: "memory" }).catch(() => null))?.memory : null;
+    return {
+      sessionWasm: exports?.memory?.buffer.byteLength ?? 0,
+      index: fs ? session().searchMemory() : null,
+      embed,
+    };
+  },
   searchThumb: (id) => session().searchThumb(id),
   volumeIndexing: (path) => session().volumeIndexing(path),
   setVolumeIndexing: (path, on) => session().setVolumeIndexing(path, on),
@@ -853,7 +865,7 @@ const methods = {
 
 onmessage = async ({ data: { id, method, args } }) => {
   try {
-    ready ??= init();
+    ready ??= init().then((e) => (exports = e));
     await ready;
     const call = methods[method];
     if (!call) throw new Error(`no method ${method}`);

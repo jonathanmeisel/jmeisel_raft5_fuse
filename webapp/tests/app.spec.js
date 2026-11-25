@@ -1954,3 +1954,101 @@ test("the app refuses to run in a frame", async ({ page }) => {
   const frame = page.frameLocator("iframe");
   await expect(frame.locator("body")).toContainText("doesn't run inside a frame");
 });
+
+/// Words for the memory test's corpus: a fixed, made-up vocabulary, so
+/// files share some words and not others, as real ones do.
+function corpusWords(count) {
+  const syllables = ["ka", "lo", "mer", "tis", "an", "dre", "vo", "lu", "pen", "sa", "ri", "gol", "bas", "ne", "tor", "mi"];
+  let seed = 7;
+  // The high bits: a linear congruential generator's low bits repeat soon.
+  const next = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return Math.floor(seed / 65536);
+  };
+  const words = [];
+  for (let i = 0; i < count; i++) {
+    let w = "";
+    for (let n = 2 + (next() % 3); n > 0; n--) w += syllables[next() % syllables.length];
+    words.push(w);
+  }
+  return { words, next };
+}
+
+/// The renderer processes' memory (Linux), largest first: {pid, pss, rss}
+/// in MB, from /proc. The app's tab and its Workers share one renderer.
+async function rendererMemory(browser) {
+  const cdp = await browser.newBrowserCDPSession();
+  const { processInfo } = await cdp.send("SystemInfo.getProcessInfo");
+  await cdp.detach();
+  const mb = (text, field) => Math.round(Number(new RegExp(`^${field}:\\s+(\\d+)`, "m").exec(text)?.[1] ?? 0) / 1024);
+  return processInfo
+    .filter((p) => p.type === "renderer")
+    .map((p) => {
+      try {
+        const text = readFileSync(`/proc/${p.id}/smaps_rollup`, "utf8");
+        return { pid: p.id, pss: mb(text, "Pss"), rss: mb(text, "Rss") };
+      } catch {
+        return { pid: p.id, pss: 0, rss: 0 };
+      }
+    })
+    .sort((a, b) => b.pss - a.pss);
+}
+
+/// What a search by meaning costs in memory, on a fixed corpus: 2,000 text
+/// files and 100 photos, indexed with vectors by `raft5fs index`. Prints
+/// the numbers (and keeps them in test-results/memory.json) to compare
+/// changes by; it checks no budget yet.
+test("memory during a search, reported", async ({ browser }) => {
+  test.setTimeout(20 * 60_000);
+  const local = mkdtempSync(join(tmpdir(), "memory-corpus-"));
+  const dir = join(local, "corpus");
+  mkdirSync(dir);
+  const { words, next } = corpusWords(3000);
+  for (let f = 0; f < 2000; f++) {
+    const text = [];
+    for (let w = 0; w < 300; w++) text.push(words[next() % (w % 7 === 0 ? 50 : words.length)]);
+    writeFileSync(join(dir, `note-${f}.txt`), text.join(" "));
+  }
+  for (let p = 0; p < 100; p++) writeFileSync(join(dir, `IMG_${p}.jpg`), fixture("lisbon.jpg"));
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await enrol(page, "max");
+  // Stays logged in, to come back after a reload.
+  await login(page, "max", true);
+  await addFolder(page, "corpus");
+  await open(page, "corpus");
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByText("Add New").click();
+  await page.getByText("Upload folder").click();
+  await (await chooser).setFiles(dir);
+  await expect(page.getByText("Uploaded 2100 files.")).toBeVisible({ timeout: 10 * 60_000 });
+  rmSync(local, { recursive: true, force: true });
+  await nativeIndex("max", "corpus");
+
+  // A search by words and meaning, with photos: both models load.
+  await page.reload();
+  await expect(accountButton(page)).toBeVisible(SLOW);
+  await open(page, "corpus");
+  await searchUntil(page, words[3], "corpus/note-");
+  await expect
+    .poll(async () => (await page.evaluate(() => globalThis.raft5fsMemory()))?.embed?.loaded?.length ?? 0, {
+      timeout: 5 * 60_000,
+    })
+    .toBe(2);
+  const during = {
+    workers: await page.evaluate(() => globalThis.raft5fsMemory()),
+    renderers: await rendererMemory(browser),
+  };
+  // A minute later, with nothing to do.
+  await page.waitForTimeout(70_000);
+  const idle = {
+    workers: await page.evaluate(() => globalThis.raft5fsMemory()),
+    renderers: await rendererMemory(browser),
+  };
+  const report = { during, idle };
+  console.log(JSON.stringify(report, null, 2));
+  mkdirSync(new URL("../test-results/", import.meta.url), { recursive: true });
+  writeFileSync(new URL("../test-results/memory.json", import.meta.url), JSON.stringify(report, null, 2));
+  expect(during.renderers.length).toBeGreaterThan(0);
+});

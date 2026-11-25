@@ -61,6 +61,14 @@ impl Bm25 {
         self.search_with(&terms, &stats, limit, |_| true)
     }
 
+    /// How many distinct words it has, and how many postings in all.
+    pub fn size(&self) -> (usize, usize) {
+        (
+            self.postings.len(),
+            self.postings.values().map(Vec::len).sum(),
+        )
+    }
+
     /// Adds this index's counts for `terms` to `stats`.
     pub fn add_stats(&self, terms: &[String], stats: &mut Stats) {
         stats.chunks += self.chunks.len() as u64;
