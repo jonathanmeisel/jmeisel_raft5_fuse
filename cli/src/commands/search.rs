@@ -18,7 +18,7 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
-use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL as MODEL};
+use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
 use raft5fs_search::view::{View, search_many};
 use tokio::runtime::Runtime;

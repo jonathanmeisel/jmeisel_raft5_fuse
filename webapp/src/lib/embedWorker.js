@@ -59,7 +59,8 @@ function webModel(key) {
 
 /// The text model, and CLIP's text side only: photos' image vectors are
 /// made on native devices.
-const MODELS = { e5: webModel("e5"), clip: webModel("clip") };
+// The ONNX exports models.json keeps for the web app (webText, webClip).
+const MODELS = { e5: webModel("webText"), clip: webModel("webClip") };
 const CACHE = "raft5fs-models";
 
 /// What a first load of model `name` downloads: every piece of every file.

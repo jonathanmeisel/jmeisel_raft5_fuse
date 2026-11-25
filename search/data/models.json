@@ -1,7 +1,121 @@
 {
-  "about": "Every model search uses, pinned: the one place to change one (see search/src/vector.rs, 'Changing a model'). Native clients (raft5fs-indexer) and the web app (embedWorker.js, scripts/fetch-models.mjs) read it. Each file: its role, where it comes from (at a pinned revision), its SHA-256 and size, which clients use it, and for the web app the size of the pieces it is cut into (under GitHub Pages' 100 MB a file; 0 for whole).",
+  "about": "Every model search uses, pinned: the one place to change one (see search/src/vector.rs, 'Changing a model'). Native clients (raft5fs-indexer) and the web app (embedWorker.js, scripts/fetch-models.mjs) read it, and raft5fs-search turns names, sizes and thresholds into its constants when it builds (search/build.rs). The files are raft5fs-embed's: converted from their sources by its `convert` example (the models workflow checks them) and attached to a release (embed/MODELS-NOTICE.txt gives their sources and licences). Each file: its role, where it comes from, its SHA-256 and size, which clients use it, and for the web app the size of the pieces it is cut into (under GitHub Pages' 100 MB a file; 0 for whole). Each model also gives: its vectors' size (dims); the models it replaces, whose vectors devices make again; what goes before a query and a passage; how its vector is pooled (cls, mean); the most tokens it reads; and how search tells a match from a miss (search: floor, margin from the best match, z: how far above the mean of a query's scores, and for text minWords, the fewest words a chunk needs to be embedded), measured as search/src/view.rs says. Until the web app runs raft5fs-embed too, it embeds queries with the ONNX exports under webText and webClip (onnxruntime-web); their vectors agree with the native models' to about cosine 0.996.",
   "models": {
-    "e5": {
+    "text": {
+      "name": "multilingual-e5-small-q8_0@614241f",
+      "dims": 384,
+      "replaces": [
+        "multilingual-e5-small-int8@761b726"
+      ],
+      "search": {
+        "floor": 0.75,
+        "margin": 0.05,
+        "z": 2.0,
+        "minWords": 8
+      },
+      "query": "query: ",
+      "passage": "passage: ",
+      "pooling": "mean",
+      "maxTokens": 512,
+      "files": [
+        {
+          "role": "body",
+          "local": "body.gguf",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/text-body.gguf",
+          "sha256": "e9e3557a035579d8edb76935a5b7daf4a119945ba7cb5c241a55733d6a26f600",
+          "size": 23601856,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        },
+        {
+          "role": "table",
+          "local": "table.q8",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/text-table.q8",
+          "sha256": "e9ad8da8d9433243294c81f9af6eae7d36959172a23630091df7465ef894a617",
+          "size": 102015096,
+          "piece": 60000000,
+          "clients": [
+            "native"
+          ]
+        },
+        {
+          "role": "tokenizer",
+          "local": "tokenizer.bin",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/text-tokenizer.bin",
+          "sha256": "82ff07537761c82a048e79c002182a312f67ef567af8e1f5417e893828951881",
+          "size": 5318930,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "name": "mclip-vit-b32-q8_0@58edf8c+327ab67",
+      "dims": 512,
+      "replaces": [
+        "mclip-vit-b32-int8@58edf8c+6b7c523"
+      ],
+      "search": {
+        "floor": 0.215,
+        "margin": 0.04,
+        "z": 1.5
+      },
+      "query": "",
+      "passage": "",
+      "pooling": "mean",
+      "maxTokens": 128,
+      "files": [
+        {
+          "role": "body",
+          "local": "text-body.gguf",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/clip-text-body.gguf",
+          "sha256": "27fc7bb6085f8ad125cdd12a229ea7f83d52003bd7d007edb3e19e1fe52f2bff",
+          "size": 48517760,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        },
+        {
+          "role": "table",
+          "local": "text-table.q8",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/clip-text-table.q8",
+          "sha256": "838b412d7aaba4508b29731b8ad53d66998d012e2cc880ad75dea50d9165c1ba",
+          "size": 97550352,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        },
+        {
+          "role": "tokenizer",
+          "local": "tokenizer.bin",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/clip-tokenizer.bin",
+          "sha256": "3fdbe9ecafb9ed312df131992f72ee0ef617561174d5b96a0d5a5fd8d598ed61",
+          "size": 1115099,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        },
+        {
+          "role": "vision",
+          "local": "vision.gguf",
+          "url": "https://github.com/jonathanmeisel/jmeisel_raft5_fuse/releases/download/models-2026-11-25/clip-vision.gguf",
+          "sha256": "e3dc99164841a24f7b41cd777ab73bf887029d6e9031adeceb2d522d865074d4",
+          "size": 100755072,
+          "piece": 0,
+          "clients": [
+            "native"
+          ]
+        }
+      ]
+    },
+    "webText": {
       "name": "multilingual-e5-small-int8@761b726",
       "files": [
         {
@@ -12,7 +126,6 @@
           "size": 118308185,
           "piece": 60000000,
           "clients": [
-            "native",
             "web"
           ]
         },
@@ -24,7 +137,6 @@
           "size": 17082730,
           "piece": 0,
           "clients": [
-            "native",
             "web"
           ]
         },
@@ -41,7 +153,7 @@
         }
       ]
     },
-    "clip": {
+    "webClip": {
       "name": "mclip-vit-b32-int8@58edf8c+6b7c523",
       "files": [
         {
@@ -52,7 +164,6 @@
           "size": 135377779,
           "piece": 60000000,
           "clients": [
-            "native",
             "web"
           ]
         },
@@ -64,7 +175,6 @@
           "size": 1961847,
           "piece": 0,
           "clients": [
-            "native",
             "web"
           ]
         },
@@ -87,7 +197,6 @@
           "size": 1572984,
           "piece": 0,
           "clients": [
-            "native",
             "web"
           ]
         },
@@ -103,33 +212,6 @@
           ]
         }
       ]
-    }
-  },
-  "runtime": {
-    "about": "ONNX Runtime, which native clients load at run time (the ort crate's load-dynamic): the library from Microsoft's PyPI wheel for each platform, built for glibc 2.28 and later. The wheel is fetched and checked, and the library taken out of it and checked. The same version as the web app's onnxruntime-web.",
-    "version": "1.31.1",
-    "platforms": {
-      "linux-x86_64": {
-        "url": "https://files.pythonhosted.org/packages/eb/27/c6a823bac55b2977bea2027c3ec9393a2c1002cb9a09eb40354563e02730/onnxruntime-1.31.1-cp312-cp312-manylinux_2_28_x86_64.whl",
-        "sha256": "1f3dea47f2f0e5117c2404cea7d21fd253ae7836a3bf167a501cdfbb2600d536",
-        "size": 23760988,
-        "member": "onnxruntime/capi/libonnxruntime.so.1.31.1",
-        "library_sha256": "fc44112fbe06d7d689c57e11d3862031f64711007e4ee020f8eed5185fd2c1d3"
-      },
-      "linux-aarch64": {
-        "url": "https://files.pythonhosted.org/packages/ba/e4/1ed1a7a5f4702d899091fa2b976d377995250c307326ec8dc9ae6378aa13/onnxruntime-1.31.1-cp312-cp312-manylinux_2_28_aarch64.whl",
-        "sha256": "0b9a492176886992e0e875f06bc0367e333f5fff11711a2d642e18b02f3009cc",
-        "size": 21420803,
-        "member": "onnxruntime/capi/libonnxruntime.so.1.31.1",
-        "library_sha256": "8aa3b76b28c778a2b1dd660d34161adb1d508c9ccd04ff9dc80e26eca5df8467"
-      },
-      "macos-aarch64": {
-        "url": "https://files.pythonhosted.org/packages/0e/f7/cecc0efeeea83bff2f7789ae1b80f27fa0f0210d6d9d66d1f0031a6b5e47/onnxruntime-1.31.1-cp312-cp312-macosx_14_0_arm64.whl",
-        "sha256": "96dd2564b10ea7153ad9c207e7cd8e5917cb3ba521e0e0a62ac03486fdc8d56c",
-        "size": 20882125,
-        "member": "onnxruntime/capi/libonnxruntime.1.31.1.dylib",
-        "library_sha256": "d586cbe89effc085a09d3341b3cfbd5c322517f9d397aeb20814af21433f2b36"
-      }
     }
   }
 }

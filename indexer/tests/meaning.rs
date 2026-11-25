@@ -10,7 +10,7 @@ use raft5fs_client::indexer::{
 };
 use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::Vault;
-use raft5fs_indexer::embed::{E5, Embedder, MODEL, cache_dir};
+use raft5fs_indexer::embed::{Embedder, MODEL, TextModel, cache_dir};
 use raft5fs_search::view::{QueryVector, View};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
@@ -27,7 +27,7 @@ fn a_query_finds_a_file_by_meaning_in_another_language() {
     let dir = std::env::var_os("RAFT5FS_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(cache_dir);
-    let embedder = Arc::new(Embedder(Arc::new(E5::new(dir))));
+    let embedder = Arc::new(Embedder(Arc::new(TextModel::new(dir))));
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let remote = rt
@@ -123,7 +123,7 @@ fn photos_are_found_by_what_they_show_with_thumbnails() {
     let clip = Arc::new(ImageEmbedder(Arc::new(Clip::new(
         dir("RAFT5FS_CLIP_DIR").unwrap_or_else(raft5fs_indexer::clip::cache_dir),
     ))));
-    let e5 = Arc::new(Embedder(Arc::new(E5::new(
+    let text = Arc::new(Embedder(Arc::new(TextModel::new(
         dir("RAFT5FS_MODEL_DIR").unwrap_or_else(cache_dir),
     ))));
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
@@ -155,7 +155,7 @@ fn photos_are_found_by_what_they_show_with_thumbnails() {
     }
     let tools = Tools {
         extract: Arc::new(Native),
-        embed: Some(Arc::clone(&e5) as Arc<dyn Embed>),
+        embed: Some(Arc::clone(&text) as Arc<dyn Embed>),
         image: Some(Arc::clone(&clip) as Arc<dyn raft5fs_client::indexer::ImageEmbed>),
     };
     let stats = rt

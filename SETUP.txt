@@ -1166,25 +1166,26 @@ can index it. A share of a folder inside a volume can't be searched yet.
 
 A search matches words, and also meaning: each piece of text gets a
 vector from a language model (multilingual-e5-small), and so does the
-query, so "bike routes in vermont" finds a German note about cycling in
-Vermont with none of those words. Results that match both ways come
+query, so "rutas en bicicleta por Vermont" finds an English note about
+cycling in Vermont with none of those words. Results that match both ways come
 first. A search of several volumes
 ranks them as one: a strong match in one volume comes before a weak one
 in another, and a volume with nothing on the subject gives nothing by
 meaning.
 
 The model runs on each device that indexes or searches, never on the
-servers. It downloads the first time it is needed (about 135 MB, from
-Hugging Face, which sees only that this machine fetched it), into
-~/.cache/raft5fs/models, and is checked against a pinned SHA-256 before
-use. Native clients run it with ONNX Runtime, which also downloads
-then (about 24 MB, Microsoft's build from PyPI, pinned the same way; it
-needs glibc 2.28 or newer). To use a copy the system already has, set
-RAFT5FS_ONNXRUNTIME to its libonnxruntime. The web app serves the same files itself (webapp/README.md) and
-keeps them in the browser after the first search. A browser keeps the
+servers, with candle (raft5fs-embed), the same code on every client. It
+downloads the first time it is needed (about 130 MB, from this project's
+GitHub releases, which see only that this machine fetched it), into
+~/.cache/raft5fs/models, and each file is checked against a pinned
+SHA-256 before use. Native clients hold the model's word table on disk
+and read only the rows they use. The web app serves the same files
+itself (webapp/README.md) and keeps them in the browser after the first
+search. A browser keeps the
 index it has read, sealed to the account, unless "Keep search data on
 this device" is off. Indexing with the models takes CPU: about half the
-cores, at most four, while a pass runs.
+cores, at most four, while a pass runs (CANDLE_NUM_THREADS sets another
+number).
 
 Only native devices (a mount, a WebDAV server, raft5fs index) make
 vectors. The web app indexes words, dates, places and thumbnails, and
@@ -1209,11 +1210,16 @@ get the state on its other side.
 
 Photos are also found by what they show, in any language ("Strand am
 Meer", "kids at the beach"), with CLIP: on native devices a second model
-(about 225 MB, downloaded as the first is, into the same folder) gives
+(about 250 MB, downloaded as the first is, into the same folder) gives
 each photo a vector, and each query one. The web app doesn't make photos'
 vectors: a native device fills them in at its next pass. It does
-search them, with CLIP's text side (about 140 MB more, downloaded on the
-first search of a volume whose photos have vectors). Results show each
+search them, with CLIP's text side (about 150 MB more, downloaded on the
+first search of a volume whose photos have vectors).
+
+When a new version changes a model, native devices embed every file
+again at their next passes, text and photos: a big photo volume takes
+some hours, in the background. Until then, search by meaning finds only
+what is done. Results show each
 photo's thumbnail, kept sealed in the index (about 12 KB a photo), so
 they show without fetching the photos. HEIC photos (an iPhone's) get their
 dates and places everywhere, but no thumbnail or image vector on native

@@ -1,149 +1,45 @@
-//! Photos searched by what is in them: CLIP, with a text side that reads
-//! many languages.
+//! Photos searched by what is in them: CLIP ViT-B/32, with a text side
+//! that reads many languages, on candle (raft5fs-embed).
 //!
-//! - **Images:** OpenAI's CLIP ViT-B/32 vision model (Xenova's int8
-//!   export). A photo is turned upright, its shortest side scaled to 224
+//! - **Images:** a photo is turned upright, its shortest side scaled to 224
 //!   pixels, the middle 224 by 224 cut out, and normalized as CLIP's
-//!   preprocessor says.
-//! - **Text:** sentence-transformers' clip-ViT-B-32-multilingual-v1, a
-//!   multilingual DistilBERT taught to put text where CLIP puts the matching
-//!   image (its int8 ONNX export). Its vector is the mean of its last
-//!   hidden states over the real tokens, times its `Dense` layer (768 to
-//!   512, no bias), made unit length. The ONNX export leaves the layer out,
-//!   so it comes as its own file.
-//! - Native clients embed images and queries; the web app only queries
-//!   (see the web app's `clip.js`), with the same text model.
+//!   preprocessor says (`pixels`); raft5fs-embed's `Vision` gives its
+//!   vector. Native clients only: the web app doesn't make image vectors.
+//! - **Text:** the multilingual text side (DistilBERT, its `Dense` layer),
+//!   as the web app runs it, kept Q8_0: here it embeds only queries.
 //! - Files download on first use into `cache_dir()`, each checked against
 //!   its SHA-256, as `search/data/models.json` pins them (see `manifest`).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use image::imageops::FilterType;
-use ort::session::Session;
-use ort::value::Tensor;
 use raft5fs_client::indexer::ImageEmbed;
-use raft5fs_search::vector::{CLIP_DIMS, CLIP_MODEL, normalize};
-use tokenizers::{Tokenizer, TruncationParams};
+use raft5fs_embed::{SIDE, TextModel, Vision};
+use raft5fs_search::vector::CLIP_MODEL;
 
-use crate::embed::environment;
-
-/// The most tokens the text model reads (sentence-transformers' setting
-/// for it).
-const MAX_TOKENS: usize = 128;
-/// The image size the vision model takes, and how CLIP normalizes pixels.
-const SIDE: u32 = 224;
+const SIDE_PX: u32 = SIDE as u32;
 const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 const STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 /// Where these files are kept: beside `embed`'s.
 pub fn cache_dir() -> PathBuf {
-    crate::embed::cache_dir()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-        .join(CLIP_MODEL)
+    crate::embed::models_dir().join(CLIP_MODEL)
 }
 
 struct Models {
-    text: Session,
-    vision: Session,
-    tokenizer: Tokenizer,
-    /// The text side's last layer: 512 rows of 768.
-    dense: Vec<f32>,
-}
-
-/// The weights of a safetensors file with one F32 tensor of `len` values.
-fn read_dense(bytes: &[u8], len: usize) -> Result<Vec<f32>, String> {
-    let bad = || "the text model's last layer isn't as expected".to_string();
-    let head = u64::from_le_bytes(bytes.get(..8).ok_or_else(bad)?.try_into().unwrap()) as usize;
-    let data = bytes.get(8 + head..).ok_or_else(bad)?;
-    if data.len() != len * 4 {
-        return Err(bad());
-    }
-    Ok(data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect())
+    text: TextModel,
+    vision: Vision,
 }
 
 fn load(dir: &Path) -> Result<Models, String> {
+    let text = crate::embed::load_text(dir, "clip", false)?;
     let manifest = crate::manifest::model("clip");
-    manifest.fetch(dir)?;
-    let at = |role: &str| dir.join(&manifest.file(role).local);
-    let mut tokenizer = Tokenizer::from_file(at("tokenizer"))
-        .map_err(|e| format!("cannot read the CLIP tokenizer: {e}"))?;
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: MAX_TOKENS,
-            ..TruncationParams::default()
-        }))
-        .map_err(|e| format!("cannot set up the CLIP tokenizer: {e}"))?;
-    tokenizer.with_padding(None);
-    let dense = std::fs::read(at("dense"))
-        .map_err(|e| format!("cannot read the CLIP text model's last layer: {e}"))
-        .and_then(|b| read_dense(&b, CLIP_DIMS * 768))?;
-    let env = environment()?;
-    let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4));
-    let session = |role: &str| {
-        Session::builder(&env)
-            .and_then(|b| Ok(b.with_intra_threads(threads)?))
-            .and_then(|mut b| b.commit_from_file(at(role)))
-            .map_err(|e| format!("cannot load {CLIP_MODEL}: {e}"))
-    };
-    Ok(Models {
-        text: session("model")?,
-        vision: session("vision")?,
-        tokenizer,
-        dense,
-    })
-}
-
-/// The text side, for `text` alone (no padding, as for `embed`).
-fn text_vector(m: &mut Models, text: &str) -> Result<Vec<f32>, String> {
-    let fail = |e: ort::Error| format!("{CLIP_MODEL} failed: {e}");
-    let enc = m
-        .tokenizer
-        .encode(text, true)
-        .map_err(|e| format!("cannot read the text into tokens: {e}"))?;
-    let ids: Vec<i64> = enc.get_ids().iter().map(|&i| i64::from(i)).collect();
-    let n = ids.len();
-    let shape = [1i64, n as i64];
-    let outputs = m
-        .text
-        .run(ort::inputs![
-            "input_ids" => Tensor::from_array((shape, ids)).map_err(fail)?,
-            "attention_mask" => Tensor::from_array((shape, vec![1i64; n])).map_err(fail)?,
-        ])
-        .map_err(fail)?;
-    let (_, hidden) = outputs[0].try_extract_tensor::<f32>().map_err(fail)?;
-    if hidden.len() != n * 768 {
-        return Err(format!("{CLIP_MODEL} gave output of an unexpected shape"));
-    }
-    let mut mean = vec![0f32; 768];
-    for t in 0..n {
-        for (m, h) in mean.iter_mut().zip(&hidden[t * 768..(t + 1) * 768]) {
-            *m += h / n as f32;
-        }
-    }
-    Ok(project(&m.dense, &mean))
-}
-
-/// `x` (768) through the text side's last layer, made unit length.
-fn project(dense: &[f32], x: &[f32]) -> Vec<f32> {
-    let mut out: Vec<f32> = (0..CLIP_DIMS)
-        .map(|j| {
-            dense[j * 768..(j + 1) * 768]
-                .iter()
-                .zip(x)
-                .map(|(w, v)| w * v)
-                .sum()
-        })
-        .collect();
-    normalize(&mut out);
-    out
+    let path = dir.join(&manifest.file("vision").local);
+    let mut body = File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let vision = Vision::load(&mut body).map_err(|e| format!("cannot load {CLIP_MODEL}: {e}"))?;
+    Ok(Models { text, vision })
 }
 
 /// A photo as the vision model takes it: upright, its shortest side 224,
@@ -163,14 +59,14 @@ pub fn pixels(bytes: &[u8], orientation: u16) -> Option<Vec<f32>> {
         _ => img,
     };
     let (w, h) = (img.width().max(1), img.height().max(1));
-    let scale = SIDE as f32 / w.min(h) as f32;
+    let scale = SIDE_PX as f32 / w.min(h) as f32;
     let (nw, nh) = (
-        ((w as f32 * scale).round() as u32).max(SIDE),
-        ((h as f32 * scale).round() as u32).max(SIDE),
+        ((w as f32 * scale).round() as u32).max(SIDE_PX),
+        ((h as f32 * scale).round() as u32).max(SIDE_PX),
     );
     let resized = img.resize_exact(nw, nh, FilterType::CatmullRom).to_rgb8();
-    let (x0, y0) = ((nw - SIDE) / 2, (nh - SIDE) / 2);
-    let side = SIDE as usize;
+    let (x0, y0) = ((nw - SIDE_PX) / 2, (nh - SIDE_PX) / 2);
+    let side = SIDE;
     let mut out = vec![0f32; 3 * side * side];
     for y in 0..side {
         for x in 0..side {
@@ -183,26 +79,10 @@ pub fn pixels(bytes: &[u8], orientation: u16) -> Option<Vec<f32>> {
     Some(out)
 }
 
-fn image_vector(m: &mut Models, pixels: Vec<f32>) -> Result<Vec<f32>, String> {
-    let fail = |e: ort::Error| format!("{CLIP_MODEL} failed: {e}");
-    let shape = [1i64, 3, SIDE as i64, SIDE as i64];
-    let outputs = m
-        .vision
-        .run(ort::inputs!["pixel_values" => Tensor::from_array((shape, pixels)).map_err(fail)?])
-        .map_err(fail)?;
-    let (_, v) = outputs[0].try_extract_tensor::<f32>().map_err(fail)?;
-    if v.len() != CLIP_DIMS {
-        return Err(format!("{CLIP_MODEL} gave output of an unexpected shape"));
-    }
-    let mut v = v.to_vec();
-    normalize(&mut v);
-    Ok(v)
-}
-
 /// CLIP, loaded on first use.
 pub struct Clip {
     dir: PathBuf,
-    models: OnceLock<Result<Arc<Mutex<Models>>, String>>,
+    models: OnceLock<Result<Arc<Models>, String>>,
 }
 
 impl Clip {
@@ -217,15 +97,25 @@ impl Clip {
         Self::new(cache_dir())
     }
 
-    fn models(&self) -> Result<Arc<Mutex<Models>>, String> {
+    fn models(&self) -> Result<Arc<Models>, String> {
         self.models
-            .get_or_init(|| load(&self.dir).map(|m| Arc::new(Mutex::new(m))))
+            .get_or_init(|| load(&self.dir).map(Arc::new))
             .clone()
     }
 
     /// A query's vector, on this thread.
     pub fn text_now(&self, text: &str) -> Result<Vec<f32>, String> {
-        text_vector(&mut self.models()?.lock().unwrap(), text)
+        let m = self.models()?;
+        let mut v = m
+            .text
+            .embed(&[text])
+            .map_err(|e| format!("{CLIP_MODEL} failed: {e}"))?;
+        Ok(v.remove(0))
+    }
+
+    /// The token ids the text side reads for `text`.
+    pub fn text_ids(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(self.models()?.text.ids(text))
     }
 
     /// A photo's vector, on this thread; `Ok(None)` for a picture this
@@ -234,7 +124,11 @@ impl Clip {
         let Some(px) = pixels(bytes, orientation) else {
             return Ok(None);
         };
-        image_vector(&mut self.models()?.lock().unwrap(), px).map(Some)
+        let m = self.models()?;
+        m.vision
+            .embed(px)
+            .map(Some)
+            .map_err(|e| format!("{CLIP_MODEL} failed: {e}"))
     }
 }
 
@@ -295,32 +189,18 @@ mod tests {
         assert!(pixels(b"nope", 1).is_none());
     }
 
-    #[test]
-    fn the_last_layer_reads_and_projects() {
-        // A layer that keeps the first 512 values: a 512 by 768 identity.
-        let mut w = vec![0f32; CLIP_DIMS * 768];
-        for j in 0..CLIP_DIMS {
-            w[j * 768 + j] = 1.0;
-        }
-        let mut file = 8u64.to_le_bytes().to_vec();
-        file.extend_from_slice(b"{}      ");
-        file.extend(w.iter().flat_map(|x| x.to_le_bytes()));
-        let dense = read_dense(&file, CLIP_DIMS * 768).unwrap();
-        let x: Vec<f32> = (0..768).map(|i| if i == 3 { 2.0 } else { 0.0 }).collect();
-        let v = project(&dense, &x);
-        assert!((v[3] - 1.0).abs() < 1e-6 && v.iter().filter(|x| **x != 0.0).count() == 1);
-        assert!(read_dense(&file[..100], CLIP_DIMS * 768).is_err());
+    fn clip_dir() -> PathBuf {
+        std::env::var_os("RAFT5FS_CLIP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(cache_dir)
     }
 
     /// The real models: set RAFT5FS_CLIP_DIR to a folder with their files
     /// (or one to download them into) and run with --ignored.
     #[test]
-    #[ignore = "needs the CLIP models (about 225 MB)"]
+    #[ignore = "needs the CLIP models (about 250 MB)"]
     fn photos_match_what_they_show_in_any_language() {
-        let dir = std::env::var_os("RAFT5FS_CLIP_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(cache_dir);
-        let clip = Clip::new(dir);
+        let clip = Clip::new(clip_dir());
         let pictures: Vec<(&str, &[u8])> = vec![
             ("beach", include_bytes!("../tests/pictures/beach.jpg")),
             ("forest", include_bytes!("../tests/pictures/forest.jpg")),
@@ -337,7 +217,7 @@ mod tests {
             ("trees in a forest", "forest"),
             ("un bosque", "forest"),
             ("a stop sign", "stop"),
-            ("birthday cake", "cake"),
+            ("pastel de cumpleaños", "cake"),
         ];
         for (q, want) in queries {
             let v = clip.text_now(q).unwrap();
@@ -356,16 +236,13 @@ mod tests {
         }
     }
 
-    /// Writes what the native text side gives for a few queries, for the
-    /// web app's parity test (webapp/tests/parity.test.js). Run again with
+    /// Writes what the text side gives for a few queries, for the web
+    /// app's parity test (webapp/tests/parity.test.js). Run again with
     /// --ignored after changing the model.
     #[test]
-    #[ignore = "needs the CLIP models (about 225 MB)"]
+    #[ignore = "needs the CLIP models (about 250 MB)"]
     fn write_the_web_apps_clip_fixture() {
-        let dir = std::env::var_os("RAFT5FS_CLIP_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(cache_dir);
-        let clip = Clip::new(dir);
+        let clip = Clip::new(clip_dir());
         let texts = [
             "a sunny beach by the sea",
             "Strand am Meer",
@@ -374,15 +251,7 @@ mod tests {
         ];
         let mut out = format!("{{\n  \"model\": \"{CLIP_MODEL}\",\n  \"cases\": [\n");
         for (i, text) in texts.iter().enumerate() {
-            let models = clip.models().unwrap();
-            let ids = models
-                .lock()
-                .unwrap()
-                .tokenizer
-                .encode(*text, true)
-                .unwrap()
-                .get_ids()
-                .to_vec();
+            let ids = clip.text_ids(text).unwrap();
             let v = clip.text_now(text).unwrap();
             let nums: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
             let ids: Vec<String> = ids.iter().map(u32::to_string).collect();

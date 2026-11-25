@@ -5,52 +5,44 @@
 //! Quantizing to one byte loses little: a dot product moves by about 0.01,
 //! much less than what tells a match from a miss.
 //!
-//! **Changing a model** (`E5_MODEL` or `CLIP_MODEL`):
+//! **Changing a model** (`TEXT_MODEL` or `CLIP_MODEL`):
 //!
-//! - Pin its files in `data/models.json`, which every client reads: each
-//!   file's URL at a revision, SHA-256 and size. Give it a new name there
-//!   and here (raft5fs-indexer's `manifest` tests check they agree).
-//! - Add the old name to `E5_REPLACES` (or `CLIP_REPLACES`). Devices on
-//!   the new version embed the old records again at their next walk;
-//!   devices still on the old version leave the new records alone.
+//! - Convert it (raft5fs-embed's `convert` example; `fetch-sources.sh`
+//!   pins its sources), attach the files to a release (the models
+//!   workflow checks and uploads them), and pin them in `data/models.json`
+//!   with a new name: every client reads it.
+//! - A model of the BERT family (BERT, XLM-R, DistilBERT) needs no code:
+//!   its settings travel in its file, and models.json says what goes
+//!   before a query and a passage, and how it pools. Another kind needs
+//!   raft5fs-embed to learn it.
+//! - Put the old name in its `replaces`. Devices on the new version embed
+//!   the old records again at their next pass; devices still on the old
+//!   version leave the new records alone.
 //! - Fetch it for the web app (`npm run model` in webapp).
 //! - Write the parity fixtures again (raft5fs-indexer's ignored
 //!   `write_the_web_apps_*` tests), and run `npm run test:parity`.
 //! - Measure again what scores tell a match from a miss (the real-model
-//!   tests print them), and set `view`'s floors and margins to fit. For
-//!   photos, measure on real photos, not drawings, which score higher:
-//!   raft5fs-indexer's `clip_scores` example scores queries against a
-//!   folder of them.
+//!   tests print them), and set its `search` numbers in models.json to fit
+//!   (see `view`). For photos, measure on real photos, not drawings, which
+//!   score higher: raft5fs-indexer's `clip_scores` example scores queries
+//!   against a folder of them.
 
 use crate::record::Vector;
 
-/// The model that every client embeds with: multilingual-e5-small, the int8
-/// export at Hugging Face revision 761b726 (see raft5fs-indexer's `embed`
-/// and the web app's `embedWorker.js`). A new export or revision needs a
-/// new name, as vectors from two exports don't compare.
-pub const E5_MODEL: &str = "multilingual-e5-small-int8@761b726";
-
-/// The size of its vectors.
-pub const E5_DIMS: usize = 384;
-
-/// The text models `E5_MODEL` supersedes: records that name one are
-/// embedded again at a device's next walk. To upgrade the model, add the
-/// old name here; a device still on the old version doesn't know the new
-/// name, so it leaves those records alone.
-pub const E5_REPLACES: &[&str] = &[];
-
-/// The model photos are searched by what they show with: OpenAI's CLIP
-/// ViT-B/32 for images (Xenova's int8 export, revision 6b7c523), and
-/// sentence-transformers' clip-ViT-B-32-multilingual-v1 for text (its
-/// int8 export, revision 58edf8c), which puts text where CLIP puts the
-/// image (see raft5fs-indexer's `clip`).
-pub const CLIP_MODEL: &str = "mclip-vit-b32-int8@58edf8c+6b7c523";
-
-/// The size of its vectors.
-pub const CLIP_DIMS: usize = 512;
-
-/// The photo models `CLIP_MODEL` supersedes, as for `E5_REPLACES`.
-pub const CLIP_REPLACES: &[&str] = &[];
+// The models' names, sizes, the models they replace and their search
+// thresholds, from data/models.json (build.rs):
+//
+// - `TEXT_MODEL`: the model every client embeds text with (now
+//   multilingual-e5-small, Q8_0; raft5fs-embed's `TextModel`).
+//   `TEXT_DIMS`: the size of its vectors.
+// - `TEXT_REPLACES`: the text models it supersedes. Records that name one
+//   are embedded again at a device's next pass; a device still on the old
+//   version doesn't know the new name, so it leaves new records alone.
+// - `CLIP_MODEL`: the model photos are searched by what they show with
+//   (now CLIP ViT-B/32 with a multilingual text side, Q8_0; raft5fs-embed).
+//   `CLIP_DIMS`, `CLIP_REPLACES`: as for text.
+// - `*_FLOOR`, `*_MARGIN`, `*_Z`, `TEXT_MIN_WORDS`: see `view`.
+include!(concat!(env!("OUT_DIR"), "/models.rs"));
 
 /// A vector of unit length as one byte per dimension.
 pub fn quantize(v: &[f32]) -> Vector {

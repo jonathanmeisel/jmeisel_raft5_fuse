@@ -15,8 +15,8 @@ import { loadE5 } from "../src/lib/e5.js";
 import { loadClip } from "../src/lib/clip.js";
 
 const manifest = JSON.parse(readFileSync(new URL("../../search/data/models.json", import.meta.url)));
-const MODEL = manifest.models.e5.name;
-const CLIP_MODEL = manifest.models.clip.name;
+const MODEL = manifest.models.webText.name;
+const CLIP_MODEL = manifest.models.webClip.name;
 
 const fixture = JSON.parse(readFileSync(new URL("fixtures/e5-vectors.json", import.meta.url)));
 const dir = new URL(`../public/models/${MODEL}/`, import.meta.url);

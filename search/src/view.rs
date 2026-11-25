@@ -14,7 +14,7 @@ use crate::bm25::{Bm25, ChunkRef, Stats, query_terms};
 use crate::manifest::Manifest;
 use crate::rank::fuse;
 use crate::record::{DocKind, Entry, Record};
-use crate::vector::dot;
+use crate::vector::{self, dot};
 
 /// How a chunk matches a query by meaning, with multilingual-e5. Its
 /// cosines bunch together, so no one number tells a match from a miss:
@@ -28,9 +28,11 @@ use crate::vector::dot;
 /// - So a chunk matches if it is within `MEANING_MARGIN` of the best match
 ///   in all the volumes searched, above `MIN_SIMILARITY` at all, and
 ///   stands out from the other scores (`Cutoff`).
-pub const MIN_SIMILARITY: f32 = 0.75;
-pub const MEANING_MARGIN: f32 = 0.05;
-pub const MIN_MEANING_WORDS: u32 = 8;
+///
+/// These numbers are in data/models.json (the text model's `search`).
+pub const MIN_SIMILARITY: f32 = vector::TEXT_FLOOR;
+pub const MEANING_MARGIN: f32 = vector::TEXT_MARGIN;
+pub const MIN_MEANING_WORDS: u32 = vector::TEXT_MIN_WORDS;
 
 /// How a photo matches a query by what it shows, with CLIP, whose cosines
 /// are low and close together. On real photos (20 from Wikimedia Commons,
@@ -41,8 +43,10 @@ pub const MIN_MEANING_WORDS: u32 = 8;
 /// matches if it is within `IMAGE_MARGIN` of the best match in all the
 /// volumes searched, stands out from the others (`Cutoff`),
 /// and is above `MIN_IMAGE_SIMILARITY`; rank decides the rest.
-pub const MIN_IMAGE_SIMILARITY: f32 = 0.215;
-pub const IMAGE_MARGIN: f32 = 0.04;
+///
+/// These numbers are in data/models.json (the photo model's `search`).
+pub const MIN_IMAGE_SIMILARITY: f32 = vector::CLIP_FLOOR;
+pub const IMAGE_MARGIN: f32 = vector::CLIP_MARGIN;
 
 /// A query's embedding, and the model that made it.
 pub struct QueryVector<'a> {
@@ -376,8 +380,9 @@ struct Cutoff {
 /// These are first estimates, from the score ranges above (matches 0.79
 /// to 0.87 against others at 0.70 to 0.78; photos 0.214 to 0.294 against
 /// 0.18 to 0.225): check them against real volumes.
-pub const MEANING_Z: f32 = 2.0;
-pub const IMAGE_Z: f32 = 1.5;
+/// In data/models.json too.
+pub const MEANING_Z: f32 = vector::TEXT_Z;
+pub const IMAGE_Z: f32 = vector::CLIP_Z;
 
 /// The fewest scores the spread rule (`Cutoff::z`) needs: with fewer, the
 /// mean and deviation say little.

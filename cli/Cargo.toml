@@ -16,9 +16,9 @@ fuse = ["dep:raft5fs-fuse", "dep:fuser"]
 # `raft5fs webdav`.
 webdav = ["dep:raft5fs-webdav", "tokio/net", "tokio/signal"]
 # Search indexing (`raft5fs index`, and in mounts and WebDAV), and searching
-# by meaning and by what photos show: the models, on ONNX Runtime, which
-# has no prebuilt binaries for every platform. Without it, this device
-# doesn't index (others do), and searches by words, places and dates.
+# by meaning and by what photos show: the models, on candle
+# (raft5fs-embed). Without it, this device doesn't index (others do), and
+# searches by words, places and dates.
 index = ["dep:raft5fs-indexer", "tokio/signal"]
 
 [dependencies]

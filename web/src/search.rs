@@ -38,7 +38,7 @@ use raft5fs_proto::types::FsError;
 use raft5fs_search::extract::{Extracted, Format, READER, extract_with};
 use raft5fs_search::geo::{PLACES_SHA256, Places};
 use raft5fs_search::record::{DocKind, Extra, Thumb};
-use raft5fs_search::vector::{CLIP_MODEL, E5_MODEL};
+use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
 use raft5fs_search::view::{QueryVector, View, search_many};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -152,11 +152,11 @@ impl JsEmbed {
 
 impl Embed for JsEmbed {
     fn model(&self) -> &str {
-        E5_MODEL
+        TEXT_MODEL
     }
 
     fn replaces(&self, older: &str) -> bool {
-        raft5fs_search::vector::E5_REPLACES.contains(&older)
+        raft5fs_search::vector::TEXT_REPLACES.contains(&older)
     }
 
     fn passages<'a>(&'a self, texts: Vec<String>) -> Local<'a, Result<Vec<Vec<f32>>, String>> {
@@ -455,7 +455,7 @@ fn loaded_js(l: &Loaded) -> LoadedJs {
             .updated_by
             .as_ref()
             .map(|(user, device)| format!("{user} on {device}")),
-        meaning: l.view.has_model(E5_MODEL),
+        meaning: l.view.has_model(TEXT_MODEL),
         off: l.off,
         photos: l.view.photos(CLIP_MODEL).0,
         photos_seen: l.view.photos(CLIP_MODEL).1,
@@ -552,7 +552,7 @@ impl Fs {
                 .map(|(&ino, l)| (ino, Rc::clone(l)))
                 .collect();
             let limit = limit.clamp(1, 200) as usize;
-            let has_vectors = views.iter().any(|(_, l)| l.view.has_model(E5_MODEL));
+            let has_vectors = views.iter().any(|(_, l)| l.view.has_model(TEXT_MODEL));
             let has_images = views
                 .iter()
                 .any(|(_, l)| l.view.has_image_model(CLIP_MODEL));
@@ -582,7 +582,7 @@ impl Fs {
                 None
             };
             let q = vector.as_deref().map(|values| QueryVector {
-                model: E5_MODEL,
+                model: TEXT_MODEL,
                 values,
             });
             let image = image_vector.as_deref().map(|values| QueryVector {

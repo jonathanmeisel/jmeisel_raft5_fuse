@@ -13,6 +13,10 @@ kamadak-exif = "0.6"
 # Segments are compressed. Pure Rust, so it builds for the browser too.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+[build-dependencies]
+# Reads data/models.json for the models' constants (build.rs).
+serde_json = "1"
+
 [dev-dependencies]
 # For the build-places example, which reads Natural Earth's GeoJSON.
 serde_json = "1"
