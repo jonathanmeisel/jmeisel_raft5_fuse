@@ -150,7 +150,16 @@ impl View {
     pub fn new(entries: impl IntoIterator<Item = Entry>) -> Self {
         let mut view = View::default();
         view.add(entries);
+        view.shrink();
         view
+    }
+
+    /// Gives back the room its lists grew into: after a load, once its
+    /// last `add`.
+    pub fn shrink(&mut self) {
+        self.keywords.shrink();
+        self.docs.shrink_to_fit();
+        self.newest.shrink_to_fit();
     }
 
     /// Adds `entries`, from segments the view hasn't seen. For each inode
@@ -189,38 +198,45 @@ impl View {
         }
     }
 
-    /// Indexes `r` as a new doc, and gives its number.
-    fn push(&mut self, r: Record) -> usize {
+    /// Indexes `r` as a new doc, and gives its number. Its chunks' word
+    /// lists go into the keyword index and are not kept with the record.
+    fn push(&mut self, mut r: Record) -> usize {
         let doc = self.docs.len();
         self.keywords.add_path(doc, &r.path);
-        for (i, c) in r.chunks.iter().enumerate() {
+        for (i, c) in r.chunks.iter_mut().enumerate() {
             let at = ChunkRef {
                 doc,
                 chunk: Some(i),
             };
             self.keywords.add(at, &c.terms, c.len);
+            c.terms = Vec::new();
         }
         self.docs.push(Some(r));
         self.live += 1;
         doc
     }
 
-    /// Builds the docs and the keyword index again from the live docs.
+    /// Keeps only the live docs, renumbered in inode order, and the keyword
+    /// index's entries for them.
     fn rebuild(&mut self) {
-        let mut live: Vec<Record> = std::mem::take(&mut self.docs)
-            .into_iter()
-            .flatten()
+        let mut live: Vec<(u64, usize)> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter_map(|(doc, r)| Some((r.as_ref()?.ino, doc)))
             .collect();
-        live.sort_by_key(|r| r.ino);
-        self.keywords = Bm25::default();
-        self.live = 0;
-        for r in live {
-            let ino = r.ino;
-            let doc = self.push(r);
+        live.sort();
+        let mut renumber = vec![None; self.docs.len()];
+        let mut docs = Vec::with_capacity(live.len());
+        for (new, &(ino, old)) in live.iter().enumerate() {
+            renumber[old] = Some(new);
+            docs.push(self.docs[old].take());
             if let Some(slot) = self.newest.get_mut(&ino) {
-                slot.1 = Some(doc);
+                slot.1 = Some(new);
             }
         }
+        self.keywords.compact(|old| renumber[old]);
+        self.docs = docs;
     }
 
     /// The live docs, with their numbers.
@@ -628,6 +644,45 @@ mod tests {
         assert_eq!(paths(&grown, "pears"), ["b.txt", "d.txt"]);
         assert_eq!(grown.len(), 3);
         assert_eq!(whole.len(), 3);
+    }
+
+    #[test]
+    fn a_view_loaded_a_segment_at_a_time_searches_as_one_loaded_whole() {
+        let words = ["pears", "plums", "apples", "figs", "dates", "limes"];
+        let mut segments: Vec<Vec<Entry>> = Vec::new();
+        for s in 0..6u64 {
+            // Each segment writes 20 files again, some as tombstones: past
+            // a quarter dead, the view rebuilds.
+            segments.push(
+                (0..20u64)
+                    .map(|i| {
+                        let ino = (i * 7 + s * 3) % 40;
+                        if (i + s) % 9 == 0 {
+                            Entry::Gone { ino, at_ms: s + 1 }
+                        } else {
+                            let w = words[((i + s) % 6) as usize];
+                            let text = format!("{w} and {} on day {s}", words[(i % 6) as usize]);
+                            record(ino, s + 1, &format!("{ino}.txt"), &text)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let mut grown = View::default();
+        for seg in &segments {
+            grown.add(seg.clone());
+        }
+        grown.shrink();
+        let whole = View::new(segments.concat());
+        assert_eq!(grown.len(), whole.len());
+        assert_eq!(grown.stats().words, whole.stats().words);
+        for q in words.iter().chain(&["day", "and"]) {
+            let mut a = paths(&grown, q);
+            let mut b = paths(&whole, q);
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{q}");
+        }
     }
 
     #[test]

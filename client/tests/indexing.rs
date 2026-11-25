@@ -1350,3 +1350,58 @@ fn a_busy_volume_says_when_its_claim_runs_out() {
     assert!(text.contains(&format!("by {TESTER}")), "{text}");
     assert!(text.contains("runs out in 10 minutes"), "{text}");
 }
+
+#[test]
+fn reading_a_segment_at_a_time_gives_the_same_index_and_stops_at_a_compaction() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, notes) = volume(&backend, &tester);
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    write(&backend, &tester, v, "new.txt", b"fresh");
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let into = |known: &std::collections::HashSet<String>| {
+        let mut batches = Vec::new();
+        let head = rt
+            .block_on(raft5fs_client::indexer::read_index_into(
+                &tester,
+                v,
+                None,
+                known,
+                &mut |e| batches.push(e),
+            ))
+            .unwrap()
+            .unwrap();
+        (head, batches)
+    };
+    // Whole, a segment at a time: one batch for each segment.
+    let (head, batches) = into(&Default::default());
+    assert!(!head.reset);
+    assert_eq!(batches.len(), head.keys.len());
+    let mut view = View::default();
+    for b in batches {
+        view.add(b);
+    }
+    view.shrink();
+    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
+    assert_eq!(view.len(), 4);
+    // Nothing new since: nothing read.
+    let known: std::collections::HashSet<String> = head.keys.iter().cloned().collect();
+    let (again, batches) = into(&known);
+    assert!(!again.reset && batches.is_empty());
+    // A compaction takes the known segments away: it says so, reading
+    // nothing.
+    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
+        .unwrap();
+    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
+        .unwrap();
+    assert!(
+        pass(&backend, &tester, v, id, PassKind::Auto)
+            .unwrap()
+            .compacted
+    );
+    let (after, batches) = into(&known);
+    assert!(after.reset);
+    assert!(batches.is_empty());
+}

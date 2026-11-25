@@ -20,11 +20,51 @@ pub struct ChunkRef {
     pub chunk: Option<usize>,
 }
 
+/// A chunk as the index keeps it: its doc, which chunk (`PATH` for the
+/// path), and its length in words.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    doc: u32,
+    chunk: u32,
+    len: u32,
+}
+
+const PATH: u32 = u32::MAX;
+
+impl Slot {
+    fn at(self) -> ChunkRef {
+        ChunkRef {
+            doc: self.doc as usize,
+            chunk: (self.chunk != PATH).then_some(self.chunk as usize),
+        }
+    }
+}
+
+/// The chunks a word is in, and how often, as two lists (6 bytes a
+/// posting, where pairs would take 8).
+#[derive(Default, Clone)]
+struct Postings {
+    chunks: Vec<u32>,
+    counts: Vec<u16>,
+}
+
+impl Postings {
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, u16)> + '_ {
+        self.chunks.iter().copied().zip(self.counts.iter().copied())
+    }
+}
+
+/// The index: each word once, by number, and for each word the chunks it
+/// is in and how often.
 #[derive(Default)]
 pub struct Bm25 {
-    /// For each term, the chunks it is in and how often.
-    postings: HashMap<String, Vec<(u32, u16)>>,
-    chunks: Vec<(ChunkRef, u32)>,
+    words: HashMap<String, u32>,
+    postings: Vec<Postings>,
+    chunks: Vec<Slot>,
     total_len: u64,
 }
 
@@ -32,13 +72,25 @@ impl Bm25 {
     /// Adds a chunk with its counted terms and its length in words.
     pub fn add(&mut self, at: ChunkRef, terms: &[(String, u16)], len: u32) {
         let id = self.chunks.len() as u32;
-        self.chunks.push((at, len.max(1)));
+        self.chunks.push(Slot {
+            doc: at.doc as u32,
+            chunk: at.chunk.map_or(PATH, |c| c as u32),
+            len: len.max(1),
+        });
         self.total_len += u64::from(len.max(1));
         for (term, count) in terms {
-            self.postings
-                .entry(term.clone())
-                .or_default()
-                .push((id, *count));
+            let word = match self.words.get(term) {
+                Some(&w) => w,
+                None => {
+                    let w = self.postings.len() as u32;
+                    self.words.insert(term.clone(), w);
+                    self.postings.push(Postings::default());
+                    w
+                }
+            };
+            let p = &mut self.postings[word as usize];
+            p.chunks.push(id);
+            p.counts.push(*count);
         }
     }
 
@@ -50,6 +102,58 @@ impl Bm25 {
         if !t.is_empty() {
             self.add(ChunkRef { doc, chunk: None }, &counted(&t), t.len() as u32);
         }
+    }
+
+    /// Keeps only the chunks of docs that `doc` maps, renumbered as it
+    /// says, and drops words no chunk has any more.
+    pub fn compact(&mut self, doc: impl Fn(usize) -> Option<usize>) {
+        let mut renumber = vec![u32::MAX; self.chunks.len()];
+        let mut chunks = Vec::new();
+        self.total_len = 0;
+        for (old, slot) in self.chunks.iter().enumerate() {
+            if let Some(d) = doc(slot.doc as usize) {
+                renumber[old] = chunks.len() as u32;
+                self.total_len += u64::from(slot.len);
+                chunks.push(Slot {
+                    doc: d as u32,
+                    ..*slot
+                });
+            }
+        }
+        self.chunks = chunks;
+        let mut postings = Vec::new();
+        let old_postings = std::mem::take(&mut self.postings);
+        let mut words: Vec<(String, u32)> = self.words.drain().collect();
+        words.sort_by_key(|(_, w)| *w);
+        for (word, w) in words {
+            let mut kept: Vec<(u32, u16)> = old_postings[w as usize]
+                .iter()
+                .filter_map(|(chunk, n)| {
+                    let new = renumber[chunk as usize];
+                    (new != u32::MAX).then_some((new, n))
+                })
+                .collect();
+            kept.sort_by_key(|(chunk, _)| *chunk);
+            if !kept.is_empty() {
+                self.words.insert(word, postings.len() as u32);
+                postings.push(Postings {
+                    chunks: kept.iter().map(|k| k.0).collect(),
+                    counts: kept.iter().map(|k| k.1).collect(),
+                });
+            }
+        }
+        self.postings = postings;
+    }
+
+    /// Gives back the room the lists grew into and don't use.
+    pub fn shrink(&mut self) {
+        for p in &mut self.postings {
+            p.chunks.shrink_to_fit();
+            p.counts.shrink_to_fit();
+        }
+        self.postings.shrink_to_fit();
+        self.chunks.shrink_to_fit();
+        self.words.shrink_to_fit();
     }
 
     /// The documents that match `query`, best first, each with its score and
@@ -64,8 +168,8 @@ impl Bm25 {
     /// How many distinct words it has, and how many postings in all.
     pub fn size(&self) -> (usize, usize) {
         (
-            self.postings.len(),
-            self.postings.values().map(Vec::len).sum(),
+            self.words.len(),
+            self.postings.iter().map(Postings::len).sum(),
         )
     }
 
@@ -74,7 +178,10 @@ impl Bm25 {
         stats.chunks += self.chunks.len() as u64;
         stats.total_len += self.total_len;
         for term in terms {
-            let df = self.postings.get(term).map_or(0, Vec::len) as u64;
+            let df = self
+                .words
+                .get(term)
+                .map_or(0, |&w| self.postings[w as usize].len()) as u64;
             *stats.df.entry(term.clone()).or_default() += df;
         }
     }
@@ -99,7 +206,7 @@ impl Bm25 {
         let avg = stats.total_len as f32 / n;
         let mut scores: HashMap<u32, f32> = HashMap::new();
         for term in terms {
-            let Some(list) = self.postings.get(term) else {
+            let Some(list) = self.words.get(term).map(|&w| &self.postings[w as usize]) else {
                 continue;
             };
             let df = stats
@@ -109,8 +216,8 @@ impl Bm25 {
                 .unwrap_or(0)
                 .max(list.len() as u64) as f32;
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            for &(id, tf) in list {
-                let len = self.chunks[id as usize].1 as f32;
+            for (id, tf) in list.iter() {
+                let len = self.chunks[id as usize].len as f32;
                 let tf = f32::from(tf);
                 let s = idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / avg));
                 *scores.entry(id).or_default() += s;
@@ -118,7 +225,7 @@ impl Bm25 {
         }
         let mut best: HashMap<usize, (f32, Option<usize>)> = HashMap::new();
         for (id, score) in scores {
-            let at = self.chunks[id as usize].0;
+            let at = self.chunks[id as usize].at();
             if !live(at.doc) {
                 continue;
             }

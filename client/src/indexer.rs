@@ -323,22 +323,33 @@ const LOAD_TRIES: usize = 5;
 /// The index of `volume` as its files are now. Makes `INDEX_DIR` if there
 /// is none and `create` says so; otherwise `None` for no index.
 async fn load(vault: &Vault, volume: u64, create: bool) -> Result<Option<Loaded>, FsError> {
-    load_with(vault, volume, create, None, &HashSet::new()).await
+    load_with(vault, volume, create, None, &HashSet::new(), None).await
 }
+
+/// Where `read_index_into` puts each segment's entries as it reads them.
+#[cfg(not(target_arch = "wasm32"))]
+pub type EntrySink<'a> = &'a mut (dyn FnMut(Vec<Entry>) + Send);
+#[cfg(target_arch = "wasm32")]
+pub type EntrySink<'a> = &'a mut dyn FnMut(Vec<Entry>);
 
 /// `load`, with segments taken from `cache` where it has them, and put
 /// there when they are read. Segments in `known` are not read, unless one
 /// of them is gone (`Loaded::reset`).
+///
+/// With `sink`, each segment's entries go there as they are read, and
+/// `Loaded::entries` is empty; and if a known segment is gone, nothing is
+/// read, so that the caller starts again from nothing.
 async fn load_with(
     vault: &Vault,
     volume: u64,
     create: bool,
     cache: Option<&dyn SegmentCache>,
     known: &HashSet<String>,
+    mut sink: Option<EntrySink<'_>>,
 ) -> Result<Option<Loaded>, FsError> {
     let mut tries = 0;
     loop {
-        match load_once(vault, volume, create, cache, known).await {
+        match load_once(vault, volume, create, cache, known, &mut sink).await {
             Err(e) if e.errno == errno::ENOENT && tries + 1 < LOAD_TRIES => tries += 1,
             other => return other,
         }
@@ -351,6 +362,7 @@ async fn load_once(
     create: bool,
     cache: Option<&dyn SegmentCache>,
     known: &HashSet<String>,
+    sink: &mut Option<EntrySink<'_>>,
 ) -> Result<Option<Loaded>, FsError> {
     let dir = match vault.lookup(volume, OsStr::new(INDEX_DIR)).await {
         Ok(attr) => attr.ino,
@@ -411,6 +423,10 @@ async fn load_once(
         c.keep_only(volume, &keys).await;
     }
     let mut all = Vec::new();
+    let mut read = 0;
+    if reset && sink.is_some() {
+        listed.clear();
+    }
     for (key, ino, seg) in listed {
         if !reset && known.contains(&key) {
             continue;
@@ -430,7 +446,13 @@ async fn load_once(
             }
         };
         match decode_segment(&bytes) {
-            Ok(entries) => all.extend(entries),
+            Ok(entries) => {
+                read += entries.len();
+                match sink.as_mut() {
+                    Some(sink) => sink(entries),
+                    None => all.extend(entries),
+                }
+            }
             Err(e) => {
                 eprintln!("search index: skipped {seg}: {e}");
                 unread = true;
@@ -440,7 +462,7 @@ async fn load_once(
     Ok(Some(Loaded {
         dir,
         manifests,
-        read: all.len(),
+        read,
         entries: view::latest(all),
         keys,
         reset,
@@ -476,7 +498,7 @@ pub async fn read_index_since(
     cache: Option<&dyn SegmentCache>,
     known: &HashSet<String>,
 ) -> Result<Option<IndexDelta>, FsError> {
-    Ok(load_with(vault, volume, false, cache, known)
+    Ok(load_with(vault, volume, false, cache, known, None)
         .await?
         .map(|l| IndexDelta {
             progress: view::progress(&l.manifests),
@@ -484,6 +506,39 @@ pub async fn read_index_since(
             keys: l.keys,
             reset: l.reset,
         }))
+}
+
+/// Reads what is new in `volume`'s index since a read that saw the
+/// segments in `known`, one segment at a time into `add`, so that the
+/// caller holds one segment's entries at once, not the whole index's.
+/// `None` if it has none.
+///
+/// If a segment in `known` is gone (compacted away), it reads nothing and
+/// says so (`IndexHead::reset`): read again, with nothing known, into a
+/// new view.
+pub async fn read_index_into(
+    vault: &Vault,
+    volume: u64,
+    cache: Option<&dyn SegmentCache>,
+    known: &HashSet<String>,
+    add: EntrySink<'_>,
+) -> Result<Option<IndexHead>, FsError> {
+    Ok(load_with(vault, volume, false, cache, known, Some(add))
+        .await?
+        .map(|l| IndexHead {
+            progress: view::progress(&l.manifests),
+            keys: l.keys,
+            reset: l.reset,
+        }))
+}
+
+/// What `read_index_into` read, besides the entries.
+pub struct IndexHead {
+    pub progress: view::Progress,
+    /// Every segment now, to pass as `known` next time.
+    pub keys: Vec<String>,
+    /// A known segment is gone, and nothing was read.
+    pub reset: bool,
 }
 
 /// The bytes of `thumb`, a thumbnail in `volume`'s index.

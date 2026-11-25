@@ -29,8 +29,7 @@ use std::sync::Arc;
 
 use js_sys::{Array, Float32Array, Function, Promise, Uint8Array};
 use raft5fs_client::indexer::{
-    self, BuiltIn, Embed, Extract, IndexDelta, IndexStatus, Indexer, IndexerConfig, SegmentCache,
-    Tools,
+    self, BuiltIn, Embed, Extract, IndexStatus, Indexer, IndexerConfig, SegmentCache, Tools,
 };
 use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
@@ -376,33 +375,42 @@ impl Inner {
             .get(&ino)
             .map(|l| l.keys.clone())
             .unwrap_or_default();
-        let read = indexer::read_index_since(self.vault(), ino, cache, &known).await?;
+        // What is new since the last read: a few segments, so collected.
+        let mut delta = Vec::new();
+        let head = if known.is_empty() {
+            None
+        } else {
+            indexer::read_index_into(self.vault(), ino, cache, &known, &mut |e| delta.extend(e))
+                .await?
+        };
         let old = self.search.views.borrow_mut().remove(&ino);
         let old = old.and_then(|l| Rc::try_unwrap(l).ok());
-        let whole = |d: IndexDelta| {
-            (
-                View::new(d.entries),
-                d.keys.into_iter().collect(),
-                d.progress,
-            )
+        let grown = match (head, old) {
+            (Some(h), Some(mut l)) if !h.reset => {
+                l.view.add(delta);
+                l.view.shrink();
+                Some((l.view, h.keys.into_iter().collect(), h.progress))
+            }
+            // A first read, a segment compacted away, or a search still
+            // holding the old view: the index is read whole (from the
+            // cache), a segment at a time, into a new view.
+            _ => None,
         };
-        let (view, keys, progress) = match read {
-            None => (View::default(), HashSet::new(), Default::default()),
-            Some(d) if d.reset || known.is_empty() => whole(d),
-            Some(d) => match old {
-                Some(mut l) => {
-                    l.view.add(d.entries);
-                    (l.view, d.keys.into_iter().collect(), d.progress)
-                }
-                // A search still holds the old view: read the index whole,
-                // from the cache.
-                None => match indexer::read_index_since(self.vault(), ino, cache, &HashSet::new())
-                    .await?
-                {
-                    Some(d) => whole(d),
+        let (view, keys, progress) = match grown {
+            Some(g) => g,
+            None => {
+                let mut view = View::default();
+                let head =
+                    indexer::read_index_into(self.vault(), ino, cache, &HashSet::new(), &mut |e| {
+                        view.add(e)
+                    })
+                    .await?;
+                view.shrink();
+                match head {
+                    Some(h) => (view, h.keys.into_iter().collect(), h.progress),
                     None => (View::default(), HashSet::new(), Default::default()),
-                },
-            },
+                }
+            }
         };
         let loaded = Rc::new(Loaded {
             path,
