@@ -40,6 +40,7 @@
       globalThis.raft5fsTest = {
         setEmbedIdle: (ms) => session.setEmbedIdle(ms),
         modelState: () => session.modelState(),
+        setSearchLimits: (ask, background) => session.setSearchLimits(ask, background),
       };
     }
     me = who;

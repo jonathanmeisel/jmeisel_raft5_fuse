@@ -2,6 +2,10 @@
   // A top-level folder's search indexing: whether its files are indexed
   // for search, for everyone who can read it. Only its owner can turn that
   // off, which also removes its index to free the space it takes.
+  //
+  // Also, for this browser only: whether to download the folder's index to
+  // search it here (searchSetting.js). By default yes, unless it is big.
+  import * as searchSetting from "../lib/searchSetting.js";
   import Dialog from "./Dialog.svelte";
   import ErrorText from "./ErrorText.svelte";
 
@@ -17,6 +21,26 @@
     (s) => (state = s),
     (e) => (error = e.message),
   );
+
+  /// The index's size, and whether this browser downloads it: as chosen
+  /// here, else as this browser's setting says, else if it is small.
+  let size = $state(null);
+  let chosen = $state(null);
+  // svelte-ignore state_referenced_locally
+  fs.searchSize(path).then(
+    (s) => (size = s),
+    () => {},
+  );
+  const here = $derived(
+    chosen ?? (state?.volume && size ? (searchSetting.download(state.volume) ?? size.bytes <= size.limit) : false),
+  );
+
+  function setHere(on) {
+    chosen = on;
+    if (state?.volume) searchSetting.setDownload(state.volume, on);
+  }
+
+  const mb = (bytes) => Math.max(1, Math.round(bytes / 1e6));
 
   async function set(on) {
     working = true;
@@ -56,6 +80,14 @@
       <p><button onclick={() => (confirming = true)}>Turn off…</button></p>
     {:else}
       <p><button disabled={working} onclick={() => set(true)}>Turn on</button></p>
+    {/if}
+    {#if state.on && size}
+      <p>
+        <label>
+          <input type="checkbox" checked={here} onchange={(e) => setHere(e.currentTarget.checked)} />
+          Download its index to search it in this browser{size.bytes ? ` (${mb(size.bytes)} MB)` : ""}
+        </label>
+      </p>
     {/if}
   {:else if !error}
     <p class="note">Loading…</p>

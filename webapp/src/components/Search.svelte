@@ -6,6 +6,13 @@
   //   once it is a minute old (the wasm `searchLoad` decides). The Worker
   //   keeps what it has read (unless this browser's setting says not to),
   //   so reading again fetches only what is new.
+  // - A folder's index is downloaded whole, unless it is big (over 500 MiB)
+  //   and this browser wasn't asked to (its Search indexing dialog). One
+  //   not downloaded isn't searched here, and the results say so. A big
+  //   download runs in the background: the results show how far it is,
+  //   and search it once it is in.
+  // - Once an index of over 50 MB is kept, the page asks the browser to
+  //   keep this site's storage (`navigator.storage.persist`).
   // - A share of a folder inside someone's top-level folder has no index of
   //   its own yet, so it isn't searched.
   // - Typing searches after a pause; Enter searches at once; Escape closes
@@ -114,13 +121,37 @@
     const loaded = [];
     for (const v of volumes) {
       try {
-        loaded.push(await fs.searchLoad(v));
+        loaded.push(await fs.searchLoad(v, searchSetting.download(v)));
       } catch (e) {
         // A share of a folder inside a volume, or a group: not searched.
         if (e.code !== "EINVAL") throw e;
       }
     }
+    if (loaded.some((l) => l.downloaded && l.bytes > PERSIST_BYTES)) keepStorage();
     return loaded;
+  }
+
+  const PERSIST_BYTES = 50e6;
+  let persisting = false;
+  /// Asks the browser to keep this site's storage, once: else it may
+  /// delete a large index when the disk runs low, and it is downloaded
+  /// again.
+  function keepStorage() {
+    if (persisting) return;
+    persisting = true;
+    navigator.storage?.persist?.().catch(() => {});
+  }
+
+  /// While an index downloads in the background: searches again once a
+  /// second, so its progress shows, and its results once it is in.
+  let again = null;
+  $effect(() => () => clearTimeout(again));
+  function whileDownloading(loaded, mine) {
+    clearTimeout(again);
+    if (loaded.some((l) => l.downloading) && open)
+      again = setTimeout(() => {
+        if (mine === asked) run();
+      }, 1000);
   }
 
   async function run() {
@@ -138,10 +169,11 @@
     let volumes;
     try {
       const loaded = await ensureRead(await scope());
-      volumes = loaded.map((l) => l.volume);
-      const found = await fs.search(q, volumes, 50, false);
+      volumes = loaded.filter((l) => l.downloaded).map((l) => l.volume);
+      const found = volumes.length ? await fs.search(q, volumes, 50, false) : { hits: [], meaning: false };
       if (mine !== asked) return;
       status = loaded;
+      whileDownloading(loaded, mine);
       results = found.hits;
       if (!found.meaning) return;
       needed = [...(found.vectors ? ["text"] : []), ...(found.images ? ["clip"] : [])];
@@ -222,6 +254,8 @@
   };
 
   const notIndexed = $derived(status.filter((s) => !s.indexed && !s.off).map((s) => s.volume.slice(1)));
+  const notHere = $derived(status.filter((s) => s.indexed && !s.off && !s.downloaded && !s.downloading));
+  const downloading = $derived(status.filter((s) => s.downloading));
   const off = $derived(status.filter((s) => s.off).map((s) => s.volume.slice(1)));
   const placeholder = $derived(
     everywhere || !volumeOf(folder) ? "Search all folders" : `Search ${volumeOf(folder).slice(1)}`,
@@ -293,7 +327,22 @@
         </button>
       {/each}
       <p class="status">
-        {#each status.filter((s) => s.indexed && !s.off) as s (s.volume)}
+        {#each downloading as s (s.volume)}
+          <span>
+            Downloading the index of {s.volume.slice(1)}: {Math.floor((100 * s.downloading[0]) / Math.max(1, s.downloading[1]))}%
+            ({mb(s.downloading[1])} MB); it is searched once it is in.
+          </span>
+        {/each}
+        {#if notHere.length}
+          <span>
+            Not searched here, its index not downloaded: {notHere.map((s) => `${s.volume.slice(1)} (${mb(s.bytes)} MB)`).join(", ")}.
+            A folder's More → Search indexing can download it.
+          </span>
+        {/if}
+        {#each status.filter((s) => s.downloadError) as s (s.volume)}
+          <span>The index of {s.volume.slice(1)} didn't download: {s.downloadError}</span>
+        {/each}
+        {#each status.filter((s) => s.indexed && !s.off && s.downloaded) as s (s.volume)}
           <span>{s.volume.slice(1)}: {s.files} files, indexed {ago(s.updatedMs)}{s.by ? ` by ${s.by}` : ""}</span>
           {#if s.photos > s.photosSeen}
             <span>

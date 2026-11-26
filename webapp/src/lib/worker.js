@@ -785,7 +785,12 @@ const methods = {
   /// another of this browser's tabs.
   pruning: () => (!pruneWanted ? "off" : prunesHere ? "running" : "elsewhere"),
 
-  searchLoad: (path) => session().searchLoad(path),
+  searchLoad: (path, download) => session().searchLoad(path, download ?? undefined),
+  searchSize: (path) => session().searchSize(path),
+  /// For the browser tests only: the download limits, in bytes.
+  setSearchLimits(ask, background) {
+    if (import.meta.env.MODE !== "production") session().setSearchLimits(ask, background);
+  },
   search: (query, volumes, limit, meaning) => session().search(query, volumes, limit, meaning),
   /// Whether the search model is loaded, loading (and how far), or kept
   /// in this browser so that loading it downloads nothing.

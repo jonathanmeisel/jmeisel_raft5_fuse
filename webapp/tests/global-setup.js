@@ -29,7 +29,7 @@ export default async function () {
   if (!existsSync(binary)) {
     throw new Error("build it first: cargo build -p raft5fs-testkit --example web_dev");
   }
-  const users = ["alice", "bob", "carol", "erin", "frank", "gina", "hank", "iris", "jack", "kim", "lena", "mona", "nils", "olga", "pia", "quinn", "rosa", "sam", "tom", "uma", "val", "wes", "xia", "yan", "kai", "lux", "mia", "ned", "oli", "max", "pat"].flatMap((u) => ["--user", u]);
+  const users = ["alice", "bob", "carol", "erin", "frank", "gina", "hank", "iris", "jack", "kim", "lena", "mona", "nils", "olga", "pia", "quinn", "rosa", "sam", "tom", "uma", "val", "wes", "xia", "yan", "kai", "lux", "mia", "ned", "oli", "max", "pat", "ola"].flatMap((u) => ["--user", u]);
   const backend = spawn(binary, ["--origin", "http://localhost:4173", "--out", `${app}config/local`, ...users], {
     cwd: root,
   });

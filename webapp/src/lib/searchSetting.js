@@ -1,6 +1,9 @@
 // This browser's search settings, kept for the browser, not the account.
 // The browser doesn't index: native devices do.
 //
+// - Whether to download each folder's index, to search it here: by
+//   default yes, unless it is over 500 MiB (the wasm `searchLoad` decides).
+//   A folder whose index isn't downloaded isn't searched here.
 // - "Keep search data on this device": the index segments it has read, so
 //   a search here fetches only what is new. Off for a borrowed computer.
 // - Whether to download the search models (about 130 MB for text, and 150
@@ -11,6 +14,7 @@
 import { mobile } from "./pruneSetting.js";
 
 const KEEP = "raft5fs:keep-search";
+const DOWNLOAD = "raft5fs:index-download";
 const MEANING = "raft5fs:search-meaning";
 
 function read(key) {
@@ -25,6 +29,27 @@ function write(key, value) {
   try {
     localStorage.setItem(key, value);
   } catch {}
+}
+
+/// Whether to download `volume`'s index (as the root shows it, like
+/// "/photos"): true, false, or null for the default.
+export function download(volume) {
+  try {
+    const all = JSON.parse(read(DOWNLOAD) ?? "{}");
+    const v = all?.[volume];
+    return typeof v === "boolean" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setDownload(volume, on) {
+  let all = {};
+  try {
+    all = JSON.parse(read(DOWNLOAD) ?? "{}") ?? {};
+  } catch {}
+  all[volume] = !!on;
+  write(DOWNLOAD, JSON.stringify(all));
 }
 
 export const keepSearch = () => read(KEEP) !== "off";

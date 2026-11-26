@@ -119,7 +119,9 @@ export function connect({ onStorageError } = {}) {
     pruneEstimate: (path) => call("pruneEstimate", [path]),
     setPruneHere: (on) => call("setPruneHere", [!!on]),
     pruning: () => call("pruning", []),
-    searchLoad: (path) => call("searchLoad", [path]),
+    searchLoad: (path, download) => call("searchLoad", [path, download ?? null]),
+    searchSize: (path) => call("searchSize", [path]),
+    setSearchLimits: (ask, background) => call("setSearchLimits", [ask, background]),
     search: (query, volumes, limit, meaning) =>
       call("search", [query, volumes ?? [], limit ?? 50, !!meaning]),
     modelState: () => call("modelState", []),

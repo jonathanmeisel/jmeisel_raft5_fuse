@@ -1648,7 +1648,8 @@ async function searchUntil(page, query, path, timeout = 120_000) {
 /// vectors that browsers search by but don't make. Tries again while a
 /// browser's pass holds the folder's claim.
 /// Needs the CLI built: cargo build -p raft5fs --no-default-features --features index
-async function nativeIndex(user, folder, { timeout = 600_000, threads } = {}) {
+/// With `compact`, the CLI compacts even a small volume, into a generation.
+async function nativeIndex(user, folder, { timeout = 600_000, threads, compact } = {}) {
   const binary = new URL("../../target/debug/raft5fs", import.meta.url).pathname;
   // No profile, and no pins of the tester's own.
   const config = mkdtempSync(join(tmpdir(), "raft5fs-cli-"));
@@ -1664,6 +1665,7 @@ async function nativeIndex(user, folder, { timeout = 600_000, threads } = {}) {
             XDG_CONFIG_HOME: config,
             RAFT5FS_PASSWORD: PASSWORD,
             ...(threads ? { CANDLE_NUM_THREADS: String(threads) } : {}),
+            ...(compact ? { RAFT5FS_COMPACT_MIN: "1" } : {}),
           },
           encoding: "utf8",
           timeout,
@@ -1742,6 +1744,53 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   const after = await search(page, "receipts");
   await expect(after).toContainText("Indexing is off: notes", SLOW);
   await expect(after).toContainText("Nothing found.");
+
+  expect(problems).toEqual([]);
+});
+
+test("a big index is searched once this browser downloads it, and a new generation replaces it", async ({ browser }) => {
+  // `raft5fs index` may first download its models, and the page reads the
+  // index again only a minute after it last did.
+  test.setTimeout(300_000);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const problems = watch(page);
+  await enrol(page, "ola");
+  await login(page, "ola");
+  await addFolder(page, "big");
+  await open(page, "big");
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "zebra.txt", mimeType: "text/plain", buffer: Buffer.from("Notes on the zebras of the savanna.") },
+    { name: "okapi.txt", mimeType: "text/plain", buffer: Buffer.from("The okapi lives in the forest.") },
+  ]);
+  await expect(item(page, "okapi.txt")).toBeVisible(SLOW);
+  await nativeIndex("ola", "big", { compact: true });
+  // Any index counts as big here, and downloads in the background.
+  await page.evaluate(() => globalThis.raft5fsTest.setSearchLimits(1, 0));
+
+  // Not downloaded: not searched, and the results say why.
+  const none = await search(page, "zebras");
+  await expect(none).toContainText(/Not searched here, its index not downloaded: big \(\d+ MB\)/, SLOW);
+  await expect(none.getByText("Nothing found.")).toBeVisible(SLOW);
+  await page.keyboard.press("Escape");
+
+  // Asked to, this browser downloads it, then finds what is in it.
+  await page.getByText("My files").first().click();
+  await more(page, "big", "Search indexing");
+  await page.getByLabel(/Download its index to search it in this browser/).check();
+  await page.getByRole("button", { name: "Close" }).last().click();
+  await open(page, "big");
+  await searchUntil(page, "zebras", "big/zebra.txt");
+
+  // A file added and the index compacted again: the new generation
+  // downloads while the old one is searched, then has both.
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "gnu.txt", mimeType: "text/plain", buffer: Buffer.from("A gnu crossed the river.") },
+  ]);
+  await expect(item(page, "gnu.txt")).toBeVisible(SLOW);
+  await nativeIndex("ola", "big", { compact: true });
+  await searchUntil(page, "gnu river", "big/gnu.txt");
+  await searchUntil(page, "okapi", "big/okapi.txt");
 
   expect(problems).toEqual([]);
 });
