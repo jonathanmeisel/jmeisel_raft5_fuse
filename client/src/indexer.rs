@@ -45,6 +45,7 @@ use raft5fs_proto::types::{Activity, ActivityOp, Attr, FsError, Kind};
 use raft5fs_proto::{clock, errno};
 use raft5fs_search::INDEX_DIR;
 use raft5fs_search::extract::{self, Extracted, Format};
+use raft5fs_search::generation;
 use raft5fs_search::manifest::{IndexerId, Manifest, decode_manifest, encode_manifest};
 use raft5fs_search::record::{Chunk, DocKind, Entry, Extra, Record, Stamp, Thumb, Vector};
 use raft5fs_search::segment::{decode_segment, encode_segment};
@@ -53,6 +54,17 @@ use raft5fs_search::vector::quantize;
 use raft5fs_search::view;
 use raft5fs_search::view::MIN_MEANING_WORDS;
 use tokio::sync::Notify;
+
+mod cache;
+#[cfg(not(target_arch = "wasm32"))]
+mod compaction;
+pub mod open;
+#[cfg(not(target_arch = "wasm32"))]
+mod spill;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use cache::DiskCache;
+pub use cache::MemoryCache;
 
 use crate::remote::Remote;
 use crate::rt::{self, AbortHandle, BoxFuture};
@@ -71,30 +83,25 @@ const SEGMENT_ENTRIES: usize = 200;
 /// ... or how many bytes, about, whichever comes first: a run of large
 /// files would otherwise hold much memory before it is stored.
 const SEGMENT_BYTES: usize = 8 << 20;
-/// Entries in a segment that compaction writes: fewer, larger reads.
-const COMPACT_ENTRIES: usize = 2000;
-/// A pass compacts when the index has more segments beyond what its live
-/// entries need than this, or than the segments they need, ...
-///
-/// The second keeps the bytes compaction writes in step with the bytes
-/// passes add: a large index is rewritten only after it has grown by
-/// about as much again. Snapshots keep the old files for a while, so
-/// compacting often would cost quota.
-const SPARE_SEGMENTS: usize = 16;
-/// ... or when more than this share of its entries are replaced ones.
+/// A pass compacts once the recent segments hold more files than this
+/// share of the generation's, ...
+const RECENT_SHARE: f64 = 0.075;
+/// ... or this many chunks, which every reader holds in memory, ...
+const RECENT_CHUNKS: usize = 25_000;
+/// ... or are this many files, ...
+const RECENT_SEGMENTS: usize = 64;
+/// ... or when more than this share of the generation's files are dead.
 const DEAD_SHARE: f64 = 0.3;
-/// Compaction copies the live thumbnails out of a thumbnails file only
-/// when less than this share of it is live; else it keeps the file.
-const LIVE_THUMBS_SHARE: f64 = 0.5;
-/// Compaction starts a new thumbnails file past this size.
-const THUMBS_FILE_MAX: u64 = 32 << 20;
+/// How long a compaction keeps the files it replaced, for readers part-way
+/// through them. Snapshots keep them a while too.
+pub const GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 /// How much of a file is read in one request.
 const READ_PIECE: u64 = 4 << 20;
 /// How many log entries one page asks for.
 const LOG_PAGE: u32 = 200;
 
 /// How fast an indexer works, and what it leaves alone.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IndexerConfig {
     /// How often a background indexer looks for volumes to index.
     pub poll: Duration,
@@ -117,6 +124,16 @@ pub struct IndexerConfig {
     /// Volumes this device does not index (others still may), as this
     /// account's root shows them, such as `photos` or `CS101/notes`.
     pub skip: Vec<String>,
+    /// The fewest recent files worth a compaction: a small index stays in
+    /// recent segments. Tests set it low.
+    pub compact_min: usize,
+    /// How long a compaction keeps what it replaced (`GRACE_MS`).
+    pub grace: Duration,
+    /// Where the index files read are kept between passes (sealed), and
+    /// where compaction keeps its work: a folder of this device's cache.
+    /// `None`: kept for one pass only, and the index is never compacted.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for IndexerConfig {
@@ -130,6 +147,10 @@ impl Default for IndexerConfig {
             stall: Duration::from_secs(30 * 60),
             device: String::new(),
             skip: Vec::new(),
+            compact_min: 200,
+            grace: Duration::from_millis(GRACE_MS),
+            #[cfg(not(target_arch = "wasm32"))]
+            cache_dir: None,
         }
     }
 }
@@ -297,14 +318,15 @@ pub enum PassKind {
 /// Where a volume's index is, and whose files are in it.
 struct Loaded {
     dir: u64,
+    /// The index folder's files, by name.
+    files: HashMap<String, u64>,
     manifests: Vec<Manifest>,
-    /// The newest entry for each inode, from every segment read.
+    /// The generation, if the index was compacted.
+    header: Option<generation::Header>,
+    /// The newest entry for each inode, from every recent segment read.
     entries: HashMap<u64, Entry>,
     /// Every segment the manifests list, by cache key (`segment_key`).
     keys: Vec<String>,
-    /// How many entries the segments read hold, counting those that a
-    /// newer one replaces.
-    read: usize,
     /// Whether a segment known to the caller is gone (compacted away), so
     /// that every segment was read.
     reset: bool,
@@ -324,13 +346,7 @@ fn segment_key(volume: u64, ino: u64, name: &str) -> String {
 /// while it reads: an indexer replaces its manifest by a rename.
 const LOAD_TRIES: usize = 5;
 
-/// The index of `volume` as its files are now. Makes `INDEX_DIR` if there
-/// is none and `create` says so; otherwise `None` for no index.
-async fn load(vault: &Vault, volume: u64, create: bool) -> Result<Option<Loaded>, FsError> {
-    load_with(vault, volume, create, None, &HashSet::new(), None).await
-}
-
-/// Where `read_index_into` puts each segment's entries as it reads them.
+/// Where `load_with` puts each segment's entries as it reads them.
 #[cfg(not(target_arch = "wasm32"))]
 pub type EntrySink<'a> = &'a mut (dyn FnMut(Vec<Entry>) + Send);
 #[cfg(target_arch = "wasm32")]
@@ -398,7 +414,7 @@ async fn load_once(
     let mut manifests = Vec::new();
     let mut unread = false;
     for (name, &ino) in &files {
-        if !name.starts_with("manifest-") || name.ends_with(".new") {
+        if !Manifest::is_manifest(name) {
             continue;
         }
         match decode_manifest(&read_all(vault, ino).await?) {
@@ -421,13 +437,31 @@ async fn load_once(
     let keys: Vec<String> = listed.iter().map(|(key, ..)| key.clone()).collect();
     let now: HashSet<&String> = keys.iter().collect();
     let reset = known.iter().any(|k| !now.contains(k));
-    if let Some(c) = cache
-        && (known.is_empty() || reset)
+    // The generation, named by the manifest that compacted last.
+    let header = match manifests
+        .iter()
+        .filter_map(|m| Some((m.updated_ms, m.generation?)))
+        .max()
     {
-        c.keep_only(volume, &keys).await;
-    }
+        None => None,
+        Some((_, id)) => {
+            let name = generation::head_name(&id);
+            // Gone: replaced by a newer compaction meanwhile (`load_with`
+            // reads again).
+            let &ino = files
+                .get(&name)
+                .ok_or_else(|| FsError::new(errno::ENOENT, "the index's generation is gone"))?;
+            match generation::decode_header(&read_all(vault, ino).await?) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("search index: skipped {name}: {e}");
+                    unread = true;
+                    None
+                }
+            }
+        }
+    };
     let mut all = Vec::new();
-    let mut read = 0;
     if reset && sink.is_some() {
         listed.clear();
     }
@@ -450,13 +484,10 @@ async fn load_once(
             }
         };
         match decode_segment(&bytes) {
-            Ok(entries) => {
-                read += entries.len();
-                match sink.as_mut() {
-                    Some(sink) => sink(entries),
-                    None => all.extend(entries),
-                }
-            }
+            Ok(entries) => match sink.as_mut() {
+                Some(sink) => sink(entries),
+                None => all.extend(entries),
+            },
             Err(e) => {
                 eprintln!("search index: skipped {seg}: {e}");
                 unread = true;
@@ -465,84 +496,14 @@ async fn load_once(
     }
     Ok(Some(Loaded {
         dir,
+        files,
         manifests,
-        read,
+        header,
         entries: view::latest(all),
         keys,
         reset,
         unread,
     }))
-}
-
-/// Every entry in `volume`'s index, for searching it. `None` if it has
-/// none.
-pub async fn read_index(vault: &Vault, volume: u64) -> Result<Option<IndexSnapshot>, FsError> {
-    read_index_cached(vault, volume, None).await
-}
-
-/// `read_index`, reading only the segments that `cache` doesn't have.
-pub async fn read_index_cached(
-    vault: &Vault,
-    volume: u64,
-    cache: Option<&dyn SegmentCache>,
-) -> Result<Option<IndexSnapshot>, FsError> {
-    Ok(read_index_since(vault, volume, cache, &HashSet::new())
-        .await?
-        .map(|l| IndexSnapshot {
-            progress: l.progress,
-            entries: l.entries,
-        }))
-}
-
-/// What is new in `volume`'s index since a read that saw the segments in
-/// `known` (`IndexDelta::keys` of the last read). `None` if it has none.
-pub async fn read_index_since(
-    vault: &Vault,
-    volume: u64,
-    cache: Option<&dyn SegmentCache>,
-    known: &HashSet<String>,
-) -> Result<Option<IndexDelta>, FsError> {
-    Ok(load_with(vault, volume, false, cache, known, None)
-        .await?
-        .map(|l| IndexDelta {
-            progress: view::progress(&l.manifests),
-            entries: l.entries.into_values().collect(),
-            keys: l.keys,
-            reset: l.reset,
-        }))
-}
-
-/// Reads what is new in `volume`'s index since a read that saw the
-/// segments in `known`, one segment at a time into `add`, so that the
-/// caller holds one segment's entries at once, not the whole index's.
-/// `None` if it has none.
-///
-/// If a segment in `known` is gone (compacted away), it reads nothing and
-/// says so (`IndexHead::reset`): read again, with nothing known, into a
-/// new view.
-pub async fn read_index_into(
-    vault: &Vault,
-    volume: u64,
-    cache: Option<&dyn SegmentCache>,
-    known: &HashSet<String>,
-    add: EntrySink<'_>,
-) -> Result<Option<IndexHead>, FsError> {
-    Ok(load_with(vault, volume, false, cache, known, Some(add))
-        .await?
-        .map(|l| IndexHead {
-            progress: view::progress(&l.manifests),
-            keys: l.keys,
-            reset: l.reset,
-        }))
-}
-
-/// What `read_index_into` read, besides the entries.
-pub struct IndexHead {
-    pub progress: view::Progress,
-    /// Every segment now, to pass as `known` next time.
-    pub keys: Vec<String>,
-    /// A known segment is gone, and nothing was read.
-    pub reset: bool,
 }
 
 /// The bytes of `thumb`, a thumbnail in `volume`'s index.
@@ -565,25 +526,6 @@ pub trait SegmentCache: MaybeSend + MaybeSync {
         let _ = (volume, keys);
         Box::pin(async {})
     }
-}
-
-/// A volume's index as read: its entries, and how far indexing got.
-pub struct IndexSnapshot {
-    pub progress: view::Progress,
-    pub entries: Vec<Entry>,
-}
-
-/// What is new in a volume's index (`read_index_since`).
-pub struct IndexDelta {
-    pub progress: view::Progress,
-    /// The newest entry for each inode in the segments not known before;
-    /// with `reset`, in every segment.
-    pub entries: Vec<Entry>,
-    /// Every segment now, to pass as `known` next time.
-    pub keys: Vec<String>,
-    /// A known segment is gone, so `entries` are the whole index: build
-    /// the view again from them.
-    pub reset: bool,
 }
 
 async fn read_all(vault: &Vault, ino: u64) -> Result<Vec<u8>, FsError> {
@@ -668,6 +610,40 @@ fn entry_bytes(entry: &Entry) -> usize {
     64 + r.path.len() + chunks + image
 }
 
+/// What a pass keeps of each live file: what tells whether the file
+/// changed, or whether this device can do more for it.
+#[derive(Debug, Clone)]
+struct Known {
+    path: String,
+    stamp: Stamp,
+    kind: DocKind,
+    /// The model of its text vectors; empty for none.
+    model: String,
+    reader: u32,
+    /// A photo's image vector's model, and whether it has one.
+    image: Option<(String, bool)>,
+    /// Whether a chunk is long enough to embed.
+    embeddable: bool,
+}
+
+impl Known {
+    fn of_record(r: &Record) -> Self {
+        Self::of_row(&generation::Row::of(r, MIN_MEANING_WORDS))
+    }
+
+    fn of_row(r: &generation::Row) -> Self {
+        Self {
+            path: r.path.clone(),
+            stamp: r.stamp,
+            kind: r.kind,
+            model: r.model.clone(),
+            reader: r.reader,
+            image: r.image.clone(),
+            embeddable: r.embeddable,
+        }
+    }
+}
+
 /// One pass over one volume, under a claim.
 struct Pass<'a> {
     vault: &'a Vault,
@@ -676,8 +652,21 @@ struct Pass<'a> {
     config: &'a IndexerConfig,
     dir: u64,
     mine: Manifest,
-    entries: HashMap<u64, Entry>,
-    /// The inode of each live record's path, to drop a file replaced by
+    /// Every live file.
+    files: HashMap<u64, Known>,
+    /// The newest entry for each file in the recent segments, this pass's
+    /// own included: what the next compaction folds in.
+    recent: HashMap<u64, Entry>,
+    /// The generation, if the index was compacted.
+    generation: Option<Arc<raft5fs_search::index::Generation>>,
+    header: Option<generation::Header>,
+    /// The index folder's files when the pass began, by name.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    listing: HashMap<String, u64>,
+    /// The other indexers' manifests when the pass began.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    others: Vec<Manifest>,
+    /// The inode of each live file's path, to drop a file replaced by
     /// another at the same path.
     by_path: HashMap<String, u64>,
     pending: Vec<Entry>,
@@ -695,9 +684,7 @@ struct Pass<'a> {
     told: Instant,
     /// When the pass last made progress (ms): see `IndexerConfig::stall`.
     alive: &'a AtomicU64,
-    /// Entries in all listed segments, counting replaced ones, and how many
-    /// segments: what tells when to compact.
-    read: usize,
+    /// Recent segment files listed, in every manifest.
     segment_files: usize,
 }
 
@@ -760,27 +747,33 @@ impl Pass<'_> {
     }
 
     async fn push(&mut self, entry: Entry) -> Result<(), FsError> {
+        let ino = entry.ino();
+        if let Some(old) = self.files.get(&ino)
+            && self.by_path.get(&old.path) == Some(&ino)
+        {
+            let old_path = old.path.clone();
+            self.by_path.remove(&old_path);
+        }
         match &entry {
             Entry::Record(r) => {
-                self.by_path.insert(r.path.clone(), r.ino);
+                self.by_path.insert(r.path.clone(), ino);
+                self.files.insert(ino, Known::of_record(r));
             }
-            Entry::Gone { ino, .. } | Entry::Moved { ino, .. } => {
-                if let Some(Entry::Record(old)) = self.entries.get(ino) {
-                    let old_path = old.path.clone();
-                    if self.by_path.get(&old_path) == Some(ino) {
-                        self.by_path.remove(&old_path);
-                    }
-                }
-                if let Entry::Moved { ino, path, .. } = &entry {
-                    self.by_path.insert(path.clone(), *ino);
+            Entry::Gone { .. } => {
+                self.files.remove(&ino);
+            }
+            Entry::Moved { path, .. } => {
+                self.by_path.insert(path.clone(), ino);
+                if let Some(k) = self.files.get_mut(&ino) {
+                    k.path.clone_from(path);
                 }
             }
         }
-        let merged = match self.entries.remove(&entry.ino()) {
+        let merged = match self.recent.remove(&ino) {
             Some(old) => old.then(entry.clone()),
             None => entry.clone(),
         };
-        self.entries.insert(merged.ino(), merged);
+        self.recent.insert(ino, merged);
         self.pending_bytes += entry_bytes(&entry);
         self.pending.push(entry);
         if self.pending.len() >= SEGMENT_ENTRIES || self.pending_bytes >= SEGMENT_BYTES {
@@ -806,7 +799,6 @@ impl Pass<'_> {
         let entries = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
         write_fresh(self.vault, self.dir, &name, &encode_segment(&entries)).await?;
-        self.read += entries.len();
         self.segment_files += 1;
         self.mine.segments.push(name);
         self.mine.next_segment += 1;
@@ -819,149 +811,56 @@ impl Pass<'_> {
         replace(self.vault, self.dir, &name, &encode_manifest(&self.mine)).await
     }
 
-    /// Whether the index has so many segments, or so many replaced entries,
-    /// that it is worth compacting.
+    /// Whether the recent segments hold enough to compact: a share of the
+    /// generation, or so many chunks that readers' memory would suffer,
+    /// or so many files; or the generation has many dead files.
     fn compaction_due(&self) -> bool {
-        let live = self.entries.len();
-        let dead = self.read.saturating_sub(live);
-        let needed = live.div_ceil(COMPACT_ENTRIES);
-        self.segment_files > 1
-            && (self.segment_files > needed + SPARE_SEGMENTS.max(needed)
-                || dead as f64 > self.read as f64 * DEAD_SHARE)
+        let generation = self.header.as_ref().map_or(0, |h| h.files) as f64;
+        let chunks: usize = self
+            .recent
+            .values()
+            .map(|e| match e {
+                Entry::Record(r) => r.chunks.len(),
+                _ => 0,
+            })
+            .sum();
+        let dead = self.generation.as_ref().map_or(0, |g| {
+            self.recent
+                .keys()
+                .filter(|ino| g.file_of(**ino).is_some())
+                .count()
+        });
+        let recent = self.recent.len() as f64;
+        recent >= self.config.compact_min as f64
+            && (recent > generation * RECENT_SHARE
+                || chunks >= RECENT_CHUNKS
+                || self.segment_files > RECENT_SEGMENTS
+                || (generation > 0.0 && dead as f64 > generation * DEAD_SHARE))
     }
 
-    /// Writes the index again as this indexer's own: every live entry, in
-    /// few segments, with one manifest. Then removes every other index file.
-    /// Run under the claim only, so that no one else writes meanwhile.
-    ///
-    /// - Tombstones stay: a reader may still hold an older copy.
-    /// - A thumbnails file stays, unless most of it is dead: then its live
-    ///   thumbnails are copied to a new one.
-    /// - The order keeps the index whole for a reader at every step: new
-    ///   files first, then the manifest that lists them, then deletes. A
-    ///   reader that finds a file gone reads the index again (`load`).
-    /// - Progress from every manifest (cursor, files to check again, last
-    ///   walk) goes into this indexer's.
-    async fn compact(&mut self, full_walk_ms: u64) -> Result<(), FsError> {
-        self.flush().await?;
-        self.store().await?;
-        let id = self.mine.id;
-        let files: HashMap<String, u64> = self
-            .vault
-            .children(self.dir)
-            .await?
+    /// Deletes the retired files whose time has come.
+    async fn retire_due(&mut self) -> Result<(), FsError> {
+        let now = clock::now_millis();
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.mine.retired)
             .into_iter()
-            .filter(|i| i.kind == Kind::File)
-            .map(|i| (name_text(&i.name), i.ino))
-            .collect();
-        let mut entries: Vec<Entry> = self.entries.values().cloned().collect();
-        entries.sort_by_key(Entry::ino);
-        let mut next = self.mine.next_segment;
-
-        // Thumbnails files that are mostly dead.
-        let mut live_bytes: HashMap<String, u64> = HashMap::new();
-        for e in &entries {
-            if let Entry::Record(Record {
-                extra: Extra { thumb: Some(t), .. },
-                ..
-            }) = e
-            {
-                *live_bytes.entry(t.file.clone()).or_default() += u64::from(t.len);
-            }
-        }
-        let mut copy = HashSet::new();
-        for (file, live) in &live_bytes {
-            let Some(&ino) = files.get(file) else {
-                continue;
-            };
-            let size = self.vault.remote().getattr(ino).await?.size;
-            if (*live as f64) < size as f64 * LIVE_THUMBS_SHARE {
-                copy.insert(file.clone());
-            }
-        }
-        let mut out = Vec::new();
-        let mut name = Manifest::thumbs_name(&id, next);
-        for e in &mut entries {
-            let Entry::Record(r) = e else { continue };
-            let Some(t) = r.extra.thumb.as_mut().filter(|t| copy.contains(&t.file)) else {
-                continue;
-            };
-            self.alive.store(clock::now_millis(), Ordering::Relaxed);
-            let bytes = self
-                .vault
-                .read(files[&t.file], t.offset, t.len as usize)
-                .await?;
-            *t = Thumb {
-                file: name.clone(),
-                offset: out.len() as u64,
-                len: bytes.len() as u32,
-            };
-            out.extend_from_slice(&bytes);
-            if out.len() as u64 >= THUMBS_FILE_MAX {
-                write_fresh(self.vault, self.dir, &name, &std::mem::take(&mut out)).await?;
-                next += 1;
-                name = Manifest::thumbs_name(&id, next);
-            }
-        }
-        if !out.is_empty() {
-            write_fresh(self.vault, self.dir, &name, &out).await?;
-            next += 1;
-        }
-
-        // The segments, then the manifest that lists only them.
-        let mut segments = Vec::new();
-        for batch in entries.chunks(COMPACT_ENTRIES) {
-            self.beat();
-            let name = Manifest::segment_name(&id, next);
-            write_fresh(self.vault, self.dir, &name, &encode_segment(batch)).await?;
-            segments.push(name);
-            next += 1;
-        }
-        self.mine.segments = segments;
-        self.mine.next_segment = next.max(self.mine.next_segment + 1);
-        self.mine.full_walk_ms = self.mine.full_walk_ms.max(full_walk_ms);
-        self.mine.updated_ms = clock::now_millis();
-        self.save_manifest().await?;
-        for e in entries {
-            self.entries.insert(e.ino(), e);
-        }
-
-        // What nothing lists now: other indexers' manifests first, so that
-        // no manifest lists a segment that is gone.
-        let mine = Manifest::file_name(&id);
-        let listed: HashSet<&String> = self.mine.segments.iter().collect();
-        let shown: HashSet<String> = self
-            .entries
-            .values()
-            .filter_map(|e| match e {
-                Entry::Record(r) => r.extra.thumb.as_ref().map(|t| t.file.clone()),
-                Entry::Gone { .. } | Entry::Moved { .. } => None,
-            })
-            .collect();
-        let mut doomed: Vec<&String> = files
-            .keys()
-            .filter(|f| f.starts_with("manifest-") && **f != mine)
-            .collect();
-        doomed.extend(files.keys().filter(|f| {
-            (f.starts_with("seg-") && !listed.contains(f))
-                || (f.starts_with("thumbs-") && !shown.contains(*f))
-        }));
-        for f in doomed {
-            match self.vault.unlink(self.dir, OsStr::new(f)).await {
+            .partition(|(_, at)| *at <= now);
+        self.mine.retired = kept;
+        for (name, _) in &due {
+            match self.vault.unlink(self.dir, OsStr::new(name)).await {
                 Ok(_) => {}
                 Err(e) if e.errno == errno::ENOENT => {}
                 Err(e) => return Err(e),
             }
         }
-        self.read = self.entries.len();
-        self.segment_files = self.mine.segments.len();
-        self.stats.compacted = true;
+        if !due.is_empty() {
+            self.save_manifest().await?;
+        }
         Ok(())
     }
 
     async fn gone(&mut self, ino: u64) -> Result<(), FsError> {
         self.beat();
-        if matches!(self.entries.get(&ino), Some(Entry::Record(_))) {
+        if self.files.contains_key(&ino) {
             self.stats.gone += 1;
             let at_ms = clock::now_millis();
             self.push(Entry::Gone { ino, at_ms }).await?;
@@ -975,7 +874,7 @@ impl Pass<'_> {
     /// embed has nothing to embed, but one another device couldn't read
     /// (`Unread`) is read here if it can be, and so is one that older
     /// readers read (`extract::READER`).
-    fn embedded_as_now(&self, old: &Record) -> bool {
+    fn embedded_as_now(&self, old: &Known) -> bool {
         let name = old.path.rsplit('/').next().unwrap_or(&old.path);
         if old.kind == DocKind::Unread && self.tools.extract.reads(name) >= old.stamp.size {
             return false;
@@ -984,7 +883,7 @@ impl Pass<'_> {
         // has the model), or one from a model this one supersedes.
         if let Some(image) = &self.tools.image
             && old.kind == DocKind::Photo
-            && match &old.extra.image {
+            && match &old.image {
                 None => true,
                 Some((m, _)) => m != image.model() && image.replaces(m),
             }
@@ -992,7 +891,7 @@ impl Pass<'_> {
             return false;
         }
         // Read by older readers, which found less in it than these would.
-        if old.extra.reader < extract::READER
+        if old.reader < extract::READER
             && !matches!(Format::of(name), Format::Other)
             && self.tools.extract.reads(name) > 0
         {
@@ -1003,7 +902,7 @@ impl Pass<'_> {
         };
         // Text with no vectors yet (a failed model, or a device with none),
         // or vectors from a model this one supersedes.
-        !old.chunks.iter().any(|c| c.len >= MIN_MEANING_WORDS)
+        !old.embeddable
             || old.model == embed.model()
             || !(old.model.is_empty() || embed.replaces(&old.model))
     }
@@ -1113,16 +1012,13 @@ impl Pass<'_> {
         {
             self.gone(other).await?;
         }
-        if let Some(Entry::Record(old)) = self.entries.get(&ino)
+        if let Some(old) = self.files.get(&ino)
             && old.stamp == stamp
             && self.embedded_as_now(old)
         {
             if old.path != path {
-                let mut moved = old.clone();
-                moved.path = path;
-                moved.at_ms = at_ms;
                 self.stats.moved += 1;
-                self.push(Entry::Record(moved)).await?;
+                self.push(Entry::Moved { ino, at_ms, path }).await?;
             }
             return Ok(());
         }
@@ -1281,10 +1177,10 @@ impl Pass<'_> {
             }
         }
         let missing: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|(ino, e)| matches!(e, Entry::Record(_)) && !seen.contains(*ino))
-            .map(|(ino, _)| *ino)
+            .files
+            .keys()
+            .filter(|ino| !seen.contains(*ino))
+            .copied()
             .collect();
         for ino in missing {
             self.gone(ino).await?;
@@ -1326,6 +1222,46 @@ async fn read_log(
     }
 }
 
+/// Where a pass keeps the index files it reads: on disk in the config's
+/// folder, for this account, or else in memory for the pass.
+fn pass_cache(vault: &Vault, config: &IndexerConfig) -> Arc<dyn SegmentCache> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (Some(dir), Some(identity)) = (&config.cache_dir, vault.remote().identity()) {
+        return Arc::new(DiskCache::new(
+            disk_dir(dir, vault.remote().username()),
+            identity,
+        ));
+    }
+    let _ = (vault, config);
+    Arc::new(MemoryCache::default())
+}
+
+/// The folder in `base` where `user`'s index files are kept.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn disk_dir(base: &std::path::Path, user: &str) -> std::path::PathBuf {
+    base.join("index").join(raft5fs_wire::hex(user.as_bytes()))
+}
+
+/// This device's cache folder for the index: `$XDG_CACHE_HOME/raft5fs`, or
+/// `~/.cache/raft5fs`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cache_base() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("raft5fs"))
+}
+
+/// `vault`'s disk cache in `base` (`cache_base`), if it is logged in.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn disk_cache(vault: &Vault, base: &std::path::Path) -> Option<Arc<dyn SegmentCache>> {
+    let identity = vault.remote().identity()?;
+    Some(Arc::new(DiskCache::new(
+        disk_dir(base, vault.remote().username()),
+        identity,
+    )))
+}
+
 /// One pass over `volume`, which the caller has claimed.
 /// One pass over `volume`. With `claimed`, no one else writes its index
 /// meanwhile, so the pass may compact it.
@@ -1342,7 +1278,9 @@ async fn run_pass(
     progress: &mut (dyn FnMut(&PassStats) + Send),
 ) -> Result<PassStats, FsError> {
     let started = clock::now_millis();
-    let loaded = load(vault, volume, true)
+    let owned = pass_cache(vault, config);
+    let cache: &dyn SegmentCache = owned.as_ref();
+    let loaded = load_with(vault, volume, true, Some(cache), &HashSet::new(), None)
         .await?
         .expect("load makes the index folder");
     let so_far = view::progress(&loaded.manifests);
@@ -1356,13 +1294,48 @@ async fn run_pass(
             id,
             ..Manifest::default()
         });
-    let by_path = loaded
-        .entries
-        .values()
-        .filter_map(|e| match e {
-            Entry::Record(r) => Some((r.path.clone(), r.ino)),
-            Entry::Gone { .. } | Entry::Moved { .. } => None,
-        })
+    let others: Vec<Manifest> = loaded
+        .manifests
+        .iter()
+        .filter(|m| m.id != id)
+        .cloned()
+        .collect();
+    // The generation's files, then the recent segments' on top.
+    let generation = match &loaded.header {
+        Some(h) => {
+            open::fetch_generation(vault, volume, &loaded.files, h, cache, &mut |_, _| {}).await?;
+            Some(Arc::new(open::generation_of(volume, h, cache).await?))
+        }
+        None => None,
+    };
+    let mut files: HashMap<u64, Known> = HashMap::new();
+    if let Some(g) = &generation {
+        let index = raft5fs_search::index::Index::new(
+            Some(Arc::clone(g)),
+            view::View::new(loaded.entries.values().cloned()),
+        );
+        for row in index.rows() {
+            files.insert(row.ino, Known::of_row(&row));
+        }
+    }
+    for e in loaded.entries.values() {
+        match e {
+            Entry::Record(r) => {
+                files.insert(r.ino, Known::of_record(r));
+            }
+            Entry::Gone { ino, .. } => {
+                files.remove(ino);
+            }
+            Entry::Moved { ino, path, .. } => {
+                if let Some(k) = files.get_mut(ino) {
+                    k.path.clone_from(path);
+                }
+            }
+        }
+    }
+    let by_path = files
+        .iter()
+        .map(|(&ino, k)| (k.path.clone(), ino))
         .collect();
     let mut pass = Pass {
         vault,
@@ -1371,7 +1344,12 @@ async fn run_pass(
         config,
         dir: loaded.dir,
         mine,
-        entries: loaded.entries,
+        files,
+        recent: loaded.entries,
+        generation,
+        header: loaded.header,
+        listing: loaded.files,
+        others,
         by_path,
         pending: Vec::new(),
         pending_bytes: 0,
@@ -1381,13 +1359,15 @@ async fn run_pass(
         stats: PassStats::default(),
         progress,
         told: Instant::now(),
-        read: loaded.read,
         segment_files: loaded.keys.len(),
         alive,
     };
     pass.mine.user = vault.remote().username().to_string();
     pass.mine.device = config.device.clone();
     pass.mine.model = tools.model().to_string();
+    if claimed {
+        pass.retire_due().await?;
+    }
     let mut full = kind == PassKind::Full
         || so_far.full_walk_ms == 0
         || started.saturating_sub(so_far.full_walk_ms) > FULL_WALK_EVERY_MS;
@@ -1429,7 +1409,7 @@ async fn run_pass(
             }
             // Files edited lately, which the log may not note again.
             for (&ino, _) in recent.iter().filter(|(ino, _)| !seen.contains(*ino)) {
-                let Some(Entry::Record(r)) = pass.entries.get(&ino).cloned() else {
+                let Some(r) = pass.files.get(&ino).cloned() else {
                     continue;
                 };
                 match vault.remote().getattr(ino).await {
@@ -1445,14 +1425,10 @@ async fn run_pass(
             // do more for than whoever indexed them: vectors a browser
             // left out, a PDF it couldn't read, an older reader's record.
             let behind: Vec<(u64, String)> = pass
-                .entries
-                .values()
-                .filter_map(|e| match e {
-                    Entry::Record(r) if !seen.contains(&r.ino) && !pass.embedded_as_now(r) => {
-                        Some((r.ino, r.path.clone()))
-                    }
-                    _ => None,
-                })
+                .files
+                .iter()
+                .filter(|(ino, k)| !seen.contains(*ino) && !pass.embedded_as_now(k))
+                .map(|(&ino, k)| (ino, k.path.clone()))
                 .collect();
             for (ino, path) in behind {
                 // A model that fails now would fail for each of them.
@@ -1491,7 +1467,10 @@ async fn run_pass(
         pass.save_manifest().await?;
     }
     if can_compact && pass.compaction_due() {
-        pass.compact(so_far.full_walk_ms).await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if config.cache_dir.is_some() {
+            pass.compact(so_far.full_walk_ms).await?;
+        }
     }
     Ok(pass.stats)
 }

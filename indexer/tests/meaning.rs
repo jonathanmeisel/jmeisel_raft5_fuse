@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use raft5fs_client::indexer::{
-    BuiltIn, Embed, IndexerConfig, PassKind, Tools, index_claimed, new_id, read_index,
+    BuiltIn, Embed, IndexerConfig, MemoryCache, PassKind, Tools, index_claimed, new_id, open,
 };
 use raft5fs_client::remote::Remote;
 use raft5fs_client::vault::Vault;
 use raft5fs_indexer::embed::{Embedder, MODEL, TextModel, cache_dir};
-use raft5fs_search::view::{QueryVector, View};
+use raft5fs_search::view::QueryVector;
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
 #[test]
@@ -76,7 +76,17 @@ fn a_query_finds_a_file_by_meaning_in_another_language() {
         ))
         .unwrap();
     assert!(stats.failed.is_empty(), "{:?}", stats.failed);
-    let view = View::new(rt.block_on(read_index(&vault, v)).unwrap().unwrap().entries);
+    // A small index, in recent segments only.
+    let opened = rt
+        .block_on(open::open(
+            &vault,
+            v,
+            Arc::new(MemoryCache::default()),
+            &mut |_, _| {},
+        ))
+        .unwrap()
+        .unwrap();
+    let view = &opened.index.recent;
     let query = "bike routes in vermont";
     let q = rt.block_on(embedder.query(query)).unwrap();
     let hits = view.search_with(
@@ -170,7 +180,17 @@ fn photos_are_found_by_what_they_show_with_thumbnails() {
         ))
         .unwrap();
     assert!(stats.failed.is_empty(), "{:?}", stats.failed);
-    let view = View::new(rt.block_on(read_index(&vault, v)).unwrap().unwrap().entries);
+    // A small index, in recent segments only.
+    let opened = rt
+        .block_on(open::open(
+            &vault,
+            v,
+            Arc::new(MemoryCache::default()),
+            &mut |_, _| {},
+        ))
+        .unwrap()
+        .unwrap();
+    let view = &opened.index.recent;
     assert!(view.has_image_model(CLIP_MODEL));
     for (query, want) in [
         ("Strand am Meer", "IMG_1.jpg"),

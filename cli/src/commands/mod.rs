@@ -293,6 +293,7 @@ impl SessionArgs {
             let index = IndexerConfig {
                 device: search::device_name(),
                 skip,
+                cache_dir: raft5fs_client::indexer::cache_base(),
                 ..IndexerConfig::default()
             };
             config.index = Some((index, native_tools()));

@@ -2,12 +2,13 @@
 
 use clap::Args;
 use raft5fs_client::cli::Context;
-use raft5fs_client::indexer::read_index;
+use raft5fs_client::indexer::open::{self, Opened};
 #[cfg(feature = "index")]
 use raft5fs_client::indexer::{
     Embed, ImageEmbed, IndexerConfig, PassKind, PassStats, describe, index_claimed,
     indexable_volumes, new_id, survey,
 };
+use raft5fs_client::indexer::{MemoryCache, SegmentCache, cache_base, disk_cache};
 use raft5fs_client::vault::Vault;
 #[cfg(feature = "index")]
 use raft5fs_indexer::clip::ImageEmbedder;
@@ -18,9 +19,10 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
+use raft5fs_search::index::Index;
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
-use raft5fs_search::view::{View, search_many};
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use super::{ConnectArgs, Outcome, log_in, runtime};
@@ -44,6 +46,10 @@ pub struct IndexArgs {
     /// Show how far indexing got in each volume. Changes nothing.
     #[arg(long, conflicts_with_all = ["full", "dry_run"])]
     pub status: bool,
+    /// Check how much searching only the nearest clusters loses, on each
+    /// volume's own vectors and file names. Changes nothing.
+    #[arg(long, conflicts_with_all = ["full", "dry_run", "status"])]
+    pub check_recall: bool,
 }
 
 #[derive(Args)]
@@ -64,7 +70,7 @@ pub struct SearchArgs {
 #[cfg(feature = "index")]
 fn query_vectors(
     runtime: &Runtime,
-    views: &[&View],
+    views: &[&Index],
     query: &str,
 ) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
     let text = if views.iter().any(|v| v.has_model(MODEL)) {
@@ -94,7 +100,7 @@ fn query_vectors(
 
 /// A build without the models: words, places and dates only.
 #[cfg(not(feature = "index"))]
-fn query_vectors(_: &Runtime, views: &[&View], _: &str) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+fn query_vectors(_: &Runtime, views: &[&Index], _: &str) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
     if views
         .iter()
         .any(|v| v.has_model(MODEL) || v.has_image_model(CLIP_MODEL))
@@ -193,15 +199,16 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     let mut failed = false;
     if args.status {
         for (label, ino) in volumes {
-            match runtime.block_on(read_index(&vault, ino)) {
+            match runtime.block_on(open_volume(&vault, ino)) {
                 Ok(None) => println!("{label}: not indexed yet"),
-                Ok(Some(index)) => {
-                    let p = index.progress;
+                Ok(Some(opened)) => {
+                    let p = &opened.progress;
                     let by = p
                         .updated_by
+                        .as_ref()
                         .map(|(user, device)| format!(" by {user} on {device}"))
                         .unwrap_or_default();
-                    let view = View::new(index.entries);
+                    let view = &opened.index;
                     let (photos, seen) = view.photos(CLIP_MODEL);
                     let pictures = if photos > 0 {
                         format!(", {photos} photos ({seen} searchable by what they show)")
@@ -213,6 +220,35 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
                         view.len(),
                         ago(p.updated_ms)
                     );
+                }
+                Err(e) => {
+                    println!("{label}: {e}");
+                    failed = true;
+                }
+            }
+        }
+        return Ok(if failed { 2 } else { 0 });
+    }
+    if args.check_recall {
+        for (label, ino) in volumes {
+            match runtime.block_on(open_volume(&vault, ino)) {
+                Ok(None) => println!("{label}: not indexed yet"),
+                Ok(Some(opened)) => {
+                    let c = runtime.block_on(open::check_recall(&opened, 50));
+                    let share = |r: Option<(f64, usize)>| match r {
+                        Some((recall, n)) => format!("{recall:.3} over {n} queries"),
+                        None => "nothing to check".into(),
+                    };
+                    println!("{label}:");
+                    println!("  by meaning: result recall {}", share(c.text));
+                    println!("  photos: result recall {}", share(c.photos));
+                    println!(
+                        "  by name: {} of {} files found in the first 10",
+                        c.names.0, c.names.1
+                    );
+                    if let Some(note) = c.note {
+                        println!("  ({note})");
+                    }
                 }
                 Err(e) => {
                     println!("{label}: {e}");
@@ -255,11 +291,19 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
         }
         return Ok(if failed { 2 } else { 0 });
     }
-    let config = IndexerConfig {
+    let mut config = IndexerConfig {
         pace: std::time::Duration::ZERO,
         device: device_name(),
+        cache_dir: cache_base(),
         ..IndexerConfig::default()
     };
+    // The browser tests compact small volumes, to search generations.
+    if let Some(n) = std::env::var("RAFT5FS_COMPACT_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.compact_min = n;
+    }
     let kind = if args.full {
         PassKind::Full
     } else {
@@ -302,6 +346,22 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     Ok(if failed { 2 } else { 0 })
 }
 
+/// `volume`'s index, kept in this device's cache between runs.
+async fn open_volume(
+    vault: &Vault,
+    volume: u64,
+) -> Result<Option<Opened>, raft5fs_proto::types::FsError> {
+    let cache: Arc<dyn SegmentCache> = cache_base()
+        .and_then(|base| disk_cache(vault, &base))
+        .unwrap_or_else(|| Arc::new(MemoryCache::default()));
+    open::open(vault, volume, cache, &mut |done, all| {
+        if all > 64 << 20 && done < all {
+            eprint!("\rdownloading the index: {}%", done * 100 / all.max(1));
+        }
+    })
+    .await
+}
+
 pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
@@ -314,20 +374,20 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     })?;
     let mut views = Vec::new();
     for (label, ino) in &volumes {
-        let index = match runtime.block_on(read_index(&vault, *ino)) {
-            Ok(Some(index)) => index,
+        let opened = match runtime.block_on(open_volume(&vault, *ino)) {
+            Ok(Some(o)) => o,
             Ok(None) => continue,
             // A folder inside a volume, or one this account can't read.
             Err(e) if e.errno == errno::EACCES || e.errno == errno::EINVAL => continue,
             Err(e) => return Err(format!("cannot read the index of {label}: {e}")),
         };
-        views.push((label, *ino, View::new(index.entries)));
+        views.push((label, opened));
     }
     if views.is_empty() {
         return Err("no volume here has a search index yet: run `raft5fs index`".into());
     }
-    let views_only: Vec<&View> = views.iter().map(|(_, _, v)| v).collect();
-    let (query_vector, image_vector) = query_vectors(&runtime, &views_only, &args.query);
+    let indexes: Vec<&Index> = views.iter().map(|(_, o)| &o.index).collect();
+    let (query_vector, image_vector) = query_vectors(&runtime, &indexes, &args.query);
     // All the volumes are ranked as one (`view::search_many`).
     let vector = query_vector.as_deref().map(|values| QueryVector {
         model: MODEL,
@@ -337,7 +397,14 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
         model: CLIP_MODEL,
         values,
     });
-    let merged = search_many(&views_only, &args.query, vector, image, args.limit);
+    let opened: Vec<&Opened> = views.iter().map(|(_, o)| o).collect();
+    let merged = runtime.block_on(open::search(
+        &opened,
+        &args.query,
+        vector,
+        image,
+        args.limit,
+    ));
     if merged.is_empty() {
         println!("nothing found");
         return Ok(1);

@@ -21,6 +21,9 @@ const FORMAT: u8 = 2;
 /// The id of one indexer: one device's index files are named by it.
 pub type IndexerId = [u8; 16];
 
+/// Manifests' names start so.
+const PREFIX: &str = "index-";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Manifest {
     pub id: IndexerId,
@@ -51,12 +54,17 @@ pub struct Manifest {
 impl Manifest {
     /// The file name of this indexer's manifest.
     pub fn file_name(id: &IndexerId) -> String {
-        format!("manifest-{}", raft5fs_wire::hex(id))
+        format!("{PREFIX}{}", raft5fs_wire::hex(id))
     }
 
-    /// The file name of this indexer's segment `n`.
+    /// Whether `name` is a manifest's (not one being written).
+    pub fn is_manifest(name: &str) -> bool {
+        name.starts_with(PREFIX) && !name.ends_with(".new")
+    }
+
+    /// The file name of this indexer's recent segment `n`.
     pub fn segment_name(id: &IndexerId, n: u32) -> String {
-        format!("seg-{}-{n}", raft5fs_wire::hex(id))
+        format!("recent-{}-{n}", raft5fs_wire::hex(id))
     }
 
     /// The file name of the thumbnails that segment `n`'s records show:
@@ -194,11 +202,13 @@ mod tests {
         let id = [1; 16];
         assert_eq!(
             Manifest::file_name(&id),
-            "manifest-01010101010101010101010101010101"
+            "index-01010101010101010101010101010101"
         );
+        assert!(Manifest::is_manifest(&Manifest::file_name(&id)));
+        assert!(!Manifest::is_manifest("index-01.new"));
         assert_eq!(
             Manifest::segment_name(&id, 3),
-            "seg-01010101010101010101010101010101-3"
+            "recent-01010101010101010101010101010101-3"
         );
     }
 }

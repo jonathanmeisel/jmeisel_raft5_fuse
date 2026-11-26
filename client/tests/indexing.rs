@@ -5,9 +5,10 @@
 use std::ffi::OsStr;
 use std::sync::Arc;
 
+use raft5fs_client::indexer::open::{self, Opened};
 use raft5fs_client::indexer::{
-    BuiltIn, Embed, IndexerConfig, PassKind, PassStats, Tools, index_claimed, indexable_volumes,
-    new_id, read_index, read_index_since,
+    BuiltIn, Embed, IndexerConfig, MemoryCache, PassKind, PassStats, SegmentCache, Tools,
+    index_claimed, indexable_volumes, new_id,
 };
 use raft5fs_client::remote::Remote;
 use raft5fs_client::session::{Session, SessionConfig};
@@ -15,7 +16,7 @@ use raft5fs_client::vault::{VIRTUAL_ROOT, Vault};
 use raft5fs_proto::errno;
 use raft5fs_search::INDEX_DIR;
 use raft5fs_search::manifest::{IndexerId, Manifest};
-use raft5fs_search::view::View;
+use raft5fs_search::view::{Hit, QueryVector};
 use raft5fs_testkit::{Backend, TEST_CHUNK_SIZE, TESTER, credentials, fs_tls};
 
 #[test]
@@ -70,30 +71,99 @@ fn pass_with(
     kind: PassKind,
     tools: &Tools,
 ) -> Result<PassStats, raft5fs_proto::types::FsError> {
+    let config = IndexerConfig {
+        pace: std::time::Duration::ZERO,
+        ..IndexerConfig::default()
+    };
     backend.runtime.block_on(index_claimed(
         vault,
         volume,
         id,
-        &IndexerConfig {
-            pace: std::time::Duration::ZERO,
-            ..IndexerConfig::default()
-        },
+        &config,
         tools,
         kind,
         &mut |_| {},
     ))
 }
 
+/// A folder of this test's own, for a device's cache.
+fn cache_dir() -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("raft5fs-index-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A pass by a device that compacts as soon as there is anything, and
+/// keeps what a compaction replaced for no time at all.
+fn compacting(
+    backend: &Backend,
+    vault: &Vault,
+    volume: u64,
+    id: IndexerId,
+    tools: &Tools,
+    cache: &std::path::Path,
+) -> Result<PassStats, raft5fs_proto::types::FsError> {
+    let config = IndexerConfig {
+        pace: std::time::Duration::ZERO,
+        compact_min: 1,
+        grace: std::time::Duration::ZERO,
+        cache_dir: Some(cache.to_path_buf()),
+        ..IndexerConfig::default()
+    };
+    backend.runtime.block_on(index_claimed(
+        vault,
+        volume,
+        id,
+        &config,
+        tools,
+        PassKind::Auto,
+        &mut |_| {},
+    ))
+}
+
+/// `volume`'s index, open, kept in `cache`.
+fn opened_in(
+    backend: &Backend,
+    vault: &Vault,
+    volume: u64,
+    cache: Arc<dyn SegmentCache>,
+) -> Option<Opened> {
+    backend
+        .runtime
+        .block_on(open::open(vault, volume, cache, &mut |_, _| {}))
+        .unwrap()
+}
+
+/// `volume`'s index, open, read afresh.
+fn opened(backend: &Backend, vault: &Vault, volume: u64) -> Option<Opened> {
+    opened_in(backend, vault, volume, Arc::new(MemoryCache::default()))
+}
+
+/// What a search of `volume` for `query` finds, best first; with `vector`
+/// (model and values), by meaning too.
+fn hits(
+    backend: &Backend,
+    vault: &Vault,
+    volume: u64,
+    query: &str,
+    vector: Option<(&str, &[f32])>,
+) -> Vec<Hit> {
+    let index = opened(backend, vault, volume).expect("the volume has an index");
+    let q = vector.map(|(model, values)| QueryVector { model, values });
+    backend
+        .runtime
+        .block_on(open::search(&[&index], query, q, None, 10))
+        .into_iter()
+        .map(|h| h.1)
+        .collect()
+}
+
 /// The paths that a search of `volume`'s index for `query` finds, best
 /// first.
 fn search(backend: &Backend, vault: &Vault, volume: u64, query: &str) -> Vec<String> {
-    let index = backend
-        .runtime
-        .block_on(read_index(vault, volume))
-        .unwrap()
-        .expect("the volume has an index");
-    View::new(index.entries)
-        .search(query, 10)
+    hits(backend, vault, volume, query, None)
         .into_iter()
         .map(|h| h.path)
         .collect()
@@ -396,8 +466,7 @@ fn a_session_indexes_in_the_background() {
     let tester = vault(&backend, TESTER);
     write(&backend, &tester, v, "first.txt", b"background words");
     let found = |query: &str| {
-        let index = rt.block_on(read_index(&tester, v)).unwrap();
-        index.is_some_and(|i| !View::new(i.entries).search(query, 5).is_empty())
+        opened(&backend, &tester, v).is_some() && !search(&backend, &tester, v, query).is_empty()
     };
     let wait_for = |query: &str| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -491,23 +560,23 @@ fn tools(embed: &Arc<Fake>) -> Tools {
 /// The models named by `volume`'s live records with text long enough to
 /// embed.
 fn models(backend: &Backend, vault: &Vault, volume: u64) -> Vec<String> {
-    let index = backend
-        .runtime
-        .block_on(read_index(vault, volume))
-        .unwrap()
-        .unwrap();
-    let mut out: Vec<String> = raft5fs_search::view::latest(index.entries)
-        .into_values()
-        .filter_map(|e| match e {
-            raft5fs_search::record::Entry::Record(r)
-                if r.chunks
-                    .iter()
-                    .any(|c| c.len >= raft5fs_search::view::MIN_MEANING_WORDS) =>
-            {
-                Some(r.model)
-            }
-            _ => None,
-        })
+    let index = opened(backend, vault, volume).unwrap().index;
+    let mut out: Vec<String> = index
+        .rows()
+        .into_iter()
+        .filter(|r| r.embeddable)
+        .map(|r| r.model)
+        .chain(
+            index
+                .recent
+                .live_records()
+                .filter(|r| {
+                    r.chunks
+                        .iter()
+                        .any(|c| c.len >= raft5fs_search::view::MIN_MEANING_WORDS)
+                })
+                .map(|r| r.model.clone()),
+        )
         .collect();
     out.sort();
     out
@@ -525,23 +594,9 @@ fn chunks_get_vectors_and_a_new_model_embeds_again() {
 
     // Searched by meaning: the query's words aren't in the file, but its
     // vector (from the fake model) is the file's.
-    let index = backend
-        .runtime
-        .block_on(read_index(&tester, v))
-        .unwrap()
-        .unwrap();
-    let view = View::new(index.entries);
     let q = Fake::vector("receipts for the tax return, due in April, kept in the blue folder");
-    let hits = view.search_with(
-        "quittungen",
-        Some(raft5fs_search::view::QueryVector {
-            model: "fake@1",
-            values: &q,
-        }),
-        None,
-        5,
-    );
-    assert_eq!(hits[0].path, "notes/tax.txt");
+    let found = hits(&backend, &tester, v, "quittungen", Some(("fake@1", &q)));
+    assert_eq!(found[0].path, "notes/tax.txt");
 
     // A new model that supersedes it: a walk embeds the two text files
     // again, not the photo.
@@ -647,29 +702,23 @@ fn a_second_read_fetches_only_new_segments() {
     let (v, _) = volume(&backend, &tester);
     let id = new_id();
     pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    let kept = Kept::default();
-    let read = |kept: &Kept| {
-        let index = rt
-            .block_on(raft5fs_client::indexer::read_index_cached(
-                &tester,
-                v,
-                Some(kept),
-            ))
-            .unwrap()
-            .unwrap();
-        View::new(index.entries)
-    };
-    read(&kept);
-    let first = kept.pieces.lock().unwrap().len();
-    assert!(first >= 1);
+    let kept = Arc::new(Kept::default());
+    let first = opened_in(&backend, &tester, v, kept.clone()).unwrap();
+    let pieces = kept.pieces.lock().unwrap().len();
+    assert!(pieces >= 1);
     assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     write(&backend, &tester, v, "new.txt", b"fresh");
     pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    let view = read(&kept);
-    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
-    // The old segments came from the cache; only the new one was read.
-    assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), first);
-    assert_eq!(kept.pieces.lock().unwrap().len(), first + 1);
+    let again = rt
+        .block_on(open::refresh(&tester, first, &mut |_, _| {}))
+        .unwrap()
+        .unwrap();
+    let found = rt.block_on(open::search(&[&again], "fresh", None, None, 5));
+    assert_eq!(found[0].1.path, "new.txt");
+    // Only the new segment was read; the old ones weren't asked again.
+    assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(kept.pieces.lock().unwrap().len(), pieces + 1);
+    assert_eq!(again.index.len(), 4);
 }
 
 /// Reads "PDFs" as plain text, to stand in for a device with a PDF reader.
@@ -820,12 +869,8 @@ fn thumbnails_are_kept_beside_their_records_and_read_back() {
     let id = new_id();
     pass_with(&backend, &tester, v, id, PassKind::Auto, &tools).unwrap();
     let thumb_of = |path: &str| {
-        let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
-        let hit = View::new(index.entries)
-            .search(
-                path.rsplit('/').next().unwrap().split('.').next().unwrap(),
-                5,
-            )
+        let name = path.rsplit('/').next().unwrap().split('.').next().unwrap();
+        let hit = hits(&backend, &tester, v, name, None)
             .into_iter()
             .find(|h| h.path == path)
             .unwrap_or_else(|| panic!("{path} not found"));
@@ -869,14 +914,15 @@ impl raft5fs_client::indexer::ImageEmbed for FakeImages {
 #[test]
 fn a_photo_another_device_indexed_gets_its_image_vector_here() {
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
     let tester = vault(&backend, TESTER);
     let (v, _) = volume(&backend, &tester);
     // A browser's pass: no image model.
     pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
     let has_vector = || {
-        let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
-        View::new(index.entries).has_image_model("fake-clip@1")
+        opened(&backend, &tester, v)
+            .unwrap()
+            .index
+            .has_image_model("fake-clip@1")
     };
     assert!(!has_vector());
     // A device with one fills it in at its next walk, and only the photo.
@@ -917,7 +963,6 @@ impl raft5fs_client::indexer::ImageEmbed for BlindImages {
 #[test]
 fn a_native_pass_fills_in_what_a_browser_left_out_without_a_walk() {
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
     let tester = vault(&backend, TESTER);
     let (v, _) = volume(&backend, &tester);
     // The browser's first pass walks the volume, by words only.
@@ -935,8 +980,13 @@ fn a_native_pass_fills_in_what_a_browser_left_out_without_a_walk() {
     assert!(!stats.full, "no walk was due");
     assert_eq!(stats.indexed, 3, "the text file, the track and the photo");
     assert_eq!(models(&backend, &tester, v), ["fake@1", "fake@1"]);
-    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
-    assert_eq!(View::new(index.entries).photos("fake-clip@1"), (1, 1));
+    assert_eq!(
+        opened(&backend, &tester, v)
+            .unwrap()
+            .index
+            .photos("fake-clip@1"),
+        (1, 1)
+    );
     // Then there's nothing more to do.
     let stats = pass_with(&backend, &tester, v, id, PassKind::Auto, &native).unwrap();
     assert_eq!(stats.indexed, 0);
@@ -945,7 +995,6 @@ fn a_native_pass_fills_in_what_a_browser_left_out_without_a_walk() {
 #[test]
 fn a_photo_the_model_cant_decode_is_tried_once() {
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
     let tester = vault(&backend, TESTER);
     let (v, _) = volume(&backend, &tester);
     let blind = Arc::new(BlindImages::default());
@@ -963,8 +1012,13 @@ fn a_photo_the_model_cant_decode_is_tried_once() {
     }
     assert_eq!(blind.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     // It counts as a photo, not as one searchable by what it shows.
-    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
-    assert_eq!(View::new(index.entries).photos("fake-clip@1"), (1, 0));
+    assert_eq!(
+        opened(&backend, &tester, v)
+            .unwrap()
+            .index
+            .photos("fake-clip@1"),
+        (1, 0)
+    );
 }
 
 #[test]
@@ -1030,19 +1084,39 @@ fn thumbs_tools() -> Tools {
 
 fn thumb_of(backend: &Backend, vault: &Vault, volume: u64, path: &str) -> Vec<u8> {
     let rt = &backend.runtime;
-    let index = rt.block_on(read_index(vault, volume)).unwrap().unwrap();
-    let hit = View::new(index.entries)
-        .search(path.split('.').next().unwrap(), 5)
-        .into_iter()
-        .find(|h| h.path == path)
-        .unwrap_or_else(|| panic!("{path} not found"));
+    let hit = hits(
+        backend,
+        vault,
+        volume,
+        path.split('.').next().unwrap(),
+        None,
+    )
+    .into_iter()
+    .find(|h| h.path == path)
+    .unwrap_or_else(|| panic!("{path} not found"));
     let thumb = hit.thumb.expect("a photo has a thumbnail");
     rt.block_on(raft5fs_client::indexer::read_thumb(vault, volume, &thumb))
         .unwrap()
 }
 
+/// The manifest of indexer `id` in `volume`'s index.
+fn manifest_of(backend: &Backend, vault: &Vault, volume: u64, id: &IndexerId) -> Manifest {
+    let rt = &backend.runtime;
+    let dir = rt
+        .block_on(vault.lookup(volume, OsStr::new(INDEX_DIR)))
+        .unwrap()
+        .ino;
+    let ino = rt
+        .block_on(vault.lookup(dir, OsStr::new(&Manifest::file_name(id))))
+        .unwrap()
+        .ino;
+    let size = rt.block_on(vault.remote().getattr(ino)).unwrap().size;
+    let bytes = rt.block_on(vault.read(ino, 0, size as usize)).unwrap();
+    raft5fs_search::manifest::decode_manifest(&bytes).unwrap()
+}
+
 #[test]
-fn compaction_leaves_one_indexers_files_and_the_same_index() {
+fn a_compaction_writes_one_generation_that_searches_the_same() {
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let tester = vault(&backend, TESTER);
@@ -1053,9 +1127,8 @@ fn compaction_leaves_one_indexers_files_and_the_same_index() {
     let tools = thumbs_tools();
     let (a, b) = (new_id(), new_id());
     let stats = pass_with(&backend, &tester, v, a, PassKind::Auto, &tools).unwrap();
-    assert!(!stats.compacted);
-    // Another device sees three photos go and one renamed: 4 of 10 entries
-    // are then dead, and the thumbnails file is mostly dead too.
+    assert!(!stats.compacted, "a small index stays in recent segments");
+    // Another device sees three photos go and one renamed, and compacts.
     for name in ["p1.jpg", "p2.jpg", "p3.jpg"] {
         rt.block_on(tester.unlink(v, OsStr::new(name))).unwrap();
     }
@@ -1067,16 +1140,23 @@ fn compaction_leaves_one_indexers_files_and_the_same_index() {
         false,
     ))
     .unwrap();
-    let stats = pass_with(&backend, &tester, v, b, PassKind::Auto, &tools).unwrap();
+    let cache = cache_dir();
+    let stats = compacting(&backend, &tester, v, b, &tools, &cache).unwrap();
     assert!(stats.compacted, "{stats:?}");
-    assert_eq!(
-        index_files(&backend, &tester, v),
-        [
-            Manifest::file_name(&b),
-            Manifest::segment_name(&b, 2),
-            Manifest::thumbs_name(&b, 1),
-        ]
+    let m = manifest_of(&backend, &tester, v, &b);
+    let generation = m.generation.expect("the manifest names its generation");
+    assert!(m.segments.is_empty());
+    let files = index_files(&backend, &tester, v);
+    assert!(files.contains(&raft5fs_search::generation::head_name(&generation)));
+    assert!(!files.contains(&Manifest::file_name(&a)), "{files:?}");
+    // What it replaced stays, retired, for readers part-way through it.
+    assert!(
+        m.retired
+            .iter()
+            .any(|(name, _)| name == &Manifest::segment_name(&a, 0))
     );
+    assert!(files.contains(&Manifest::segment_name(&a, 0)));
+
     assert_eq!(search(&backend, &tester, v, "receipts"), ["notes/tax.txt"]);
     assert_eq!(search(&backend, &tester, v, "kingdom"), ["ride.gpx"]);
     assert!(search(&backend, &tester, v, "p1").is_empty());
@@ -1084,10 +1164,14 @@ fn compaction_leaves_one_indexers_files_and_the_same_index() {
         thumb_of(&backend, &tester, v, "shore.jpg"),
         b"thumb of photo.jpg"
     );
-    // How far indexing got is kept.
-    let index = rt.block_on(read_index(&tester, v)).unwrap().unwrap();
-    assert!(index.progress.full_walk_ms > 0);
-    // The first device goes on, with a manifest of its own again.
+    let index = opened(&backend, &tester, v).unwrap();
+    assert!(
+        index.progress.full_walk_ms > 0,
+        "how far indexing got is kept"
+    );
+    assert_eq!(index.index.len(), 3);
+
+    // The first device goes on, in recent segments over the generation.
     write(
         &backend,
         &tester,
@@ -1099,79 +1183,80 @@ fn compaction_leaves_one_indexers_files_and_the_same_index() {
     assert_eq!(stats.indexed, 1);
     assert_eq!(search(&backend, &tester, v, "compaction"), ["later.txt"]);
     assert_eq!(search(&backend, &tester, v, "receipts"), ["notes/tax.txt"]);
-}
 
-#[test]
-fn a_thumbnails_file_another_record_still_shows_is_kept() {
-    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
-    let tester = vault(&backend, TESTER);
-    let (v, notes) = volume(&backend, &tester);
-    let tools = thumbs_tools();
-    let (a, b) = (new_id(), new_id());
-    pass_with(&backend, &tester, v, a, PassKind::Auto, &tools).unwrap();
-    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
-        .unwrap();
-    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
-        .unwrap();
-    let stats = pass_with(&backend, &tester, v, b, PassKind::Auto, &tools).unwrap();
-    assert!(stats.compacted, "{stats:?}");
+    // The next compaction deletes what the first retired, and folds the
+    // new file in.
+    let stats = compacting(&backend, &tester, v, b, &tools, &cache).unwrap();
+    assert!(stats.compacted);
+    let files = index_files(&backend, &tester, v);
+    assert!(!files.contains(&Manifest::segment_name(&a, 0)), "{files:?}");
+    let old_head = raft5fs_search::generation::head_name(&generation);
+    let m = manifest_of(&backend, &tester, v, &b);
+    assert!(m.retired.iter().any(|(name, _)| *name == old_head));
+    // The pass after deletes the first generation it retired.
+    compacting(&backend, &tester, v, b, &tools, &cache).unwrap();
+    assert!(!index_files(&backend, &tester, v).contains(&old_head));
+    assert_eq!(search(&backend, &tester, v, "compaction"), ["later.txt"]);
     assert_eq!(
-        index_files(&backend, &tester, v),
-        [
-            Manifest::file_name(&b),
-            Manifest::segment_name(&b, 1),
-            Manifest::thumbs_name(&a, 0),
-        ]
-    );
-    assert_eq!(
-        thumb_of(&backend, &tester, v, "photo.jpg"),
+        thumb_of(&backend, &tester, v, "shore.jpg"),
         b"thumb of photo.jpg"
     );
-    assert!(search(&backend, &tester, v, "receipts").is_empty());
+    std::fs::remove_dir_all(cache).unwrap();
 }
 
 #[test]
-fn a_read_since_the_last_gets_only_new_entries_until_a_compaction() {
+fn a_refresh_reads_new_segments_and_a_compaction_switches_the_generation() {
     let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
     let rt = &backend.runtime;
     let tester = vault(&backend, TESTER);
     let (v, notes) = volume(&backend, &tester);
     let id = new_id();
     pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    let kept = Kept::default();
-    let since = |known: &std::collections::HashSet<String>| {
-        rt.block_on(read_index_since(&tester, v, Some(&kept), known))
+    let kept = Arc::new(Kept::default());
+    let first = opened_in(&backend, &tester, v, kept.clone()).unwrap();
+    assert!(first.header.is_none());
+    assert_eq!(first.index.len(), 3);
+    write(&backend, &tester, v, "new.txt", b"fresh");
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let refresh = |o: Opened| {
+        rt.block_on(open::refresh(&tester, o, &mut |_, _| {}))
             .unwrap()
             .unwrap()
     };
-    let first = since(&Default::default());
-    assert!(!first.reset);
-    assert_eq!(first.entries.len(), 3);
-    let mut view = View::new(first.entries);
-    write(&backend, &tester, v, "new.txt", b"fresh");
-    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    let second = since(&first.keys.iter().cloned().collect());
-    assert!(!second.reset);
-    assert_eq!(second.entries.len(), 1);
-    view.add(second.entries);
-    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
-    assert_eq!(view.len(), 4);
-    // A compaction takes the known segments away: the next read is whole,
-    // and the cache lets go of what's gone.
+    let second = refresh(first);
+    assert_eq!(second.index.len(), 4);
+    // A compaction: the next refresh reads the new generation, and the
+    // cache lets go of what's gone.
     rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
         .unwrap();
     rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
         .unwrap();
-    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    assert!(stats.compacted, "{stats:?}");
-    let third = since(&second.keys.iter().cloned().collect());
-    assert!(third.reset);
-    assert_eq!(third.keys.len(), 1);
-    let view = View::new(third.entries);
-    assert_eq!(view.len(), 2);
-    let cached: Vec<String> = kept.pieces.lock().unwrap().keys().cloned().collect();
-    assert_eq!(cached, third.keys);
+    let cache = cache_dir();
+    assert!(
+        compacting(&backend, &tester, v, id, &Tools::words_only(), &cache)
+            .unwrap()
+            .compacted
+    );
+    let third = refresh(second);
+    assert!(third.header.is_some());
+    assert_eq!(third.index.len(), 2);
+    let mut cached: Vec<String> = kept.pieces.lock().unwrap().keys().cloned().collect();
+    let mut keys = third.keys();
+    cached.sort();
+    keys.sort();
+    assert_eq!(cached, keys);
+    // New files after it come in recent segments, on the same generation.
+    write(&backend, &tester, v, "later.txt", b"later words");
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let fourth = refresh(third);
+    assert_eq!(
+        fourth.header.as_ref().map(|h| h.id),
+        fourth.header.as_ref().map(|h| h.id)
+    );
+    assert_eq!(fourth.index.len(), 3);
+    let found = rt.block_on(open::search(&[&fourth], "later", None, None, 5));
+    assert_eq!(found[0].1.path, "later.txt");
+    std::fs::remove_dir_all(cache).unwrap();
 }
 
 #[test]
@@ -1210,9 +1295,11 @@ fn an_index_with_a_file_it_cant_read_is_not_compacted() {
         .unwrap();
     rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
         .unwrap();
-    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let cache = cache_dir();
+    let stats = compacting(&backend, &tester, v, id, &Tools::words_only(), &cache).unwrap();
     assert!(!stats.compacted);
     assert!(index_files(&backend, &tester, v).contains(&newer));
+    std::fs::remove_dir_all(cache).unwrap();
 }
 
 /// An extractor that never finishes a text file: a pass stuck in it.
@@ -1351,61 +1438,6 @@ fn a_busy_volume_says_when_its_claim_runs_out() {
     assert!(text.contains("runs out in 10 minutes"), "{text}");
 }
 
-#[test]
-fn reading_a_segment_at_a_time_gives_the_same_index_and_stops_at_a_compaction() {
-    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
-    let rt = &backend.runtime;
-    let tester = vault(&backend, TESTER);
-    let (v, notes) = volume(&backend, &tester);
-    let id = new_id();
-    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    write(&backend, &tester, v, "new.txt", b"fresh");
-    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
-    let into = |known: &std::collections::HashSet<String>| {
-        let mut batches = Vec::new();
-        let head = rt
-            .block_on(raft5fs_client::indexer::read_index_into(
-                &tester,
-                v,
-                None,
-                known,
-                &mut |e| batches.push(e),
-            ))
-            .unwrap()
-            .unwrap();
-        (head, batches)
-    };
-    // Whole, a segment at a time: one batch for each segment.
-    let (head, batches) = into(&Default::default());
-    assert!(!head.reset);
-    assert_eq!(batches.len(), head.keys.len());
-    let mut view = View::default();
-    for b in batches {
-        view.add(b);
-    }
-    view.shrink();
-    assert_eq!(view.search("fresh", 5)[0].path, "new.txt");
-    assert_eq!(view.len(), 4);
-    // Nothing new since: nothing read.
-    let known: std::collections::HashSet<String> = head.keys.iter().cloned().collect();
-    let (again, batches) = into(&known);
-    assert!(!again.reset && batches.is_empty());
-    // A compaction takes the known segments away: it says so, reading
-    // nothing.
-    rt.block_on(tester.unlink(notes, OsStr::new("tax.txt")))
-        .unwrap();
-    rt.block_on(tester.unlink(v, OsStr::new("ride.gpx")))
-        .unwrap();
-    assert!(
-        pass(&backend, &tester, v, id, PassKind::Auto)
-            .unwrap()
-            .compacted
-    );
-    let (after, batches) = into(&known);
-    assert!(after.reset);
-    assert!(batches.is_empty());
-}
-
 /// A model that notes how many passages each call gives it.
 #[derive(Default)]
 struct Batches(std::sync::Mutex<Vec<usize>>);
@@ -1473,7 +1505,7 @@ fn a_pass_over_large_files_stores_them_in_several_segments() {
     pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
     let segments = index_files(&backend, &tester, v)
         .into_iter()
-        .filter(|n| n.starts_with("seg-"))
+        .filter(|n| n.starts_with("recent-"))
         .count();
     assert!(segments >= 2, "{segments} segments");
     assert_eq!(search(&backend, &tester, v, "w3x399999"), ["big3.txt"]);

@@ -1,6 +1,12 @@
-//! Search in the browser: each volume's index read into memory and searched
-//! by path, words and meaning.
+//! Search in the browser: each volume's index downloaded, kept in the
+//! cache, and searched by path, words and meaning.
 //!
+//! - **Downloading.** A volume's index is downloaded whole, so what the
+//!   browser fetches never depends on a query. One bigger than
+//!   `DOWNLOAD_LIMIT` is downloaded only if asked (the app's per-volume
+//!   setting); one not downloaded isn't searched here. A big download runs
+//!   in the background, and the volume is searched once it is in; a new
+//!   generation downloads while the old one is still searched.
 //! - **The browser doesn't index.** Native devices write the index (words,
 //!   vectors and thumbnails); the models here embed queries only.
 //! - **The app's tools.** The Worker gives `setSearchTools` functions:
@@ -16,11 +22,12 @@
 //!   in, or all it has loaded.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use js_sys::{Array, Float32Array, Function, Promise, Uint8Array};
+use raft5fs_client::indexer::open::{self as index_open, Opened};
 use raft5fs_client::indexer::{self, SegmentCache};
 use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
@@ -28,7 +35,7 @@ use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
 use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
-use raft5fs_search::view::{QueryVector, View, search_many};
+use raft5fs_search::view::QueryVector;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
@@ -44,14 +51,30 @@ pub(crate) struct State {
     /// Each loaded volume's view, by inode, with its path and how far
     /// indexing got.
     views: RefCell<HashMap<u64, Rc<Loaded>>>,
+    /// Downloads in the background, by inode: bytes done and in all, and
+    /// the error that ended one.
+    downloads: RefCell<HashMap<u64, Rc<RefCell<Download>>>>,
+    /// The limits that tests lower (`setSearchLimits`).
+    limits: RefCell<Option<(u64, u64)>>,
 }
+
+/// A download in the background.
+#[derive(Default)]
+struct Download {
+    done: u64,
+    total: u64,
+    error: Option<String>,
+}
+
+/// An index bigger than this is downloaded only if asked.
+pub const DOWNLOAD_LIMIT: u64 = 500 << 20;
+/// One smaller than this is downloaded at once, before the search: it is
+/// quick, and the search then has it.
+pub const INLINE_LIMIT: u64 = 16 << 20;
 
 struct Loaded {
     path: String,
-    view: View,
-    /// The segments `view` holds, to read only new ones next time.
-    keys: HashSet<String>,
-    progress: raft5fs_search::view::Progress,
+    opened: Opened,
     /// Whether its owner has turned indexing off.
     off: bool,
     /// When it was read (ms).
@@ -190,6 +213,14 @@ struct LoadedJs {
     by: Option<String>,
     /// Whether its files have vectors, so a query is embedded too.
     meaning: bool,
+    /// Its generation's size in bytes (0 before a compaction).
+    bytes: f64,
+    /// Whether it is downloaded and searched here.
+    downloaded: bool,
+    /// A download in progress: bytes done and in all.
+    downloading: Option<(f64, f64)>,
+    /// Why the last download failed, if it did.
+    download_error: Option<String>,
     /// Whether its owner has turned indexing off.
     off: bool,
     /// How many photos it has, and how many of them can be found by what
@@ -234,66 +265,73 @@ impl Inner {
         }
     }
 
-    async fn load_view(&self, ino: u64, path: String) -> Result<Rc<Loaded>, FsError> {
+    /// The download limits: (ask above, background above).
+    fn limits(&self) -> (u64, u64) {
+        self.search
+            .limits
+            .borrow()
+            .unwrap_or((DOWNLOAD_LIMIT, INLINE_LIMIT))
+    }
+
+    /// Reads volume `ino`'s index if it wasn't read in the last minute,
+    /// fetching only what this browser hasn't kept. `download` is the
+    /// app's setting for it: `None` downloads it unless it is bigger than
+    /// `DOWNLOAD_LIMIT`. Gives what search shows of it.
+    async fn load_view(
+        self: &Rc<Self>,
+        ino: u64,
+        path: String,
+        download: Option<bool>,
+    ) -> Result<LoadedJs, FsError> {
         let now = js_sys::Date::now();
-        if let Some(l) = self.search.views.borrow().get(&ino)
-            && now - l.at < RELOAD_MS
-        {
-            return Ok(Rc::clone(l));
-        }
-        let off = self.vault().remote().get_volume(ino).await?.indexing_off;
-        let tools = self.tools().ok();
-        let cache = tools.map(JsCache);
-        let cache = cache.as_ref().map(|c| c as &dyn SegmentCache);
-        let known = self
+        let fresh = self
             .search
             .views
             .borrow()
             .get(&ino)
-            .map(|l| l.keys.clone())
+            .filter(|l| now - l.at < RELOAD_MS)
+            .cloned();
+        if let Some(l) = fresh {
+            return Ok(self.with_download(ino, loaded_js(&l)));
+        }
+        let off = self.vault().remote().get_volume(ino).await?.indexing_off;
+        let head = index_open::head(self.vault(), ino)
+            .await?
             .unwrap_or_default();
-        // What is new since the last read: a few segments, so collected.
-        let mut delta = Vec::new();
-        let head = if known.is_empty() {
-            None
-        } else {
-            indexer::read_index_into(self.vault(), ino, cache, &known, &mut |e| delta.extend(e))
-                .await?
-        };
+        let bytes = head.generation.map_or(0, |g| g.1);
+        let (ask_above, inline_below) = self.limits();
+        if !download.unwrap_or(bytes <= ask_above) {
+            // Not here: forget what this browser kept of it.
+            self.search.views.borrow_mut().remove(&ino);
+            self.cache().keep_only(ino, &[]).await;
+            return Ok(skipped_js(path, &head, bytes, off));
+        }
         let old = self.search.views.borrow_mut().remove(&ino);
-        let old = old.and_then(|l| Rc::try_unwrap(l).ok());
-        let grown = match (head, old) {
-            (Some(h), Some(mut l)) if !h.reset => {
-                l.view.add(delta);
-                l.view.shrink();
-                Some((l.view, h.keys.into_iter().collect(), h.progress))
-            }
-            // A first read, a segment compacted away, or a search still
-            // holding the old view: the index is read whole (from the
-            // cache), a segment at a time, into a new view.
-            _ => None,
-        };
-        let (view, keys, progress) = match grown {
-            Some(g) => g,
-            None => {
-                let mut view = View::default();
-                let head =
-                    indexer::read_index_into(self.vault(), ino, cache, &HashSet::new(), &mut |e| {
-                        view.add(e)
-                    })
-                    .await?;
-                view.shrink();
-                match head {
-                    Some(h) => (view, h.keys.into_iter().collect(), h.progress),
-                    None => (View::default(), HashSet::new(), Default::default()),
+        let same =
+            old.as_ref().map(|l| l.opened.generation()) == Some(head.generation.map(|g| g.0));
+        // A new generation (or a first download) that is big: in the
+        // background, while the old one, if any, is still searched.
+        if !same && bytes >= inline_below {
+            self.download_later(ino, path.clone(), off);
+            return match old {
+                Some(l) => {
+                    let js = loaded_js(&l);
+                    self.search.views.borrow_mut().insert(ino, l);
+                    Ok(self.with_download(ino, js))
                 }
-            }
+                None => Ok(self.with_download(ino, skipped_js(path, &head, bytes, off))),
+            };
+        }
+        // A search still holding the old one: read it whole again.
+        let old = old.and_then(|l| Rc::try_unwrap(l).ok());
+        let opened = match old {
+            Some(l) => index_open::refresh(self.vault(), l.opened, &mut |_, _| {}).await?,
+            None => index_open::open(self.vault(), ino, self.cache(), &mut |_, _| {}).await?,
         };
+        let opened = opened.unwrap_or_else(|| Opened::empty(ino, self.cache()));
         let loaded = Rc::new(Loaded {
             path,
-            view,
-            keys,
-            progress,
+            opened,
             off,
             at: now,
         });
@@ -301,25 +339,119 @@ impl Inner {
             .views
             .borrow_mut()
             .insert(ino, Rc::clone(&loaded));
-        Ok(loaded)
+        Ok(loaded_js(&loaded))
+    }
+
+    /// `js`, with the volume's download in progress, if one is.
+    fn with_download(&self, ino: u64, mut js: LoadedJs) -> LoadedJs {
+        if let Some(d) = self.search.downloads.borrow().get(&ino) {
+            let d = d.borrow();
+            if d.error.is_none() {
+                js.downloading = Some((d.done as f64, d.total as f64));
+            }
+            js.download_error.clone_from(&d.error);
+        }
+        js
+    }
+
+    /// Downloads volume `ino`'s index in the background, unless that is
+    /// running already; the volume is searched once it is in. Pieces are
+    /// kept as they come, so a download cut short goes on from there.
+    fn download_later(self: &Rc<Self>, ino: u64, path: String, off: bool) {
+        if self
+            .search
+            .downloads
+            .borrow()
+            .get(&ino)
+            .is_some_and(|d| d.borrow().error.is_none())
+        {
+            return;
+        }
+        let state = Rc::new(RefCell::new(Download::default()));
+        self.search
+            .downloads
+            .borrow_mut()
+            .insert(ino, Rc::clone(&state));
+        let inner = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let shown = Rc::clone(&state);
+            let mut progress = move |done: u64, total: u64| {
+                let mut d = shown.borrow_mut();
+                d.done = done;
+                d.total = total;
+            };
+            match index_open::open(inner.vault(), ino, inner.cache(), &mut progress).await {
+                Ok(opened) => {
+                    let loaded = Rc::new(Loaded {
+                        path,
+                        opened: opened.unwrap_or_else(|| Opened::empty(ino, inner.cache())),
+                        off,
+                        at: js_sys::Date::now(),
+                    });
+                    inner.search.views.borrow_mut().insert(ino, loaded);
+                    inner.search.downloads.borrow_mut().remove(&ino);
+                }
+                Err(e) => state.borrow_mut().error = Some(e.message),
+            }
+        });
+    }
+
+    /// Where this tab keeps index files: IndexedDB through the app, or
+    /// memory before the app gives its tools.
+    // A browser runs the client on one thread, where this never crosses
+    // to another.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn cache(&self) -> Arc<dyn SegmentCache> {
+        match self.tools() {
+            Ok(tools) => Arc::new(JsCache(tools)),
+            Err(_) => Arc::new(indexer::MemoryCache::default()),
+        }
     }
 }
 
-fn loaded_js(l: &Loaded) -> LoadedJs {
-    let p = &l.progress;
+/// A volume that isn't downloaded here, for JavaScript.
+fn skipped_js(volume: String, head: &index_open::Head, bytes: u64, off: bool) -> LoadedJs {
+    let p = &head.progress;
     LoadedJs {
-        volume: l.path.clone(),
+        volume,
         indexed: p.updated_ms > 0,
-        files: l.view.len(),
+        files: 0,
         updated_ms: p.updated_ms as f64,
         by: p
             .updated_by
             .as_ref()
             .map(|(user, device)| format!("{user} on {device}")),
-        meaning: l.view.has_model(TEXT_MODEL),
+        meaning: false,
+        bytes: bytes as f64,
+        downloaded: false,
+        downloading: None,
+        download_error: None,
+        off,
+        photos: 0,
+        photos_seen: 0,
+    }
+}
+
+fn loaded_js(l: &Loaded) -> LoadedJs {
+    let p = &l.opened.progress;
+    let view = &l.opened.index;
+    LoadedJs {
+        volume: l.path.clone(),
+        indexed: p.updated_ms > 0,
+        files: view.len(),
+        updated_ms: p.updated_ms as f64,
+        by: p
+            .updated_by
+            .as_ref()
+            .map(|(user, device)| format!("{user} on {device}")),
+        meaning: view.has_model(TEXT_MODEL),
+        bytes: l.opened.bytes() as f64,
+        downloaded: true,
+        downloading: None,
+        download_error: None,
         off: l.off,
-        photos: l.view.photos(CLIP_MODEL).0,
-        photos_seen: l.view.photos(CLIP_MODEL).1,
+        photos: view.photos(CLIP_MODEL).0,
+        photos_seen: view.photos(CLIP_MODEL).1,
     }
 }
 
@@ -353,16 +485,52 @@ impl Fs {
     }
 
     /// Reads the index of the volume that `path` is in, if it wasn't read in
-    /// the last minute, fetching only what this browser hasn't kept. Gives
-    /// `{volume, indexed, files, updatedMs, by, meaning, off}`.
+    /// the last minute, fetching only what this browser hasn't kept.
+    /// `download` is this browser's setting for the volume: true, false, or
+    /// null for the default (download unless it is over 500 MiB). Gives
+    /// `{volume, indexed, files, updatedMs, by, meaning, bytes, downloaded,
+    /// downloading: [done, total] or null, downloadError, off, photos,
+    /// photosSeen}`; a volume not `downloaded` isn't searched.
     #[wasm_bindgen(js_name = searchLoad)]
-    pub fn search_load(&self, path: String) -> Promise {
+    pub fn search_load(&self, path: String, download: Option<bool>) -> Promise {
         let inner = Rc::clone(&self.0);
         promise(async move {
             let (ino, volume) = inner.search_volume_at(&path).await?;
-            let loaded = inner.load_view(ino, volume).await?;
-            Ok(loaded_js(&loaded))
+            inner.load_view(ino, volume, download).await
         })
+    }
+
+    /// How big the index of the volume `path` is in, in bytes, and the size
+    /// above which this browser asks before downloading one: `{bytes,
+    /// limit}`. Reads only its manifests and header.
+    #[wasm_bindgen(js_name = searchSize)]
+    pub fn search_size(&self, path: String) -> Promise {
+        #[derive(Serialize)]
+        struct Size {
+            bytes: f64,
+            limit: f64,
+        }
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let (ino, _) = inner.search_volume_at(&path).await?;
+            let head = index_open::head(inner.vault(), ino)
+                .await?
+                .unwrap_or_default();
+            Ok(Size {
+                bytes: head.generation.map_or(0, |g| g.1) as f64,
+                limit: inner.limits().0 as f64,
+            })
+        })
+    }
+
+    /// For the browser tests only: the download limits, in bytes (ask
+    /// above `ask`, in the background above `background`).
+    #[wasm_bindgen(js_name = setSearchLimits)]
+    pub fn set_search_limits(&self, ask: f64, background: f64) {
+        self.0
+            .search
+            .limits
+            .replace(Some((ask as u64, background as u64)));
     }
 
     /// Searches the loaded volumes whose paths are in `volumes` (all
@@ -408,10 +576,12 @@ impl Fs {
                 .map(|(&ino, l)| (ino, Rc::clone(l)))
                 .collect();
             let limit = limit.clamp(1, 200) as usize;
-            let has_vectors = views.iter().any(|(_, l)| l.view.has_model(TEXT_MODEL));
+            let has_vectors = views
+                .iter()
+                .any(|(_, l)| l.opened.index.has_model(TEXT_MODEL));
             let has_images = views
                 .iter()
-                .any(|(_, l)| l.view.has_image_model(CLIP_MODEL));
+                .any(|(_, l)| l.opened.index.has_image_model(CLIP_MODEL));
             let mut meaning_error = None;
             let vector = if meaning && has_vectors {
                 let embedded = match inner.tools() {
@@ -445,9 +615,10 @@ impl Fs {
                 model: CLIP_MODEL,
                 values,
             });
-            // All the volumes are ranked as one (`view::search_many`).
-            let all: Vec<&View> = views.iter().map(|(_, l)| &l.view).collect();
-            let hits = search_many(&all, &query, q, image, limit)
+            // All the volumes are ranked as one (`index::search`).
+            let all: Vec<&Opened> = views.iter().map(|(_, l)| &l.opened).collect();
+            let hits = index_open::search(&all, &query, q, image, limit)
+                .await
                 .into_iter()
                 .map(|(i, h)| {
                     let (ino, l) = &views[i];
@@ -492,6 +663,7 @@ impl Fs {
         #[serde(rename_all = "camelCase")]
         struct Sizes {
             volumes: usize,
+            generation_files: usize,
             docs: usize,
             live: usize,
             chunks: usize,
@@ -502,7 +674,13 @@ impl Fs {
         }
         let mut out = Sizes::default();
         for l in self.0.search.views.borrow().values() {
-            let s = l.view.stats();
+            let s = l.opened.index.recent.stats();
+            out.generation_files += l
+                .opened
+                .index
+                .generation
+                .as_ref()
+                .map_or(0, |g| g.rows().len());
             out.volumes += 1;
             out.docs += s.docs;
             out.live += s.live;
