@@ -11,10 +11,10 @@
 
 use std::collections::HashMap;
 
-use crate::bm25::{Bm25, Stats, query_terms};
+use crate::bm25::Bm25;
 use crate::manifest::Manifest;
-use crate::paths::{PathMatches, Paths, word_weights};
-use crate::rank::{Ranking, above_cutoff, merge};
+use crate::paths::Paths;
+use crate::rank::Ranking;
 use crate::record::{DocKind, Entry, Record};
 use crate::vector::{self, dot};
 
@@ -296,6 +296,11 @@ impl View {
         self.codes = codes;
     }
 
+    /// The live records.
+    pub fn live_records(&self) -> impl Iterator<Item = &Record> {
+        self.records().map(|(_, r)| r)
+    }
+
     /// The live docs, with their numbers.
     fn records(&self) -> impl Iterator<Item = (usize, &Record)> + Clone {
         self.docs
@@ -311,6 +316,14 @@ impl View {
     /// Moves of files whose records this view doesn't have.
     pub fn moves(&self) -> &HashMap<u64, (u64, String)> {
         &self.moves
+    }
+
+    /// The newest entry's time for each inode, and whether it is a live
+    /// record here: what tells which of a generation's files are dead.
+    pub fn newest(&self) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
+        self.newest
+            .iter()
+            .map(|(&ino, &(at, doc))| (ino, at, doc.is_some()))
     }
 
     /// How big the view is, for measuring its memory.
@@ -451,11 +464,25 @@ impl Cutoff {
     /// The lowest score that counts among `scores`.
     pub fn threshold(&self, scores: &[f32]) -> f32 {
         let best = scores.iter().copied().fold(f32::MIN, f32::max);
+        let all: Vec<(f32, f32)> = scores.iter().map(|&s| (s, 1.0)).collect();
+        self.threshold_with(best, &all)
+    }
+
+    /// The lowest score that counts, given the best match and the scores
+    /// of the whole search, each standing for `weight` files. A search
+    /// that scored only some files (the nearest clusters) gives a sample
+    /// of the rest here, so the spread rule sees every file, not only the
+    /// near ones.
+    pub fn threshold_with(&self, best: f32, population: &[(f32, f32)]) -> f32 {
         let mut least = self.floor.max(best - self.margin);
-        if scores.len() >= MIN_SPREAD_POPULATION {
-            let n = scores.len() as f32;
-            let mean = scores.iter().sum::<f32>() / n;
-            let var = scores.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+        let n: f32 = population.iter().map(|p| p.1).sum();
+        if n >= MIN_SPREAD_POPULATION as f32 {
+            let mean = population.iter().map(|p| p.0 * p.1).sum::<f32>() / n;
+            let var = population
+                .iter()
+                .map(|p| (p.0 - mean) * (p.0 - mean) * p.1)
+                .sum::<f32>()
+                / n;
             least = least.max(mean + self.z * var.sqrt());
         }
         least
@@ -506,18 +533,8 @@ pub fn search_many(
     search_many_with(views, query, vector, image, limit, &Ranking::default())
 }
 
-/// `search_many`, ranked by `ranking`.
-///
-/// - **Paths:** query words in folder and file names (`paths`).
-/// - **Keywords:** BM25 over files, with statistics from every view
-///   together, so scores compare across views. A match needs
-///   `min_coverage` of the query's weight and `keyword_margin` of the best
-///   score. It scores its share of the best, times its coverage to the
-///   power `coverage_power`.
-/// - **Meaning and photos:** chosen from every view's scores together
-///   (`Cutoff`), so a view with nothing relevant gives none. A match
-///   scores from 0.5 at the cutoff to 1 at `span` above it.
-/// - The lists are merged by score (`rank::merge`), once, over all views.
+/// `search_many`, ranked by `ranking`: as `index::search`, over views
+/// alone.
 pub fn search_many_with(
     views: &[&View],
     query: &str,
@@ -526,158 +543,22 @@ pub fn search_many_with(
     limit: usize,
     ranking: &Ranking,
 ) -> Vec<(usize, Hit)> {
-    // Each list looks deeper than the result, so a file a little way
-    // down several still rises.
-    let depth = limit.saturating_mul(3).max(10);
-    type Key = (usize, usize);
-
-    let terms = query_terms(query);
-    // Paths, with word weights from every view together.
-    let matches: Vec<PathMatches> = views
-        .iter()
-        .map(|v| v.paths.matching(&terms, |doc| v.docs[doc].is_some()))
-        .collect();
-    let mut df = vec![0usize; terms.len()];
-    for m in &matches {
-        for (d, n) in df.iter_mut().zip(&m.df) {
-            *d += n;
-        }
-    }
-    let weights = word_weights(&df, matches.iter().map(|m| m.docs).sum());
-    let mut paths: Vec<(Key, f32)> = Vec::new();
-    for (i, m) in matches.into_iter().enumerate() {
-        paths.extend(
-            m.ranked(&weights, depth)
-                .into_iter()
-                .map(|(doc, s)| ((i, doc), s)),
-        );
-    }
-    paths.retain(|p| p.1 >= ranking.min_coverage * 0.5);
-    paths.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    paths.truncate(depth);
-
-    let mut stats = Stats::default();
-    for v in views {
-        v.keywords.add_stats(&terms, &mut stats);
-    }
-    let mut keyword: Vec<(Key, f32, f32)> = Vec::new();
-    for (i, v) in views.iter().enumerate() {
-        let found = v
-            .keywords
-            .search_with(&terms, &stats, depth, |doc| v.docs[doc].is_some());
-        keyword.extend(found.into_iter().map(|m| ((i, m.doc), m.score, m.coverage)));
-    }
-    keyword.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    let best_keyword = keyword.first().map_or(0.0, |k| k.1);
-    keyword.retain(|k| k.2 >= ranking.min_coverage && k.1 >= best_keyword * ranking.keyword_margin);
-    keyword.truncate(depth);
-
-    let mut meaning: Vec<(Key, usize, f32)> = Vec::new();
-    let mut meaning_cut = 0.0;
-    if let Some(q) = &vector {
-        for (i, v) in views.iter().enumerate() {
-            meaning.extend(
-                v.meaning_scores(q)
-                    .into_iter()
-                    .map(|(d, c, s)| ((i, d), c, s)),
-            );
-        }
-        let scores: Vec<f32> = meaning.iter().map(|m| m.2).collect();
-        meaning_cut = Cutoff {
-            floor: MIN_SIMILARITY,
-            margin: MEANING_MARGIN,
-            z: MEANING_Z,
-        }
-        .threshold(&scores);
-        meaning.retain(|m| m.2 >= meaning_cut);
-        meaning.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
-        meaning.truncate(depth);
-    }
-
-    let mut shown: Vec<(Key, f32)> = Vec::new();
-    let mut shown_cut = 0.0;
-    if let Some(q) = &image {
-        for (i, v) in views.iter().enumerate() {
-            shown.extend(v.image_scores(q).into_iter().map(|(d, s)| ((i, d), s)));
-        }
-        let scores: Vec<f32> = shown.iter().map(|m| m.1).collect();
-        shown_cut = Cutoff {
-            floor: MIN_IMAGE_SIMILARITY,
-            margin: IMAGE_MARGIN,
-            z: IMAGE_Z,
-        }
-        .threshold(&scores);
-        shown.retain(|m| m.1 >= shown_cut);
-        shown.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        shown.truncate(depth);
-    }
-
-    let lists = [
-        (ranking.weight_path, paths.clone()),
-        (
-            ranking.weight_keyword,
-            keyword
-                .iter()
-                .map(|k| {
-                    let share = k.1 / best_keyword.max(f32::MIN_POSITIVE);
-                    (k.0, share * k.2.powf(ranking.coverage_power))
-                })
-                .collect(),
-        ),
-        (
-            ranking.weight_meaning,
-            meaning
-                .iter()
-                .map(|m| (m.0, above_cutoff(m.2, meaning_cut, ranking.meaning_span)))
-                .collect(),
-        ),
-        (
-            ranking.weight_photo,
-            shown
-                .iter()
-                .map(|s| (s.0, above_cutoff(s.1, shown_cut, ranking.photo_span)))
-                .collect(),
-        ),
-    ];
-    let by_keyword: HashMap<Key, ()> = keyword.iter().map(|k| (k.0, ())).collect();
-    let by_meaning: HashMap<Key, usize> = meaning.iter().map(|m| (m.0, m.1)).collect();
-    let weights: Vec<(u16, f32)> = stats
-        .weights(&terms)
-        .into_iter()
-        .map(|(t, w)| (word_code(t), w))
-        .collect();
-    merge(&lists, ranking.bonus, ranking.keep)
-        .into_iter()
-        .take(limit)
-        .map(|((i, doc), score)| {
-            let r = views[i].docs[doc].as_ref().expect("search finds live docs");
-            // The chunk with the words the user typed, else the one that
-            // matched by meaning, else the first.
-            let chunk = by_keyword
-                .contains_key(&(i, doc))
-                .then(|| chunk_with(&views[i].codes[doc], &weights))
-                .flatten()
-                .or_else(|| by_meaning.get(&(i, doc)).copied())
-                .or(if r.chunks.is_empty() { None } else { Some(0) });
-            let preview = chunk
-                .map(|c| r.chunks[c].preview.clone())
-                .unwrap_or_default();
-            let hit = Hit {
-                ino: r.ino,
-                path: r.path.clone(),
-                kind: r.kind,
-                preview,
-                score,
-                thumb: r.extra.thumb.clone(),
-            };
-            (i, hit)
-        })
-        .collect()
+    let sources: Vec<_> = views.iter().map(|v| v.source()).collect();
+    crate::index::search_all(
+        &sources,
+        query,
+        vector.as_ref(),
+        image.as_ref(),
+        limit,
+        ranking,
+        |_, _| None,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bm25::{Stats, query_terms};
     use crate::record::Stamp;
     use crate::text::chunks;
     use crate::vector::{normalize, quantize};

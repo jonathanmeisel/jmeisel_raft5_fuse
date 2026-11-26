@@ -6,6 +6,9 @@
 //! - `run`: searches every query as the apps do (`search_many`), over the
 //!   corpus as one volume or split into several, and sums the measures
 //!   per query set.
+//! - `run_indexed`: the same over generations built from the corpus
+//!   (`compact::build`), as clients search a compacted index: kept words
+//!   only, and only the nearest clusters' vectors.
 //! - `fetch`: the pinned corpus (data/corpus.json), downloaded once into
 //!   the cache and checked against its SHA-256.
 
@@ -18,11 +21,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use raft5fs_search::compact::{Config, build};
+use raft5fs_search::generation::{PieceId, pieces};
+use raft5fs_search::index::{Generation, Index, search_all};
 use raft5fs_search::rank::Ranking;
 use raft5fs_search::record::{DocKind, Entry, Record};
 use raft5fs_search::view::{QueryVector, View, search_many_with};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use corpus::{Corpus, Query};
 use metrics::Totals;
@@ -105,6 +112,98 @@ pub fn run_with(
                     let mut out: BTreeMap<String, Totals> = BTreeMap::new();
                     for q in qs {
                         let found = ranked(corpus, refs, q, limit, ranking);
+                        let relevant: HashMap<u64, u8> = q.relevant.iter().copied().collect();
+                        let photos = wants_photos(&q.set);
+                        let wrong = |ino: u64| (kinds.get(&ino) == Some(&DocKind::Photo)) != photos;
+                        out.entry(q.set.clone())
+                            .or_default()
+                            .add(&found, &relevant, wrong);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut all: BTreeMap<String, Totals> = BTreeMap::new();
+    for part in parts {
+        for (set, t) in part {
+            merge(all.entry(set).or_default(), &t);
+        }
+    }
+    let mut total = Totals::default();
+    for t in all.values() {
+        merge(&mut total, t);
+    }
+    all.insert("all".into(), total);
+    all
+}
+
+/// The corpus's records split into `volumes` generations, each with its
+/// pieces.
+pub fn indexed(corpus: &Corpus, volumes: usize) -> Vec<(Index, HashMap<PieceId, Vec<u8>>)> {
+    let n = volumes.max(1);
+    let mut parts: Vec<Vec<Record>> = vec![Vec::new(); n];
+    for r in &corpus.records {
+        parts[(r.ino as usize) % n].push(r.clone());
+    }
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, records)| {
+            let config = Config {
+                text_model: corpus.text_model.clone(),
+                clip_model: corpus.clip_model.clone(),
+                ..Config::new([i as u8; 8], [7; 32], 1)
+            };
+            let (header, files) = build(&records, config).expect("a generation builds in memory");
+            let all = pieces(&header, &files).expect("its pieces split");
+            let g = Generation::load(header, |id| all.get(&id).cloned()).expect("it loads");
+            (Index::new(Some(Arc::new(g)), View::default()), all)
+        })
+        .collect()
+}
+
+/// `run_with`, over generations (`indexed`).
+pub fn run_indexed(
+    corpus: &Corpus,
+    queries: &[Query],
+    indexes: &[(Index, HashMap<PieceId, Vec<u8>>)],
+    limit: usize,
+    threads: usize,
+    ranking: &Ranking,
+) -> BTreeMap<String, Totals> {
+    let kinds: HashMap<u64, DocKind> = corpus.records.iter().map(|r| (r.ino, r.kind)).collect();
+    let per = queries.len().div_ceil(threads.max(1)).max(1);
+    let parts: Vec<BTreeMap<String, Totals>> = std::thread::scope(|s| {
+        let handles: Vec<_> = queries
+            .chunks(per)
+            .map(|qs| {
+                let kinds = &kinds;
+                s.spawn(move || {
+                    let sources: Vec<_> = indexes.iter().map(|(i, _)| i.source()).collect();
+                    let mut out: BTreeMap<String, Totals> = BTreeMap::new();
+                    for q in qs {
+                        let text = QueryVector {
+                            model: &corpus.text_model,
+                            values: &q.vector,
+                        };
+                        let image = QueryVector {
+                            model: &corpus.clip_model,
+                            values: &q.clip,
+                        };
+                        let found: Vec<u64> = search_all(
+                            &sources,
+                            &q.text,
+                            Some(&text),
+                            Some(&image),
+                            limit,
+                            ranking,
+                            |i, id| indexes[i].1.get(&id).cloned(),
+                        )
+                        .into_iter()
+                        .map(|(_, h)| h.ino)
+                        .collect();
                         let relevant: HashMap<u64, u8> = q.relevant.iter().copied().collect();
                         let photos = wants_photos(&q.set);
                         let wrong = |ino: u64| (kinds.get(&ino) == Some(&DocKind::Photo)) != photos;

@@ -11,6 +11,8 @@
 //! - Probing is tried at several shares of the vectors, so the numbers
 //!   carry over to larger volumes, where the same number of vectors is a
 //!   smaller share.
+//! - Text centres are trained around the vectors' mean, as a
+//!   generation's are (RAFT5FS_EVAL_UNCENTRED compares without).
 //! - For photos, it also tries centres trained on image vectors and query
 //!   vectors together: CLIP keeps text and images somewhat apart, so a
 //!   text query's nearest image centre may be a poor guide. Half the
@@ -27,11 +29,12 @@ use raft5fs_search::view::{
 use crate::corpus::{Corpus, Query};
 
 /// Shares of the vectors probed.
-pub const SHARES: [f64; 6] = [0.01, 0.02, 0.05, 0.1, 0.2, 1.0];
+pub const SHARES: [f64; 9] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0];
 /// The fewest clusters a query probes.
 pub const MIN_CLUSTERS: usize = 8;
-/// Files a search shows at most.
-const LIMIT: usize = 50;
+/// Files a search shows at most: 50, as the web app asks, unless `report`
+/// is given another number.
+static LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(50);
 
 /// Vectors to search: a flat list, and the file each belongs to.
 pub struct Vectors {
@@ -39,6 +42,8 @@ pub struct Vectors {
     pub values: Vec<f32>,
     pub files: Vec<u64>,
     pub cutoff: Cutoff,
+    /// Whether its centres are trained around its mean.
+    pub centre: bool,
 }
 
 impl Vectors {
@@ -70,6 +75,7 @@ pub fn text_vectors(corpus: &Corpus) -> Vectors {
             margin: MEANING_MARGIN,
             z: MEANING_Z,
         },
+        centre: true,
     };
     for r in corpus
         .records
@@ -98,6 +104,7 @@ pub fn image_vectors(corpus: &Corpus) -> Vectors {
             margin: IMAGE_MARGIN,
             z: IMAGE_Z,
         },
+        centre: false,
     };
     for r in &corpus.records {
         if let Some((model, vec)) = &r.extra.image
@@ -162,7 +169,7 @@ fn shown(
     let least = threshold(&v.cutoff, top, &population);
     let mut out: Vec<(u64, f32)> = best.into_iter().filter(|&(_, s)| s >= least).collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    out.truncate(LIMIT);
+    out.truncate(LIMIT.load(std::sync::atomic::Ordering::Relaxed));
     out.into_iter().map(|(f, _)| f).collect()
 }
 
@@ -195,9 +202,10 @@ pub fn measure(
     centres: &Centres,
     queries: &[&[f32]],
 ) -> (Vec<(f64, f64, f64)>, usize) {
+    let mean = mean_of(v);
     let mut members: Vec<Vec<usize>> = vec![Vec::new(); centres.len()];
     for i in 0..v.len() {
-        members[cluster::nearest(centres, v.row(i)).0].push(i);
+        members[cluster::nearest(centres, &centred(v.row(i), &mean)).0].push(i);
     }
     let sizes: Vec<usize> = members.iter().map(Vec::len).collect();
     let sample = sample_of(v);
@@ -207,7 +215,7 @@ pub fn measure(
         let handles: Vec<_> = queries
             .chunks(per)
             .map(|qs| {
-                let (members, sizes, sample) = (&members, &sizes, &sample);
+                let (members, sizes, sample, mean) = (&members, &sizes, &sample, &mean);
                 s.spawn(move || {
                     let mut sums = vec![(0f64, 0f64); SHARES.len()];
                     let mut counted = 0;
@@ -224,7 +232,13 @@ pub fn measure(
                         };
                         for (k, share) in SHARES.iter().enumerate() {
                             let want = (v.len() as f64 * share).ceil() as usize;
-                            let probed = cluster::probe(centres, q, sizes, want, MIN_CLUSTERS);
+                            let probed = cluster::probe(
+                                centres,
+                                &centred(q, mean),
+                                sizes,
+                                want,
+                                MIN_CLUSTERS,
+                            );
                             let rows = || probed.iter().flat_map(|&c| members[c].iter().copied());
                             sums[k].0 += recall(shown(v, rows(), q, None));
                             sums[k].1 += recall(shown(v, rows(), q, Some(sample)));
@@ -254,20 +268,42 @@ pub fn measure(
     (rows, counted)
 }
 
+/// The vectors' mean, which text centres are trained around, as a
+/// generation's are; photos' are not (`compact`). With
+/// RAFT5FS_EVAL_UNCENTRED set, neither is, to compare.
+fn mean_of(v: &Vectors) -> Vec<f32> {
+    let mut mean = vec![0f32; v.dims];
+    if !v.centre || std::env::var_os("RAFT5FS_EVAL_UNCENTRED").is_some() || v.is_empty() {
+        return Vec::new();
+    }
+    for i in 0..v.len() {
+        mean.iter_mut().zip(v.row(i)).for_each(|(m, x)| *m += x);
+    }
+    mean.iter_mut().for_each(|m| *m /= v.len() as f32);
+    mean
+}
+
+fn centred(x: &[f32], mean: &[f32]) -> Vec<f32> {
+    raft5fs_search::generation::centred(x, mean)
+}
+
 /// Centres for `v`: about √n of them, trained on up to 100k vectors.
 pub fn centres_for(v: &Vectors, extra: &[f32]) -> Centres {
     let k = cluster::count_for(v.len(), 0);
     let step = v.len().div_ceil(100_000).max(1);
+    let mean = mean_of(v);
     let mut sample: Vec<f32> = (0..v.len())
         .step_by(step)
-        .flat_map(|i| v.row(i).to_vec())
+        .flat_map(|i| centred(v.row(i), &mean))
         .collect();
     sample.extend_from_slice(extra);
     cluster::train(&sample, v.dims, k, 10, 1)
 }
 
-/// Prints result recall for text and for photos.
-pub fn report(corpus: &Corpus) {
+/// Prints result recall for text and for photos, of the first `limit`
+/// results.
+pub fn report(corpus: &Corpus, limit: usize) {
+    LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
     let text = text_vectors(corpus);
     let images = image_vectors(corpus);
     let all_text: Vec<&[f32]> = corpus.queries.iter().map(|q| q.vector.as_slice()).collect();

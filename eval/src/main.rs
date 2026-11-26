@@ -6,6 +6,8 @@
 //! - `--compare`: one volume and four, side by side.
 //! - `--limit N`: results per search (default 50, as the web app asks).
 //! - `--report FILE`: also write the measures as JSON.
+//! - `--generation`: search generations built from the corpus, as clients
+//!   search a compacted index, not the plain view.
 //! - `recall` (first): result recall of clustered search, text and photos.
 //! - `tune` (first): the ranking's numbers that score best (`tune`), over
 //!   `--volumes` volumes (default 4) and every query.
@@ -19,6 +21,7 @@ fn main() {
     let mut volumes = vec![1usize];
     let mut limit = 50;
     let mut report: Option<PathBuf> = None;
+    let mut generation = false;
     let mut args = std::env::args().skip(1).peekable();
     let recall = args.next_if(|a| a == "recall").is_some();
     let tune = args.next_if(|a| a == "tune").is_some();
@@ -36,6 +39,7 @@ fn main() {
             "--compare" => volumes = vec![1, 4],
             "--limit" => limit = value().parse().unwrap_or_else(|_| fail("--limit N")),
             "--report" => report = Some(PathBuf::from(value())),
+            "--generation" => generation = true,
             _ => fail(&format!("unknown argument {a}")),
         }
     }
@@ -51,7 +55,7 @@ fn main() {
         corpus.clip_model
     );
     if recall {
-        raft5fs_eval::recall::report(&corpus);
+        raft5fs_eval::recall::report(&corpus, limit);
         return;
     }
     if tune {
@@ -69,9 +73,14 @@ fn main() {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut json = serde_json::Map::new();
     for n in volumes {
-        let views = split(&corpus.records, n);
         let started = std::time::Instant::now();
-        let results = run(&corpus, &views, limit, threads);
+        let results = if generation {
+            let indexes = raft5fs_eval::indexed(&corpus, n);
+            let ranking = raft5fs_search::rank::Ranking::default();
+            raft5fs_eval::run_indexed(&corpus, &corpus.queries, &indexes, limit, threads, &ranking)
+        } else {
+            run(&corpus, &split(&corpus.records, n), limit, threads)
+        };
         println!(
             "\n{n} volume(s), {:.1}s\n{}",
             started.elapsed().as_secs_f64(),

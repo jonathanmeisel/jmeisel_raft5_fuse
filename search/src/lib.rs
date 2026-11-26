@@ -18,9 +18,11 @@
 
 pub mod bm25;
 pub mod cluster;
+pub mod compact;
 pub mod extract;
 pub mod generation;
 pub mod geo;
+pub mod index;
 pub mod manifest;
 pub mod paths;
 pub mod rank;
