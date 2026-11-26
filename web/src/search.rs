@@ -1,20 +1,13 @@
-//! Search in the browser: each volume's index read into memory, searched by
-//! words and meaning, and kept up to date by this tab when it holds the
-//! account's index lock.
+//! Search in the browser: each volume's index read into memory and searched
+//! by path, words and meaning.
 //!
-//! - **Indexing here is words only:** text, dates, places and thumbnails.
-//!   Vectors, for text and for photos, come from native devices; the
-//!   models here embed queries only.
+//! - **The browser doesn't index.** Native devices write the index (words,
+//!   vectors and thumbnails); the models here embed queries only.
 //! - **The app's tools.** The Worker gives `setSearchTools` functions:
-//!   `embed(texts, query)` (the embed Worker's model), `pdf(bytes)` (the PDF
-//!   module), `cacheGet(key)` / `cachePut(key, bytes)` /
-//!   `cacheKeep(volume, keys)` (IndexedDB),
-//!   `places()` (the places table, `places.bin`, which the app serves and
-//!   this checks against its pinned SHA-256), `thumb(bytes)` (a photo's
-//!   thumbnail, drawn by the embed Worker), and `clip(text)` (a query's
-//!   vector for searching photos by what they show).
-//!   Indexing and search use them as raft5fs-client's `Embed`, `Extract`
-//!   and `SegmentCache`.
+//!   `embed(texts, query)` (the embed Worker's model), `cacheGet(key)` /
+//!   `cachePut(key, bytes)` / `cacheKeep(volume, keys)` (IndexedDB), and
+//!   `clip(text)` (a query's vector for searching photos by what they
+//!   show). The cache is raft5fs-client's `SegmentCache`.
 //! - **The cache** keeps the segments this browser has read, sealed with
 //!   raft5fs-crypto's `local`, so a copy of the browser's files is
 //!   ciphertext without the account. Reading an index again fetches only
@@ -28,29 +21,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use js_sys::{Array, Float32Array, Function, Promise, Uint8Array};
-use raft5fs_client::indexer::{
-    self, BuiltIn, Embed, Extract, IndexStatus, Indexer, IndexerConfig, SegmentCache, Tools,
-};
+use raft5fs_client::indexer::{self, SegmentCache};
 use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
-use raft5fs_search::extract::{Extracted, Format, READER, extract_with};
-use raft5fs_search::geo::{PLACES_SHA256, Places};
-use raft5fs_search::record::{DocKind, Extra, Thumb};
+use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
 use raft5fs_search::view::{QueryVector, View, search_many};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
 use super::{Fs, Inner, failure, fs_failure, promise};
 
 type Local<'a, T> = futures_util::future::LocalBoxFuture<'a, T>;
-
-/// The most bytes of a PDF that are read.
-const PDF_MAX: u64 = 64 << 20;
 
 /// What search keeps for this session.
 #[derive(Default)]
@@ -59,7 +44,6 @@ pub(crate) struct State {
     /// Each loaded volume's view, by inode, with its path and how far
     /// indexing got.
     views: RefCell<HashMap<u64, Rc<Loaded>>>,
-    indexer: RefCell<Option<Indexer>>,
 }
 
 struct Loaded {
@@ -81,35 +65,12 @@ const RELOAD_MS: f64 = 60_000.0;
 /// The app's functions.
 struct JsTools {
     embed: Function,
-    pdf: Function,
     cache_get: Function,
     cache_put: Function,
     /// Optional: without it, segments compacted away stay in the cache.
     cache_keep: Option<Function>,
-    places: Function,
-    thumb: Function,
     clip: Function,
-    /// The places table, once fetched.
-    places_table: RefCell<Option<Rc<Places>>>,
     identity: Arc<Identity>,
-}
-
-impl JsTools {
-    /// The places table: fetched and checked the first time, or `None` if
-    /// it can't be had now.
-    async fn places(&self) -> Option<Rc<Places>> {
-        if let Some(p) = self.places_table.borrow().clone() {
-            return Some(p);
-        }
-        let got = call(&self.places, &[]).await.ok()?;
-        let bytes = got.dyn_into::<Uint8Array>().ok()?.to_vec();
-        if raft5fs_wire::hex(&Sha256::digest(&bytes)) != PLACES_SHA256 {
-            return None;
-        }
-        let table = Rc::new(Places::decode(&bytes).ok()?);
-        self.places_table.replace(Some(Rc::clone(&table)));
-        Some(table)
-    }
 }
 
 async fn call(f: &Function, args: &[JsValue]) -> Result<JsValue, String> {
@@ -134,6 +95,13 @@ fn js_message(e: &JsValue) -> String {
 struct JsEmbed(Rc<JsTools>);
 
 impl JsEmbed {
+    /// A query's vector.
+    async fn query(&self, text: &str) -> Result<Vec<f32>, String> {
+        let mut v = self.vectors(vec![text.to_string()], true).await?;
+        v.pop()
+            .ok_or_else(|| "the model gave no vector".to_string())
+    }
+
     async fn vectors(&self, texts: Vec<String>, query: bool) -> Result<Vec<Vec<f32>>, String> {
         let list: Array = texts.iter().map(|t| JsValue::from_str(t)).collect();
         let got = call(&self.0.embed, &[list.into(), query.into()]).await?;
@@ -147,77 +115,6 @@ impl JsEmbed {
                     .map_err(|_| "the model gave something that isn't a vector".to_string())
             })
             .collect()
-    }
-}
-
-impl Embed for JsEmbed {
-    fn model(&self) -> &str {
-        TEXT_MODEL
-    }
-
-    fn replaces(&self, older: &str) -> bool {
-        raft5fs_search::vector::TEXT_REPLACES.contains(&older)
-    }
-
-    fn passages<'a>(&'a self, texts: Vec<String>) -> Local<'a, Result<Vec<Vec<f32>>, String>> {
-        Box::pin(self.vectors(texts, false))
-    }
-
-    fn query<'a>(&'a self, text: &'a str) -> Local<'a, Result<Vec<f32>, String>> {
-        Box::pin(async move {
-            let mut v = self.vectors(vec![text.to_string()], true).await?;
-            v.pop()
-                .ok_or_else(|| "the model gave no vector".to_string())
-        })
-    }
-}
-
-/// What raft5fs-search reads, and PDF through the PDF module.
-struct JsExtract(Rc<JsTools>);
-
-impl Extract for JsExtract {
-    fn reads(&self, name: &str) -> u64 {
-        match Format::of(name) {
-            Format::Pdf => PDF_MAX,
-            _ => BuiltIn.reads(name),
-        }
-    }
-
-    fn extract<'a>(&'a self, name: &'a str, bytes: Vec<u8>) -> Local<'a, Option<Extracted>> {
-        Box::pin(async move {
-            match Format::of(name) {
-                Format::Pdf => {}
-                Format::Gpx | Format::Tcx | Format::Photo => {
-                    let places = self.0.places().await;
-                    let mut got = extract_with(name, &bytes, places.as_deref())?;
-                    // Without places: read it again once they can be had.
-                    if places.is_none() {
-                        got.extra.reader = READER - 1;
-                    }
-                    if got.kind == DocKind::Photo {
-                        let bytes = Uint8Array::from(bytes.as_slice());
-                        got.thumb = call(&self.0.thumb, &[bytes.into()])
-                            .await
-                            .ok()
-                            .and_then(|t| t.dyn_into::<Uint8Array>().ok())
-                            .map(|t| t.to_vec());
-                    }
-                    return Some(got);
-                }
-                _ => return BuiltIn.extract(name, bytes).await,
-            }
-            let bytes = Uint8Array::from(bytes.as_slice());
-            let text = call(&self.0.pdf, &[bytes.into()]).await.ok()?.as_string()?;
-            Some(Extracted {
-                kind: DocKind::Text,
-                text,
-                extra: Extra {
-                    reader: READER,
-                    ..Extra::default()
-                },
-                thumb: None,
-            })
-        })
     }
 }
 
@@ -311,32 +208,12 @@ fn kind_name(kind: DocKind) -> &'static str {
 }
 
 impl Inner {
-    /// Stops this tab's indexer, at logout.
-    pub(crate) fn search_stop(&self) -> Option<Indexer> {
-        self.search.indexer.take()
-    }
-
     fn tools(&self) -> Result<Rc<JsTools>, FsError> {
         self.search
             .tools
             .borrow()
             .clone()
             .ok_or_else(|| FsError::new(errno::EAGAIN, "search isn't set up in this tab"))
-    }
-
-    // `Tools` holds `Arc`s, for native clients' threads. A browser runs the
-    // client on one thread, where these never cross to another.
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn index_tools(&self) -> Result<Tools, FsError> {
-        let tools = self.tools()?;
-        Ok(Tools {
-            extract: Arc::new(JsExtract(tools)),
-            // A browser indexes words, dates, places and thumbnails only:
-            // text and image vectors are left to native devices, whose
-            // next pass fills them in. The models here only embed queries.
-            embed: None,
-            image: None,
-        })
     }
 
     /// The volume that `path` is in: its inode and its path in the app.
@@ -426,22 +303,6 @@ impl Inner {
             .insert(ino, Rc::clone(&loaded));
         Ok(loaded)
     }
-
-    fn start_indexer(&self, device: String, skip: Vec<String>) -> Result<(), FsError> {
-        let tools = self.index_tools()?;
-        let vault = raft5fs_client::vault::Vault::new(Arc::clone(self.vault().remote()))?
-            .with_known_keys(self.vault().known_keys().duplicate());
-        let config = IndexerConfig {
-            device,
-            skip,
-            ..IndexerConfig::default()
-        };
-        // Dropping the one before stops it.
-        self.search
-            .indexer
-            .replace(Some(indexer::spawn(vault, config, tools)));
-        Ok(())
-    }
 }
 
 fn loaded_js(l: &Loaded) -> LoadedJs {
@@ -465,9 +326,8 @@ fn loaded_js(l: &Loaded) -> LoadedJs {
 #[wasm_bindgen]
 impl Fs {
     /// Gives search the app's functions: `tools` is an object with
-    /// `embed`, `pdf`, `cacheGet`, `cachePut`, `places`, `thumb` and `clip`
-    /// (see the top of `search`). Until then, search works by words only,
-    /// with no cache.
+    /// `embed`, `cacheGet`, `cachePut`, `cacheKeep` and `clip` (see the top
+    /// of `search`). Until then, search works by words only, with no cache.
     #[wasm_bindgen(js_name = setSearchTools)]
     pub fn set_search_tools(&self, tools: JsValue) -> Result<(), JsValue> {
         let get = |name: &str| -> Result<Function, JsValue> {
@@ -483,14 +343,10 @@ impl Fs {
             .ok_or_else(|| failure("EACCES", "not logged in"))?;
         self.0.search.tools.replace(Some(Rc::new(JsTools {
             embed: get("embed")?,
-            pdf: get("pdf")?,
             cache_get: get("cacheGet")?,
             cache_put: get("cachePut")?,
             cache_keep: get("cacheKeep").ok(),
-            places: get("places")?,
-            thumb: get("thumb")?,
             clip: get("clip")?,
-            places_table: RefCell::new(None),
             identity,
         })));
         Ok(())
@@ -627,42 +483,6 @@ impl Fs {
         })
     }
 
-    /// Starts indexing, in the background, the volumes this account can
-    /// write, less `skip` (as the root shows them). `device` names this
-    /// browser in the status search shows. Needs `setSearchTools`.
-    #[wasm_bindgen(js_name = startIndexing)]
-    pub fn start_indexing(&self, device: String, skip: Vec<String>) -> Result<(), JsValue> {
-        self.0.start_indexer(device, skip).map_err(fs_failure)
-    }
-
-    /// Stops indexing here, and gives up the claim of the volume it was
-    /// indexing; a pass cut short is finished by the next.
-    #[wasm_bindgen(js_name = stopIndexing)]
-    pub fn stop_indexing(&self) -> Promise {
-        let indexer = self.0.search.indexer.take();
-        promise(async move {
-            if let Some(indexer) = indexer {
-                indexer.stop().await;
-            }
-            Ok(())
-        })
-    }
-
-    /// Asks this tab's indexer to look for changes now, as after an
-    /// upload. Nothing if it doesn't index.
-    #[wasm_bindgen(js_name = kickIndexing)]
-    pub fn kick_indexing(&self) {
-        if let Some(i) = self.0.search.indexer.borrow().as_ref() {
-            i.kick();
-        }
-    }
-
-    /// Whether this tab indexes.
-    #[wasm_bindgen(getter)]
-    pub fn indexing(&self) -> bool {
-        self.0.search.indexer.borrow().is_some()
-    }
-
     /// How big the loaded indexes are, for measuring memory: `{volumes,
     /// docs, live, chunks, chunkWords, vectors, words, postings}`, summed
     /// over the loaded volumes.
@@ -693,51 +513,6 @@ impl Fs {
             out.postings += s.postings;
         }
         serde_wasm_bindgen::to_value(&out).unwrap_or(JsValue::NULL)
-    }
-
-    /// What this tab's indexer is doing: `{current: {volume, detail} or
-    /// null, last: [{volume, detail}], error}`, or null if it doesn't
-    /// index.
-    #[wasm_bindgen(js_name = indexStatus)]
-    pub fn index_status(&self) -> Promise {
-        #[derive(Serialize)]
-        struct Line {
-            volume: String,
-            detail: String,
-        }
-        #[derive(Serialize)]
-        struct Status {
-            current: Option<Line>,
-            last: Vec<Line>,
-            error: Option<String>,
-        }
-        let inner = Rc::clone(&self.0);
-        promise(async move {
-            let Some(s): Option<IndexStatus> =
-                inner.search.indexer.borrow().as_ref().map(Indexer::status)
-            else {
-                return Ok(None);
-            };
-            let paths = inner.volume_paths().await.unwrap_or_default();
-            let name = |ino: u64| paths.get(&ino).cloned().unwrap_or_else(|| ino.to_string());
-            let mut last: Vec<Line> = s
-                .last
-                .iter()
-                .map(|(&ino, d)| Line {
-                    volume: name(ino),
-                    detail: d.clone(),
-                })
-                .collect();
-            last.sort_by(|a, b| a.volume.cmp(&b.volume));
-            Ok(Some(Status {
-                current: s.current.map(|(ino, d)| Line {
-                    volume: name(ino),
-                    detail: d,
-                }),
-                last,
-                error: s.error,
-            }))
-        })
     }
 
     /// Whether the volume `path` is in is indexed for search, and whether

@@ -1,11 +1,6 @@
-// This browser's search settings, kept for the browser, not the account:
+// This browser's search settings, kept for the browser, not the account.
+// The browser doesn't index: native devices do.
 //
-// - "Index for search on this device": on by default for a computer, off
-//   for a phone or tablet, as for re-sealing (pruneSetting.js). Indexing
-//   reads every changed file, for its words only (native devices add
-//   vectors); another device that can write a volume indexes it if this
-//   one doesn't.
-// - Volumes this browser doesn't index (others still may).
 // - "Keep search data on this device": the index segments it has read, so
 //   a search here fetches only what is new. Off for a borrowed computer.
 // - Whether to download the search models (about 130 MB for text, and 150
@@ -15,8 +10,6 @@
 //   says yes (`meaningAllowed`).
 import { mobile } from "./pruneSetting.js";
 
-const INDEX = "raft5fs:index-here";
-const SKIP = "raft5fs:index-skip";
 const KEEP = "raft5fs:keep-search";
 const MEANING = "raft5fs:search-meaning";
 
@@ -34,47 +27,8 @@ function write(key, value) {
   } catch {}
 }
 
-export function indexHere() {
-  const kept = read(INDEX);
-  if (kept === "on" || kept === "off") return kept === "on";
-  return !mobile();
-}
-
-export const setIndexHere = (on) => write(INDEX, on ? "on" : "off");
-
-/// The volumes (as the root shows them, like "/photos") this browser skips.
-export function indexSkip() {
-  try {
-    const list = JSON.parse(read(SKIP) ?? "[]");
-    return Array.isArray(list) ? list.filter((v) => typeof v === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-export const setIndexSkip = (list) => write(SKIP, JSON.stringify(list));
-
 export const keepSearch = () => read(KEEP) !== "off";
 export const setKeepSearch = (on) => write(KEEP, on ? "on" : "off");
-
-/// What the status of an index calls this browser: "Firefox on Linux".
-export function deviceName() {
-  const ua = navigator.userAgent;
-  const name =
-    (/Edg\//.test(ua) && "Edge") ||
-    (/Firefox\//.test(ua) && "Firefox") ||
-    (/Chrome\//.test(ua) && "Chrome") ||
-    (/Safari\//.test(ua) && "Safari") ||
-    "a browser";
-  const os =
-    (/Android/.test(ua) && "Android") ||
-    (/iPhone|iPad/.test(ua) && "iOS") ||
-    (/Mac OS X/.test(ua) && "macOS") ||
-    (/Windows/.test(ua) && "Windows") ||
-    (/Linux/.test(ua) && "Linux") ||
-    "";
-  return os ? `${name} on ${os}` : name;
-}
 
 /// The search models' sizes, as the question about them says: for text,
 /// and for photos (CLIP's text side).

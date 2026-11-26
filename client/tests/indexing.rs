@@ -1452,3 +1452,29 @@ fn passages_from_several_files_are_embedded_together() {
     assert_eq!(calls.iter().sum::<usize>(), 20);
     assert_eq!(models(&backend, &tester, v), vec!["batched@1"; 20]);
 }
+
+#[test]
+fn a_pass_over_large_files_stores_them_in_several_segments() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, true, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    // Each file has about 400,000 distinct words: some MB of words in its
+    // record, so four of them pass a segment's size long before its count.
+    for f in 0..4 {
+        let text: Vec<String> = (0..400_000).map(|w| format!("w{f}x{w}")).collect();
+        write(
+            &backend,
+            &tester,
+            v,
+            &format!("big{f}.txt"),
+            text.join(" ").as_bytes(),
+        );
+    }
+    pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    let segments = index_files(&backend, &tester, v)
+        .into_iter()
+        .filter(|n| n.starts_with("seg-"))
+        .count();
+    assert!(segments >= 2, "{segments} segments");
+    assert_eq!(search(&backend, &tester, v, "w3x399999"), ["big3.txt"]);
+}

@@ -111,19 +111,14 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
 - Search: the box in the header (`Search.svelte`) searches the open
   top-level folder, or with **All** every one, by words and by meaning (the
   wasm `search`; `SETUP.txt` section 15). A result opens the file.
-  - The tab that holds the account's index lock (a Web Lock, as for
-    re-sealing) indexes in the background, if the account menu's **Index
-    for search on this device** is on: by default on a computer, off on a
-    phone or tablet (`searchSetting.js`). An upload is indexed a few seconds
-    later. A browser indexes words, dates, places and thumbnails only.
-    Vectors come from native devices, which add them to records a
-    browser wrote at their next pass.
-  - `src/lib/embedWorker.js` is a Worker of its own, so indexing never holds
-    up the session's calls. It embeds queries with the search models (the
-    `raft5fs-embed-web` crate: raft5fs-embed, the code native clients run,
-    built with WebAssembly SIMD), and reads PDFs with the PDF module (the
-    `raft5fs-pdf-web` crate: a PDF that crashes it only restarts it). It
-    holds no keys, and ends after a minute without work, giving back the
+  - The browser doesn't index: native devices (a mount, WebDAV, or
+    `raft5fs index`) write the index, words, vectors and thumbnails. An
+    upload from the app is found once a native device's next pass has
+    indexed it.
+  - `src/lib/embedWorker.js` is a Worker of its own, so loading the models
+    never holds up the session's calls. It embeds queries with the search
+    models (the `raft5fs-embed-web` crate: raft5fs-embed, the code native
+    clients run, built with WebAssembly SIMD). It holds no keys, and ends after a minute without work, giving back the
     models' memory; the next search loads them again from the browser.
   - The models are served by the app from `public/models/`, which
     `npm run model` (`scripts/fetch-models.mjs`) fetches as
@@ -146,10 +141,7 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     that to the volume's view in memory. Segments a compaction removed
     are dropped from it (`cacheKeep`). **Keep search data on this device**
     off keeps nothing, for a borrowed computer.
-  - Tracks and photos are named with the places table (`search/data/`,
-    served from `public/data/places.bin`, checked against its pinned
-    SHA-256), fetched by the tab that indexes. Photos get thumbnails, drawn
-    on an OffscreenCanvas in the embed Worker; results show them.
+  - Photos' thumbnails, which native devices make, show with results.
   - Photos are found by what they show with CLIP (its multilingual text
     side only, served beside the text model): native devices give photos
     their image vectors, and a search of a folder whose photos have them
@@ -207,11 +199,10 @@ ids, and its vectors to cosine 0.999, against
 which native clients wrote
 (raft5fs-indexer's ignored tests `write_the_web_apps_parity_fixture` and
 `write_the_web_apps_clip_fixture`; run them again after changing a
-model). In the browser tests, indexing is off in every tab except the
-search tests', which upload text, Word and PDF files, find them by their
-words, run `raft5fs index` (the CLI, as a desktop would) to add vectors,
-find them by meaning in another language, check that what the browser
-keeps of the index is sealed, and turn indexing off as the owner.
+model). The search tests upload text, Word and PDF files, run `raft5fs
+index` (the CLI, as a desktop would), find them by their words and by
+meaning in another language, check that what the browser keeps of the
+index is sealed, and turn indexing off as the owner.
 
 The tests start their own `web_dev`, build the app for it, and drive it in
 headless Chromium: two users enroll, upload and download (one file large

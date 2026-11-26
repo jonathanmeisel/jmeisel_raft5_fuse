@@ -84,7 +84,7 @@ jobs:
       - name: The client builds for browsers
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo clippy -p raft5fs-client -p raft5fs-web -p raft5fs-pdf-web --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy -p raft5fs-client -p raft5fs-web --target wasm32-unknown-unknown -- -D warnings
           RUSTFLAGS='--cfg getrandom_backend="wasm_js" -C target-feature=+simd128' cargo clippy -p raft5fs-embed-web --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test
 

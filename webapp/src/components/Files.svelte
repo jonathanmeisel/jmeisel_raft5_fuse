@@ -65,14 +65,9 @@
   let pendingCount = $state(0);
   /// Whether this browser re-seals in the background (account menu).
   let reseal = $state(pruneHere());
-  /// Whether this browser indexes for search, and keeps what it has read
-  /// of indexes (account menu; see searchSetting.js).
-  let indexing = $state(searchSetting.indexHere());
+  /// Whether this browser keeps what it has read of indexes (account menu;
+  /// see searchSetting.js).
   let keepSearch = $state(searchSetting.keepSearch());
-
-  function sendIndexing() {
-    fs.setIndexHere(indexing, searchSetting.indexSkip(), searchSetting.deviceName()).catch(() => {});
-  }
   /// Whether this tab is re-sealing now, and video or audio is playing.
   let pruning = false;
   let playing = false;
@@ -122,7 +117,6 @@
     if (visitor) return;
     fs.setPruneHere(reseal).catch(() => {});
     fs.setKeepSearch(keepSearch).catch(() => {});
-    sendIndexing();
     refreshPending();
     refreshOffers();
     refreshStorage();
@@ -869,7 +863,6 @@
     ...(account.caps.includes("links") ? [{ id: "links", text: "Public links", icon: "wxi-link" }] : []),
     { id: "fingerprint", text: "My safety code", icon: "wxi-information-outline" },
     { id: "reseal", text: "Re-seal on this device", icon: reseal ? "wxi-check" : "wxi-empty" },
-    { id: "index", text: "Index for search on this device", icon: indexing ? "wxi-check" : "wxi-empty" },
     { id: "keep-search", text: "Keep search data on this device", icon: keepSearch ? "wxi-check" : "wxi-empty" },
     { id: "logout", text: "Log out", icon: "wxi-external", separator: true },
   ]);
@@ -894,10 +887,6 @@
       reseal = !reseal;
       setPruneHere(reseal);
       fs.setPruneHere(reseal).catch(() => {});
-    } else if (id === "index") {
-      indexing = !indexing;
-      searchSetting.setIndexHere(indexing);
-      sendIndexing();
     } else if (id === "keep-search") {
       keepSearch = !keepSearch;
       searchSetting.setKeepSearch(keepSearch);

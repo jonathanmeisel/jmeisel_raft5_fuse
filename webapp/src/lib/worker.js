@@ -188,68 +188,31 @@ function openChannel(user) {
 }
 
 /// Once the session exists: applies the saves that arrived first, gives
-/// search its tools, and waits for the account's prune lock and index
-/// lock, to run the background prune and indexing while it holds them
-/// (until the Worker ends).
+/// search its tools, and waits for the account's prune lock, to run the
+/// background prune while it holds it (until the Worker ends). Native
+/// devices index for search; the browser only reads the index.
 function joined(user, { early }) {
   for (const [name, bytes] of early.splice(0)) fs.storeUpdated(name, bytes);
   searchPrefix = `${config.fsId}/${user}/`;
-  fs.setSearchTools({
-    embed,
-    pdf: readPdf,
-    cacheGet,
-    cachePut,
-    cacheKeep,
-    places: fetchPlaces,
-    thumb: makeThumb,
-    clip: clipQuery,
-  });
+  fs.setSearchTools({ embed, cacheGet, cachePut, cacheKeep, clip: clipQuery });
   navigator.locks.request(`raft5fs:${config.fsId}:${user}:prune`, () => {
     if (!fs) return null;
     prunesHere = true;
     if (pruneWanted) fs.resumePruning();
     return new Promise(() => {});
   });
-  navigator.locks.request(`raft5fs:${config.fsId}:${user}:index`, () => {
-    if (!fs) return null;
-    indexesHere = true;
-    if (indexWanted) startIndexing();
-    return new Promise(() => {});
-  });
 }
 
 // ----------------------------------------------------------------- search
 
-/// Whether this tab holds the account's index lock, and whether this
-/// browser indexes at all (the page's setting, sent after login), with the
-/// volumes it skips and what it calls this browser.
-let indexesHere = false;
-let indexWanted = false;
-let indexSkip = [];
-let device = "a browser";
 /// Whether to keep index segments in IndexedDB (the page's setting).
 let keepSearch = true;
 /// The account's keys in the "search" store start with this.
 let searchPrefix = "";
 
-function startIndexing() {
-  try {
-    fs.startIndexing(device, indexSkip);
-  } catch (e) {
-    postMessage({ event: "storage-error", message: `search indexing: ${e.message}` });
-  }
-}
-
 let embedder = null;
 let nextEmbed = 1;
 const embedCalls = new Map();
-
-/// How long a PDF or a thumbnail may take in the embed Worker. Past it,
-/// the Worker is taken to be stuck (a PDF that loops, a picture that never
-/// decodes) and is started again, and the call fails, so indexing goes on
-/// to the next file. Model calls have no limit: a first download can take
-/// long on a slow line.
-const STUCK_MS = 120_000;
 
 /// How long the embed Worker may go without work before it ends.
 /// WebAssembly memory never shrinks, so ending the Worker is the only way
@@ -291,9 +254,8 @@ function restartEmbedder(why) {
   embedder = null;
 }
 
-/// A call to the embed Worker, started on first use. With `limit` (ms), a
-/// call not answered by then fails, and the Worker starts again.
-function embedCall(message, transfer = [], limit = 0) {
+/// A call to the embed Worker, started on first use.
+function embedCall(message) {
   if (!embedder) {
     embedder = new Worker(new URL("./embedWorker.js", import.meta.url), { type: "module" });
     embedder.onmessage = ({ data }) => {
@@ -310,41 +272,20 @@ function embedCall(message, transfer = [], limit = 0) {
   if (!asking) lastWork = Date.now();
   armIdle();
   return new Promise((resolve, reject) => {
-    let timer = 0;
     const done = (f) => (value) => {
-      clearTimeout(timer);
       if (!asking) lastWork = Date.now();
       f(value);
     };
     embedCalls.set(id, { resolve: done(resolve), reject: done(reject), asking });
-    embedder.postMessage({ id, ...message }, transfer);
-    if (limit) {
-      timer = setTimeout(() => {
-        if (embedCalls.has(id)) restartEmbedder(`${message.op} took over ${limit / 1000} s, so it was stopped`);
-      }, limit);
-    }
+    embedder.postMessage({ id, ...message });
   });
 }
 
 /// The vectors of `texts` (an array of strings), as Float32Arrays.
 const embed = async (texts, query) => (await embedCall({ op: "embed", texts, query })).vectors;
 
-/// The places table (search/data/places.bin), which the app serves; the
-/// wasm client checks it.
-async function fetchPlaces() {
-  const response = await fetch(new URL(`${import.meta.env.BASE_URL}data/places.bin`, self.location.origin));
-  if (!response.ok) throw new Error(`no places table on this site (${response.status})`);
-  return new Uint8Array(await response.arrayBuffer());
-}
-
 /// A query's vector for photos (CLIP's text side), as a Float32Array.
 const clipQuery = async (text) => (await embedCall({ op: "clip", text })).vector;
-
-/// A photo's thumbnail (a JPEG), or null.
-const makeThumb = async (bytes) => (await embedCall({ op: "thumb", bytes }, [bytes.buffer], STUCK_MS)).thumb;
-
-/// The text of a PDF, or null.
-const readPdf = async (bytes) => (await embedCall({ op: "pdf", bytes }, [bytes.buffer], STUCK_MS)).text;
 
 async function cacheGet(key) {
   if (!keepSearch) return null;
@@ -632,8 +573,6 @@ const methods = {
       }
       closing = true;
       await s.close(handle);
-      // Indexed soon, if this tab indexes.
-      s.kickIndexing();
     } catch (e) {
       if (!closing) await s.close(handle).catch(() => {});
       if (!existing) await s.remove(path).catch(() => {});
@@ -851,7 +790,6 @@ const methods = {
   /// Whether the search model is loaded, loading (and how far), or kept
   /// in this browser so that loading it downloads nothing.
   modelState: async () => (await embedCall({ op: "state" })).state,
-  indexStatus: () => session().indexStatus(),
   /// For the browser tests only: how long the embed Worker may be idle.
   setEmbedIdle(ms) {
     if (import.meta.env.MODE !== "production") idleMs = ms;
@@ -872,23 +810,6 @@ const methods = {
   searchThumb: (id) => session().searchThumb(id),
   volumeIndexing: (path) => session().volumeIndexing(path),
   setVolumeIndexing: (path, on) => session().setVolumeIndexing(path, on),
-  /// Turns this browser's background indexing on or off (it runs in the
-  /// tab that holds the index lock), with the volumes it skips and what
-  /// it calls this browser.
-  async setIndexHere(on, skip, name) {
-    indexWanted = on;
-    indexSkip = skip;
-    device = name;
-    if (!indexesHere) return;
-    await session().stopIndexing();
-    if (on) startIndexing();
-  },
-  /// Stops this tab's indexing, giving up its claim (`stop` in rpc.js).
-  stopIndexing: async () => {
-    if (fs) await session().stopIndexing();
-  },
-  /// As `pruning`, for indexing.
-  indexing: () => (!indexWanted ? "off" : indexesHere ? "running" : "elsewhere"),
   /// Whether this browser keeps the index segments it has read. Turning
   /// it off removes what it kept.
   async setKeepSearch(on) {

@@ -1,6 +1,6 @@
 // Fetches the search models into public/models/<name>/, for the build to
 // serve from the app's own origin (the page's CSP loads nothing from
-// elsewhere), and copies the places table into public/data/.
+// elsewhere).
 //
 // - What to fetch comes from search/data/models.json, the one place every
 //   client's models are pinned: each file the web app uses, at its pinned
@@ -13,7 +13,7 @@
 //
 // Not committed (see .gitignore). Usage: npm run model.
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 
 const app = new URL("..", import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL("../search/data/models.json", app)));
@@ -78,9 +78,3 @@ for (const name of readdirSync(new URL("public/models/", app))) {
     console.log(`removed ${name}`);
   }
 }
-
-// The places table that tracks and photos are named with (search/data,
-// committed), served beside the models.
-mkdirSync(new URL("public/data/", app), { recursive: true });
-copyFileSync(new URL("../search/data/places.bin", app), new URL("public/data/places.bin", app));
-console.log("public/data/places.bin");

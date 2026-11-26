@@ -19,7 +19,8 @@
 //!   none, counts as out of date: the next pass that sees it embeds it
 //!   again.
 //! - **Resumable.** A pass stores what it has every `SEGMENT_ENTRIES`
-//!   files. A pass cut short is finished by whoever claims the volume
+//!   files, or sooner once they reach about `SEGMENT_BYTES`. A pass cut
+//!   short is finished by whoever claims the volume
 //!   next: files already indexed as they are now are skipped.
 //!
 //! Gaps in the activity log, and how a pass covers them:
@@ -65,8 +66,11 @@ pub const OVERLAP_MS: u64 = 2 * 60 * 1000;
 pub const RECHECK_MS: u64 = 15 * 60 * 1000;
 /// How often a pass walks the whole volume.
 pub const FULL_WALK_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
-/// How many entries go in one segment before a pass stores it.
+/// How many entries go in one segment before a pass stores it...
 const SEGMENT_ENTRIES: usize = 200;
+/// ... or how many bytes, about, whichever comes first: a run of large
+/// files would otherwise hold much memory before it is stored.
+const SEGMENT_BYTES: usize = 8 << 20;
 /// Entries in a segment that compaction writes: fewer, larger reads.
 const COMPACT_ENTRIES: usize = 2000;
 /// A pass compacts when the index has more segments beyond what its live
@@ -644,6 +648,26 @@ fn name_text(name: &OsStr) -> String {
     String::from_utf8_lossy(os_bytes::bytes(name)).into_owned()
 }
 
+/// About how many bytes `entry` takes in a segment, before compression:
+/// its path, and each chunk's preview, words and vector.
+fn entry_bytes(entry: &Entry) -> usize {
+    let Entry::Record(r) = entry else { return 16 };
+    let chunks: usize = r
+        .chunks
+        .iter()
+        .map(|c| {
+            let words: usize = c.terms.iter().map(|(t, _)| t.len() + 3).sum();
+            c.preview.len() + words + c.vector.as_ref().map_or(0, |v| v.values.len() + 4)
+        })
+        .sum();
+    let image = r
+        .extra
+        .image
+        .as_ref()
+        .map_or(0, |(_, v)| v.values.len() + 4);
+    64 + r.path.len() + chunks + image
+}
+
 /// One pass over one volume, under a claim.
 struct Pass<'a> {
     vault: &'a Vault,
@@ -657,6 +681,8 @@ struct Pass<'a> {
     /// another at the same path.
     by_path: HashMap<String, u64>,
     pending: Vec<Entry>,
+    /// About how many bytes `pending` takes encoded (`entry_bytes`).
+    pending_bytes: usize,
     /// The thumbnails of `pending`'s records, one after another.
     pending_thumbs: Vec<u8>,
     /// Records waiting for their chunks' vectors, with the chunks' texts
@@ -748,8 +774,9 @@ impl Pass<'_> {
             }
         }
         self.entries.insert(entry.ino(), entry.clone());
+        self.pending_bytes += entry_bytes(&entry);
         self.pending.push(entry);
-        if self.pending.len() >= SEGMENT_ENTRIES {
+        if self.pending.len() >= SEGMENT_ENTRIES || self.pending_bytes >= SEGMENT_BYTES {
             self.store().await?;
         }
         Ok(())
@@ -770,6 +797,7 @@ impl Pass<'_> {
         }
         let name = Manifest::segment_name(&self.mine.id, n);
         let entries = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
         write_fresh(self.vault, self.dir, &name, &encode_segment(&entries)).await?;
         self.read += entries.len();
         self.segment_files += 1;
@@ -1339,6 +1367,7 @@ async fn run_pass(
         entries: loaded.entries,
         by_path,
         pending: Vec::new(),
+        pending_bytes: 0,
         pending_thumbs: Vec::new(),
         queued: Vec::new(),
         listings: HashMap::new(),

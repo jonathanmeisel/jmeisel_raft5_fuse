@@ -9,33 +9,7 @@ import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-// Search indexing is on by default on a computer, and would run the model in
-// every tab of every test. Each new browser context here starts with it off;
-// the search tests turn it back on.
-// Sandboxed frames (the viewer's) have no localStorage: nothing to set there.
-const INDEX_OFF = () => {
-  try {
-    localStorage.setItem("raft5fs:index-here", "off");
-  } catch {}
-};
-const test = base.extend({
-  context: async ({ context }, use) => {
-    await context.addInitScript(INDEX_OFF);
-    await use(context);
-  },
-  browser: [
-    async ({ browser }, use) => {
-      const newContext = browser.newContext.bind(browser);
-      browser.newContext = async (options) => {
-        const context = await newContext(options);
-        await context.addInitScript(INDEX_OFF);
-        return context;
-      };
-      await use(browser);
-    },
-    { scope: "worker" },
-  ],
-});
+const test = base;
 
 const invites = () =>
   JSON.parse(readFileSync(new URL("../config/local/invites.json", import.meta.url)));
@@ -1709,11 +1683,6 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   // index again only a minute after it last did.
   test.setTimeout(300_000);
   const context = await browser.newContext();
-  await context.addInitScript(() => {
-    try {
-      localStorage.setItem("raft5fs:index-here", "on");
-    } catch {}
-  });
   const page = await context.newPage();
   const problems = watch(page);
   await enrol(page, "kai");
@@ -1727,13 +1696,13 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   ]);
   await expect(item(page, "page.pdf")).toBeVisible(SLOW);
 
+  // A desktop indexes the folder: the browser only reads the index.
+  await nativeIndex("kai", "notes");
   // Words: in a text file, a Word file, and a PDF.
   await searchUntil(page, "receipts", "notes/taxes.txt");
   await searchUntil(page, "tomatoes basil", "notes/minutes.docx");
   await searchUntil(page, "raft5fs", "notes/page.pdf");
-  // Meaning, in another language, with no word in common: from the
-  // vectors a desktop adds.
-  await nativeIndex("kai", "notes");
+  // Meaning, in another language, with no word in common.
   const results = await searchUntil(page, "Steuererklärung Belege", "notes/taxes.txt");
   await expect(results.getByRole("option").first()).toContainText("notes/taxes.txt");
   await expect(results).toContainText(/notes: \d+ files, indexed .* by kai on /);
@@ -1777,35 +1746,12 @@ test("files are found by their words and their meaning", async ({ browser }) => 
   expect(problems).toEqual([]);
 });
 
-test("a phone doesn't index for search unless asked", async ({ browser }) => {
-  const context = await browser.newContext({ isMobile: true, hasTouch: true, viewport: { width: 390, height: 800 } });
-  // Not the tests' own setting: the device's default. Chromium's mobile
-  // emulation doesn't say it's mobile in userAgentData, as a phone does.
-  await context.addInitScript(() => {
-    try {
-      localStorage.removeItem("raft5fs:index-here");
-    } catch {}
-    Object.defineProperty(navigator, "userAgentData", { value: { mobile: true }, configurable: true });
-  });
-  const page = await context.newPage();
-  await enrol(page, "lux");
-  await login(page, "lux");
-  await accountButton(page).click();
-  const choice = page.getByRole("menuitem", { name: "Index for search on this device" });
-  await expect(choice.locator(".wxi-empty")).toHaveCount(1);
-});
-
 test("a phone asks before downloading the search model, and finds words meanwhile", async ({ browser }) => {
   // `raft5fs index` may first download its models, and the page reads the
   // index again only a minute after it last did.
   test.setTimeout(300_000);
-  // A browser indexes a folder's words, and a desktop adds vectors.
+  // A desktop indexes the folder.
   const computer = await browser.newContext();
-  await computer.addInitScript(() => {
-    try {
-      localStorage.setItem("raft5fs:index-here", "on");
-    } catch {}
-  });
   const desk = await computer.newPage();
   await enrol(desk, "mia");
   await login(desk, "mia");
@@ -1816,8 +1762,8 @@ test("a phone asks before downloading the search model, and finds words meanwhil
     { name: "ride.txt", mimeType: "text/plain", buffer: Buffer.from(ride) },
   ]);
   await expect(item(desk, "ride.txt")).toBeVisible(SLOW);
-  await searchUntil(desk, "gravel", "trips/ride.txt");
   await nativeIndex("mia", "trips");
+  await searchUntil(desk, "gravel", "trips/ride.txt");
   await searchUntil(desk, "Fahrradtour", "trips/ride.txt");
 
   // The same account on a phone, which doesn't index.
@@ -1871,12 +1817,9 @@ function gpxRide(name, a, b) {
 }
 
 test("photos are found by where and when they were taken, and rides by where they go", async ({ browser }) => {
+  // `raft5fs index` may first download its models.
+  test.setTimeout(300_000);
   const context = await browser.newContext();
-  await context.addInitScript(() => {
-    try {
-      localStorage.setItem("raft5fs:index-here", "on");
-    } catch {}
-  });
   const page = await context.newPage();
   const problems = watch(page);
   await enrol(page, "ned");
@@ -1890,6 +1833,7 @@ test("photos are found by where and when they were taken, and rides by where the
     { name: "coast.gpx", mimeType: "application/gpx+xml", buffer: Buffer.from(gpxRide("Coast ride", [41.6, -70.6], [41.7, -70.5])) },
   ]);
   await expect(item(page, "coast.gpx")).toBeVisible(SLOW);
+  await nativeIndex("ned", "trips");
 
   // A photo by its place and month, with its thumbnail.
   const photos = await searchUntil(page, "Lisbon 2024", "trips/IMG_0412.jpg");

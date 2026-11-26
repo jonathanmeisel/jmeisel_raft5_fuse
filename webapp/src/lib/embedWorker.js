@@ -1,6 +1,6 @@
-// The embed Worker: the search models, and the PDF reader, apart from the
-// session's Worker, so that minutes of indexing never hold up its calls.
-// It holds no keys: the session's Worker sends it text, or a PDF's bytes.
+// The embed Worker: the search models, apart from the session's Worker, so
+// that loading and running them never holds up its calls. It holds no
+// keys: the session's Worker sends it a query's text.
 //
 // - The models are raft5fs-embed's, as native clients run them (the
 //   raft5fs-embed-web module): multilingual-e5-small for text, and CLIP's
@@ -14,17 +14,12 @@
 //   memory. Without OPFS (some private windows), the table is held in
 //   memory instead.
 // - What goes before a query or a passage comes from models.json.
-// - PDFs are read by the PDF module (raft5fs-pdf-web). A PDF that makes it
-//   trap ends that instance only; the next PDF starts a new one.
-// - Photos' thumbnails are drawn here too, on an OffscreenCanvas.
 //
 // Messages: {id, op: "embed", texts, query} → {id, vectors}; {id, op:
-// "clip", text} → {id, vector}; {id, op: "pdf", bytes} → {id, text}; {id,
-// op: "thumb", bytes} → {id, thumb}; {id, op: "state"} → {id, state: {text,
+// "clip", text} → {id, vector}; {id, op: "state"} → {id, state: {text,
 // clip: {ready, loading, cached}, loaded, total}}, and {id, op: "memory"},
 // at once. A failure answers {id, error}.
 import initEmbed, { Model, Sha256, memoryBytes } from "../wasm/raft5fs_embed_web.js";
-import initPdf, { pdfText } from "../wasm/raft5fs_pdf_web.js";
 // Every model, pinned in one place for every client (see its "about").
 import manifest from "../../../search/data/models.json";
 
@@ -288,49 +283,10 @@ async function state() {
   return out;
 }
 
-/// The longest side of a photo's thumbnail (raft5fs-search's THUMB_PX).
-const THUMB_PX = 256;
-
-/// A photo's thumbnail, as a JPEG: upright (the browser reads its EXIF
-/// orientation), at most THUMB_PX on its longest side. Null for a format
-/// this browser can't decode.
-async function makeThumb(bytes) {
-  try {
-    const image = await createImageBitmap(new Blob([bytes]));
-    const scale = Math.min(1, THUMB_PX / Math.max(image.width, image.height));
-    const w = Math.max(1, Math.round(image.width * scale));
-    const h = Math.max(1, Math.round(image.height * scale));
-    const canvas = new OffscreenCanvas(w, h);
-    canvas.getContext("2d").drawImage(image, 0, 0, w, h);
-    image.close();
-    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 });
-    return new Uint8Array(await blob.arrayBuffer());
-  } catch {
-    return null;
-  }
-}
-
-let pdfReady = null;
-/// The PDF module's exports, once loaded (for `memory`).
-let pdfExports = null;
-
-async function readPdf(bytes) {
-  pdfReady ??= initPdf().then((e) => (pdfExports = e));
-  await pdfReady;
-  try {
-    return pdfText(bytes) ?? null;
-  } catch {
-    // A trap leaves the module unusable: start a new one next time.
-    pdfReady = null;
-    return null;
-  }
-}
-
-/// Bytes of WebAssembly memory this Worker holds (the models' module, the
-/// PDF module), and which models are loaded.
+/// Bytes of WebAssembly memory this Worker holds (the models' module), and
+/// which models are loaded.
 function memory() {
   return {
-    pdfWasm: pdfExports?.memory?.buffer.byteLength ?? 0,
     modelWasm: embedExports ? memoryBytes() : 0,
     loaded: Object.keys(ready).filter((m) => ready[m]),
   };
@@ -340,7 +296,7 @@ function memory() {
 /// passage.
 let queue = Promise.resolve();
 
-onmessage = ({ data: { id, op, texts, query, text, bytes } }) => {
+onmessage = ({ data: { id, op, texts, query, text } }) => {
   // How the models are: answered at once, not after queued work.
   if (op === "state") {
     state().then((s) => postMessage({ id, state: s }));
@@ -354,15 +310,6 @@ onmessage = ({ data: { id, op, texts, query, text, bytes } }) => {
   }
   queue = queue.then(async () => {
     try {
-      if (op === "pdf") {
-        postMessage({ id, text: await readPdf(bytes) });
-        return;
-      }
-      if (op === "thumb") {
-        const thumb = await makeThumb(bytes);
-        postMessage({ id, thumb }, thumb ? [thumb.buffer] : []);
-        return;
-      }
       if (op === "clip") {
         const vector = await (await use("clip")).embed(text);
         postMessage({ id, vector }, [vector.buffer]);

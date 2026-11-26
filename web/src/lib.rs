@@ -2355,9 +2355,6 @@ impl Fs {
         let inner = Rc::clone(&self.0);
         promise(async move {
             inner.stop_pruner();
-            if let Some(indexer) = inner.search_stop() {
-                indexer.stop().await;
-            }
             inner.handles.borrow_mut().clear();
             inner.session.shutdown().await;
             Ok(())
