@@ -1192,12 +1192,10 @@ this device" is off. Indexing with the models takes CPU: about half the
 cores, at most four, while a pass runs (CANDLE_NUM_THREADS sets another
 number).
 
-Only native devices (a mount, a WebDAV server, raft5fs index) make
-vectors. The web app indexes words, dates, places and thumbnails, and
-uses the models only to search. When a pass on a native device finds
-files that were indexed without vectors, it adds them, whether or not
-the files changed. So a volume that only browsers index is searched
-by words alone, until a native device indexes it once.
+Only native devices (a mount, a WebDAV server, raft5fs index) index.
+The web app only searches, with the models for queries alone; a file
+uploaded there is found once a native device's next pass has indexed it.
+So a volume is searched only once a native device has indexed it.
 
 What is indexed: plain text and source code, HTML, Word, PowerPoint and
 Excel files (docx, pptx, xlsx), OpenDocument files, PDF, chat exports,
@@ -1234,16 +1232,13 @@ show.
 
 Indexing runs by itself. A mount or a WebDAV server indexes, in the
 background, each volume this account can write (not the Android build,
-which doesn't index at all, section 14), and so does the web app, in one tab per account,
-unless its account menu's "Index for search on this device" is off (it
-is off by default on a phone or tablet). In the web app, the search box
+which doesn't index at all, section 14). In the web app, the search box
 in the header searches the open top-level folder, or every one. Devices take turns: one claims a volume on the
 servers for a while, as with prunes (7.2), and others leave it alone.
-"Being indexed elsewhere" means another device of yours, or a browser
-tab, holds that claim; it says when the claim runs out. A pass renews
+"Being indexed elsewhere" means another device of yours holds that
+claim; it says when the claim runs out. A pass renews
 its claim while it makes progress, and gives it up when it ends, or when
-its device stops indexing (a mount or tab closing, Ctrl-C in raft5fs
-index, logging out or locking the web app). A device that vanishes mid-
+its device stops indexing (a mount closing, Ctrl-C in raft5fs index). A device that vanishes mid-
 pass leaves its claim until it runs out (10 minutes); a pass stuck for
 30 minutes stops and gives its claim up. A pass follows the volume's activity log (section 8), so it reads only
 what changed; once a day it walks the whole volume, for anything the
@@ -1254,6 +1249,9 @@ log missed. To index now, in the foreground:
   raft5fs index --status         how far each got, and who did it
   raft5fs index photos --dry-run read everything, say how big its
                                  index would be, store nothing
+  raft5fs index --check-recall   how much searching by meaning loses by
+                                 reading only the nearest clusters (see
+                                 below), on each volume's own vectors
 
 To keep one device off a volume (a laptop and a big photo volume, say),
 give the mount --index-skip photos, or put index_skip = ["photos"] in
@@ -1277,11 +1275,59 @@ word stored once in a segment. A vector says roughly what its text is
 about, and someone with the index could partly recover the text from
 it, so it is sealed as strongly as the files are.
 
-Each device writes its own index files, and never changes them. So the
-index grows with every change, and a device that holds the claim
-compacts it now and then. It writes all live entries again as a few
-large files of its own, then deletes the rest. This happens when the
-small files outnumber the large ones (and there are more than 16), or
-when more than 30% of the entries are out of date. A browser reads only
-the index files it has not read yet, and adds them to what it has.
+How the index is kept. Each device writes its own small files of what
+changed ("recent segments"), and never changes them. Now and then a
+device that holds the claim compacts them, with what came before, into
+one "generation": a few large files (about 8 MB each) that hold
+
+  - a row for each file: its path, kind, date, place and thumbnail;
+  - the words, in shards picked by a keyed hash of each word, with each
+    file that has the word and how often (a file keeps its pieces' 50
+    most telling words; words in more than a quarter of the files, in
+    a volume of 1,000 files or more, are left out, as they say little);
+  - the vectors, grouped around about the square root of their number of
+    centres (k-means, computed again each time), photos' apart from
+    text's;
+  - each piece of text's preview.
+
+A search reads the rows and the centres into memory, and only the shards
+of the query's words and the groups nearest its vectors from what the
+device keeps: memory stays small as a volume grows, and searching by
+meaning compares the query with only about 20,000 vectors. That finds
+about what comparing with all of them would (raft5fs index
+--check-recall measures it on a volume). A volume of under about 50,000
+pieces of text has one group: every vector is compared.
+
+A compaction happens when the recent segments hold more than 7.5% as
+many files as the generation, or 25,000 pieces of text (which every
+reader keeps in memory), or 64 files, or when more than 30% of the
+generation's files are out of date; not for fewer than 200 recent
+files. It keeps what it replaced for a day, for readers part-way
+through it, then a later pass deletes it. A compacting device needs
+about 300-450 MB of memory for the models and about 150-250 MB more,
+and spill space on its own disk about the size of the new generation
+(in ~/.cache/raft5fs, sealed, deleted when done).
+
+Browsers download a volume's whole index, never only the parts a query
+needs, so what they fetch says nothing about what is searched. They
+keep it (sealed) and then fetch only what is new; a new generation
+downloads in the background while the old one is still searched. A
+volume whose index is over 500 MiB isn't downloaded unless asked, in its
+More, Search indexing, in that browser; one not downloaded isn't
+searched there, and the search panel says so. After keeping a large
+index, the app asks the browser not to delete its storage when the disk
+runs low. Native devices keep what they read in ~/.cache/raft5fs/index,
+sealed to the account.
+
+Upgrading from a version before generations. The index is in a new
+format, and nothing reads the old one. After upgrading, as each volume's
+owner:
+
+  1. raft5fs volume indexing <volume> off --delete-index
+  2. update every native client, and the web app (a new release)
+  3. raft5fs volume indexing <volume> on
+     raft5fs index --full
+
+Search is out between steps 1 and 3, until the first pass has written
+something. The first pass reads and embeds every file again.
 

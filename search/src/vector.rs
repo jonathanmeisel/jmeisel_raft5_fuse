@@ -26,6 +26,15 @@
 //!   (see `view`). For photos, measure on real photos, not drawings, which
 //!   score higher: raft5fs-indexer's `clip_scores` example scores queries
 //!   against a folder of them.
+//! - Build the test corpus again with the new model (raft5fs-eval's
+//!   `build_corpus` example), release it, pin it in eval/data/corpus.json,
+//!   and run raft5fs-eval (and `raft5fs-eval recall`): the ranking's
+//!   numbers in models.json (`ranking`) and the probing in `index` were
+//!   set by measuring with the old one.
+//! - A generation's clusters hold vectors of one model. After the change,
+//!   the next compaction trains new centres on the new vectors, and leaves
+//!   the old model's vectors out: until then, search by meaning finds only
+//!   what was embedded again since.
 
 use crate::record::Vector;
 

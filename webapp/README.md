@@ -135,12 +135,22 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     Saver, or on a slow connection, it asks before that download
     (`searchSetting.js`): **Download**, **Not now** (until the page
     reloads), or **Never on this device**.
-  - IndexedDB's `search` store keeps the index segments this browser has
-    read, sealed to the account in the wasm client (raft5fs-crypto's
-    `local`), so searching again fetches only what is new, and adds only
-    that to the volume's view in memory. Segments a compaction removed
-    are dropped from it (`cacheKeep`). **Keep search data on this device**
-    off keeps nothing, for a borrowed computer.
+  - A folder's index is downloaded whole: its recent segments, and its
+    generation's server files, kept piece by piece in IndexedDB's `search`
+    store, sealed to the account in the wasm client (raft5fs-crypto's
+    `local`). In memory are only the generation's rows and centres and the
+    recent segments; a query reads its keyword shards and nearest
+    clusters from the store (SETUP.txt section 15). Searching again
+    fetches only what is new; a new generation downloads in the
+    background while the old one is searched, and then what it replaced
+    is dropped (`cacheKeep`). **Keep search data on this device** off
+    keeps nothing, for a borrowed computer.
+  - An index over 500 MiB isn't downloaded unless this browser is asked
+    to, in the folder's **More → Search indexing** (`searchSetting.js`);
+    one not downloaded isn't searched, and the results say so. A big
+    download shows its progress in the results. After keeping an index
+    of over 50 MB, the page asks for persistent storage
+    (`navigator.storage.persist`).
   - Photos' thumbnails, which native devices make, show with results.
   - Photos are found by what they show with CLIP (its multilingual text
     side only, served beside the text model): native devices give photos
