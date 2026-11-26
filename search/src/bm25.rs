@@ -1,164 +1,166 @@
-//! Keyword ranking (Okapi BM25) over chunks, built in memory from records.
+//! Keyword ranking (Okapi BM25) over files, built in memory from records.
 //!
-//! - Each chunk is a document. A file's score is its best chunk's score, so
-//!   a long file does not win only by being long.
-//! - A file's path counts as one more chunk, so "vermont" finds files in a
-//!   `vermont/` folder.
+//! - Each file is a document: a word's count is its count in the whole
+//!   file, and a file's length is all its words. A long file that names a
+//!   word once ranks below a short one about it; search by meaning still
+//!   finds a long file's focused passage.
+//! - Paths are not words here: `paths` searches them.
+//! - Words in more than `COMMON_SHARE` of the files searched (with at
+//!   least `COMMON_MIN_FILES` files) count for nothing, as the index drops
+//!   them at compaction: they say little and cost the most.
+//! - A match also gives its coverage: the share of the query's weight
+//!   (each word by its rarity) that the file has.
 
 use std::collections::HashMap;
 
-use crate::text::{counted, terms};
+use crate::text::terms;
+use crate::vector::{RANKING_COMMON_MIN_FILES, RANKING_COMMON_SHARE};
 
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
-/// One chunk's place: which document (by the caller's number) and which
-/// chunk of it. `chunk` is `None` for the path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChunkRef {
-    pub doc: usize,
-    pub chunk: Option<usize>,
+/// One word's BM25 score in a file: its weight (`Stats::weights`), its
+/// count there, the file's length, and the files' mean length.
+pub fn term_score(idf: f32, tf: f32, len: f32, avg: f32) -> f32 {
+    idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / avg))
 }
 
-/// A chunk as the index keeps it: its doc, which chunk (`PATH` for the
-/// path), and its length in words.
-#[derive(Debug, Clone, Copy)]
-struct Slot {
-    doc: u32,
-    chunk: u32,
-    len: u32,
-}
+/// Words in more than this share of the files count for nothing...
+pub const COMMON_SHARE: f64 = RANKING_COMMON_SHARE;
+/// ... once there are at least this many files. Fewer files say too
+/// little about which words are common.
+pub const COMMON_MIN_FILES: u64 = RANKING_COMMON_MIN_FILES;
 
-const PATH: u32 = u32::MAX;
-
-impl Slot {
-    fn at(self) -> ChunkRef {
-        ChunkRef {
-            doc: self.doc as usize,
-            chunk: (self.chunk != PATH).then_some(self.chunk as usize),
-        }
-    }
-}
-
-/// The chunks a word is in, and how often, as two lists (6 bytes a
-/// posting, where pairs would take 8).
+/// The files a word is in, and how often, as two lists.
 #[derive(Default, Clone)]
 struct Postings {
-    chunks: Vec<u32>,
+    docs: Vec<u32>,
     counts: Vec<u16>,
 }
 
 impl Postings {
     fn len(&self) -> usize {
-        self.chunks.len()
+        self.docs.len()
     }
 
     fn iter(&self) -> impl Iterator<Item = (u32, u16)> + '_ {
-        self.chunks.iter().copied().zip(self.counts.iter().copied())
+        self.docs.iter().copied().zip(self.counts.iter().copied())
     }
 }
 
-/// The index: each word once, by number, and for each word the chunks it
-/// is in and how often.
+/// The index: each word once, by number, and for each word the files it
+/// is in and how often. Docs are numbered by the caller.
 #[derive(Default)]
 pub struct Bm25 {
     words: HashMap<String, u32>,
     postings: Vec<Postings>,
-    chunks: Vec<Slot>,
+    /// Each doc's length in words; 0 for numbers never added.
+    lens: Vec<u32>,
+    docs: u64,
     total_len: u64,
 }
 
+/// One keyword match: the doc, its score, and its coverage (0–1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Match {
+    pub doc: usize,
+    pub score: f32,
+    pub coverage: f32,
+}
+
 impl Bm25 {
-    /// Adds a chunk with its counted terms and its length in words.
-    pub fn add(&mut self, at: ChunkRef, terms: &[(String, u16)], len: u32) {
-        let id = self.chunks.len() as u32;
-        self.chunks.push(Slot {
-            doc: at.doc as u32,
-            chunk: at.chunk.map_or(PATH, |c| c as u32),
-            len: len.max(1),
-        });
-        self.total_len += u64::from(len.max(1));
-        for (term, count) in terms {
+    /// Adds `doc` with its chunks' counted terms (sorted by word, as
+    /// records keep them) and lengths.
+    pub fn add_doc<'a>(
+        &mut self,
+        doc: usize,
+        chunks: impl IntoIterator<Item = (&'a [(String, u16)], u32)>,
+    ) {
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        let mut len = 0u32;
+        for (terms, l) in chunks {
+            len = len.saturating_add(l);
+            for (t, n) in terms {
+                *counts.entry(t.as_str()).or_default() += u32::from(*n);
+            }
+        }
+        if self.lens.len() <= doc {
+            self.lens.resize(doc + 1, 0);
+        }
+        let len = len.max(1);
+        self.lens[doc] = len;
+        self.docs += 1;
+        self.total_len += u64::from(len);
+        let mut sorted: Vec<(&str, u32)> = counts.into_iter().collect();
+        sorted.sort_unstable();
+        for (term, count) in sorted {
             let word = match self.words.get(term) {
                 Some(&w) => w,
                 None => {
                     let w = self.postings.len() as u32;
-                    self.words.insert(term.clone(), w);
+                    self.words.insert(term.to_string(), w);
                     self.postings.push(Postings::default());
                     w
                 }
             };
             let p = &mut self.postings[word as usize];
-            p.chunks.push(id);
-            p.counts.push(*count);
+            p.docs.push(doc as u32);
+            p.counts.push(count.min(u32::from(u16::MAX)) as u16);
         }
     }
 
-    /// Adds `doc`'s path as a chunk of its own. Names like `photo.jpg` and
-    /// `tax_2024-v2` are one word to the Unicode rules, so the path is cut
-    /// at `.`, `_` and `-` too, and each part found alone.
-    pub fn add_path(&mut self, doc: usize, path: &str) {
-        let t = terms(&path.replace(['/', '.', '_', '-'], " "));
-        if !t.is_empty() {
-            self.add(ChunkRef { doc, chunk: None }, &counted(&t), t.len() as u32);
-        }
-    }
-
-    /// Keeps only the chunks of docs that `doc` maps, renumbered as it
-    /// says, and drops words no chunk has any more.
+    /// Keeps only the docs that `doc` maps, renumbered as it says, and
+    /// drops words no doc has any more.
     pub fn compact(&mut self, doc: impl Fn(usize) -> Option<usize>) {
-        let mut renumber = vec![u32::MAX; self.chunks.len()];
-        let mut chunks = Vec::new();
+        let mut lens = Vec::new();
+        self.docs = 0;
         self.total_len = 0;
-        for (old, slot) in self.chunks.iter().enumerate() {
-            if let Some(d) = doc(slot.doc as usize) {
-                renumber[old] = chunks.len() as u32;
-                self.total_len += u64::from(slot.len);
-                chunks.push(Slot {
-                    doc: d as u32,
-                    ..*slot
-                });
+        for (old, &len) in self.lens.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            if let Some(d) = doc(old) {
+                if lens.len() <= d {
+                    lens.resize(d + 1, 0);
+                }
+                lens[d] = len;
+                self.docs += 1;
+                self.total_len += u64::from(len);
             }
         }
-        self.chunks = chunks;
-        let mut postings = Vec::new();
+        self.lens = lens;
         let old_postings = std::mem::take(&mut self.postings);
         let mut words: Vec<(String, u32)> = self.words.drain().collect();
         words.sort_by_key(|(_, w)| *w);
         for (word, w) in words {
             let mut kept: Vec<(u32, u16)> = old_postings[w as usize]
                 .iter()
-                .filter_map(|(chunk, n)| {
-                    let new = renumber[chunk as usize];
-                    (new != u32::MAX).then_some((new, n))
-                })
+                .filter_map(|(d, n)| doc(d as usize).map(|new| (new as u32, n)))
                 .collect();
-            kept.sort_by_key(|(chunk, _)| *chunk);
+            kept.sort_by_key(|(d, _)| *d);
             if !kept.is_empty() {
-                self.words.insert(word, postings.len() as u32);
-                postings.push(Postings {
-                    chunks: kept.iter().map(|k| k.0).collect(),
+                self.words.insert(word, self.postings.len() as u32);
+                self.postings.push(Postings {
+                    docs: kept.iter().map(|k| k.0).collect(),
                     counts: kept.iter().map(|k| k.1).collect(),
                 });
             }
         }
-        self.postings = postings;
     }
 
     /// Gives back the room the lists grew into and don't use.
     pub fn shrink(&mut self) {
         for p in &mut self.postings {
-            p.chunks.shrink_to_fit();
+            p.docs.shrink_to_fit();
             p.counts.shrink_to_fit();
         }
         self.postings.shrink_to_fit();
-        self.chunks.shrink_to_fit();
+        self.lens.shrink_to_fit();
         self.words.shrink_to_fit();
     }
 
-    /// The documents that match `query`, best first, each with its score and
-    /// best chunk. At most `limit`.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, f32, Option<usize>)> {
+    /// The docs that match `query`, best first. At most `limit`.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<Match> {
         let terms = query_terms(query);
         let mut stats = Stats::default();
         self.add_stats(&terms, &mut stats);
@@ -175,7 +177,7 @@ impl Bm25 {
 
     /// Adds this index's counts for `terms` to `stats`.
     pub fn add_stats(&self, terms: &[String], stats: &mut Stats) {
-        stats.chunks += self.chunks.len() as u64;
+        stats.docs += self.docs;
         stats.total_len += self.total_len;
         for term in terms {
             let df = self
@@ -186,8 +188,8 @@ impl Bm25 {
         }
     }
 
-    /// The documents that match `terms` (`query_terms`), scored with
-    /// `stats`, over only the documents that `live` keeps.
+    /// The docs that match `terms` (`query_terms`), scored with `stats`,
+    /// over only the docs that `live` keeps.
     ///
     /// With `stats` from several indexes (`add_stats`), scores compare
     /// across them: a word rare in one small volume but common in the
@@ -198,45 +200,40 @@ impl Bm25 {
         stats: &Stats,
         limit: usize,
         live: impl Fn(usize) -> bool,
-    ) -> Vec<(usize, f32, Option<usize>)> {
-        if self.chunks.is_empty() || stats.chunks == 0 {
+    ) -> Vec<Match> {
+        if self.docs == 0 || stats.docs == 0 {
             return Vec::new();
         }
-        let n = stats.chunks as f32;
+        let n = stats.docs as f32;
         let avg = stats.total_len as f32 / n;
-        let mut scores: HashMap<u32, f32> = HashMap::new();
-        for term in terms {
+        let weights = stats.weights(terms);
+        let total: f32 = weights.iter().map(|w| w.1).sum();
+        if total <= 0.0 {
+            return Vec::new();
+        }
+        let mut scores: HashMap<u32, (f32, f32)> = HashMap::new();
+        for (term, idf) in weights {
             let Some(list) = self.words.get(term).map(|&w| &self.postings[w as usize]) else {
                 continue;
             };
-            let df = stats
-                .df
-                .get(term)
-                .copied()
-                .unwrap_or(0)
-                .max(list.len() as u64) as f32;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            for (id, tf) in list.iter() {
-                let len = self.chunks[id as usize].len as f32;
-                let tf = f32::from(tf);
-                let s = idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / avg));
-                *scores.entry(id).or_default() += s;
+            for (d, tf) in list.iter() {
+                let len = self.lens[d as usize] as f32;
+                let s = term_score(idf, f32::from(tf), len, avg);
+                let e = scores.entry(d).or_default();
+                e.0 += s;
+                e.1 += idf;
             }
         }
-        let mut best: HashMap<usize, (f32, Option<usize>)> = HashMap::new();
-        for (id, score) in scores {
-            let at = self.chunks[id as usize].at();
-            if !live(at.doc) {
-                continue;
-            }
-            let slot = best.entry(at.doc).or_insert((f32::MIN, None));
-            // Show a chunk of text rather than the path when they tie.
-            if score > slot.0 || (score == slot.0 && slot.1.is_none()) {
-                *slot = (score, at.chunk);
-            }
-        }
-        let mut out: Vec<_> = best.into_iter().map(|(d, (s, c))| (d, s, c)).collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut out: Vec<Match> = scores
+            .into_iter()
+            .filter(|(d, _)| live(*d as usize))
+            .map(|(d, (score, w))| Match {
+                doc: d as usize,
+                score,
+                coverage: w / total,
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc.cmp(&b.doc)));
         out.truncate(limit);
         out
     }
@@ -250,64 +247,114 @@ pub fn query_terms(query: &str) -> Vec<String> {
     t
 }
 
-/// What BM25 scores by, over one index or several: how many chunks, their
-/// total length, and how many chunks have each query word.
+/// What BM25 scores by, over one index or several: how many docs, their
+/// total length, and how many docs have each query word.
 #[derive(Debug, Default)]
 pub struct Stats {
-    pub chunks: u64,
+    pub docs: u64,
     pub total_len: u64,
     pub df: HashMap<String, u64>,
+}
+
+impl Stats {
+    /// Whether `term` is too common to count.
+    pub fn is_common(&self, term: &str) -> bool {
+        self.docs >= COMMON_MIN_FILES
+            && self.df.get(term).copied().unwrap_or(0) as f64 > self.docs as f64 * COMMON_SHARE
+    }
+
+    /// Each term that counts, with its weight (inverse document
+    /// frequency). Words no doc has don't count: no file can match them,
+    /// so they would only lower every file's coverage.
+    pub fn weights<'a>(&self, terms: &'a [String]) -> Vec<(&'a str, f32)> {
+        let n = self.docs as f32;
+        terms
+            .iter()
+            .filter(|t| !self.is_common(t))
+            .filter_map(|t| {
+                let df = self.df.get(t.as_str()).copied().unwrap_or(0) as f32;
+                (df > 0.0).then(|| (t.as_str(), ((n - df + 0.5) / (df + 0.5) + 1.0).ln()))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::counted;
 
-    fn add_text(index: &mut Bm25, doc: usize, chunk: usize, text: &str) {
-        let t = terms(text);
-        index.add(
-            ChunkRef {
-                doc,
-                chunk: Some(chunk),
-            },
-            &counted(&t),
-            t.len() as u32,
-        );
+    fn add_text(index: &mut Bm25, doc: usize, chunks: &[&str]) {
+        let counted: Vec<(Vec<(String, u16)>, u32)> = chunks
+            .iter()
+            .map(|c| {
+                let t = terms(c);
+                (counted(&t), t.len() as u32)
+            })
+            .collect();
+        index.add_doc(doc, counted.iter().map(|(t, l)| (t.as_slice(), *l)));
     }
 
     #[test]
     fn rarer_and_more_frequent_terms_rank_higher() {
         let mut index = Bm25::default();
-        add_text(&mut index, 0, 0, "the bike ride along the lake");
-        add_text(&mut index, 1, 0, "the the the the lake");
-        add_text(&mut index, 2, 0, "bike bike bike repair notes");
+        add_text(&mut index, 0, &["the bike ride along the lake"]);
+        add_text(&mut index, 1, &["the the the the lake"]);
+        add_text(&mut index, 2, &["bike bike bike repair notes"]);
         let hits = index.search("bike", 10);
-        assert_eq!(hits.iter().map(|h| h.0).collect::<Vec<_>>(), [2, 0]);
-        // "the" is in most chunks, so it adds little next to "lake".
+        assert_eq!(hits.iter().map(|h| h.doc).collect::<Vec<_>>(), [2, 0]);
+        // "the" is in most files, so it adds little next to "lake".
         let hits = index.search("the lake", 10);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.0 != 2));
+        assert!(hits.iter().all(|h| h.doc != 2));
     }
 
     #[test]
-    fn a_file_scores_by_its_best_chunk_and_its_path_counts() {
+    fn a_file_counts_its_words_across_chunks() {
         let mut index = Bm25::default();
-        add_text(&mut index, 0, 0, "nothing here");
-        add_text(&mut index, 0, 1, "receipts for the tax return");
-        index.add_path(1, "vermont/routes/kingdom_loop.gpx");
-        let hits = index.search("tax", 10);
-        assert_eq!(hits, [(0, hits[0].1, Some(1))]);
-        let hits = index.search("Vermont", 10);
-        assert_eq!(hits[0].0, 1);
-        assert_eq!(hits[0].2, None, "found by its path");
-        assert_eq!(index.search("kingdom gpx", 10)[0].0, 1);
+        add_text(&mut index, 0, &["receipts and more", "tax return receipts"]);
+        add_text(&mut index, 1, &["tax notes"]);
+        let hits = index.search("tax receipts", 10);
+        assert_eq!(hits[0].doc, 0);
+        assert!((hits[0].coverage - 1.0).abs() < 1e-6);
+        assert!(hits[1].coverage < 1.0);
+    }
+
+    #[test]
+    fn common_words_count_for_nothing_in_a_large_index() {
+        let mut index = Bm25::default();
+        let files = COMMON_MIN_FILES as usize;
+        for d in 0..files {
+            let text = if d % 10 == 0 {
+                "the kayak trip"
+            } else {
+                "the notes"
+            };
+            add_text(&mut index, d, &[text]);
+        }
+        // "the" is in every file: it finds nothing alone, and adds nothing.
+        assert!(index.search("the", 10).is_empty());
+        let hits = index.search("the kayak", 10);
+        assert!((hits[0].coverage - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compacting_renumbers_and_drops_dead_docs() {
+        let mut index = Bm25::default();
+        add_text(&mut index, 0, &["alpha"]);
+        add_text(&mut index, 1, &["beta"]);
+        add_text(&mut index, 2, &["alpha beta"]);
+        index.compact(|d| [None, Some(0), Some(1)][d]);
+        assert_eq!(index.size(), (2, 3));
+        let hits: Vec<usize> = index.search("alpha", 10).iter().map(|h| h.doc).collect();
+        assert_eq!(hits, [1]);
     }
 
     #[test]
     fn nothing_matches_an_empty_index_or_query() {
         assert!(Bm25::default().search("x", 5).is_empty());
         let mut index = Bm25::default();
-        add_text(&mut index, 0, 0, "words");
+        add_text(&mut index, 0, &["words"]);
         assert!(index.search("", 5).is_empty());
         assert!(index.search("other", 5).is_empty());
     }

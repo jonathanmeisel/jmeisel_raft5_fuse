@@ -7,6 +7,8 @@
 //! - `--limit N`: results per search (default 50, as the web app asks).
 //! - `--report FILE`: also write the measures as JSON.
 //! - `recall` (first): result recall of clustered search, text and photos.
+//! - `tune` (first): the ranking's numbers that score best (`tune`), over
+//!   `--volumes` volumes (default 4) and every query.
 use std::path::PathBuf;
 
 use raft5fs_eval::corpus::Corpus;
@@ -19,6 +21,10 @@ fn main() {
     let mut report: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1).peekable();
     let recall = args.next_if(|a| a == "recall").is_some();
+    let tune = args.next_if(|a| a == "tune").is_some();
+    if tune {
+        volumes = vec![4];
+    }
     while let Some(a) = args.next() {
         let mut value = || {
             args.next()
@@ -46,6 +52,18 @@ fn main() {
     );
     if recall {
         raft5fs_eval::recall::report(&corpus);
+        return;
+    }
+    if tune {
+        let start = raft5fs_search::rank::Ranking::default();
+        let (best, score) =
+            raft5fs_eval::tune::tune(&corpus, volumes[0], corpus.queries.len(), start);
+        println!("best ({score:.4}): {best:#?}");
+        let views = split(&corpus.records, volumes[0]);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let results =
+            raft5fs_eval::run_with(&corpus, &corpus.queries, &views, limit, threads, &best);
+        println!("{}", table(&results));
         return;
     }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());

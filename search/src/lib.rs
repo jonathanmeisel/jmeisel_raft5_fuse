@@ -21,6 +21,7 @@ pub mod cluster;
 pub mod extract;
 pub mod geo;
 pub mod manifest;
+pub mod paths;
 pub mod rank;
 pub mod record;
 pub mod segment;

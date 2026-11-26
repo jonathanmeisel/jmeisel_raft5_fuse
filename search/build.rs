@@ -1,4 +1,5 @@
-//! Writes the search models' constants (`vector`, `view`) from
+//! Writes the search models' constants (`vector`, `view`) and the ranking's
+//! (`rank`, `bm25`) from
 //! `data/models.json`, the one place a model is pinned: a model of the
 //! same kind is changed there, not here.
 
@@ -57,6 +58,42 @@ fn main() {
         .as_u64()
         .expect("text's search.minWords");
     writeln!(out, "pub const TEXT_MIN_WORDS: u32 = {words};").unwrap();
+    let ranking = &json["ranking"];
+    let f = |path: &[&str]| -> f64 {
+        let mut v = ranking;
+        for p in path {
+            v = &v[*p];
+        }
+        v.as_f64()
+            .unwrap_or_else(|| panic!("ranking.{}", path.join(".")))
+    };
+    for (name, path) in [
+        ("WEIGHT_PATH", &["weights", "path"][..]),
+        ("WEIGHT_KEYWORD", &["weights", "keyword"]),
+        ("WEIGHT_MEANING", &["weights", "meaning"]),
+        ("WEIGHT_PHOTO", &["weights", "photo"]),
+        ("BONUS", &["bonus"]),
+        ("KEEP", &["keep"]),
+        ("MIN_COVERAGE", &["minCoverage"]),
+        ("KEYWORD_MARGIN", &["keywordMargin"]),
+        ("COVERAGE_POWER", &["coveragePower"]),
+        ("MEANING_SPAN", &["meaningSpan"]),
+        ("PHOTO_SPAN", &["photoSpan"]),
+    ] {
+        writeln!(out, "pub const RANKING_{name}: f32 = {:?};", f(path) as f32).unwrap();
+    }
+    writeln!(
+        out,
+        "pub const RANKING_COMMON_SHARE: f64 = {:?};",
+        f(&["commonShare"])
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "pub const RANKING_COMMON_MIN_FILES: u64 = {};",
+        f(&["commonMinFiles"]) as u64
+    )
+    .unwrap();
     let dest = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("models.rs");
     std::fs::write(dest, out).unwrap();
 }

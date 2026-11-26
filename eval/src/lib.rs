@@ -12,13 +12,15 @@
 pub mod corpus;
 pub mod metrics;
 pub mod recall;
+pub mod tune;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use raft5fs_search::rank::Ranking;
 use raft5fs_search::record::{DocKind, Entry, Record};
-use raft5fs_search::view::{QueryVector, View, search_many};
+use raft5fs_search::view::{QueryVector, View, search_many_with};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -36,7 +38,13 @@ pub fn split(records: &[Record], volumes: usize) -> Vec<View> {
 }
 
 /// The inodes that `query` finds over `views`, best first.
-pub fn ranked(corpus: &Corpus, views: &[&View], query: &Query, limit: usize) -> Vec<u64> {
+pub fn ranked(
+    corpus: &Corpus,
+    views: &[&View],
+    query: &Query,
+    limit: usize,
+    ranking: &Ranking,
+) -> Vec<u64> {
     let text = QueryVector {
         model: &corpus.text_model,
         values: &query.vector,
@@ -45,7 +53,7 @@ pub fn ranked(corpus: &Corpus, views: &[&View], query: &Query, limit: usize) -> 
         model: &corpus.clip_model,
         values: &query.clip,
     };
-    search_many(views, &query.text, Some(text), Some(image), limit)
+    search_many_with(views, &query.text, Some(text), Some(image), limit, ranking)
         .into_iter()
         .map(|(_, hit)| hit.ino)
         .collect()
@@ -64,7 +72,25 @@ pub fn run(
     limit: usize,
     threads: usize,
 ) -> BTreeMap<String, Totals> {
-    let queries = &corpus.queries;
+    run_with(
+        corpus,
+        &corpus.queries,
+        views,
+        limit,
+        threads,
+        &Ranking::default(),
+    )
+}
+
+/// `run`, over `queries`, ranked by `ranking`.
+pub fn run_with(
+    corpus: &Corpus,
+    queries: &[Query],
+    views: &[View],
+    limit: usize,
+    threads: usize,
+    ranking: &Ranking,
+) -> BTreeMap<String, Totals> {
     let refs: Vec<&View> = views.iter().collect();
     let kinds: HashMap<u64, DocKind> = corpus.records.iter().map(|r| (r.ino, r.kind)).collect();
     let threads = threads.max(1);
@@ -78,7 +104,7 @@ pub fn run(
                 s.spawn(move || {
                     let mut out: BTreeMap<String, Totals> = BTreeMap::new();
                     for q in qs {
-                        let found = ranked(corpus, refs, q, limit);
+                        let found = ranked(corpus, refs, q, limit, ranking);
                         let relevant: HashMap<u64, u8> = q.relevant.iter().copied().collect();
                         let photos = wants_photos(&q.set);
                         let wrong = |ino: u64| (kinds.get(&ino) == Some(&DocKind::Photo)) != photos;

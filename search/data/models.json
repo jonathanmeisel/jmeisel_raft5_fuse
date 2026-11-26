@@ -121,5 +121,23 @@
         }
       ]
     }
+  },
+  "ranking": {
+    "about": "How search ranks: each list's score (0-1) times its weight, plus a bonus per extra list; results below keep x the best are dropped. Keyword matches need minCoverage of the query's weight and keywordMargin of the best score; their score is their share of the best times coverage to the power coveragePower. Meaning and photo matches score 1 at span above their cutoff. Words in more than commonShare of the files count for nothing once there are commonMinFiles files. Set by measuring with raft5fs-eval.",
+    "weights": {
+      "path": 1.0,
+      "keyword": 2.0,
+      "meaning": 1.0,
+      "photo": 1.0
+    },
+    "bonus": 0.0,
+    "keep": 0.3,
+    "minCoverage": 0.0,
+    "keywordMargin": 0.35,
+    "coveragePower": 2.0,
+    "meaningSpan": 0.05,
+    "photoSpan": 0.06,
+    "commonShare": 0.25,
+    "commonMinFiles": 1000
   }
 }
