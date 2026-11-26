@@ -32,7 +32,10 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
   this account are marked in the top folder. The folder menu in the
   header (`FolderMenu.svelte`) says how the open folder is shared: with
   whom, by public link, and through which folder above it; or, in a folder
-  this account only reads, who shared it.
+  this account only reads, who shared it. It also sets how folders show
+  (list, grid or two panels) and the details pane: the app has one bar,
+  and SVAR's own toolbar is hidden. On a phone, a button beside it opens
+  the folder tree.
 - `src/components/Viewer.svelte`: double-clicking an image, text, a video,
   audio or a PDF opens it here; "Open in new tab" too.
 - `public/sw.js` and `src/lib/streams.js`: a service worker that streams
@@ -72,7 +75,8 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
 - `src/components/`: the screens and dialogs. `Files.svelte` sends every
   SVAR action to the Worker and then lists the folders again. What the
   account may do (its capabilities) decides what the account menu
-  (`AccountMenu.svelte`, the user's name in the header) offers:
+  (`AccountMenu.svelte`, the user's initial and name in the header)
+  offers:
   **Users** (`UsersDialog.svelte`: invite, change capabilities and
   quotas, re-enroll, remove (giving the folders they own to someone
   first), measure storage now, and, in one list of orphaned folders,
@@ -175,7 +179,7 @@ at the version `web/Cargo.toml` pins, and Node.
 
 ```sh
 npm ci
-npm run wasm                       # the client and the PDF module, into src/wasm
+npm run wasm                       # the client, into src/wasm
 npm run model                      # the search models, into public/models
 cargo run -p raft5fs-testkit --example web_dev   # in another terminal
 npm run dev                        # http://localhost:5173
@@ -200,7 +204,7 @@ npm run wasm
 npm run model
 npm run test:parity                # the model gives native clients' vectors
 npx playwright test
-MEMORY_TEST=1 npx playwright test -g memory   # what a search holds (10+ min)
+MEMORY_TEST=1 npx playwright test -g memory   # what a search holds (about 30 min)
 ```
 
 `test:parity` runs the app's models module in Node and checks its token

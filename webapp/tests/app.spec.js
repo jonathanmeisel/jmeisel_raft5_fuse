@@ -1945,6 +1945,56 @@ test("there is one search box, and on a phone it leaves the folder menu room", a
   await expect(folder).toBeVisible();
 });
 
+test("one bar: the folder menu sets the view, and a phone's tree button opens the tree", async ({ browser }) => {
+  const desk = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+  const problems = watch(desk);
+  await enrol(desk, "lux");
+  await login(desk, "lux");
+  await addFolder(desk, "trips");
+  await open(desk, "trips");
+  // SVAR's toolbar is gone: its controls are in the folder menu.
+  await expect(desk.locator(".wx-filemanager .wx-toolbar")).toBeHidden();
+  const folder = desk.getByRole("button", { name: /^Folder \(/ });
+  // SVAR opens in Grid.
+  await folder.click();
+  await expect(desk.getByRole("menuitemradio", { name: "Grid" })).toHaveAttribute("aria-checked", "true");
+  await desk.getByRole("menuitemradio", { name: "List" }).click();
+  await expect(desk.locator(".wx-filemanager .wx-cards")).toHaveCount(0);
+  await folder.click();
+  await expect(desk.getByRole("menuitemradio", { name: "List" })).toHaveAttribute("aria-checked", "true");
+  await desk.getByRole("menuitemcheckbox", { name: "Show details" }).click();
+  await expect(desk.locator(".wx-filemanager .wx-content > .wx-info")).toBeVisible();
+  await folder.click();
+  await desk.getByRole("menuitemradio", { name: "Grid" }).click();
+  await expect(desk.locator(".wx-filemanager .wx-cards").first()).toBeVisible();
+  // Outside a share the menu has only View.
+  await desk.getByText("My files").first().click();
+  await desk.getByRole("button", { name: /^Folder \(/ }).click();
+  await expect(desk.getByRole("menuitemradio")).toHaveCount(3);
+  await expect(desk.getByRole("menuitemcheckbox", { name: "Show deleted" })).toHaveCount(0);
+  await desk.keyboard.press("Escape");
+  // Wide, the tree always shows, so there is no tree button.
+  await expect(desk.getByRole("button", { name: "Folders" })).toBeHidden();
+
+  const phone = await (
+    await browser.newContext({ viewport: { width: 390, height: 800 }, isMobile: true, hasTouch: true })
+  ).newPage();
+  await phone.goto("/");
+  await phone.getByLabel("Filesystem").selectOption(localFsId());
+  await login(phone, "lux");
+  const tree = phone.locator(".wx-filemanager .wx-sidebar-visible");
+  await expect(tree).toHaveCount(0);
+  await phone.getByRole("button", { name: "Folders" }).click();
+  await expect(tree).toBeVisible();
+  await phone.getByRole("button", { name: "Folders" }).click();
+  await expect(tree).toHaveCount(0);
+  // A phone has no details pane.
+  await phone.getByRole("button", { name: /^Folder \(/ }).click();
+  await expect(phone.getByRole("menuitemradio", { name: "Grid" })).toBeVisible();
+  await expect(phone.getByRole("menuitemcheckbox", { name: "Show details" })).toBeHidden();
+  expect(problems).toEqual([]);
+});
+
 test("the app refuses to run in a frame", async ({ page }) => {
   // A page that frames the app. Chrome won't let a page from another
   // origin frame a local one at all, so this one is on the app's origin;

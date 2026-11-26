@@ -27,7 +27,7 @@
   .dialog {
     box-sizing: border-box; width: min(520px, 92vw); max-height: 100%; overflow: auto;
     overscroll-behavior: contain;
-    background: var(--panel); border-radius: 10px; padding: 20px 24px;
+    background: var(--panel); border: var(--menu-border); border-radius: 10px; padding: 20px 24px;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
   }
   .dialog.wide { width: min(1000px, 94vw); }

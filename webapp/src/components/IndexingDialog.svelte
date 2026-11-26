@@ -60,6 +60,7 @@
 <Dialog title="Search indexing" {onclose}>
   {#if error}<p class="error"><ErrorText {fs} message={error} /></p>{/if}
   {#if state}
+    <!-- For everyone: whether the folder is indexed. -->
     <p>
       {state.on
         ? `The files in ${state.volume.slice(1)} are indexed for search, so anyone who can read it can search it.`
@@ -72,29 +73,43 @@
         Turning it off stops every device indexing it, and removes its index, which frees the space it
         takes. You can turn it on again later; it is then indexed from the start.
       </p>
-      <p>
-        <button disabled={working} onclick={() => set(false)}>Turn off and remove the index</button>
+      <div class="row">
+        <button class="danger" disabled={working} onclick={() => set(false)}>Turn off and remove the index</button>
         <button disabled={working} onclick={() => (confirming = false)}>Cancel</button>
-      </p>
+      </div>
     {:else if state.on}
-      <p><button onclick={() => (confirming = true)}>Turn off…</button></p>
+      <div class="row"><button onclick={() => (confirming = true)}>Turn off…</button></div>
     {:else}
-      <p><button disabled={working} onclick={() => set(true)}>Turn on</button></p>
+      <div class="row"><button class="primary" disabled={working} onclick={() => set(true)}>Turn on</button></div>
     {/if}
+    <!-- For this browser only: whether to download the index. -->
     {#if state.on && size}
-      <p>
-        <label>
-          <input type="checkbox" checked={here} onchange={(e) => setHere(e.currentTarget.checked)} />
+      <label class="here">
+        <input type="checkbox" checked={here} onchange={(e) => setHere(e.currentTarget.checked)} />
+        <span>
           Download its index to search it in this browser{size.bytes ? ` (${mb(size.bytes)} MB)` : ""}
-        </label>
-      </p>
+          <span class="note">Only this browser. Folders not downloaded aren't searched here.</span>
+        </span>
+      </label>
     {/if}
   {:else if !error}
     <p class="note">Loading…</p>
   {/if}
-  <p><button onclick={onclose}>Close</button></p>
+  <div class="footer"><button onclick={onclose}>Close</button></div>
 </Dialog>
 
 <style>
   .error { color: var(--danger); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 4px; }
+  .here {
+    display: flex; gap: 10px; align-items: flex-start;
+    margin: 16px 0 0; padding-top: 14px; border-top: 1px solid var(--border);
+    color: var(--text); font-size: 1em;
+  }
+  .here input { margin-top: 3px; flex: none; }
+  .here .note { display: block; margin-top: 2px; }
+  .footer {
+    display: flex; justify-content: flex-end;
+    margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border);
+  }
 </style>

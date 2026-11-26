@@ -6,7 +6,10 @@
   --text: rgba(255, 255, 255, 0.9);
   --muted: #9fa1ae;
   --border: #384047;
-  --accent: #DF2F90;
+  /* Menus and other pop-ups sit on the same colour as the page, so a
+     lighter edge sets them apart. */
+  --menu-border: 1px solid rgba(255, 255, 255, 0.2);
+  --accent: #7a67eb;
   --danger: #fe6158;
   --warn-bg: #3b3424;
   color-scheme: dark;
@@ -76,6 +79,13 @@ select {
   color: var(--text);
 }
 
+/* Checkboxes and radio buttons keep their own size, beside their text. */
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
+  padding: 0;
+}
+
 label {
   display: block;
   margin: 10px 0 4px;
@@ -100,10 +110,53 @@ label {
   line-height: 1.6;
 }
 
-/* SVAR's file manager in the app's accent. Two classes, so these win
-   over the theme's own settings whatever order the styles load in. */
+/* SVAR's file manager in the app's accent, and flat: the header and the
+   files share one background, the folder tree is darker, and there are no
+   gutters or rounded cards between them. Two classes, so these win over
+   the theme's own settings whatever order the styles load in. The rules
+   below reach into SVAR's own class names: check them after a SVAR
+   upgrade. */
 .wx-theme.wx-willow-dark-theme {
   --wx-color-primary: var(--accent);
-  --wx-color-primary-selected: rgba(223, 47, 144, 0.3);
-  --wx-color-secondary-hover: rgba(223, 47, 144, 0.12);
+  --wx-color-primary-selected: rgba(122, 103, 235, 0.3);
+  --wx-color-secondary-hover: rgba(122, 103, 235, 0.12);
+  --wx-fm-background: var(--wx-background);
+  --tree-bg: #222326;
 }
+.wx-willow-dark-theme .wx-filemanager .wx-sidebar { padding: 0; }
+.wx-willow-dark-theme .wx-filemanager .wx-sidebar > .wx-wrapper {
+  background: var(--tree-bg);
+  border-radius: 0;
+}
+.wx-willow-dark-theme .wx-filemanager .wx-content-wrapper { margin-top: 0; }
+/* SVAR sizes the files beside the tree with a 10 px gutter, inline. */
+.wx-willow-dark-theme .wx-filemanager .wx-content {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto !important;
+}
+.wx-willow-dark-theme .wx-filemanager .wx-content-item,
+.wx-willow-dark-theme .wx-filemanager .wx-content-item-fit { padding: 0; }
+.wx-willow-dark-theme .wx-filemanager .wx-breadcrumbs,
+.wx-willow-dark-theme .wx-filemanager .wx-content-item > .wx-wrapper,
+.wx-willow-dark-theme .wx-filemanager .wx-content-item-fit > .wx-wrapper,
+.wx-willow-dark-theme .wx-filemanager .wx-table,
+.wx-willow-dark-theme .wx-filemanager .wx-upload-area { border-radius: 0; }
+/* No box around the list of files, only lines between rows. A file
+   dragged over the list still outlines it. */
+.wx-willow-dark-theme .wx-filemanager .wx-list:not(.wx-active) > .wx-upload-area:not(.wx-active) .wx-table-box {
+  border-color: transparent;
+}
+/* Column lines in the rows, as in the header. */
+.wx-willow-dark-theme .wx-filemanager .wx-list > .wx-upload-area .wx-body .wx-each-cell:not(:last-child) {
+  border-right: var(--wx-fm-grid-border);
+}
+/* Cards in the grid: on the page's colour, so an edge shows each one. */
+.wx-willow-dark-theme .wx-filemanager .wx-cards .wx-item { border: 1px solid var(--border); }
+/* A line between the files and the details pane. */
+.wx-willow-dark-theme .wx-filemanager .wx-content > .wx-info,
+.wx-willow-dark-theme .wx-filemanager .wx-content-wrapper > .wx-info {
+  border-left: 1px solid var(--border);
+}
+/* SVAR's menus: the context menu, and Add New. */
+.wx-willow-dark-theme .wx-menu { border: var(--menu-border); }

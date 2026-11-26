@@ -55,6 +55,11 @@
   const STREAMED = new Set(["video", "audio", "pdf"]);
 
   let api = null;
+  /// How SVAR shows folders, and whether its details pane is open; the
+  /// folder menu shows and sets them, as SVAR's toolbar is hidden.
+  let view = $state({ mode: "cards", preview: false });
+  /// The file manager's box, to reach SVAR's hidden tree button.
+  let fmBox = $state(null);
   let initial = $state(null);
   let error = $state("");
   /// What a finished folder transfer has to say, when it isn't an error.
@@ -667,6 +672,9 @@
 
   function init(fm) {
     api = fm;
+    const { mode, preview: details } = api.getReactiveState();
+    mode.subscribe((m) => (view.mode = m));
+    details.subscribe((on) => (view.preview = !!on));
     // A deleted folder opens as its snapshot, and a moved one where it is.
     api.intercept("set-path", ({ id }) => {
       if (!goneAt(id)) return;
@@ -896,6 +904,12 @@
   }
 
   const several = __RAFT5FS_FILESYSTEMS__.length > 1;
+
+  /// Opens or closes the folder tree on a phone. SVAR keeps whether it is
+  /// open to itself, so this clicks its own button, in the hidden toolbar.
+  function toggleTree() {
+    fmBox?.querySelector(".wx-toolbar .wx-sidebar-icon .wx-icon")?.click();
+  }
 </script>
 
 <svelte:window onbeforeunload={beforeUnload} />
@@ -910,6 +924,13 @@
       </span>
       <button class="close" onclick={onlogout}>Close</button>
     {:else}
+      {#if view.mode !== "panels"}
+        <!-- SVAR closes the tree on a click outside it, unless the click is
+             on something marked as its toggle. -->
+        <button class="tree" aria-label="Folders" data-id="toggle-tree" onclick={toggleTree}>
+          <i class="wxi-subtask" aria-hidden="true"></i>
+        </button>
+      {/if}
       <span class="menus">
         <FolderMenu
           folder={current}
@@ -918,8 +939,11 @@
           shareable={canShowDeleted(current)}
           {showDeleted}
           {goneError}
+          {view}
           onsharing={() => (dialog = { kind: "shared-with", path: current })}
           ontoggledeleted={toggleDeleted}
+          onview={(mode) => api?.exec("set-mode", { mode })}
+          onpreview={(on) => api?.exec("show-preview", { mode: on })}
         >
           {#if several}<span class="fs">{me.filesystem}</span>{/if}
         </FolderMenu>
@@ -992,7 +1016,7 @@
   {/each}
 
 
-  <div class="fm" role="presentation" ondropcapture={dropFolder}>
+  <div class="fm" class:one-bar={!visitor} role="presentation" ondropcapture={dropFolder} bind:this={fmBox}>
     {#if initial}
         <Filemanager
           data={initial}
@@ -1151,7 +1175,8 @@
 
 <style>
   .layout { display: flex; flex-direction: column; height: 100%; }
-  /* In SVAR's colours and sizes, as one bar with its toolbar below. */
+  /* In SVAR's colours and sizes. The app's one bar: SVAR's toolbar is
+     hidden, and its controls are in the folder menu and the tree button. */
   header {
     position: relative;
     display: flex; align-items: center; gap: 12px;
@@ -1173,6 +1198,16 @@
   /* The folder menu's place: like the title, but it doesn't clip the menu
      that opens below it. */
   .menus { flex: 1; min-width: 0; display: flex; align-items: center; white-space: nowrap; }
+  /* The tree button is for SVAR's narrow layout (under 768 px), where the
+     tree is a sheet; wider, the tree always shows. */
+  .tree {
+    display: none; flex: none; width: 36px; height: 36px; padding: 0;
+    align-items: center; justify-content: center;
+    border: none; border-radius: var(--wx-radius-major, 6px);
+    background: none; color: var(--wx-icon-color); font-size: 20px;
+  }
+  .tree:hover { background: var(--wx-background-alt); }
+  @media (max-width: 767px) { .tree { display: flex; } }
   .close {
     height: 36px; border: none; border-radius: var(--wx-radius-major, 6px);
     background: var(--wx-background-alt); color: var(--wx-color-font);
@@ -1191,4 +1226,8 @@
   /* SVAR's own search box filters names in the folders already shown. The
      search in the header does that and more, so there is one search box. */
   :global(.wx-filemanager .wx-toolbar .wx-search-input) { display: none; }
+  /* One bar: SVAR's toolbar goes, but for a public link's visitor, whose
+     header has no folder menu. Theirs loses only its "Files" label. */
+  .fm.one-bar :global(.wx-toolbar) { display: none; }
+  :global(.wx-filemanager .wx-toolbar .wx-name) { display: none; }
 </style>
