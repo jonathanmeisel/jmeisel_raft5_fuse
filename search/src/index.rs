@@ -28,7 +28,7 @@ use crate::generation::{
     decode_cluster, decode_previews, decode_rows, decode_shard,
 };
 use crate::paths::{PathMatches, Paths, word_weights};
-use crate::rank::{Ranking, above_cutoff, merge};
+use crate::rank::{Ranking, Spread, merge};
 use crate::record::DocKind;
 use crate::view::{
     Cutoff, Hit, IMAGE_MARGIN, IMAGE_Z, MEANING_MARGIN, MEANING_Z, MIN_IMAGE_SIMILARITY,
@@ -505,11 +505,12 @@ fn decoded_cluster(pieces: &Pieces, i: usize, id: PieceId) -> Vec<ClusterEntry> 
 /// - **Keywords:** BM25 over files, with statistics from every source
 ///   together, so scores compare across them. A match needs
 ///   `min_coverage` of the query's weight and `keyword_margin` of the best
-///   score. It scores its share of the best, times its coverage to the
-///   power `coverage_power`.
+///   score. It grades its score over an ideal match's, times its coverage
+///   to the power `coverage_power`.
 /// - **Meaning and photos:** chosen from every source's scores together
 ///   (`Cutoff`), so a source with nothing relevant gives none. A match
-///   scores from 0.5 at the cutoff to 1 at `span` above it.
+///   grades by how far it stands above chance over every source's files
+///   (`Spread`), so the best of unrelated files grades about 0.
 /// - The lists are merged by score (`rank::merge`), once, over all.
 pub fn search(
     sources: &[Source<'_>],
@@ -601,6 +602,8 @@ pub fn search(
     }
     let mut keyword: Vec<(Key, f32, f32)> = Vec::new();
     let weights = stats.weights(&terms);
+    // An ideal match's score: every query word once, in a file of average
+    // length, scores its word's weight.
     let total: f32 = weights.iter().map(|w| w.1).sum();
     if stats.docs > 0 && total > 0.0 {
         let avg = stats.total_len as f32 / stats.docs as f32;
@@ -644,7 +647,7 @@ pub fn search(
 
     // Meaning: the recent chunks, and the probed clusters' vectors.
     let mut meaning: Vec<(Key, usize, f32)> = Vec::new();
-    let mut meaning_cut = 0.0;
+    let mut meaning_spread = None;
     let mut population: Vec<(f32, f32)> = Vec::new();
     if let Some(q) = vector {
         for (i, s) in sources.iter().enumerate() {
@@ -684,7 +687,8 @@ pub fn search(
                 .filter(|m| matches!(m.0.1, At::Recent(_)))
                 .map(|m| (m.2, 1.0)),
         );
-        meaning_cut = Cutoff {
+        meaning_spread = Spread::of(&population);
+        let meaning_cut = Cutoff {
             floor: MIN_SIMILARITY,
             margin: MEANING_MARGIN,
             z: MEANING_Z,
@@ -697,7 +701,7 @@ pub fn search(
 
     // Photos, by what they show.
     let mut shown: Vec<(Key, f32)> = Vec::new();
-    let mut shown_cut = 0.0;
+    let mut shown_spread = None;
     let mut photo_population: Vec<(f32, f32)> = Vec::new();
     if let Some(q) = image {
         for (i, s) in sources.iter().enumerate() {
@@ -730,7 +734,8 @@ pub fn search(
                 .filter(|m| matches!(m.0.1, At::Recent(_)))
                 .map(|m| (m.1, 1.0)),
         );
-        shown_cut = Cutoff {
+        shown_spread = Spread::of(&photo_population);
+        let shown_cut = Cutoff {
             floor: MIN_IMAGE_SIMILARITY,
             margin: IMAGE_MARGIN,
             z: IMAGE_Z,
@@ -748,8 +753,8 @@ pub fn search(
             keyword
                 .iter()
                 .map(|k| {
-                    let share = k.1 / best_keyword.max(f32::MIN_POSITIVE);
-                    (k.0, share * k.2.powf(ranking.coverage_power))
+                    let ideal = (k.1 / total.max(f32::MIN_POSITIVE)).min(1.0);
+                    (k.0, ideal * k.2.powf(ranking.coverage_power))
                 })
                 .collect(),
         ),
@@ -757,14 +762,22 @@ pub fn search(
             ranking.weight_meaning,
             meaning
                 .iter()
-                .map(|m| (m.0, above_cutoff(m.2, meaning_cut, ranking.meaning_span)))
+                .map(|m| {
+                    let g =
+                        Spread::grade(meaning_spread.as_ref(), m.2, ranking.z_low, ranking.z_span);
+                    (m.0, g)
+                })
                 .collect(),
         ),
         (
             ranking.weight_photo,
             shown
                 .iter()
-                .map(|s| (s.0, above_cutoff(s.1, shown_cut, ranking.photo_span)))
+                .map(|s| {
+                    let g =
+                        Spread::grade(shown_spread.as_ref(), s.1, ranking.z_low, ranking.z_span);
+                    (s.0, g)
+                })
                 .collect(),
         ),
     ];

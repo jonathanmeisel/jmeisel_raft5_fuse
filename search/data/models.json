@@ -123,20 +123,20 @@
     }
   },
   "ranking": {
-    "about": "How search ranks: each list's score (0-1) times its weight, plus a bonus per extra list; results below keep x the best are dropped. Keyword matches need minCoverage of the query's weight and keywordMargin of the best score; their score is their share of the best times coverage to the power coveragePower. Meaning and photo matches score 1 at span above their cutoff. Words in more than commonShare of the files count for nothing once there are commonMinFiles files. Set by measuring with raft5fs-eval.",
+    "about": "How search ranks: each list grades its matches 0-1 against a fixed reference, and a result's score is its grades times their weights, plus a bonus per extra list; results below keep x the best are dropped. Meaning and photo matches grade by how many standard deviations they stand above the best of as many unrelated files: 0 at zLow, 1 at zLow + zSpan. Keyword matches grade by their score over an ideal match's (every word once, in a file of average length), times their coverage to the power coveragePower; they need minCoverage of the query's weight and keywordMargin of the best score. Words in more than commonShare of the files count for nothing once there are commonMinFiles files. Set by measuring with raft5fs-eval.",
     "weights": {
       "path": 1.0,
-      "keyword": 2.0,
-      "meaning": 1.0,
-      "photo": 1.0
+      "keyword": 1.0,
+      "meaning": 0.5,
+      "photo": 0.5
     },
     "bonus": 0.0,
     "keep": 0.3,
     "minCoverage": 0.0,
-    "keywordMargin": 0.35,
+    "keywordMargin": 0.0,
     "coveragePower": 2.0,
-    "meaningSpan": 0.05,
-    "photoSpan": 0.06,
+    "zLow": -2.0,
+    "zSpan": 3.0,
     "commonShare": 0.25,
     "commonMinFiles": 1000
   }

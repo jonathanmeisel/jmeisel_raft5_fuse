@@ -1984,6 +1984,8 @@ test("one bar: the folder menu sets the view, and a phone's tree button opens th
   await login(phone, "lux");
   const tree = phone.locator(".wx-filemanager .wx-sidebar-visible");
   await expect(tree).toHaveCount(0);
+  // SVAR makes its own tree button once it has measured the screen.
+  await expect(phone.locator(".wx-filemanager .wx-sidebar-icon")).toHaveCount(1);
   await phone.getByRole("button", { name: "Folders" }).click();
   await expect(tree).toBeVisible();
   await phone.getByRole("button", { name: "Folders" }).click();

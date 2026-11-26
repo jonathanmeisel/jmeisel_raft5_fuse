@@ -77,8 +77,8 @@ fn main() {
         ("MIN_COVERAGE", &["minCoverage"]),
         ("KEYWORD_MARGIN", &["keywordMargin"]),
         ("COVERAGE_POWER", &["coveragePower"]),
-        ("MEANING_SPAN", &["meaningSpan"]),
-        ("PHOTO_SPAN", &["photoSpan"]),
+        ("Z_LOW", &["zLow"]),
+        ("Z_SPAN", &["zSpan"]),
     ] {
         writeln!(out, "pub const RANKING_{name}: f32 = {:?};", f(path) as f32).unwrap();
     }

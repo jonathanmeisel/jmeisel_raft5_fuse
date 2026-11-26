@@ -264,16 +264,18 @@ impl Stats {
     }
 
     /// Each term that counts, with its weight (inverse document
-    /// frequency). Words no doc has don't count: no file can match them,
-    /// so they would only lower every file's coverage.
+    /// frequency). A word no doc has counts too, at the highest weight:
+    /// no file matches it, so each file's coverage falls. A query whose
+    /// rarest word is in no text (a photo's subject, say) then gives weak
+    /// keyword matches, not full ones on its other words.
     pub fn weights<'a>(&self, terms: &'a [String]) -> Vec<(&'a str, f32)> {
         let n = self.docs as f32;
         terms
             .iter()
             .filter(|t| !self.is_common(t))
-            .filter_map(|t| {
+            .map(|t| {
                 let df = self.df.get(t.as_str()).copied().unwrap_or(0) as f32;
-                (df > 0.0).then(|| (t.as_str(), ((n - df + 0.5) / (df + 0.5) + 1.0).ln()))
+                (t.as_str(), ((n - df + 0.5) / (df + 0.5) + 1.0).ln())
             })
             .collect()
     }

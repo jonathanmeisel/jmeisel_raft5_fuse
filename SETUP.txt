@@ -1168,7 +1168,9 @@ A search matches words, and also meaning: each piece of text gets a
 vector from a language model (multilingual-e5-small), and so does the
 query, so "rutas en bicicleta por Vermont" finds an English note about
 cycling in Vermont with none of those words. Results that match both ways come
-first. A search of several volumes
+first. A match by meaning, or by what a photo shows, counts by how far it
+stands out from the other files for that search, so text that is only the
+least unrelated doesn't crowd out photos that show what was asked. A search of several volumes
 ranks them as one: a strong match in one volume comes before a weak one
 in another, and a volume with nothing on the subject gives nothing by
 meaning.
