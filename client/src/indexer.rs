@@ -764,16 +764,23 @@ impl Pass<'_> {
             Entry::Record(r) => {
                 self.by_path.insert(r.path.clone(), r.ino);
             }
-            Entry::Gone { ino, .. } => {
+            Entry::Gone { ino, .. } | Entry::Moved { ino, .. } => {
                 if let Some(Entry::Record(old)) = self.entries.get(ino) {
                     let old_path = old.path.clone();
                     if self.by_path.get(&old_path) == Some(ino) {
                         self.by_path.remove(&old_path);
                     }
                 }
+                if let Entry::Moved { ino, path, .. } = &entry {
+                    self.by_path.insert(path.clone(), *ino);
+                }
             }
         }
-        self.entries.insert(entry.ino(), entry.clone());
+        let merged = match self.entries.remove(&entry.ino()) {
+            Some(old) => old.then(entry.clone()),
+            None => entry.clone(),
+        };
+        self.entries.insert(merged.ino(), merged);
         self.pending_bytes += entry_bytes(&entry);
         self.pending.push(entry);
         if self.pending.len() >= SEGMENT_ENTRIES || self.pending_bytes >= SEGMENT_BYTES {
@@ -928,7 +935,7 @@ impl Pass<'_> {
             .values()
             .filter_map(|e| match e {
                 Entry::Record(r) => r.extra.thumb.as_ref().map(|t| t.file.clone()),
-                Entry::Gone { .. } => None,
+                Entry::Gone { .. } | Entry::Moved { .. } => None,
             })
             .collect();
         let mut doomed: Vec<&String> = files
@@ -1354,7 +1361,7 @@ async fn run_pass(
         .values()
         .filter_map(|e| match e {
             Entry::Record(r) => Some((r.path.clone(), r.ino)),
-            Entry::Gone { .. } => None,
+            Entry::Gone { .. } | Entry::Moved { .. } => None,
         })
         .collect();
     let mut pass = Pass {

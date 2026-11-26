@@ -49,7 +49,7 @@ pub enum DocKind {
 }
 
 impl DocKind {
-    fn byte(self) -> u8 {
+    pub(crate) fn byte(self) -> u8 {
         match self {
             DocKind::Text => 0,
             DocKind::Track => 1,
@@ -59,7 +59,7 @@ impl DocKind {
         }
     }
 
-    fn from_byte(b: u8) -> Option<Self> {
+    pub(crate) fn from_byte(b: u8) -> Option<Self> {
         Some(match b {
             0 => DocKind::Text,
             1 => DocKind::Track,
@@ -139,21 +139,44 @@ pub struct Thumb {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     Record(Record),
-    Gone { ino: u64, at_ms: u64 },
+    Gone {
+        ino: u64,
+        at_ms: u64,
+    },
+    /// The file moved to `path`; its content is as its record says. A
+    /// rename costs this, not the whole record again.
+    Moved {
+        ino: u64,
+        at_ms: u64,
+        path: String,
+    },
 }
 
 impl Entry {
     pub fn ino(&self) -> u64 {
         match self {
             Entry::Record(r) => r.ino,
-            Entry::Gone { ino, .. } => *ino,
+            Entry::Gone { ino, .. } | Entry::Moved { ino, .. } => *ino,
         }
     }
 
     pub fn at_ms(&self) -> u64 {
         match self {
             Entry::Record(r) => r.at_ms,
-            Entry::Gone { at_ms, .. } => *at_ms,
+            Entry::Gone { at_ms, .. } | Entry::Moved { at_ms, .. } => *at_ms,
+        }
+    }
+
+    /// `self`, with `newer` (for the same file) on top: the newer wins,
+    /// but a move keeps the content of the record it moves.
+    pub fn then(self, newer: Entry) -> Entry {
+        match (self, newer) {
+            (Entry::Record(mut r), Entry::Moved { at_ms, path, .. }) => {
+                r.path = path;
+                r.at_ms = at_ms;
+                Entry::Record(r)
+            }
+            (_, newer) => newer,
         }
     }
 }
@@ -192,6 +215,12 @@ pub fn encode_entry(entry: &Entry, words: &mut Words) -> Vec<u8> {
             wire::put_u8(&mut out, 1);
             wire::put_varint(&mut out, *ino);
             wire::put_varint(&mut out, *at_ms);
+        }
+        Entry::Moved { ino, at_ms, path } => {
+            wire::put_u8(&mut out, 2);
+            wire::put_varint(&mut out, *ino);
+            wire::put_varint(&mut out, *at_ms);
+            wire::put_short_bytes(&mut out, path.as_bytes());
         }
         Entry::Record(r) => {
             wire::put_u8(&mut out, 0);
@@ -388,6 +417,11 @@ pub fn decode_entry(bytes: &[u8], words: &[String]) -> Result<Entry, Error> {
     let at_ms = f.n64()?;
     let entry = match tag {
         1 => Entry::Gone { ino, at_ms },
+        2 if format == FORMAT => Entry::Moved {
+            ino,
+            at_ms,
+            path: f.string()?,
+        },
         0 => {
             let stamp = Stamp {
                 mtime_ns: f.n64()?,

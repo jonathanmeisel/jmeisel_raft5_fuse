@@ -12,6 +12,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 kamadak-exif = "0.6"
 # Segments are compressed. Pure Rust, so it builds for the browser too.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Keyed hashes pick a word's shard and its code (generation).
+sha2 = "0.10"
 
 [build-dependencies]
 # Reads data/models.json for the models' constants (build.rs).

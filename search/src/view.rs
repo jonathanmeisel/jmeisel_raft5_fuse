@@ -62,16 +62,17 @@ pub struct QueryVector<'a> {
     pub values: &'a [f32],
 }
 
-/// The newest entry for each inode in `entries`.
+/// The newest entry for each inode in `entries`. A move on top of a
+/// record gives the record at its new path (`Entry::then`).
 pub fn latest(entries: impl IntoIterator<Item = Entry>) -> HashMap<u64, Entry> {
     let mut out: HashMap<u64, Entry> = HashMap::new();
     for e in entries {
-        match out.get(&e.ino()) {
-            Some(old) if old.at_ms() > e.at_ms() => {}
-            _ => {
-                out.insert(e.ino(), e);
-            }
-        }
+        let merged = match out.remove(&e.ino()) {
+            None => e,
+            Some(old) if old.at_ms() > e.at_ms() => e.then(old),
+            Some(old) => old.then(e),
+        };
+        out.insert(merged.ino(), merged);
     }
     out
 }
@@ -155,6 +156,9 @@ pub struct View {
     /// entry is a record.
     newest: HashMap<u64, (u64, Option<usize>)>,
     live: usize,
+    /// Moves of files this view has no record of: their records are in a
+    /// generation. By inode: when, and the new path.
+    moves: HashMap<u64, (u64, String)>,
 }
 
 /// The share of dead docs at which a view builds itself again. Dead docs
@@ -195,7 +199,25 @@ impl View {
         // A fixed order, so equal scores rank the same way each time.
         fresh.sort_by_key(|e| e.ino());
         for e in fresh {
+            if let Entry::Moved { ino, at_ms, path } = e {
+                match self.newest.get(&ino) {
+                    Some(&(_, Some(doc))) => {
+                        if let Some(r) = self.docs[doc].as_mut() {
+                            r.path.clone_from(&path);
+                            r.at_ms = at_ms;
+                        }
+                        self.paths.add(doc, &path);
+                        self.newest.insert(ino, (at_ms, Some(doc)));
+                    }
+                    Some(&(_, None)) => {}
+                    None => {
+                        self.moves.insert(ino, (at_ms, path));
+                    }
+                }
+                continue;
+            }
             let ino = e.ino();
+            self.moves.remove(&ino);
             if let Some(&(_, Some(doc))) = self.newest.get(&ino) {
                 self.docs[doc] = None;
                 self.codes[doc] = Box::default();
@@ -211,6 +233,7 @@ impl View {
                 Entry::Gone { ino, at_ms } => {
                     self.newest.insert(ino, (at_ms, None));
                 }
+                Entry::Moved { .. } => unreachable!("moves are taken first"),
             }
         }
         let dead = self.docs.len() - self.live;
@@ -283,6 +306,11 @@ impl View {
 
     pub fn len(&self) -> usize {
         self.live
+    }
+
+    /// Moves of files whose records this view doesn't have.
+    pub fn moves(&self) -> &HashMap<u64, (u64, String)> {
+        &self.moves
     }
 
     /// How big the view is, for measuring its memory.
@@ -754,6 +782,37 @@ mod tests {
 
     fn paths(view: &View, query: &str) -> Vec<String> {
         view.search(query, 10).into_iter().map(|h| h.path).collect()
+    }
+
+    #[test]
+    fn a_move_keeps_the_content_at_a_new_path() {
+        let moved = |ino, at_ms, path: &str| Entry::Moved {
+            ino,
+            at_ms,
+            path: path.into(),
+        };
+        // In one batch, and in two.
+        let view = View::new([
+            moved(1, 20, "kept/plums.txt"),
+            record(1, 10, "plums.txt", "ripe plums"),
+        ]);
+        assert_eq!(paths(&view, "plums"), ["kept/plums.txt"]);
+        let mut view = View::new([record(1, 10, "plums.txt", "ripe plums")]);
+        view.add([moved(1, 20, "kept/ripe.txt")]);
+        assert_eq!(paths(&view, "ripe"), ["kept/ripe.txt"]);
+        assert_eq!(
+            paths(&view, "kept"),
+            ["kept/ripe.txt"],
+            "found by its new path"
+        );
+        // A move older than the record changes nothing; one of a file the
+        // view lacks is kept for its generation.
+        view.add([moved(1, 5, "old/ripe.txt"), moved(9, 30, "a/b.txt")]);
+        assert_eq!(paths(&view, "ripe"), ["kept/ripe.txt"]);
+        assert_eq!(view.moves().get(&9), Some(&(30, "a/b.txt".to_string())));
+        let e = moved(4, 1, "x");
+        let bytes = crate::segment::encode_segment(std::slice::from_ref(&e));
+        assert_eq!(crate::segment::decode_segment(&bytes).unwrap(), [e]);
     }
 
     #[test]

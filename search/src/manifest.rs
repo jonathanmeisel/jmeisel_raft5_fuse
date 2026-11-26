@@ -4,13 +4,19 @@
 //! changes only that one. Whoever indexes next reads every manifest and
 //! goes on from the newest cursor, so a pass cut short on one device is
 //! finished on another.
+//!
+//! - The manifest of the indexer that compacted last names the
+//!   generation (`generation`), which holds everything up to then; the
+//!   segments of every manifest hold what came after.
+//! - Files a compaction replaced stay until their time (`retired`), so a
+//!   reader part-way through them can finish.
 
 use raft5fs_wire::{self as wire, Reader};
 
 use crate::Error;
 
 const MAGIC: &[u8; 4] = b"r5mf";
-const FORMAT: u8 = 1;
+const FORMAT: u8 = 2;
 
 /// The id of one indexer: one device's index files are named by it.
 pub type IndexerId = [u8; 16];
@@ -36,6 +42,10 @@ pub struct Manifest {
     pub recent: Vec<(u64, u64)>,
     /// The embedding model of this indexer's vectors; empty for none.
     pub model: String,
+    /// The generation this indexer wrote last, if it compacted.
+    pub generation: Option<crate::generation::GenId>,
+    /// Files no longer listed, to delete once the time given (ms) passes.
+    pub retired: Vec<(String, u64)>,
 }
 
 impl Manifest {
@@ -77,6 +87,18 @@ pub fn encode_manifest(m: &Manifest) -> Vec<u8> {
         wire::put_u64(&mut out, *until);
     }
     wire::put_bytes(&mut out, m.model.as_bytes());
+    match &m.generation {
+        None => wire::put_u8(&mut out, 0),
+        Some(g) => {
+            wire::put_u8(&mut out, 1);
+            out.extend_from_slice(g);
+        }
+    }
+    wire::put_u32(&mut out, m.retired.len() as u32);
+    for (name, at) in &m.retired {
+        wire::put_bytes(&mut out, name.as_bytes());
+        wire::put_u64(&mut out, *at);
+    }
     out
 }
 
@@ -101,6 +123,15 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, Error> {
         recent.push((r.u64()?, r.u64()?));
     }
     let model = r.string()?;
+    let generation = match r.u8()? {
+        0 => None,
+        1 => Some(r.array()?),
+        _ => return Err(r.garbled()),
+    };
+    let mut retired = Vec::new();
+    for _ in 0..r.u32()? {
+        retired.push((r.string()?, r.u64()?));
+    }
     r.finish()?;
     Ok(Manifest {
         id,
@@ -113,6 +144,8 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, Error> {
         updated_ms,
         recent,
         model,
+        generation,
+        retired,
     })
 }
 
@@ -132,6 +165,8 @@ mod tests {
             updated_ms: 4,
             recent: vec![(5, 6)],
             model: String::new(),
+            generation: Some([9; 8]),
+            retired: vec![("old".into(), 7)],
         }
     }
 
@@ -145,10 +180,12 @@ mod tests {
     /// The stored layout of a manifest, pinned.
     #[test]
     fn a_manifest_keeps_its_bytes() {
-        let golden = "72356d6601abababababababababababababababab\
+        let golden = "72356d6602abababababababababababababababab\
                       00000002616c000000027063000000010000000173\
                       00000001000000000000000200000000000000030000000000000004\
-                      000000010000000000000005000000000000000600000000";
+                      000000010000000000000005000000000000000600000000\
+                      010909090909090909\
+                      00000001000000036f6c640000000000000007";
         assert_eq!(raft5fs_wire::hex(&encode_manifest(&sample())), golden);
     }
 
