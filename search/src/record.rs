@@ -40,8 +40,10 @@ pub enum DocKind {
     Text,
     /// A GPS track or route (GPX, TCX).
     Track,
-    /// A photo. Phase 4 fills these in.
     Photo,
+    /// A video or a recording: its headers' date, place and length.
+    Video,
+    Audio,
     /// A file with no text this indexer can read. Kept, so its name is
     /// still found and the indexer does not try it again until it changes.
     Opaque,
@@ -59,6 +61,8 @@ impl DocKind {
             DocKind::Photo => 2,
             DocKind::Opaque => 3,
             DocKind::Unread => 4,
+            DocKind::Video => 5,
+            DocKind::Audio => 6,
         }
     }
 
@@ -69,6 +73,8 @@ impl DocKind {
             2 => DocKind::Photo,
             3 => DocKind::Opaque,
             4 => DocKind::Unread,
+            5 => DocKind::Video,
+            6 => DocKind::Audio,
             _ => return None,
         })
     }

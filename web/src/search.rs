@@ -265,6 +265,8 @@ fn kind_name(kind: DocKind) -> &'static str {
         DocKind::Text => "text",
         DocKind::Track => "track",
         DocKind::Photo => "photo",
+        DocKind::Video => "video",
+        DocKind::Audio => "audio",
         DocKind::Opaque | DocKind::Unread => "file",
     }
 }

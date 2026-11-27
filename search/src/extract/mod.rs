@@ -13,6 +13,7 @@
 //! `Format::Pdf`). A file's format comes from its extension only.
 
 mod markup;
+pub mod media;
 mod office;
 pub mod photo;
 pub mod track;
@@ -35,6 +36,10 @@ pub enum Format {
     Photo,
     /// Read by the client's own PDF library, not by this crate.
     Pdf,
+    /// Videos and recordings: their headers, read without the rest of
+    /// the file (`media`).
+    Video,
+    Audio,
     Other,
 }
 
@@ -62,6 +67,8 @@ impl Format {
             "tcx" => Format::Tcx,
             "pdf" => Format::Pdf,
             "jpg" | "jpeg" | "heic" | "heif" | "png" | "webp" | "tif" | "tiff" => Format::Photo,
+            "mp4" | "mov" | "m4v" | "3gp" | "mkv" | "webm" | "avi" | "mts" => Format::Video,
+            "mp3" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "wav" => Format::Audio,
             e if PLAIN.contains(&e) => Format::Plain,
             _ => Format::Other,
         }
@@ -89,7 +96,8 @@ pub const THUMB_PX: u32 = 256;
 ///
 /// - 2: place names in tracks, and photos' dates, cameras and places.
 /// - 3: the facts filters read (`Meta`): places by name and code, cameras,
-///   picture sizes, pages, activities and lengths.
+///   picture sizes, pages, activities and lengths; and videos' and
+///   recordings' headers (`media`).
 pub const READER: u32 = 3;
 
 /// The text of file `name`, or `None` if this crate does not read its
@@ -121,7 +129,7 @@ pub fn extract_with(name: &str, bytes: &[u8], places: Option<&Places>) -> Option
         Format::Gpx => Some(track::parse_gpx(bytes)?.extracted(places)),
         Format::Tcx => Some(track::parse_tcx(bytes)?.extracted(places)),
         Format::Photo => Some(photo::photo_info(bytes).extracted(places)),
-        Format::Pdf | Format::Other => None,
+        Format::Pdf | Format::Video | Format::Audio | Format::Other => None,
     }
 }
 
@@ -157,7 +165,8 @@ mod tests {
         assert_eq!(Format::of("ride.gpx"), Format::Gpx);
         assert_eq!(Format::of("scan.pdf"), Format::Pdf);
         assert_eq!(Format::of("photo.JPG"), Format::Photo);
-        assert_eq!(Format::of("clip.mov"), Format::Other);
+        assert_eq!(Format::of("clip.MOV"), Format::Video);
+        assert_eq!(Format::of("memo.m4a"), Format::Audio);
         assert_eq!(Format::of("Makefile"), Format::Other);
     }
 

@@ -165,7 +165,7 @@ impl PhotoInfo {
     }
 }
 
-const MONTHS: [&str; 12] = [
+pub(crate) const MONTHS: [&str; 12] = [
     "January",
     "February",
     "March",

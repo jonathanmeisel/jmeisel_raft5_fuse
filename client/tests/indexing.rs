@@ -1623,6 +1623,16 @@ impl raft5fs_client::indexer::Extract for WithPlaces {
     ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
         Box::pin(async move { raft5fs_search::extract::extract_with(name, &bytes, Some(&self.0)) })
     }
+
+    fn media(
+        &self,
+        name: &str,
+        size: u64,
+        head: &[u8],
+        moov: Option<&[u8]>,
+    ) -> Option<raft5fs_search::extract::Extracted> {
+        raft5fs_search::extract::media::extracted(name, size, head, moov, Some(&self.0))
+    }
 }
 
 #[test]
@@ -1684,4 +1694,69 @@ fn plain_english_finds_photos_by_where_they_were_taken() {
         ("type:photo camera:iphone".into(), vec!["lisbon.jpg".into()])
     );
     assert!(find("photos from 2023").1.is_empty());
+}
+
+#[test]
+fn a_video_is_indexed_from_its_headers_with_its_place_and_length() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    // The fixture, with a megabyte of media after its `ftyp`: `moov` is
+    // past what the indexer reads of the start.
+    let fixture = include_bytes!("../../search/src/extract/testdata/lisbon.mov");
+    let ftyp = u32::from_be_bytes(fixture[0..4].try_into().unwrap()) as usize;
+    let mut movie = fixture[..ftyp].to_vec();
+    let filler = 1 << 20;
+    movie.extend(((filler + 8) as u32).to_be_bytes());
+    movie.extend(b"free");
+    movie.extend(vec![0u8; filler]);
+    movie.extend(&fixture[ftyp..]);
+    write(&backend, &tester, v, "IMG_0001.MOV", &movie);
+    write(
+        &backend,
+        &tester,
+        v,
+        "memo.mp3",
+        &[0xff, 0xfb, 0x90, 0x00, 0, 0, 0, 0],
+    );
+    let places =
+        raft5fs_search::geo::Places::decode(include_bytes!("../../search/data/places.bin"))
+            .unwrap();
+    let tools = Tools {
+        extract: Arc::new(WithPlaces(places)),
+        embed: None,
+        image: None,
+    };
+    pass_with(&backend, &tester, v, new_id(), PassKind::Auto, &tools).unwrap();
+    let video = row_of(&backend, &tester, v, "IMG_0001.MOV");
+    assert_eq!(video.kind, raft5fs_search::record::DocKind::Video);
+    assert_eq!(video.meta.duration_ms, 90_000);
+    assert_eq!(video.meta.places[0].code.as_deref(), Some("PT"));
+    let memo = row_of(&backend, &tester, v, "memo.mp3");
+    assert_eq!(memo.kind, raft5fs_search::record::DocKind::Audio);
+    let index = opened(&backend, &tester, v).unwrap();
+    let vocabulary = index.index.vocabulary();
+    let june_2026 = raft5fs_search::extract::track::iso_ms("2026-06-01").unwrap();
+    for (query, want) in [
+        ("videos from lisbon", vec!["IMG_0001.MOV"]),
+        ("videos longer than 1 minute", vec!["IMG_0001.MOV"]),
+        ("videos shorter than 1 minute", vec![]),
+        ("recordings", vec!["memo.mp3"]),
+    ] {
+        let p = raft5fs_search::query::parse(query, &vocabulary, june_2026, 0);
+        let found: Vec<String> = backend
+            .runtime
+            .block_on(open::search(
+                &[&index],
+                &p.text,
+                None,
+                None,
+                10,
+                Some(&p.filter),
+            ))
+            .into_iter()
+            .map(|h| h.1.path)
+            .collect();
+        assert_eq!(found, want, "{query}: {}", p.filter);
+    }
 }

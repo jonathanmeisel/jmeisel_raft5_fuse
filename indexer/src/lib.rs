@@ -42,6 +42,10 @@ impl Extract for Native {
         }
     }
 
+    fn media(&self, name: &str, size: u64, head: &[u8], moov: Option<&[u8]>) -> Option<Extracted> {
+        raft5fs_search::extract::media::extracted(name, size, head, moov, Some(places()))
+    }
+
     fn extract<'a>(
         &'a self,
         name: &'a str,
@@ -246,7 +250,7 @@ mod tests {
     #[test]
     fn other_formats_go_to_the_built_in_reader() {
         assert_eq!(Native.reads("a.pdf"), PDF_MAX);
-        assert_eq!(Native.reads("a.mov"), 0);
+        assert_eq!(Native.reads("a.mov"), BuiltIn.reads("a.mov"));
         assert_eq!(Native.reads("a.jpg"), BuiltIn.reads("a.jpg"));
         assert_eq!(Native.reads("a.txt"), BuiltIn.reads("a.txt"));
         let rt = tokio::runtime::Builder::new_current_thread()

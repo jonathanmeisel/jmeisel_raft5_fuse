@@ -164,6 +164,12 @@ pub trait Extract: MaybeSend + MaybeSync {
 
     /// The text of file `name`, or `None` if it has none this can read.
     fn extract<'a>(&'a self, name: &'a str, bytes: Vec<u8>) -> BoxFuture<'a, Option<Extracted>>;
+
+    /// Video or recording `name`, of `size` bytes, from its first bytes
+    /// and its `moov` box (`extract::media`). Without places by default.
+    fn media(&self, name: &str, size: u64, head: &[u8], moov: Option<&[u8]>) -> Option<Extracted> {
+        extract::media::extracted(name, size, head, moov, None)
+    }
 }
 
 /// Turns text into vectors whose dot product says how close two texts are
@@ -249,6 +255,8 @@ impl Extract for BuiltIn {
     fn reads(&self, name: &str) -> u64 {
         match Format::of(name) {
             Format::Other | Format::Pdf => 0,
+            // Only their headers.
+            Format::Video | Format::Audio => extract::media::HEAD,
             Format::Plain | Format::Html => PLAIN_MAX,
             _ => OTHER_MAX,
         }
@@ -540,6 +548,56 @@ async fn read_all(vault: &Vault, ino: u64) -> Result<Vec<u8>, FsError> {
         out.extend_from_slice(&piece);
     }
     Ok(out)
+}
+
+/// The parts of video or recording `name` (`size` bytes) that its facts
+/// are in: its first bytes, and for MP4 and QuickTime its `moov` box's
+/// body, found by reading only the top-level boxes' headers. The media
+/// itself isn't read.
+async fn read_media(
+    vault: &Vault,
+    ino: u64,
+    size: u64,
+    name: &str,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), FsError> {
+    use extract::media::{HEAD, MOOV_MAX, has_boxes, next_box};
+    let head = vault.read(ino, 0, size.min(HEAD) as usize).await?;
+    if !has_boxes(name) {
+        return Ok((head, None));
+    }
+    let mut at = 0u64;
+    // A file has a few top-level boxes; more is not an MP4.
+    for _ in 0..64 {
+        if at + 8 > size {
+            break;
+        }
+        let header = match head.get(at as usize..) {
+            Some(h) if h.len() >= 16 || at + h.len() as u64 == size => h.to_vec(),
+            _ => vault.read(ino, at, 16).await?,
+        };
+        let Some(b) = next_box(&header, at, size) else {
+            break;
+        };
+        if &b.kind == b"moov" {
+            let len = b.len - b.head;
+            if len > MOOV_MAX {
+                break;
+            }
+            let start = b.offset + b.head;
+            let mut body = Vec::with_capacity(len as usize);
+            while (body.len() as u64) < len {
+                let want = (len - body.len() as u64).min(READ_PIECE) as usize;
+                let piece = vault.read(ino, start + body.len() as u64, want).await?;
+                if piece.is_empty() {
+                    break;
+                }
+                body.extend_from_slice(&piece);
+            }
+            return Ok((head, Some(body)));
+        }
+        at = b.offset + b.len;
+    }
+    Ok((head, None))
 }
 
 /// Makes file `name` in `dir` with `bytes` in it.
@@ -1069,7 +1127,17 @@ impl Pass<'_> {
         let extract = &self.tools.extract;
         let most = extract.reads(&name);
         let mut image = None;
-        let extracted = if most > 0 && attr.size <= most {
+        let media = matches!(Format::of(&name), Format::Video | Format::Audio);
+        let extracted = if media && most > 0 {
+            match read_media(self.vault, ino, attr.size, &name).await {
+                Ok((head, moov)) => extract.media(&name, attr.size, &head, moov.as_deref()),
+                Err(e) if e.errno == errno::ENOENT => return self.gone(ino).await,
+                Err(e) => {
+                    self.stats.failed.push((path, e.to_string()));
+                    return Ok(());
+                }
+            }
+        } else if most > 0 && attr.size <= most {
             match read_all(self.vault, ino).await {
                 Ok(bytes) => {
                     // A photo's image vector, from the same bytes.

@@ -144,6 +144,11 @@ impl FileType {
         if f.kind == DocKind::Track || TRACK.contains(&ext) {
             return FileType::Track;
         }
+        match f.kind {
+            DocKind::Video => return FileType::Video,
+            DocKind::Audio => return FileType::Audio,
+            _ => {}
+        }
         let lists: [(&[&str], FileType); 7] = [
             (VIDEO, FileType::Video),
             (AUDIO, FileType::Audio),

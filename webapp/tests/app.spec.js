@@ -1877,6 +1877,8 @@ test("photos are found by where and when they were taken, and rides by where the
   await open(page, "trips");
   await page.locator("input[type=file]").setInputFiles([
     { name: "IMG_0412.jpg", mimeType: "image/jpeg", buffer: fixture("lisbon.jpg") },
+    // 90 s, filmed in Lisbon in June 2024.
+    { name: "IMG_0413.MOV", mimeType: "video/quicktime", buffer: fixture("lisbon.mov") },
     // Lyndonville to St. Johnsbury, Vermont; and Cape Cod, Massachusetts.
     { name: "morning.gpx", mimeType: "application/gpx+xml", buffer: Buffer.from(gpxRide("Morning loop", [44.5361, -72.0053], [44.4192, -72.0151])) },
     { name: "coast.gpx", mimeType: "application/gpx+xml", buffer: Buffer.from(gpxRide("Coast ride", [41.6, -70.6], [41.7, -70.5])) },
@@ -1923,6 +1925,13 @@ test("photos are found by where and when they were taken, and rides by where the
   await expect(none).toContainText("Nothing matches these filters.", SLOW);
   await none.getByRole("button", { name: "Without “Photos”" }).click();
   await expect(none.getByRole("option").filter({ hasText: "trips/morning.gpx" })).toBeVisible(SLOW);
+
+  // Videos by their headers: where, and how long.
+  const videos = await search(page, "videos from lisbon longer than 1 minute");
+  await expect(videos.getByRole("button", { name: "Remove filter: Videos" })).toBeVisible(SLOW);
+  await expect(videos.getByRole("option")).toHaveCount(1, SLOW);
+  await expect(videos.getByRole("option")).toContainText("trips/IMG_0413.MOV");
+  await expect(videos.getByRole("option")).toContainText("2 min");
 
   // Words no rule knows may suggest a type, with meaning: only applied
   // when tapped.
