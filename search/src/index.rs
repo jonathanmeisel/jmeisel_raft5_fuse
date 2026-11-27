@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::Error;
 use crate::bm25::{Stats, query_terms, term_score};
 use crate::cluster::{self, Centres};
+use crate::filter::{Facts, Filter, Sort};
 use crate::generation::{
     ClusterEntry, FILES_PER_PIECE, FilePreviews, Header, Kind, PieceId, Row, decode_centres,
     decode_cluster, decode_previews, decode_rows, decode_shard,
@@ -388,13 +389,107 @@ impl<'a> Source<'a> {
 /// Pieces a search has loaded: by index (in the list searched) and id.
 pub type Pieces = HashMap<(usize, PieceId), Vec<u8>>;
 
+/// Which of one source's live files a filter keeps.
+struct Kept {
+    generation: Vec<bool>,
+    recent: Vec<bool>,
+    /// Live generation files, and how many of them it keeps.
+    live: usize,
+    kept: usize,
+}
+
+impl Kept {
+    fn of(s: &Source<'_>, filter: &Filter) -> Self {
+        let rows: &[Row] = s.generation.map_or(&[], |g| g.rows.as_slice());
+        let mut live = 0;
+        let generation = rows
+            .iter()
+            .enumerate()
+            .map(|(f, r)| {
+                let f = f as u32;
+                if s.is_dead(f) {
+                    return false;
+                }
+                live += 1;
+                let facts = Facts::of_row(r);
+                let facts = s.moved_path(f).map_or(facts, |p| facts.at_path(p));
+                filter.keeps(&facts)
+            })
+            .collect::<Vec<_>>();
+        let kept = generation.iter().filter(|k| **k).count();
+        let recent = s
+            .recent
+            .docs
+            .iter()
+            .map(|d| {
+                d.as_ref()
+                    .is_some_and(|r| filter.keeps(&Facts::of_record(r)))
+            })
+            .collect();
+        Self {
+            generation,
+            recent,
+            live,
+            kept,
+        }
+    }
+
+    fn keeps(&self, at: At) -> bool {
+        match at {
+            At::Generation(f) => self.generation.get(f as usize).copied().unwrap_or(false),
+            At::Recent(d) => self.recent.get(d).copied().unwrap_or(false),
+        }
+    }
+
+    /// The share of the generation's live files it keeps.
+    fn share(&self) -> f64 {
+        if self.live == 0 {
+            1.0
+        } else {
+            self.kept as f64 / self.live as f64
+        }
+    }
+}
+
+/// What a filter keeps of each source: `None` for no filter, which keeps
+/// every live file.
+struct Keeps(Option<Vec<Kept>>);
+
+impl Keeps {
+    fn of(sources: &[Source<'_>], filter: Option<&Filter>) -> Self {
+        Self(
+            filter
+                .filter(|f| !f.is_empty())
+                .map(|f| sources.iter().map(|s| Kept::of(s, f)).collect()),
+        )
+    }
+
+    fn keeps(&self, i: usize, at: At) -> bool {
+        self.0.as_ref().is_none_or(|k| k[i].keeps(at))
+    }
+
+    fn is_on(&self) -> bool {
+        self.0.is_some()
+    }
+
+    fn get(&self, i: usize) -> Option<&Kept> {
+        self.0.as_ref().map(|k| &k[i])
+    }
+}
+
 /// The keyword shards and clusters a search of `sources` needs: probing
 /// `PROBE_VECTORS` vectors or `PROBE_SHARE` of them, whichever is more.
+///
+/// With a filter, each source probes more in proportion to the share of
+/// its files the filter drops, so that about as many kept files are
+/// scored. A query with no words or vectors needs nothing: it lists what
+/// the filter keeps.
 pub fn needs(
     sources: &[Source<'_>],
     query: &str,
     vector: Option<&QueryVector<'_>>,
     image: Option<&QueryVector<'_>>,
+    filter: Option<&Filter>,
 ) -> Vec<(usize, PieceId)> {
     let total: usize = sources
         .iter()
@@ -403,7 +498,22 @@ pub fn needs(
         .max()
         .unwrap_or(0);
     let vectors = PROBE_VECTORS.max((total as f64 * PROBE_SHARE).ceil() as usize);
-    needs_with(sources, query, vector, image, vectors, PROBE_CLUSTERS)
+    let keeps = Keeps::of(sources, filter);
+    if keeps.is_on() && query_terms(query).is_empty() && vector.is_none() && image.is_none() {
+        return Vec::new();
+    }
+    let scale: Vec<f64> = (0..sources.len())
+        .map(|i| keeps.get(i).map_or(1.0, |k| 1.0 / k.share().max(1e-6)))
+        .collect();
+    needs_scaled(
+        sources,
+        query,
+        vector,
+        image,
+        vectors,
+        PROBE_CLUSTERS,
+        &scale,
+    )
 }
 
 /// `needs`, probing clusters until they hold `vectors` vectors, in at
@@ -416,9 +526,24 @@ pub fn needs_with(
     vectors: usize,
     clusters: usize,
 ) -> Vec<(usize, PieceId)> {
+    let scale = vec![1.0; sources.len()];
+    needs_scaled(sources, query, vector, image, vectors, clusters, &scale)
+}
+
+/// `needs_with`, with source `i` probing `scale[i]` times as many vectors.
+fn needs_scaled(
+    sources: &[Source<'_>],
+    query: &str,
+    vector: Option<&QueryVector<'_>>,
+    image: Option<&QueryVector<'_>>,
+    vectors: usize,
+    clusters: usize,
+    scale: &[f64],
+) -> Vec<(usize, PieceId)> {
     let terms = query_terms(query);
     let mut out = Vec::new();
     for (i, s) in sources.iter().enumerate() {
+        let vectors = (vectors as f64 * scale[i]).min(usize::MAX as f64 / 2.0) as usize;
         let Some(g) = s.generation else { continue };
         let mut shards: Vec<u32> = terms
             .iter()
@@ -523,6 +648,14 @@ fn decoded_cluster(pieces: &Pieces, i: usize, id: PieceId) -> Vec<ClusterEntry> 
 ///   grades by how far it stands above chance over every source's files
 ///   (`Spread`), so the best of unrelated files grades about 0.
 /// - The lists are merged by score (`rank::merge`), once, over all.
+/// - **A filter** drops files before any list is cut, so a strong match
+///   that the filter drops never cuts one it keeps. Keyword statistics
+///   and the spreads still count every file: a match must stand out from
+///   the whole volume, not from the files the filter chose, which may all
+///   be about the query. With no
+///   words or vectors, the result is every file the filter keeps, newest
+///   first.
+#[allow(clippy::too_many_arguments)]
 pub fn search(
     sources: &[Source<'_>],
     query: &str,
@@ -531,11 +664,17 @@ pub fn search(
     limit: usize,
     pieces: &Pieces,
     ranking: &Ranking,
+    filter: Option<&Filter>,
 ) -> Vec<Found> {
     // Each list looks deeper than the result, so a file a little way down
     // several still rises.
     let depth = limit.saturating_mul(3).max(10);
     let terms = query_terms(query);
+    let keeps = Keeps::of(sources, filter);
+    if keeps.is_on() && terms.is_empty() && vector.is_none() && image.is_none() {
+        return listed(sources, &keeps, filter.and_then(|f| f.sort), limit);
+    }
+    let sort = filter.and_then(|f| f.sort);
 
     // Paths, with word weights from every source together.
     // (source, matches, where a doc number points)
@@ -543,15 +682,22 @@ pub fn search(
     let mut path_matches: Vec<FromPaths> = Vec::new();
     for (i, s) in sources.iter().enumerate() {
         let v = s.recent;
-        let m = v.paths.matching(&terms, |doc| v.docs[doc].is_some());
+        let k = &keeps;
+        let m = v.paths.matching(&terms, |doc| {
+            v.docs[doc].is_some() && k.keeps(i, At::Recent(doc))
+        });
         path_matches.push((i, m, At::Recent));
         if let Some(g) = s.generation {
             let m = g.paths.matching(&terms, |f| {
-                !s.is_dead(f as u32) && s.moved_path(f as u32).is_none()
+                !s.is_dead(f as u32)
+                    && s.moved_path(f as u32).is_none()
+                    && k.keeps(i, At::Generation(f as u32))
             });
             path_matches.push((i, m, |f| At::Generation(f as u32)));
             if let Some((_, moved)) = s.moved {
-                let m = moved.matching(&terms, |f| !s.is_dead(f as u32));
+                let m = moved.matching(&terms, |f| {
+                    !s.is_dead(f as u32) && k.keeps(i, At::Generation(f as u32))
+                });
                 path_matches.push((i, m, |f| At::Generation(f as u32)));
             }
         }
@@ -620,9 +766,10 @@ pub fn search(
         let avg = stats.total_len as f32 / stats.docs as f32;
         for (i, s) in sources.iter().enumerate() {
             let v = s.recent;
-            let found = v
-                .keywords
-                .search_with(&terms, &stats, depth, |doc| v.docs[doc].is_some());
+            let k = &keeps;
+            let found = v.keywords.search_with(&terms, &stats, depth, |doc| {
+                v.docs[doc].is_some() && k.keeps(i, At::Recent(doc))
+            });
             keyword.extend(
                 found
                     .into_iter()
@@ -635,7 +782,7 @@ pub fn search(
                     continue;
                 };
                 for &(f, tf) in &w.postings {
-                    if s.is_dead(f) {
+                    if s.is_dead(f) || !keeps.keeps(i, At::Generation(f)) {
                         continue;
                     }
                     let len = g.rows.get(f as usize).map_or(1, |r| r.words.max(1)) as f32;
@@ -662,12 +809,12 @@ pub fn search(
     let mut population: Vec<(f32, f32)> = Vec::new();
     if let Some(q) = vector {
         for (i, s) in sources.iter().enumerate() {
-            meaning.extend(
-                s.recent
-                    .meaning_scores(q)
-                    .into_iter()
-                    .map(|(d, c, sc)| ((i, At::Recent(d)), c, sc)),
-            );
+            for (d, c, sc) in s.recent.meaning_scores(q) {
+                population.push((sc, 1.0));
+                if keeps.keeps(i, At::Recent(d)) {
+                    meaning.push(((i, At::Recent(d)), c, sc));
+                }
+            }
             let Some(g) = s.generation else { continue };
             if g.header.text_model != q.model {
                 continue;
@@ -675,7 +822,7 @@ pub fn search(
             let mut best: HashMap<u32, (usize, f32)> = HashMap::new();
             for n in 0..g.text_sizes.len() as u32 {
                 for e in decoded_cluster(pieces, i, PieceId::new(Kind::TextCluster, n)) {
-                    if s.is_dead(e.file) {
+                    if s.is_dead(e.file) || !keeps.keeps(i, At::Generation(e.file)) {
                         continue;
                     }
                     let sc = crate::vector::dot(&e.vector, q.values);
@@ -685,19 +832,13 @@ pub fn search(
                     }
                 }
             }
+            population.extend(sampled(s, &g.text_sample, g.text_weight, q));
             meaning.extend(
                 best.into_iter()
                     .map(|(f, (c, sc))| ((i, At::Generation(f)), c, sc)),
             );
-            population.extend(sampled(s, &g.text_sample, g.text_weight, q));
         }
         let best = meaning.iter().map(|m| m.2).fold(f32::MIN, f32::max);
-        population.extend(
-            meaning
-                .iter()
-                .filter(|m| matches!(m.0.1, At::Recent(_)))
-                .map(|m| (m.2, 1.0)),
-        );
         meaning_spread = Spread::of(&population);
         let meaning_cut = Cutoff {
             floor: MIN_SIMILARITY,
@@ -716,19 +857,19 @@ pub fn search(
     let mut photo_population: Vec<(f32, f32)> = Vec::new();
     if let Some(q) = image {
         for (i, s) in sources.iter().enumerate() {
-            shown.extend(
-                s.recent
-                    .image_scores(q)
-                    .into_iter()
-                    .map(|(d, sc)| ((i, At::Recent(d)), sc)),
-            );
+            for (d, sc) in s.recent.image_scores(q) {
+                photo_population.push((sc, 1.0));
+                if keeps.keeps(i, At::Recent(d)) {
+                    shown.push(((i, At::Recent(d)), sc));
+                }
+            }
             let Some(g) = s.generation else { continue };
             if g.header.clip_model != q.model {
                 continue;
             }
             for n in 0..g.photo_sizes.len() as u32 {
                 for e in decoded_cluster(pieces, i, PieceId::new(Kind::PhotoCluster, n)) {
-                    if !s.is_dead(e.file) {
+                    if !s.is_dead(e.file) && keeps.keeps(i, At::Generation(e.file)) {
                         shown.push((
                             (i, At::Generation(e.file)),
                             crate::vector::dot(&e.vector, q.values),
@@ -739,12 +880,6 @@ pub fn search(
             photo_population.extend(sampled(s, &g.photo_sample, g.photo_weight, q));
         }
         let best = shown.iter().map(|m| m.1).fold(f32::MIN, f32::max);
-        photo_population.extend(
-            shown
-                .iter()
-                .filter(|m| matches!(m.0.1, At::Recent(_)))
-                .map(|m| (m.1, 1.0)),
-        );
         shown_spread = Spread::of(&photo_population);
         let shown_cut = Cutoff {
             floor: MIN_IMAGE_SIMILARITY,
@@ -794,7 +929,7 @@ pub fn search(
     ];
     let by_keyword: HashSet<Key> = keyword.iter().map(|k| k.0).collect();
     let by_meaning: HashMap<Key, usize> = meaning.iter().map(|m| (m.0, m.1)).collect();
-    merge(&lists, ranking.bonus, ranking.keep)
+    let mut found: Vec<Found> = merge(&lists, ranking.bonus, ranking.keep)
         .into_iter()
         .take(limit)
         .map(|((index, at), score)| Found {
@@ -804,7 +939,68 @@ pub fn search(
             keyword: by_keyword.contains(&(index, at)),
             chunk: by_meaning.get(&(index, at)).copied(),
         })
-        .collect()
+        .collect();
+    if let Some(sort) = sort {
+        sort_by_date(sources, &mut found, sort);
+    }
+    found
+}
+
+/// When a found file was taken (or made), for sorting by date.
+fn date_of(sources: &[Source<'_>], f: &Found) -> u64 {
+    let s = &sources[f.index];
+    match f.at {
+        At::Recent(d) => s.recent.docs[d]
+            .as_ref()
+            .map_or(0, |r| Facts::of_record(r).taken_ms()),
+        At::Generation(n) => s
+            .generation
+            .and_then(|g| g.rows.get(n as usize))
+            .map_or(0, |r| Facts::of_row(r).taken_ms()),
+    }
+}
+
+fn sort_by_date(sources: &[Source<'_>], found: &mut [Found], sort: Sort) {
+    found.sort_by_cached_key(|f| {
+        let d = date_of(sources, f);
+        match sort {
+            Sort::Newest => u64::MAX - d,
+            Sort::Oldest => d,
+        }
+    });
+}
+
+/// Every file `keeps` keeps, by date (newest first unless `sort` says),
+/// at most `limit`: a search by filter alone.
+fn listed(sources: &[Source<'_>], keeps: &Keeps, sort: Option<Sort>, limit: usize) -> Vec<Found> {
+    let mut found = Vec::new();
+    for (i, s) in sources.iter().enumerate() {
+        for (f, _) in s.gen_live() {
+            if keeps.keeps(i, At::Generation(f)) {
+                found.push(Found::listed(i, At::Generation(f)));
+            }
+        }
+        for (d, r) in s.recent.docs.iter().enumerate() {
+            if r.is_some() && keeps.keeps(i, At::Recent(d)) {
+                found.push(Found::listed(i, At::Recent(d)));
+            }
+        }
+    }
+    sort_by_date(sources, &mut found, sort.unwrap_or(Sort::Newest));
+    found.truncate(limit);
+    found
+}
+
+impl Found {
+    fn listed(index: usize, at: At) -> Self {
+        Self {
+            index,
+            at,
+            score: 1.0,
+            keyword: false,
+            chunk: None,
+        }
+    }
 }
 
 /// The previews pieces that the generation's files in `found` are in.
@@ -907,6 +1103,7 @@ pub fn hits(
 
 /// Every step at once, for sources with every piece at hand (`piece`):
 /// what native clients and tests use.
+#[allow(clippy::too_many_arguments)]
 pub fn search_all(
     sources: &[Source<'_>],
     query: &str,
@@ -914,15 +1111,18 @@ pub fn search_all(
     image: Option<&QueryVector<'_>>,
     limit: usize,
     ranking: &Ranking,
+    filter: Option<&Filter>,
     piece: impl Fn(usize, PieceId) -> Option<Vec<u8>>,
 ) -> Vec<(usize, Hit)> {
     let mut pieces = Pieces::new();
-    for (i, id) in needs(sources, query, vector, image) {
+    for (i, id) in needs(sources, query, vector, image, filter) {
         if let Some(b) = piece(i, id) {
             pieces.insert((i, id), b);
         }
     }
-    let found = search(sources, query, vector, image, limit, &pieces, ranking);
+    let found = search(
+        sources, query, vector, image, limit, &pieces, ranking, filter,
+    );
     for (i, id) in preview_needs(&found) {
         if let Some(b) = piece(i, id) {
             pieces.insert((i, id), b);

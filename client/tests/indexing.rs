@@ -154,7 +154,7 @@ fn hits(
     let q = vector.map(|(model, values)| QueryVector { model, values });
     backend
         .runtime
-        .block_on(open::search(&[&index], query, q, None, 10))
+        .block_on(open::search(&[&index], query, q, None, 10, None))
         .into_iter()
         .map(|h| h.1)
         .collect()
@@ -713,7 +713,7 @@ fn a_second_read_fetches_only_new_segments() {
         .block_on(open::refresh(&tester, first, &mut |_, _| {}))
         .unwrap()
         .unwrap();
-    let found = rt.block_on(open::search(&[&again], "fresh", None, None, 5));
+    let found = rt.block_on(open::search(&[&again], "fresh", None, None, 5, None));
     assert_eq!(found[0].1.path, "new.txt");
     // Only the new segment was read; the old ones weren't asked again.
     assert_eq!(kept.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1254,7 +1254,7 @@ fn a_refresh_reads_new_segments_and_a_compaction_switches_the_generation() {
         fourth.header.as_ref().map(|h| h.id)
     );
     assert_eq!(fourth.index.len(), 3);
-    let found = rt.block_on(open::search(&[&fourth], "later", None, None, 5));
+    let found = rt.block_on(open::search(&[&fourth], "later", None, None, 5, None));
     assert_eq!(found[0].1.path, "later.txt");
     std::fs::remove_dir_all(cache).unwrap();
 }
@@ -1572,4 +1572,37 @@ fn who_made_a_file_comes_from_the_log_and_outlasts_edits() {
     assert_eq!(edited.meta.added_by, TESTER, "still made by the tester");
     assert_eq!(edited.meta.added_ms, first.meta.added_ms);
     assert_eq!(edited.meta.changed_by, "carol");
+}
+
+#[test]
+fn a_filtered_search_returns_only_what_the_filter_keeps() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    let index = opened(&backend, &tester, v).unwrap();
+    let find = |query: &str, filter: &str| -> Vec<String> {
+        let (filter, rest) = raft5fs_search::filter::Filter::parse_syntax(filter, 0);
+        assert!(rest.is_empty());
+        backend
+            .runtime
+            .block_on(open::search(
+                &[&index],
+                query,
+                None,
+                None,
+                10,
+                Some(&filter),
+            ))
+            .into_iter()
+            .map(|h| h.1.path)
+            .collect()
+    };
+    assert_eq!(find("", "type:track"), ["ride.gpx"]);
+    assert_eq!(find("", "activity:ride"), ["ride.gpx"]);
+    assert_eq!(find("tax", "in:notes"), ["notes/tax.txt"]);
+    assert!(find("tax", "-in:notes").is_empty());
+    let mut all = find("", "-type:track");
+    all.sort();
+    assert_eq!(all, ["notes/tax.txt", "photo.jpg"]);
 }

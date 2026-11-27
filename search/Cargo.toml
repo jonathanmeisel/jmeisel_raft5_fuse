@@ -8,6 +8,8 @@ edition.workspace = true
 raft5fs-wire = { workspace = true }
 quick-xml = "0.37"
 unicode-segmentation = "1"
+# Folds accents away, to compare place and people names.
+unicode-normalization = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 kamadak-exif = "0.6"
 # Segments are compressed. Pure Rust, so it builds for the browser too.

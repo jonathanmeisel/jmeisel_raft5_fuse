@@ -199,6 +199,7 @@ pub fn run_indexed(
                             Some(&image),
                             limit,
                             ranking,
+                            None,
                             |i, id| indexes[i].1.get(&id).cloned(),
                         )
                         .into_iter()

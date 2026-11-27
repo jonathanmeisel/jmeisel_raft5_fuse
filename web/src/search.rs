@@ -33,6 +33,7 @@ use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
+use raft5fs_search::filter::Filter;
 use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
 use raft5fs_search::view::QueryVector;
@@ -227,6 +228,13 @@ struct LoadedJs {
     /// they show (have an image vector, which only a native device makes).
     photos: usize,
     photos_seen: usize,
+}
+
+/// This browser's offset from UTC now, in milliseconds, for the days
+/// that date filters name.
+fn utc_offset_ms() -> i64 {
+    // `getTimezoneOffset` is UTC minus local time, in minutes.
+    -(js_sys::Date::new_0().get_timezone_offset() as i64) * 60_000
 }
 
 fn kind_name(kind: DocKind) -> &'static str {
@@ -567,12 +575,18 @@ impl Fs {
         }
         let inner = Rc::clone(&self.0);
         promise(async move {
+            let (filter, query) = Filter::parse_syntax(&query, utc_offset_ms());
+            let named = filter.volumes();
             let views: Vec<(u64, Rc<Loaded>)> = inner
                 .search
                 .views
                 .borrow()
                 .iter()
                 .filter(|(_, l)| volumes.is_empty() || volumes.contains(&l.path))
+                .filter(|(_, l)| {
+                    let label = l.path.trim_start_matches('/');
+                    named.is_empty() || named.iter().any(|n| label.eq_ignore_ascii_case(n))
+                })
                 .map(|(&ino, l)| (ino, Rc::clone(l)))
                 .collect();
             let limit = limit.clamp(1, 200) as usize;
@@ -583,7 +597,8 @@ impl Fs {
                 .iter()
                 .any(|(_, l)| l.opened.index.has_image_model(CLIP_MODEL));
             let mut meaning_error = None;
-            let vector = if meaning && has_vectors {
+            let words = !query.trim().is_empty();
+            let vector = if meaning && has_vectors && words {
                 let embedded = match inner.tools() {
                     Ok(tools) => JsEmbed(tools).query(&query).await,
                     Err(e) => Err(e.message),
@@ -592,7 +607,7 @@ impl Fs {
             } else {
                 None
             };
-            let image_vector = if meaning && has_images {
+            let image_vector = if meaning && has_images && words {
                 let embedded = match inner.tools() {
                     Ok(tools) => call(&tools.clip, &[JsValue::from_str(&query)])
                         .await
@@ -617,7 +632,7 @@ impl Fs {
             });
             // All the volumes are ranked as one (`index::search`).
             let all: Vec<&Opened> = views.iter().map(|(_, l)| &l.opened).collect();
-            let hits = index_open::search(&all, &query, q, image, limit)
+            let hits = index_open::search(&all, &query, q, image, limit, Some(&filter))
                 .await
                 .into_iter()
                 .map(|(i, h)| {

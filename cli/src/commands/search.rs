@@ -19,6 +19,7 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
+use raft5fs_search::filter::Filter;
 use raft5fs_search::index::Index;
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
@@ -53,8 +54,11 @@ pub struct IndexArgs {
 }
 
 #[derive(Args)]
+#[command(verbatim_doc_comment)]
 pub struct SearchArgs {
-    /// What to look for.
+    /// What to look for: words, and filters such as `type:photo`,
+    /// `place:PT`, `taken:2024-06..2024-09`, `size:>10MB`, `by:alice` or
+    /// `-type:pdf` (SETUP.txt section 15 lists them all).
     pub query: String,
     /// Search only these volumes, as your root shows them. By default,
     /// every volume you can read that has an index.
@@ -346,6 +350,23 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     Ok(if failed { 2 } else { 0 })
 }
 
+/// This machine's offset from UTC now, in milliseconds, for the days that
+/// date filters name.
+fn utc_offset_ms() -> i64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `localtime_r` writes only into `tm`, which outlives it.
+        unsafe {
+            let now = libc::time(std::ptr::null_mut());
+            let mut tm: libc::tm = std::mem::zeroed();
+            if !libc::localtime_r(&now, &mut tm).is_null() {
+                return tm.tm_gmtoff * 1000;
+            }
+        }
+    }
+    0
+}
+
 /// `volume`'s index, kept in this device's cache between runs.
 async fn open_volume(
     vault: &Vault,
@@ -366,12 +387,20 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
     let vault = log_in(&runtime, &ctx)?;
-    let volumes = chosen(&runtime, &vault, &args.volumes, || {
+    let (filter, text) = Filter::parse_syntax(&args.query, utc_offset_ms());
+    let mut volumes = chosen(&runtime, &vault, &args.volumes, || {
         let (grants, _) = runtime
             .block_on(vault.remote().list_grants_covered())
             .map_err(|e| format!("cannot list what is shared with this account: {e}"))?;
         Ok(grants.into_iter().map(|g| g.ino).collect())
     })?;
+    let named = filter.volumes();
+    if !named.is_empty() {
+        volumes.retain(|(label, _)| named.iter().any(|n| label.eq_ignore_ascii_case(n)));
+    }
+    if !filter.terms.is_empty() || filter.sort.is_some() {
+        println!("Filters: {filter}");
+    }
     let mut views = Vec::new();
     for (label, ino) in &volumes {
         let opened = match runtime.block_on(open_volume(&vault, *ino)) {
@@ -387,7 +416,11 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
         return Err("no volume here has a search index yet: run `raft5fs index`".into());
     }
     let indexes: Vec<&Index> = views.iter().map(|(_, o)| &o.index).collect();
-    let (query_vector, image_vector) = query_vectors(&runtime, &indexes, &args.query);
+    let (query_vector, image_vector) = if text.trim().is_empty() {
+        (None, None)
+    } else {
+        query_vectors(&runtime, &indexes, &text)
+    };
     // All the volumes are ranked as one (`view::search_many`).
     let vector = query_vector.as_deref().map(|values| QueryVector {
         model: MODEL,
@@ -400,10 +433,11 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     let opened: Vec<&Opened> = views.iter().map(|(_, o)| o).collect();
     let merged = runtime.block_on(open::search(
         &opened,
-        &args.query,
+        &text,
         vector,
         image,
         args.limit,
+        Some(&filter),
     ));
     if merged.is_empty() {
         println!("nothing found");

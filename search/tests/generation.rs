@@ -107,6 +107,7 @@ fn search_index(
         im.as_ref(),
         20,
         &Ranking::default(),
+        None,
         |_, id| all.get(&id).cloned(),
     )
     .into_iter()
@@ -327,7 +328,16 @@ fn probing_a_few_clusters_finds_nearly_what_a_full_scan_finds() {
                 .into_iter()
                 .filter_map(|k| Some((k, all.get(&k.1)?.clone())))
                 .collect();
-            let found = index::search(&s, "", Some(&v), None, 50, &pieces, &Ranking::default());
+            let found = index::search(
+                &s,
+                "",
+                Some(&v),
+                None,
+                50,
+                &pieces,
+                &Ranking::default(),
+                None,
+            );
             index::hits(&s, "", &found, &pieces)
                 .into_iter()
                 .map(|h| h.1.ino)
@@ -346,4 +356,172 @@ fn probing_a_few_clusters_finds_nearly_what_a_full_scan_finds() {
     assert!(counted > 40);
     let recall = recall / f64::from(counted);
     assert!(recall >= 0.9, "result recall {recall:.3}");
+}
+
+/// `query` over `index`, with `filter` (in the syntax), as paths.
+fn filtered(
+    index: &Index,
+    all: &HashMap<PieceId, Vec<u8>>,
+    query: &str,
+    q: Option<&[f32]>,
+    filter: &str,
+) -> Vec<String> {
+    let (filter, rest) = raft5fs_search::filter::Filter::parse_syntax(filter, 0);
+    assert!(rest.is_empty());
+    let v = q.map(|values| QueryVector {
+        model: TEXT_MODEL,
+        values,
+    });
+    let im = q.map(|values| QueryVector {
+        model: CLIP_MODEL,
+        values,
+    });
+    index::search_all(
+        &[index.source()],
+        query,
+        v.as_ref(),
+        im.as_ref(),
+        20,
+        &Ranking::default(),
+        Some(&filter),
+        |_, id| all.get(&id).cloned(),
+    )
+    .into_iter()
+    .map(|(_, h)| h.path)
+    .collect()
+}
+
+#[test]
+fn a_filter_keeps_only_its_files_in_a_generation_and_recent_segments() {
+    let (records, recent) = changes();
+    let (index, all) = indexed(&records, recent, config(50, 4));
+    let q = vector(0, 1);
+    for (query, vector) in [("kayak", None), ("kayak", Some(q.as_slice())), ("", None)] {
+        let found = filtered(&index, &all, query, vector, "type:photo");
+        assert!(!found.is_empty(), "{query:?} finds photos");
+        for path in &found {
+            let ino: u64 = path
+                .rsplit(' ')
+                .next()
+                .and_then(|n| n.strip_suffix(".txt"))
+                .and_then(|n| n.parse().ok())
+                .unwrap();
+            assert!(ino.is_multiple_of(5), "{path} is a photo");
+        }
+        let found = filtered(&index, &all, query, vector, "-type:photo in:sub1");
+        assert!(found.iter().all(|p| p.contains("/sub1/")), "{found:?}");
+    }
+}
+
+#[test]
+fn a_filter_drops_files_before_a_strong_match_cuts_the_rest() {
+    // Every tenth file says "paddle" once; one text file says it over and
+    // over, a far better match than any photo.
+    let mut records: Vec<Record> = (1..=200)
+        .map(|i| {
+            let word = if i % 10 == 0 { "paddle" } else { "" };
+            record(i, 10, i as usize % TOPICS.len(), word)
+        })
+        .collect();
+    let mut strong = record(1000, 10, 0, &"paddle ".repeat(30));
+    strong.kind = DocKind::Text;
+    strong.extra.image = None;
+    records.push(strong);
+    let (index, all) = indexed(&records, Vec::new(), config(50, 4));
+    let unfiltered = filtered(&index, &all, "paddle", None, "");
+    assert!(unfiltered[0].ends_with("file 1000.txt"), "{unfiltered:?}");
+    // The photos that say it (every tenth file is a photo too) all come
+    // back: the strong text match was dropped before it could cut them.
+    let photos = filtered(&index, &all, "paddle", None, "type:photo");
+    assert_eq!(photos.len(), 20, "{photos:?}");
+}
+
+#[test]
+fn a_filter_alone_lists_its_files_newest_first() {
+    let records: Vec<Record> = (1..=60)
+        .map(|i| {
+            let mut r = record(i, 10, i as usize % TOPICS.len(), "");
+            r.stamp.mtime_ns = i * 86_400_000_000_000;
+            r
+        })
+        .collect();
+    let (index, all) = indexed(&records, Vec::new(), config(50, 4));
+    let found = filtered(&index, &all, "", None, "type:photo");
+    let inos: Vec<u64> = found
+        .iter()
+        .map(|p| {
+            p.rsplit(' ')
+                .next()
+                .unwrap()
+                .trim_end_matches(".txt")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(inos, [60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5]);
+    let found = filtered(&index, &all, "", None, "type:photo sort:oldest");
+    assert!(found[0].ends_with("file 5.txt"), "{found:?}");
+}
+
+#[test]
+fn a_narrow_filter_probes_more_clusters_to_find_its_files() {
+    let n = 6_000u64;
+    let records: Vec<Record> = (1..=n)
+        .map(|i| {
+            let mut r = record(i, 10, i as usize % TOPICS.len(), "");
+            for (k, c) in r.chunks.iter_mut().enumerate() {
+                let mut v = vector(i as usize % TOPICS.len(), i * 13 + k as u64);
+                v[(i % DIMS as u64) as usize] += 0.6;
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|x| *x /= norm);
+                c.vector = Some(quantize(&v));
+            }
+            r
+        })
+        .collect();
+    let (index, all) = indexed(&records, Vec::new(), config(100, 1));
+    let s = [index.source()];
+    // A third of the files, the query's topic among them.
+    let (filter, _) = raft5fs_search::filter::Filter::parse_syntax("in:sub0", 0);
+    // Near files of topic 0 whose spread put them along dimension 0.
+    let mut q = vector(0, 77);
+    q[0] += 0.6;
+    let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+    q.iter_mut().for_each(|x| *x /= norm);
+    let v = QueryVector {
+        model: TEXT_MODEL,
+        values: &q,
+    };
+    let run = |needs: Vec<(usize, PieceId)>| -> Vec<u64> {
+        let pieces: Pieces = needs
+            .into_iter()
+            .filter_map(|k| Some((k, all.get(&k.1)?.clone())))
+            .collect();
+        let found = index::search(
+            &s,
+            "",
+            Some(&v),
+            None,
+            50,
+            &pieces,
+            &Ranking::default(),
+            Some(&filter),
+        );
+        index::hits(&s, "", &found, &pieces)
+            .into_iter()
+            .map(|h| h.1.ino)
+            .collect()
+    };
+    let full = run(index::needs_with(&s, "", Some(&v), None, usize::MAX, 1));
+    assert!(!full.is_empty());
+    let few = index::needs_with(&s, "", Some(&v), None, 600, 8).len();
+    let scaled = index::needs(&s, "", Some(&v), None, Some(&filter));
+    assert!(scaled.len() > few, "{} clusters, not {few}", scaled.len());
+    let part = run(scaled);
+    let hit = part.iter().filter(|i| full.contains(i)).count();
+    assert!(
+        hit as f64 / full.len() as f64 >= 0.9,
+        "{hit} of {}",
+        full.len()
+    );
 }

@@ -551,6 +551,7 @@ pub fn search_many_with(
         image.as_ref(),
         limit,
         ranking,
+        None,
         |_, _| None,
     )
 }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
+use raft5fs_search::filter::Filter;
 use raft5fs_search::generation::{self, GenId, Header, PieceId};
 use raft5fs_search::index::{self, Generation, Index, Pieces};
 use raft5fs_search::rank::Ranking;
@@ -226,14 +227,16 @@ pub async fn refresh(
 }
 
 /// Searches `opened` as one, best first, loading each piece a query needs
-/// from its cache (where `open` put them). Each hit comes with the index
-/// in `opened` of the volume it is in.
+/// from its cache (where `open` put them), with only the files `filter`
+/// keeps. Each hit comes with the index in `opened` of the volume it is
+/// in.
 pub async fn search(
     opened: &[&Opened],
     query: &str,
     vector: Option<QueryVector<'_>>,
     image: Option<QueryVector<'_>>,
     limit: usize,
+    filter: Option<&Filter>,
 ) -> Vec<(usize, Hit)> {
     let sources: Vec<_> = opened.iter().map(|o| o.index.source()).collect();
     let mut pieces = Pieces::new();
@@ -251,7 +254,7 @@ pub async fn search(
     };
     load(
         &mut pieces,
-        index::needs(&sources, query, vector.as_ref(), image.as_ref()),
+        index::needs(&sources, query, vector.as_ref(), image.as_ref(), filter),
     )
     .await;
     let found = index::search(
@@ -262,6 +265,7 @@ pub async fn search(
         limit,
         &pieces,
         &Ranking::default(),
+        filter,
     );
     load(&mut pieces, index::preview_needs(&found)).await;
     index::hits(&sources, query, &found, &pieces)
@@ -346,7 +350,7 @@ pub async fn check_recall(opened: &Opened, queries: usize) -> RecallCheck {
                         .into_iter()
                         .filter_map(|k| Some((k, all.get(&k)?.clone())))
                         .collect();
-                    index::search(&sources, "", v, i, 50, &pieces, &Ranking::default())
+                    index::search(&sources, "", v, i, 50, &pieces, &Ranking::default(), None)
                         .into_iter()
                         .map(|f| f.at)
                         .collect()
@@ -355,7 +359,7 @@ pub async fn check_recall(opened: &Opened, queries: usize) -> RecallCheck {
                 if full.is_empty() {
                     continue;
                 }
-                let part = run(index::needs(&sources, "", v, i));
+                let part = run(index::needs(&sources, "", v, i, None));
                 sum += part.iter().filter(|a| full.contains(a)).count() as f64 / full.len() as f64;
                 counted += 1;
             }
@@ -377,7 +381,7 @@ pub async fn check_recall(opened: &Opened, queries: usize) -> RecallCheck {
         if stem.is_empty() {
             continue;
         }
-        let found = search(&[opened], stem, None, None, 10).await;
+        let found = search(&[opened], stem, None, None, 10, None).await;
         out.names.1 += 1;
         out.names.0 += usize::from(found.iter().any(|(_, hit)| hit.ino == r.ino));
     }
