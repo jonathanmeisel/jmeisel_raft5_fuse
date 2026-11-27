@@ -9,6 +9,8 @@
 //! - `--generation`: search generations built from the corpus, as clients
 //!   search a compacted index, not the plain view.
 //! - `recall` (first): result recall of clustered search, text and photos.
+//! - `parse` (first): how plain English queries read as filters, on
+//!   data/parse.json; no corpus needed.
 //! - `tune` (first): the ranking's numbers that score best (`tune`), over
 //!   `--volumes` volumes (default 4) and every query.
 use std::path::PathBuf;
@@ -23,6 +25,11 @@ fn main() {
     let mut report: Option<PathBuf> = None;
     let mut generation = false;
     let mut args = std::env::args().skip(1).peekable();
+    if args.next_if(|a| a == "parse").is_some() {
+        let report = raft5fs_eval::parse::run(&raft5fs_eval::parse::pinned());
+        raft5fs_eval::parse::print(&report);
+        return;
+    }
     let recall = args.next_if(|a| a == "recall").is_some();
     let tune = args.next_if(|a| a == "tune").is_some();
     if tune {

@@ -1606,3 +1606,82 @@ fn a_filtered_search_returns_only_what_the_filter_keeps() {
     all.sort();
     assert_eq!(all, ["notes/tax.txt", "photo.jpg"]);
 }
+
+/// Reads as `BuiltIn` does, with the places table that native clients
+/// have.
+struct WithPlaces(raft5fs_search::geo::Places);
+
+impl raft5fs_client::indexer::Extract for WithPlaces {
+    fn reads(&self, name: &str) -> u64 {
+        BuiltIn.reads(name)
+    }
+
+    fn extract<'a>(
+        &'a self,
+        name: &'a str,
+        bytes: Vec<u8>,
+    ) -> Boxed<'a, Option<raft5fs_search::extract::Extracted>> {
+        Box::pin(async move { raft5fs_search::extract::extract_with(name, &bytes, Some(&self.0)) })
+    }
+}
+
+#[test]
+fn plain_english_finds_photos_by_where_they_were_taken() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let lisbon = include_bytes!("../../webapp/tests/fixtures/lisbon.jpg");
+    write(&backend, &tester, v, "lisbon.jpg", lisbon);
+    write(
+        &backend,
+        &tester,
+        v,
+        "lisbon notes.txt",
+        b"lisbon trip plans and photos to take",
+    );
+    let places =
+        raft5fs_search::geo::Places::decode(include_bytes!("../../search/data/places.bin"))
+            .unwrap();
+    let tools = Tools {
+        extract: Arc::new(WithPlaces(places)),
+        embed: None,
+        image: None,
+    };
+    pass_with(&backend, &tester, v, new_id(), PassKind::Auto, &tools).unwrap();
+    let index = opened(&backend, &tester, v).unwrap();
+    let vocabulary = index.index.vocabulary();
+    let june_2026 = raft5fs_search::extract::track::iso_ms("2026-06-01").unwrap();
+    let find = |q: &str| -> (String, Vec<String>) {
+        let p = raft5fs_search::query::parse(q, &vocabulary, june_2026, 0);
+        let found = backend
+            .runtime
+            .block_on(open::search(
+                &[&index],
+                &p.text,
+                None,
+                None,
+                10,
+                Some(&p.filter),
+            ))
+            .into_iter()
+            .map(|h| h.1.path)
+            .collect();
+        (p.filter.to_string(), found)
+    };
+    assert_eq!(
+        find("photos from lisbon"),
+        ("type:photo place:Lisbon".into(), vec!["lisbon.jpg".into()])
+    );
+    assert_eq!(
+        find("photos from portugal in 2024"),
+        (
+            "type:photo place:PT taken:2024".into(),
+            vec!["lisbon.jpg".into()]
+        )
+    );
+    assert_eq!(
+        find("photos taken with an iphone"),
+        ("type:photo camera:iphone".into(), vec!["lisbon.jpg".into()])
+    );
+    assert!(find("photos from 2023").1.is_empty());
+}

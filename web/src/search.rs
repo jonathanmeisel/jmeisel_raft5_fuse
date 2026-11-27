@@ -33,7 +33,7 @@ use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
-use raft5fs_search::filter::Filter;
+use raft5fs_search::query::{self, Vocabulary};
 use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
 use raft5fs_search::view::QueryVector;
@@ -228,6 +228,19 @@ struct LoadedJs {
     /// they show (have an image vector, which only a native device makes).
     photos: usize,
     photos_seen: usize,
+}
+
+/// Whether the volume at `label` is volume or group `name`.
+fn in_volume(label: &str, name: &str) -> bool {
+    label.eq_ignore_ascii_case(name)
+        || label
+            .split_once('/')
+            .is_some_and(|(group, _)| group.eq_ignore_ascii_case(name))
+}
+
+/// Now, in ms since the Unix epoch.
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 /// This browser's offset from UTC now, in milliseconds, for the days
@@ -575,19 +588,29 @@ impl Fs {
         }
         let inner = Rc::clone(&self.0);
         promise(async move {
-            let (filter, query) = Filter::parse_syntax(&query, utc_offset_ms());
-            let named = filter.volumes();
-            let views: Vec<(u64, Rc<Loaded>)> = inner
+            let chosen: Vec<(u64, Rc<Loaded>)> = inner
                 .search
                 .views
                 .borrow()
                 .iter()
                 .filter(|(_, l)| volumes.is_empty() || volumes.contains(&l.path))
+                .map(|(&ino, l)| (ino, Rc::clone(l)))
+                .collect();
+            let mut vocabulary = Vocabulary::default();
+            for (_, l) in &chosen {
+                vocabulary.extend(&l.opened.index.vocabulary());
+                vocabulary.add_volume(l.path.trim_start_matches('/'));
+            }
+            let parsed = query::parse(&query, &vocabulary, now_ms(), utc_offset_ms());
+            let filter = parsed.filter;
+            let query = parsed.text;
+            let named = filter.volumes();
+            let views: Vec<(u64, Rc<Loaded>)> = chosen
+                .into_iter()
                 .filter(|(_, l)| {
                     let label = l.path.trim_start_matches('/');
-                    named.is_empty() || named.iter().any(|n| label.eq_ignore_ascii_case(n))
+                    named.is_empty() || named.iter().any(|n| in_volume(label, n))
                 })
-                .map(|(&ino, l)| (ino, Rc::clone(l)))
                 .collect();
             let limit = limit.clamp(1, 200) as usize;
             let has_vectors = views

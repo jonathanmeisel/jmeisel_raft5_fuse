@@ -1,0 +1,1009 @@
+{
+ "about": "Plain English queries and the filters and text that search should read in them (search/src/query). `now` is when they are asked, in UTC; `vocabulary` is what the searched indexes hold. A query's filter is compared as a set of terms, its text as written. Written for raft5fs, not taken from any data set.",
+ "now": "2026-11-27T12:00:00Z",
+ "vocabulary": {
+  "places": [
+   [
+    "Lisbon",
+    "Lisbon",
+    "Portugal",
+    "PT"
+   ],
+   [
+    "Porto",
+    "Porto",
+    "Portugal",
+    "PT"
+   ],
+   [
+    "Antigua Guatemala",
+    "Sacatepéquez",
+    "Guatemala",
+    "GT"
+   ],
+   [
+    "Guatemala City",
+    "Guatemala",
+    "Guatemala",
+    "GT"
+   ],
+   [
+    "Burlington",
+    "Vermont",
+    "United States",
+    "US"
+   ],
+   [
+    "Lyndonville",
+    "Vermont",
+    "United States",
+    "US"
+   ],
+   [
+    "New York City",
+    "New York",
+    "United States",
+    "US"
+   ],
+   [
+    "Atlanta",
+    "Georgia",
+    "United States",
+    "US"
+   ],
+   [
+    "Tbilisi",
+    "Tbilisi",
+    "Georgia",
+    "GE"
+   ],
+   [
+    "Paris",
+    "Île-de-France",
+    "France",
+    "FR"
+   ],
+   [
+    "Paris",
+    "Texas",
+    "United States",
+    "US"
+   ],
+   [
+    "Nice",
+    "Provence-Alpes-Côte d'Azur",
+    "France",
+    "FR"
+   ],
+   [
+    "Amman",
+    "Amman",
+    "Jordan",
+    "JO"
+   ],
+   [
+    "Istanbul",
+    "Istanbul",
+    "Turkey",
+    "TR"
+   ],
+   [
+    "Mexico City",
+    "Mexico City",
+    "Mexico",
+    "MX"
+   ],
+   [
+    "Kyoto",
+    "Kyoto",
+    "Japan",
+    "JP"
+   ],
+   [
+    "Reykjavik",
+    "Capital Region",
+    "Iceland",
+    "IS"
+   ]
+  ],
+  "people": [
+   "alice",
+   "bo",
+   "ann",
+   "carol"
+  ],
+  "cameras": [
+   "Apple iPhone 13",
+   "Canon EOS R6",
+   "FUJIFILM X100V",
+   "Google Pixel 7"
+  ],
+  "volumes": [
+   "Family",
+   "CS101/alice",
+   "Work"
+  ]
+ },
+ "queries": [
+  {
+   "query": "photos",
+   "filter": "type:photo",
+   "text": ""
+  },
+  {
+   "query": "pictures",
+   "filter": "type:photo",
+   "text": ""
+  },
+  {
+   "query": "pics from lisbon",
+   "filter": "type:photo place:Lisbon",
+   "text": ""
+  },
+  {
+   "query": "videos",
+   "filter": "type:video",
+   "text": ""
+  },
+  {
+   "query": "pdfs",
+   "filter": "type:pdf",
+   "text": ""
+  },
+  {
+   "query": "spreadsheets",
+   "filter": "type:spreadsheet",
+   "text": ""
+  },
+  {
+   "query": "presentations",
+   "filter": "type:presentation",
+   "text": ""
+  },
+  {
+   "query": "screenshots",
+   "filter": "type:screenshot",
+   "text": ""
+  },
+  {
+   "query": "selfies",
+   "filter": "is:selfie",
+   "text": ""
+  },
+  {
+   "query": "panoramas",
+   "filter": "shape:panorama",
+   "text": ""
+  },
+  {
+   "query": "voice memos",
+   "filter": "type:audio",
+   "text": ""
+  },
+  {
+   "query": "songs",
+   "filter": "type:audio",
+   "text": ""
+  },
+  {
+   "query": "bike rides",
+   "filter": "activity:ride",
+   "text": ""
+  },
+  {
+   "query": "rides",
+   "filter": "activity:ride",
+   "text": ""
+  },
+  {
+   "query": "hikes",
+   "filter": "activity:hike",
+   "text": ""
+  },
+  {
+   "query": "runs",
+   "filter": "activity:run",
+   "text": ""
+  },
+  {
+   "query": "gps tracks",
+   "filter": "type:track",
+   "text": ""
+  },
+  {
+   "query": "zip files",
+   "filter": "type:archive",
+   "text": ""
+  },
+  {
+   "query": "photos and videos",
+   "filter": "type:photo type:video",
+   "text": ""
+  },
+  {
+   "query": "pdfs or spreadsheets",
+   "filter": "type:pdf type:spreadsheet",
+   "text": ""
+  },
+  {
+   "query": "photos of documents",
+   "filter": "type:photo",
+   "text": "of documents"
+  },
+  {
+   "query": "documents with photos",
+   "filter": "type:document",
+   "text": "with photos"
+  },
+  {
+   "query": "pictures of my dog",
+   "filter": "type:photo",
+   "text": "of dog"
+  },
+  {
+   "query": "photo of a receipt",
+   "filter": "type:photo",
+   "text": "of a receipt"
+  },
+  {
+   "query": "receipts",
+   "filter": "",
+   "text": "receipts"
+  },
+  {
+   "query": "tax documents",
+   "filter": "type:document",
+   "text": "tax"
+  },
+  {
+   "query": "car insurance pdf",
+   "filter": "type:pdf",
+   "text": "car insurance"
+  },
+  {
+   "query": "budget spreadsheet",
+   "filter": "type:spreadsheet",
+   "text": "budget"
+  },
+  {
+   "query": "kayak photo",
+   "filter": "type:photo",
+   "text": "kayak"
+  },
+  {
+   "query": "video game",
+   "filter": "",
+   "text": "video game"
+  },
+  {
+   "query": "photo album",
+   "filter": "",
+   "text": "photo album"
+  },
+  {
+   "query": "music theory notes",
+   "filter": "",
+   "text": "music theory notes"
+  },
+  {
+   "query": "the selfie stick",
+   "filter": "",
+   "text": "the selfie stick"
+  },
+  {
+   "query": "image processing code",
+   "filter": "type:code",
+   "text": "image processing"
+  },
+  {
+   "query": "ride share receipts",
+   "filter": "",
+   "text": "ride share receipts"
+  },
+  {
+   "query": "running shoes",
+   "filter": "",
+   "text": "running shoes"
+  },
+  {
+   "query": "presentations for monday",
+   "filter": "type:presentation",
+   "text": "for monday"
+  },
+  {
+   "query": "photos from guatemala",
+   "filter": "type:photo place:GT",
+   "text": ""
+  },
+  {
+   "query": "photos in guatemala",
+   "filter": "type:photo place:GT",
+   "text": ""
+  },
+  {
+   "query": "guatemala photos",
+   "filter": "place:GT type:photo",
+   "text": ""
+  },
+  {
+   "query": "trip to lisbon",
+   "filter": "place:Lisbon",
+   "text": ""
+  },
+  {
+   "query": "photos near lisbon",
+   "filter": "type:photo place:Lisbon",
+   "text": ""
+  },
+  {
+   "query": "beach in nice",
+   "filter": "place:Nice",
+   "text": "beach"
+  },
+  {
+   "query": "nice beach",
+   "filter": "",
+   "text": "nice beach"
+  },
+  {
+   "query": "photos from paris",
+   "filter": "type:photo place:Paris",
+   "text": ""
+  },
+  {
+   "query": "photos from france",
+   "filter": "type:photo place:FR",
+   "text": ""
+  },
+  {
+   "query": "rides in vermont",
+   "filter": "activity:ride place:Vermont",
+   "text": ""
+  },
+  {
+   "query": "rides from lyndonville",
+   "filter": "activity:ride place:Lyndonville",
+   "text": ""
+  },
+  {
+   "query": "sunset at lake champlain",
+   "filter": "",
+   "text": "sunset at lake champlain"
+  },
+  {
+   "query": "photos from new york",
+   "filter": "type:photo place:\"New York\"",
+   "text": ""
+  },
+  {
+   "query": "new york city photos",
+   "filter": "place:\"New York City\" type:photo",
+   "text": ""
+  },
+  {
+   "query": "photos from the usa",
+   "filter": "type:photo place:US",
+   "text": ""
+  },
+  {
+   "query": "photos from america",
+   "filter": "type:photo place:US",
+   "text": ""
+  },
+  {
+   "query": "pictures from georgia",
+   "filter": "type:photo place:Georgia",
+   "text": ""
+  },
+  {
+   "query": "georgia",
+   "filter": "",
+   "text": "georgia"
+  },
+  {
+   "query": "turkey recipes",
+   "filter": "",
+   "text": "turkey recipes"
+  },
+  {
+   "query": "photos from turkey",
+   "filter": "type:photo place:TR",
+   "text": ""
+  },
+  {
+   "query": "jordan",
+   "filter": "",
+   "text": "jordan"
+  },
+  {
+   "query": "trip to jordan",
+   "filter": "place:JO",
+   "text": ""
+  },
+  {
+   "query": "kyoto temples",
+   "filter": "place:Kyoto",
+   "text": "temples"
+  },
+  {
+   "query": "reykjavik",
+   "filter": "place:Reykjavik",
+   "text": ""
+  },
+  {
+   "query": "photos from mexico",
+   "filter": "type:photo place:MX",
+   "text": ""
+  },
+  {
+   "query": "mexico city",
+   "filter": "place:\"Mexico City\"",
+   "text": ""
+  },
+  {
+   "query": "photos from spain",
+   "filter": "type:photo",
+   "text": "from spain"
+  },
+  {
+   "query": "lisbon 2024",
+   "filter": "place:Lisbon taken:2024",
+   "text": ""
+  },
+  {
+   "query": "photos from portugal in 2024",
+   "filter": "type:photo place:PT taken:2024",
+   "text": ""
+  },
+  {
+   "query": "porto",
+   "filter": "place:Porto",
+   "text": ""
+  },
+  {
+   "query": "tacos in mexico city",
+   "filter": "place:\"Mexico City\"",
+   "text": "tacos"
+  },
+  {
+   "query": "photos from 2019",
+   "filter": "type:photo taken:2019",
+   "text": ""
+  },
+  {
+   "query": "photos 2019",
+   "filter": "type:photo taken:2019",
+   "text": ""
+  },
+  {
+   "query": "pdfs from last year",
+   "filter": "type:pdf taken:2025",
+   "text": ""
+  },
+  {
+   "query": "photos from last summer",
+   "filter": "type:photo taken:2025-06..2025-08",
+   "text": ""
+  },
+  {
+   "query": "photos from this summer",
+   "filter": "type:photo taken:2026-06..2026-08",
+   "text": ""
+  },
+  {
+   "query": "christmas 2021",
+   "filter": "taken:2021-12-24..2021-12-26",
+   "text": ""
+  },
+  {
+   "query": "christmas photos",
+   "filter": "type:photo",
+   "text": "christmas"
+  },
+  {
+   "query": "photos from christmas",
+   "filter": "type:photo taken:2025-12-24..2025-12-26",
+   "text": ""
+  },
+  {
+   "query": "thanksgiving 2024",
+   "filter": "taken:2024-11-28..2024-12-01",
+   "text": ""
+  },
+  {
+   "query": "easter 2024",
+   "filter": "taken:2024-03-29..2024-04-01",
+   "text": ""
+  },
+  {
+   "query": "halloween 2023",
+   "filter": "taken:2023-10-31",
+   "text": ""
+  },
+  {
+   "query": "new year's eve 2019",
+   "filter": "taken:2019-12-31",
+   "text": ""
+  },
+  {
+   "query": "valentine's day 2024",
+   "filter": "taken:2024-02-14",
+   "text": ""
+  },
+  {
+   "query": "photos from yesterday",
+   "filter": "type:photo taken:2026-11-26",
+   "text": ""
+  },
+  {
+   "query": "today",
+   "filter": "taken:2026-11-27",
+   "text": ""
+  },
+  {
+   "query": "this week",
+   "filter": "taken:2026-11-23..2026-11-29",
+   "text": ""
+  },
+  {
+   "query": "last week",
+   "filter": "taken:2026-11-16..2026-11-22",
+   "text": ""
+  },
+  {
+   "query": "last month",
+   "filter": "taken:2026-10",
+   "text": ""
+  },
+  {
+   "query": "photos from 3 years ago",
+   "filter": "type:photo taken:2023",
+   "text": ""
+  },
+  {
+   "query": "videos from the last 3 months",
+   "filter": "type:video taken:2026-08-28..2026-11-27",
+   "text": ""
+  },
+  {
+   "query": "march 2022",
+   "filter": "taken:2022-03",
+   "text": ""
+  },
+  {
+   "query": "march 5 2022",
+   "filter": "taken:2022-03-05",
+   "text": ""
+  },
+  {
+   "query": "photos from march",
+   "filter": "type:photo taken:2026-03",
+   "text": ""
+  },
+  {
+   "query": "photos from december",
+   "filter": "type:photo taken:2025-12",
+   "text": ""
+  },
+  {
+   "query": "may in paris",
+   "filter": "place:Paris",
+   "text": "may"
+  },
+  {
+   "query": "may be useful",
+   "filter": "",
+   "text": "may be useful"
+  },
+  {
+   "query": "march madness",
+   "filter": "",
+   "text": "march madness"
+  },
+  {
+   "query": "photos between 2018 and 2020",
+   "filter": "type:photo taken:2018..2020",
+   "text": ""
+  },
+  {
+   "query": "from 2018 to 2020",
+   "filter": "taken:2018..2020",
+   "text": ""
+  },
+  {
+   "query": "2018-2020",
+   "filter": "taken:2018..2020",
+   "text": ""
+  },
+  {
+   "query": "since 2020",
+   "filter": "taken:2020..",
+   "text": ""
+  },
+  {
+   "query": "after 2015",
+   "filter": "taken:2016..",
+   "text": ""
+  },
+  {
+   "query": "before 2010",
+   "filter": "taken:..2009",
+   "text": ""
+  },
+  {
+   "query": "photos from the 90s",
+   "filter": "type:photo taken:1990..1999",
+   "text": ""
+  },
+  {
+   "query": "the 1980s",
+   "filter": "taken:1980..1989",
+   "text": ""
+  },
+  {
+   "query": "summer 2019",
+   "filter": "taken:2019-06..2019-08",
+   "text": ""
+  },
+  {
+   "query": "winter 2020",
+   "filter": "taken:2020-12..2021-02",
+   "text": ""
+  },
+  {
+   "query": "2024-06-12",
+   "filter": "taken:2024-06-12",
+   "text": ""
+  },
+  {
+   "query": "6/12/2024",
+   "filter": "taken:2024-06-12",
+   "text": ""
+  },
+  {
+   "query": "last weekend",
+   "filter": "taken:2026-11-21..2026-11-22",
+   "text": ""
+  },
+  {
+   "query": "a month ago",
+   "filter": "taken:2026-10",
+   "text": ""
+  },
+  {
+   "query": "past two weeks",
+   "filter": "taken:2026-11-14..2026-11-27",
+   "text": ""
+  },
+  {
+   "query": "tax return 2023",
+   "filter": "taken:2023",
+   "text": "tax return"
+  },
+  {
+   "query": "2023 tax return",
+   "filter": "taken:2023",
+   "text": "tax return"
+  },
+  {
+   "query": "w2 2023",
+   "filter": "taken:2023",
+   "text": "w2"
+  },
+  {
+   "query": "2000 photos",
+   "filter": "taken:2000 type:photo",
+   "text": ""
+  },
+  {
+   "query": "top 10 photos",
+   "filter": "type:photo",
+   "text": "top 10"
+  },
+  {
+   "query": "photos from monday",
+   "filter": "type:photo",
+   "text": "from monday"
+  },
+  {
+   "query": "files added last week",
+   "filter": "added:2026-11-16..2026-11-22",
+   "text": ""
+  },
+  {
+   "query": "pdfs added this week",
+   "filter": "type:pdf added:2026-11-23..2026-11-29",
+   "text": ""
+  },
+  {
+   "query": "documents edited yesterday",
+   "filter": "type:document modified:2026-11-26",
+   "text": ""
+  },
+  {
+   "query": "photos uploaded since march",
+   "filter": "type:photo added:2026-03..",
+   "text": ""
+  },
+  {
+   "query": "changed in 2025",
+   "filter": "modified:2025",
+   "text": ""
+  },
+  {
+   "query": "pdfs alice uploaded since march",
+   "filter": "type:pdf by:alice added:2026-03..",
+   "text": ""
+  },
+  {
+   "query": "photos by bo",
+   "filter": "type:photo by:bo",
+   "text": ""
+  },
+  {
+   "query": "files from alice",
+   "filter": "by:alice",
+   "text": ""
+  },
+  {
+   "query": "alice's photos",
+   "filter": "by:alice type:photo",
+   "text": ""
+  },
+  {
+   "query": "photos uploaded by carol",
+   "filter": "type:photo by:carol",
+   "text": ""
+  },
+  {
+   "query": "added by ann last month",
+   "filter": "by:ann added:2026-10",
+   "text": ""
+  },
+  {
+   "query": "by dave",
+   "filter": "",
+   "text": "by dave"
+  },
+  {
+   "query": "photos of alice",
+   "filter": "type:photo",
+   "text": "of alice"
+  },
+  {
+   "query": "photos from alice",
+   "filter": "type:photo by:alice",
+   "text": ""
+  },
+  {
+   "query": "photos taken with an iphone",
+   "filter": "type:photo camera:iphone",
+   "text": ""
+  },
+  {
+   "query": "shot on my pixel 7",
+   "filter": "camera:\"pixel 7\"",
+   "text": ""
+  },
+  {
+   "query": "canon photos",
+   "filter": "camera:canon type:photo",
+   "text": ""
+  },
+  {
+   "query": "fuji",
+   "filter": "camera:fuji",
+   "text": ""
+  },
+  {
+   "query": "iphone 13 photos",
+   "filter": "camera:\"iphone 13\" type:photo",
+   "text": ""
+  },
+  {
+   "query": "photos with my canon",
+   "filter": "type:photo camera:canon",
+   "text": ""
+  },
+  {
+   "query": "pictures with trees",
+   "filter": "type:photo",
+   "text": "with trees"
+  },
+  {
+   "query": "rides over 50 km",
+   "filter": "activity:ride distance:>50km",
+   "text": ""
+  },
+  {
+   "query": "rides over 50km",
+   "filter": "activity:ride distance:>50km",
+   "text": ""
+  },
+  {
+   "query": "rides longer than 100 miles",
+   "filter": "activity:ride distance:>160934m",
+   "text": ""
+  },
+  {
+   "query": "videos longer than 10 minutes",
+   "filter": "type:video length:>10min",
+   "text": ""
+  },
+  {
+   "query": "videos under 30 seconds",
+   "filter": "type:video length:<30s",
+   "text": ""
+  },
+  {
+   "query": "files over 1 gb",
+   "filter": "size:>1GB",
+   "text": ""
+  },
+  {
+   "query": "files bigger than 10mb",
+   "filter": "size:>10MB",
+   "text": ""
+  },
+  {
+   "query": "pdfs with more than 100 pages",
+   "filter": "type:pdf pages:>100",
+   "text": ""
+  },
+  {
+   "query": "rides with 1000 m of climbing",
+   "filter": "activity:ride climb:>1000m",
+   "text": ""
+  },
+  {
+   "query": "rides with over 1000 ft of climbing",
+   "filter": "activity:ride climb:>305m",
+   "text": ""
+  },
+  {
+   "query": "videos between 1 and 2 hours",
+   "filter": "type:video length:1h..2h",
+   "text": ""
+  },
+  {
+   "query": "photos larger than 5 mb",
+   "filter": "type:photo size:>5MB",
+   "text": ""
+  },
+  {
+   "query": "songs shorter than 3 min",
+   "filter": "type:audio length:<3min",
+   "text": ""
+  },
+  {
+   "query": "2000 km ride",
+   "filter": "",
+   "text": "2000 km ride"
+  },
+  {
+   "query": "50 km",
+   "filter": "",
+   "text": "50 km"
+  },
+  {
+   "query": "notes in family",
+   "filter": "volume:Family",
+   "text": "notes"
+  },
+  {
+   "query": "homework in cs101",
+   "filter": "volume:CS101",
+   "text": "homework"
+  },
+  {
+   "query": "receipts in my taxes folder",
+   "filter": "in:taxes",
+   "text": "receipts"
+  },
+  {
+   "query": "receipts in the folder taxes",
+   "filter": "in:taxes",
+   "text": "receipts"
+  },
+  {
+   "query": "photos in family",
+   "filter": "type:photo volume:Family",
+   "text": ""
+  },
+  {
+   "query": "photos in the snow",
+   "filter": "type:photo",
+   "text": "in the snow"
+  },
+  {
+   "query": "documents not pdfs",
+   "filter": "type:document -type:pdf",
+   "text": ""
+  },
+  {
+   "query": "photos not from 2020",
+   "filter": "type:photo -taken:2020",
+   "text": ""
+  },
+  {
+   "query": "photos without selfies",
+   "filter": "type:photo -is:selfie",
+   "text": ""
+  },
+  {
+   "query": "files except spreadsheets",
+   "filter": "-type:spreadsheet",
+   "text": ""
+  },
+  {
+   "query": "newest photos",
+   "filter": "type:photo sort:newest",
+   "text": ""
+  },
+  {
+   "query": "oldest pdfs",
+   "filter": "type:pdf sort:oldest",
+   "text": ""
+  },
+  {
+   "query": "most recent videos",
+   "filter": "type:video sort:newest",
+   "text": ""
+  },
+  {
+   "query": "latest tax documents",
+   "filter": "type:document sort:newest",
+   "text": "tax"
+  },
+  {
+   "query": "type:photo place:PT",
+   "filter": "type:photo place:PT",
+   "text": ""
+  },
+  {
+   "query": "tax type:pdf",
+   "filter": "type:pdf",
+   "text": "tax"
+  },
+  {
+   "query": "-type:pdf receipts",
+   "filter": "-type:pdf",
+   "text": "receipts"
+  },
+  {
+   "query": "paddle board",
+   "filter": "",
+   "text": "paddle board"
+  },
+  {
+   "query": "board games",
+   "filter": "",
+   "text": "board games"
+  },
+  {
+   "query": "how to file taxes",
+   "filter": "",
+   "text": "how to file taxes"
+  },
+  {
+   "query": "kayak trip",
+   "filter": "",
+   "text": "kayak trip"
+  },
+  {
+   "query": "lease agreement",
+   "filter": "",
+   "text": "lease agreement"
+  },
+  {
+   "query": "show me the money",
+   "filter": "",
+   "text": "show me the money"
+  },
+  {
+   "query": "find my keys",
+   "filter": "",
+   "text": "find my keys"
+  }
+ ]
+}

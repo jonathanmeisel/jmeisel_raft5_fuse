@@ -10,6 +10,7 @@
 //! - `extract`: the text of a file, from its bytes and name.
 //! - `geo`: which town, region and country a point is in, offline.
 //! - `filter`: which files a search may return, by their facts.
+//! - `query`: plain English queries read as filters and text.
 //! - `bm25` and `rank`: keyword ranking, and the merge of ranked lists.
 //! - `vector`: embeddings kept small, and how close two are.
 //! - `view`: every indexer's records for a volume, merged, and searched.
@@ -27,6 +28,7 @@ pub mod geo;
 pub mod index;
 pub mod manifest;
 pub mod paths;
+pub mod query;
 pub mod rank;
 pub mod record;
 pub mod segment;

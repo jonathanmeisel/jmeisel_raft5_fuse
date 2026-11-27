@@ -19,8 +19,8 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
-use raft5fs_search::filter::Filter;
 use raft5fs_search::index::Index;
+use raft5fs_search::query::{self, Vocabulary};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
 use std::sync::Arc;
@@ -350,6 +350,14 @@ pub fn index(connect: &ConnectArgs, args: IndexArgs) -> Outcome {
     Ok(if failed { 2 } else { 0 })
 }
 
+/// Whether the volume at `label` is volume or group `name`.
+fn in_volume(label: &str, name: &str) -> bool {
+    label.eq_ignore_ascii_case(name)
+        || label
+            .split_once('/')
+            .is_some_and(|(group, _)| group.eq_ignore_ascii_case(name))
+}
+
 /// This machine's offset from UTC now, in milliseconds, for the days that
 /// date filters name.
 fn utc_offset_ms() -> i64 {
@@ -387,20 +395,12 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     let ctx = Context::resolve(&connect.overrides(), true)?;
     let runtime = runtime();
     let vault = log_in(&runtime, &ctx)?;
-    let (filter, text) = Filter::parse_syntax(&args.query, utc_offset_ms());
-    let mut volumes = chosen(&runtime, &vault, &args.volumes, || {
+    let volumes = chosen(&runtime, &vault, &args.volumes, || {
         let (grants, _) = runtime
             .block_on(vault.remote().list_grants_covered())
             .map_err(|e| format!("cannot list what is shared with this account: {e}"))?;
         Ok(grants.into_iter().map(|g| g.ino).collect())
     })?;
-    let named = filter.volumes();
-    if !named.is_empty() {
-        volumes.retain(|(label, _)| named.iter().any(|n| label.eq_ignore_ascii_case(n)));
-    }
-    if !filter.terms.is_empty() || filter.sort.is_some() {
-        println!("Filters: {filter}");
-    }
     let mut views = Vec::new();
     for (label, ino) in &volumes {
         let opened = match runtime.block_on(open_volume(&vault, *ino)) {
@@ -414,6 +414,23 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
     }
     if views.is_empty() {
         return Err("no volume here has a search index yet: run `raft5fs index`".into());
+    }
+    let mut vocabulary = Vocabulary::default();
+    for (label, o) in &views {
+        vocabulary.extend(&o.index.vocabulary());
+        vocabulary.add_volume(label);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let parsed = query::parse(&args.query, &vocabulary, now, utc_offset_ms());
+    let (filter, text) = (parsed.filter, parsed.text);
+    let named = filter.volumes();
+    if !named.is_empty() {
+        views.retain(|(label, _)| named.iter().any(|n| in_volume(label, n)));
+    }
+    if !filter.terms.is_empty() || filter.sort.is_some() {
+        println!("Filters: {filter}");
     }
     let indexes: Vec<&Index> = views.iter().map(|(_, o)| &o.index).collect();
     let (query_vector, image_vector) = if text.trim().is_empty() {

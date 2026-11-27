@@ -9,11 +9,14 @@
 //! - `run_indexed`: the same over generations built from the corpus
 //!   (`compact::build`), as clients search a compacted index: kept words
 //!   only, and only the nearest clusters' vectors.
+//! - `parse`: how well plain English queries read as filters
+//!   (data/parse.json).
 //! - `fetch`: the pinned corpus (data/corpus.json), downloaded once into
 //!   the cache and checked against its SHA-256.
 
 pub mod corpus;
 pub mod metrics;
+pub mod parse;
 pub mod recall;
 pub mod tune;
 

@@ -29,6 +29,7 @@ use crate::generation::{
     decode_cluster, decode_previews, decode_rows, decode_shard,
 };
 use crate::paths::{PathMatches, Paths, word_weights};
+use crate::query::Vocabulary;
 use crate::rank::{Ranking, Spread, merge};
 use crate::record::DocKind;
 use crate::view::{
@@ -66,6 +67,9 @@ pub struct Generation {
     photo_weight: f32,
     by_ino: HashMap<u64, u32>,
     dropped: HashSet<String>,
+    /// The places, cameras and people its files name, for reading
+    /// queries.
+    vocabulary: Vocabulary,
 }
 
 impl Generation {
@@ -159,9 +163,11 @@ impl Generation {
         let photo_weight = weight(&photo_sample, photo_files);
         let mut paths = Paths::default();
         let mut by_ino = HashMap::with_capacity(rows.len());
+        let mut vocabulary = Vocabulary::default();
         for (i, r) in rows.iter().enumerate() {
             paths.add(i, &r.path);
             by_ino.insert(r.ino, i as u32);
+            vocabulary.add_meta(&r.meta);
         }
         paths.settle();
         rows.shrink_to_fit();
@@ -180,6 +186,7 @@ impl Generation {
             text_weight,
             photo_weight,
             by_ino,
+            vocabulary,
         })
     }
 
@@ -326,6 +333,21 @@ impl Index {
                 r
             })
             .collect()
+    }
+
+    /// The places, cameras and people its files name, for reading queries
+    /// (`query::parse`). A dead file's names may linger until the next
+    /// compaction: they only let a query name them.
+    pub fn vocabulary(&self) -> Vocabulary {
+        let mut v = self
+            .generation
+            .as_ref()
+            .map(|g| g.vocabulary.clone())
+            .unwrap_or_default();
+        for r in self.recent.live_records() {
+            v.add_meta(&r.extra.meta);
+        }
+        v
     }
 
     /// Every live file's row: the generation's, then the recent records'.
