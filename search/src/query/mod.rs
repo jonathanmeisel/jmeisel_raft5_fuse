@@ -1,5 +1,6 @@
 //! Plain English queries into filters: "photos from guatemala last
-//! summer" is `type:photo place:GT taken:2025-06..2025-08`, with the text
+//! summer" (in November 2026) is `type:photo place:GT
+//! taken:2026-06..2026-08`, with the text
 //! left over to search ("pictures of volcanoes" searches "volcanoes").
 //!
 //! - Words are matched by rules and word lists (`lexicon`), and dates by
@@ -688,7 +689,7 @@ mod tests {
         assert_eq!(
             parsed("pictures of volcanoes in guatemala last summer"),
             (
-                "type:photo place:GT taken:2025-06..2025-08".into(),
+                "type:photo place:GT taken:2026-06..2026-08".into(),
                 "of volcanoes".into()
             )
         );

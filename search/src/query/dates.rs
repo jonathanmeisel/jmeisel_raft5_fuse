@@ -289,10 +289,12 @@ fn single(words: &[&str], today: Today, cued: bool) -> Option<(Dates, usize)> {
             let d = if back == 0 {
                 season(s, if s == "winter" && tm <= 2 { ty - 1 } else { ty })?
             } else {
-                // The one before the last that has begun.
-                let begun = last_begun_season(s, today)?;
-                let y = begun.from?.year - 1;
-                season(s, y)?
+                // The last one that has ended: in November, this year's
+                // summer; in July, last year's.
+                [ty, ty - 1, ty - 2]
+                    .into_iter()
+                    .filter_map(|y| season(s, y))
+                    .find(|d| d.to.is_some_and(|t| t.after() <= today.0))?
             };
             return Some((d, 2));
         }
@@ -301,7 +303,7 @@ fn single(words: &[&str], today: Today, cued: bool) -> Option<(Dates, usize)> {
             let years: &[i32] = if back == 0 { &[ty] } else { &[ty, ty - 1] };
             for &y in years {
                 if let Some((d, n)) = holiday(rest, y)
-                    && (back == 0 || d.from.is_some_and(|f| f.first() <= today.0))
+                    && (back == 0 || d.to.is_some_and(|t| t.after() <= today.0))
                 {
                     return Some((d, n + 1));
                 }
@@ -642,7 +644,13 @@ mod tests {
         assert_eq!(whole("summer 2019"), "2019-06..2019-08");
         assert_eq!(whole("summer of 2019"), "2019-06..2019-08");
         assert_eq!(whole("winter 2020"), "2020-12..2021-02");
-        assert_eq!(whole("last summer"), "2025-06..2025-08");
+        // In November, the summer just past; "last winter" is the one
+        // that ended in February.
+        assert_eq!(whole("last summer"), "2026-06..2026-08");
+        assert_eq!(whole("last winter"), "2025-12..2026-02");
+        let july = Today(days_from_civil(2026, 7, 10));
+        let summer = read(&["last", "summer"], july).unwrap().0.to_string();
+        assert_eq!(summer, "2025-06..2025-08", "in July, last year's");
         assert_eq!(whole("this summer"), "2026-06..2026-08");
         assert_eq!(whole("in summer"), "2026-06..2026-08");
         assert_eq!(dates("summer"), None, "alone, a season stays text");

@@ -482,7 +482,7 @@
   },
   {
    "query": "photos from last summer",
-   "filter": "type:photo taken:2025-06..2025-08",
+   "filter": "type:photo taken:2026-06..2026-08",
    "text": ""
   },
   {
