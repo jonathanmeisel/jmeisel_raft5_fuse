@@ -791,7 +791,8 @@ const methods = {
   setSearchLimits(ask, background) {
     if (import.meta.env.MODE !== "production") session().setSearchLimits(ask, background);
   },
-  search: (query, volumes, limit, meaning) => session().search(query, volumes, limit, meaning),
+  search: (query, volumes, limit, meaning, off, on) =>
+    session().search(query, volumes, limit, meaning, off ?? [], on ?? []),
   /// Whether the search model is loaded, loading (and how far), or kept
   /// in this browser so that loading it downloads nothing.
   modelState: async () => (await embedCall({ op: "state" })).state,

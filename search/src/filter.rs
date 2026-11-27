@@ -1319,6 +1319,15 @@ mod tests {
     }
 
     #[test]
+    fn a_term_turned_off_is_left_out_by_its_id() {
+        let f = filter("type:photo place:PT -type:pdf");
+        let ids: Vec<String> = f.terms.iter().map(Term::id).collect();
+        assert_eq!(ids, ["type:photo", "place:PT", "-type:pdf"]);
+        let less = f.without(&["place:PT".into(), "-type:pdf".into()]);
+        assert_eq!(less.to_string(), "type:photo");
+    }
+
+    #[test]
     fn chips_say_what_terms_do() {
         let label = |s: &str| filter(s).terms[0].label();
         assert_eq!(label("type:photo"), "Photos");

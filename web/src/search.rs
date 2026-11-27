@@ -33,6 +33,7 @@ use raft5fs_crypto::identity::Identity;
 use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
+use raft5fs_search::filter::Filter;
 use raft5fs_search::query::{self, Vocabulary};
 use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
@@ -228,6 +229,15 @@ struct LoadedJs {
     /// they show (have an image vector, which only a native device makes).
     photos: usize,
     photos_seen: usize,
+}
+
+/// A filter a search read in its query, as the app shows it.
+#[derive(Serialize)]
+struct ChipJs {
+    /// The filter in the syntax: what `search` takes in `off` and `on`.
+    id: String,
+    label: String,
+    applied: bool,
 }
 
 /// Whether the volume at `label` is volume or group `name`.
@@ -566,12 +576,24 @@ impl Fs {
     ///
     /// Embedding the query may first need the model downloaded, so the app
     /// searches by words first and with `meaning` after.
+    ///
+    /// The query is read as filters and text (`query::parse`):
+    ///
+    /// - `chips`: each filter it read, `{id, label, applied}`. One whose id
+    ///   is in `off` is not applied.
+    /// - `suggested`: filters it might mean, which aren't applied unless
+    ///   their ids are in `on`.
+    /// - `listed`: whether the query was only filters, so the hits are
+    ///   every file they keep, newest first.
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         query: String,
         volumes: Vec<String>,
         limit: u32,
         meaning: bool,
+        off: Vec<String>,
+        on: Vec<String>,
     ) -> Promise {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -585,6 +607,9 @@ impl Fs {
             /// with `meaning` also needs the CLIP text model.
             images: bool,
             meaning_error: Option<String>,
+            chips: Vec<ChipJs>,
+            suggested: Vec<ChipJs>,
+            listed: bool,
         }
         let inner = Rc::clone(&self.0);
         promise(async move {
@@ -602,8 +627,25 @@ impl Fs {
                 vocabulary.add_volume(l.path.trim_start_matches('/'));
             }
             let parsed = query::parse(&query, &vocabulary, now_ms(), utc_offset_ms());
-            let filter = parsed.filter;
+            let chips: Vec<ChipJs> = parsed
+                .filter
+                .terms
+                .iter()
+                .map(|t| ChipJs {
+                    id: t.id(),
+                    label: t.label(),
+                    applied: !off.contains(&t.id()),
+                })
+                .collect();
+            let mut filter = parsed.filter.without(&off);
+            for id in &on {
+                let (more, _) = Filter::parse_syntax(id, utc_offset_ms());
+                for t in more.terms {
+                    filter.add(t);
+                }
+            }
             let query = parsed.text;
+            let listed = query.trim().is_empty() && !filter.is_empty();
             let named = filter.volumes();
             let views: Vec<(u64, Rc<Loaded>)> = chosen
                 .into_iter()
@@ -674,6 +716,9 @@ impl Fs {
                 vectors: has_vectors,
                 images: has_images,
                 meaning_error,
+                chips,
+                suggested: Vec::new(),
+                listed,
             })
         })
     }

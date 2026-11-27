@@ -1898,6 +1898,41 @@ test("photos are found by where and when they were taken, and rides by where the
   await expect(rides.getByRole("option").first()).toContainText("trips/morning.gpx");
   await expect(rides.getByRole("option").first()).toContainText(/Lyndonville|Vermont/);
 
+  // Plain English is read as filters, shown as chips that turn off.
+  const lisbon = await search(page, "photos from lisbon");
+  const chips = lisbon.getByRole("group", { name: "Filters" });
+  await expect(chips.getByRole("button", { name: "Remove filter: Photos" })).toBeVisible(SLOW);
+  await expect(chips.getByRole("button", { name: "Remove filter: Lisbon" })).toBeVisible();
+  await expect(lisbon.getByRole("option")).toHaveCount(1);
+  await expect(lisbon.getByRole("option")).toContainText("trips/IMG_0412.jpg");
+  await expect(lisbon).toContainText("Every file these filters keep, newest first.");
+
+  const vermont = await search(page, "rides in vermont");
+  await expect(vermont.getByRole("option")).toHaveCount(1, SLOW);
+  await expect(vermont.getByRole("option")).toContainText("trips/morning.gpx");
+  // Without Vermont, every ride.
+  await vermont.getByRole("button", { name: "Remove filter: Vermont" }).click();
+  await expect(vermont.getByRole("button", { name: "Add filter: Vermont" })).toHaveAttribute("aria-pressed", "false");
+  await expect(vermont.getByRole("option")).toHaveCount(2, SLOW);
+  // And with it again.
+  await vermont.getByRole("button", { name: "Add filter: Vermont" }).click();
+  await expect(vermont.getByRole("option")).toHaveCount(1, SLOW);
+
+  // Filters that keep nothing say so, with a way out.
+  const none = await search(page, "photos from vermont");
+  await expect(none).toContainText("Nothing matches these filters.", SLOW);
+  await none.getByRole("button", { name: "Without “Photos”" }).click();
+  await expect(none.getByRole("option").filter({ hasText: "trips/morning.gpx" })).toBeVisible(SLOW);
+
+  // On a phone the chips fit across the screen, and the page doesn't
+  // scroll sideways.
+  await page.setViewportSize({ width: 390, height: 800 });
+  const phone = await search(page, "photos from lisbon");
+  await expect(phone.getByRole("button", { name: "Remove filter: Lisbon" })).toBeVisible(SLOW);
+  const wide = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(wide).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: new URL("../test-results/filter-chips/phone.png", import.meta.url).pathname });
+
   expect(problems).toEqual([]);
 });
 

@@ -20,6 +20,11 @@
   // - On a narrow screen it is a button, so the header keeps room for the
   //   folder menu: the button opens the search bar across the whole header,
   //   and its own close button shuts it again.
+  // - Filters: the query is read as filters and text ("photos from
+  //   lisbon" is Photos and Lisbon). Each filter shows as a chip above the
+  //   results; tapping it turns it off (and on again), with the query as
+  //   typed. A new query turns them all back on. A query of filters alone
+  //   lists the files they keep, newest first.
   // - Words first, at once; then meaning, which may need the model loaded
   //   (and the first time, downloaded), so its results replace the first
   //   ones when they come. Where a download is worth asking about (a phone,
@@ -53,6 +58,13 @@
   let busy = $state(false);
   let results = $state([]);
   let status = $state([]);
+  /// The filters the query was read as (`{id, label, applied}`), the ids
+  /// turned off, and the query they are for: a new one turns all on.
+  let chips = $state([]);
+  let off = $state([]);
+  let chipsFor = "";
+  /// Whether the hits are a list of what the filters keep (no words).
+  let listed = $state(false);
   let error = $state("");
   /// The meaning search: "" (none, or done), "asking" (whether to
   /// download the model), "loading", or a note on why it gave words only.
@@ -159,7 +171,12 @@
     const q = query.trim();
     if (!q) {
       results = [];
+      chips = [];
       return;
+    }
+    if (q !== chipsFor) {
+      off = [];
+      chipsFor = q;
     }
     const mine = ++asked;
     busy = true;
@@ -170,11 +187,15 @@
     try {
       const loaded = await ensureRead(await scope());
       volumes = loaded.filter((l) => l.downloaded).map((l) => l.volume);
-      const found = volumes.length ? await fs.search(q, volumes, 50, false) : { hits: [], meaning: false };
+      const found = volumes.length
+        ? await fs.search(q, volumes, 50, false, [...off])
+        : { hits: [], meaning: false, chips: [], listed: false };
       if (mine !== asked) return;
       status = loaded;
       whileDownloading(loaded, mine);
       results = found.hits;
+      chips = found.chips;
+      listed = found.listed;
       if (!found.meaning) return;
       needed = [...(found.vectors ? ["text"] : []), ...(found.images ? ["clip"] : [])];
     } catch (e) {
@@ -205,9 +226,11 @@
           if (s && mine === asked) download = { loaded: s.loaded, total: s.total };
         }, 500);
     try {
-      const found = await fs.search(q, volumes, 50, true);
+      const found = await fs.search(q, volumes, 50, true, [...off]);
       if (mine !== asked) return;
       results = found.hits;
+      chips = found.chips;
+      listed = found.listed;
       meaning = found.meaningError ? `Searching by words only: ${found.meaningError}` : "";
     } catch (e) {
       if (mine === asked) meaning = `Searching by words only: ${e.message}`;
@@ -215,6 +238,12 @@
       clearInterval(watch);
       download = null;
     }
+  }
+
+  /// Turns filter `id` off, or on again, and searches again.
+  function toggle(id) {
+    off = off.includes(id) ? off.filter((x) => x !== id) : [...off, id];
+    run();
   }
 
   function answer(yes, always) {
@@ -256,7 +285,8 @@
   const notIndexed = $derived(status.filter((s) => !s.indexed && !s.off).map((s) => s.volume.slice(1)));
   const notHere = $derived(status.filter((s) => s.indexed && !s.off && !s.downloaded && !s.downloading));
   const downloading = $derived(status.filter((s) => s.downloading));
-  const off = $derived(status.filter((s) => s.off).map((s) => s.volume.slice(1)));
+  const turnedOff = $derived(status.filter((s) => s.off).map((s) => s.volume.slice(1)));
+  const applied = $derived(chips.filter((c) => c.applied));
   const placeholder = $derived(
     everywhere || !volumeOf(folder) ? "Search all folders" : `Search ${volumeOf(folder).slice(1)}`,
   );
@@ -286,12 +316,40 @@
   </button>
   {#if open && query.trim()}
     <div class="results" role="listbox" aria-label="Search results">
+      {#if chips.length}
+        <div class="chips" role="group" aria-label="Filters">
+          {#each chips as chip (chip.id)}
+            <button
+              class="chip"
+              class:on={chip.applied}
+              aria-pressed={chip.applied}
+              aria-label={chip.applied ? `Remove filter: ${chip.label}` : `Add filter: ${chip.label}`}
+              title={chip.id}
+              onclick={() => toggle(chip.id)}
+            >
+              <span class="label">{chip.label}</span>
+              <i class={chip.applied ? "wxi-close" : "wxi-plus"} aria-hidden="true"></i>
+            </button>
+          {/each}
+        </div>
+      {/if}
       {#if error}
         <p class="error">{error}</p>
       {:else if busy && results.length === 0}
         <p class="note">Searching…</p>
+      {:else if results.length === 0 && meaning !== "loading" && applied.length}
+        <div class="note none">
+          <span>Nothing matches these filters.</span>
+          <span class="undo">
+            {#each applied as chip (chip.id)}
+              <button onclick={() => toggle(chip.id)}>Without “{chip.label}”</button>
+            {/each}
+          </span>
+        </div>
       {:else if results.length === 0 && meaning !== "loading"}
         <p class="note">Nothing found.</p>
+      {:else if listed}
+        <p class="note">Every file these filters keep, newest first.</p>
       {/if}
       {#if meaning === "asking"}
         <div class="ask">
@@ -354,8 +412,8 @@
         {#if notIndexed.length}
           <span>Not indexed yet: {notIndexed.join(", ")}</span>
         {/if}
-        {#if off.length}
-          <span>Indexing is off: {off.join(", ")}</span>
+        {#if turnedOff.length}
+          <span>Indexing is off: {turnedOff.join(", ")}</span>
         {/if}
       </p>
       <button class="close" onclick={() => (open = false)}>Close</button>
@@ -395,6 +453,23 @@
   .error { color: var(--danger); }
   .status { display: flex; flex-direction: column; gap: 2px; font-size: 0.85em; opacity: 0.7; }
   .close { align-self: flex-end; }
+  /* Filters: filled in the accent when applied, outlined when off. On a
+     phone the row scrolls sideways. */
+  .chips {
+    display: flex; gap: 6px; padding: 2px 4px 8px; overflow-x: auto; flex: none;
+    scrollbar-width: none;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px; flex: none;
+    height: 28px; padding: 0 8px 0 12px; border-radius: 14px; white-space: nowrap;
+    border: 1px solid var(--wx-color-primary); background: transparent;
+    color: var(--wx-color-font); font-size: 13px; cursor: pointer;
+  }
+  .chip.on { background: var(--wx-color-primary); color: #fff; }
+  .chip:not(.on) .label { text-decoration: line-through; opacity: 0.75; }
+  .chip i { font-size: 16px; }
+  .none { display: flex; flex-direction: column; gap: 6px; }
+  .undo { display: flex; gap: 6px; flex-wrap: wrap; }
   .ask {
     margin: 4px 8px; display: flex; flex-direction: column; gap: 6px;
     padding: 8px; border-radius: 4px; background: var(--wx-background-alt);

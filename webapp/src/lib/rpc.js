@@ -122,8 +122,8 @@ export function connect({ onStorageError } = {}) {
     searchLoad: (path, download) => call("searchLoad", [path, download ?? null]),
     searchSize: (path) => call("searchSize", [path]),
     setSearchLimits: (ask, background) => call("setSearchLimits", [ask, background]),
-    search: (query, volumes, limit, meaning) =>
-      call("search", [query, volumes ?? [], limit ?? 50, !!meaning]),
+    search: (query, volumes, limit, meaning, off, on) =>
+      call("search", [query, volumes ?? [], limit ?? 50, !!meaning, off ?? [], on ?? []]),
     modelState: () => call("modelState", []),
     memoryReport: () => call("memoryReport", []),
     setEmbedIdle: (ms) => call("setEmbedIdle", [ms]),

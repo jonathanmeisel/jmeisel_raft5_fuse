@@ -60,6 +60,10 @@ pub struct SearchArgs {
     /// `place:PT`, `taken:2024-06..2024-09`, `size:>10MB`, `by:alice` or
     /// `-type:pdf` (SETUP.txt section 15 lists them all).
     pub query: String,
+    /// Leave out a filter the query was read as, by its id (as the
+    /// `Filters:` line shows it). May be given more than once.
+    #[arg(long = "without", value_name = "ID")]
+    pub without: Vec<String>,
     /// Search only these volumes, as your root shows them. By default,
     /// every volume you can read that has an index.
     #[arg(long = "in", value_name = "VOLUME")]
@@ -424,13 +428,27 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let parsed = query::parse(&args.query, &vocabulary, now, utc_offset_ms());
-    let (filter, text) = (parsed.filter, parsed.text);
+    let read = parsed.filter;
+    let filter = read.without(&args.without);
+    let text = parsed.text;
     let named = filter.volumes();
     if !named.is_empty() {
         views.retain(|(label, _)| named.iter().any(|n| in_volume(label, n)));
     }
-    if !filter.terms.is_empty() || filter.sort.is_some() {
-        println!("Filters: {filter}");
+    if !read.terms.is_empty() {
+        let shown: Vec<String> = read
+            .terms
+            .iter()
+            .map(|t| {
+                let off = if args.without.contains(&t.id()) {
+                    ", left out"
+                } else {
+                    ""
+                };
+                format!("{} ({}{off})", t.label(), t.id())
+            })
+            .collect();
+        println!("Filters: {}", shown.join(", "));
     }
     let indexes: Vec<&Index> = views.iter().map(|(_, o)| &o.index).collect();
     let (query_vector, image_vector) = if text.trim().is_empty() {
