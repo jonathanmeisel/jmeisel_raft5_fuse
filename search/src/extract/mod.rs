@@ -88,7 +88,9 @@ pub const THUMB_PX: u32 = 256;
 /// files read by an older one are read again.
 ///
 /// - 2: place names in tracks, and photos' dates, cameras and places.
-pub const READER: u32 = 2;
+/// - 3: the facts filters read (`Meta`): places by name and code, cameras,
+///   picture sizes, pages, activities and lengths.
+pub const READER: u32 = 3;
 
 /// The text of file `name`, or `None` if this crate does not read its
 /// format (`Other` and `Pdf`) or the file is damaged.

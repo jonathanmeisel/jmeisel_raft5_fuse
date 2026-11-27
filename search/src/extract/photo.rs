@@ -5,7 +5,9 @@
 //!   UTC (`OffsetTimeOriginal`) if the camera recorded one; else read as
 //!   UTC.
 //! - **Where:** the GPS position, named with a places table (`geo`).
-//! - **With what:** the camera's make and model.
+//! - **With what:** the camera's make and model, and whether it was a
+//!   phone's front camera (its lens model says so).
+//! - **Size:** in pixels, upright, from the EXIF size tags.
 //!
 //! A photo with no EXIF data is still a photo, found by its name.
 
@@ -16,7 +18,7 @@ use exif::{Field, In, Reader, Tag, Value};
 use super::{Extracted, READER};
 use crate::extract::track::iso_ms;
 use crate::geo::Places;
-use crate::record::{DocKind, Extra};
+use crate::record::{DocKind, Extra, Meta};
 
 /// What a photo's EXIF data says.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -30,6 +32,11 @@ pub struct PhotoInfo {
     /// How the picture is turned (EXIF `Orientation`, 1 to 8; 1 or 0 for
     /// as stored), for a thumbnail to turn it upright.
     pub orientation: u16,
+    /// Its size in pixels as stored (before `orientation`), or 0.
+    pub width: u32,
+    pub height: u32,
+    /// Taken with a phone's front camera.
+    pub selfie: bool,
 }
 
 fn ascii(f: &Field) -> Option<String> {
@@ -84,6 +91,15 @@ pub fn photo_info(bytes: &[u8]) -> PhotoInfo {
     info.orientation = get(Tag::Orientation)
         .and_then(|f| f.value.get_uint(0))
         .map_or(0, |o| o as u16);
+    let size = |tags: [Tag; 2]| {
+        tags.iter()
+            .find_map(|&t| get(t).and_then(|f| f.value.get_uint(0)))
+            .unwrap_or(0)
+    };
+    info.width = size([Tag::PixelXDimension, Tag::ImageWidth]);
+    info.height = size([Tag::PixelYDimension, Tag::ImageLength]);
+    // Phones name the lens: "iPhone 12 front camera 2.71mm f/2.2".
+    info.selfie = text(Tag::LensModel).is_some_and(|l| l.to_ascii_lowercase().contains("front"));
     let make = text(Tag::Make);
     let model = text(Tag::Model);
     info.camera = match (make, model) {
@@ -105,13 +121,19 @@ impl PhotoInfo {
         {
             words.push(month);
         }
+        let mut at_places = Vec::new();
         if let (Some(lat), Some(lon), Some(places)) = (self.lat, self.lon, places) {
-            words.extend(places.locate(lat, lon).names());
+            let place = places.locate(lat, lon);
+            words.extend(place.names());
+            if !place.names().is_empty() {
+                at_places.push(place);
+            }
         }
         if let Some(camera) = &self.camera {
             words.push(camera.clone());
         }
         let units = |deg: f64| (deg * 1e4).round() as i32;
+        let (width, height) = self.upright_size();
         Extracted {
             kind: DocKind::Photo,
             text: words.join(", "),
@@ -119,9 +141,26 @@ impl PhotoInfo {
                 reader: READER,
                 when_ms: self.when_ms,
                 at: self.lat.zip(self.lon).map(|(a, o)| (units(a), units(o))),
+                meta: Meta {
+                    places: at_places,
+                    camera: self.camera.clone().unwrap_or_default(),
+                    width,
+                    height,
+                    selfie: self.selfie,
+                    ..Meta::default()
+                },
                 ..Extra::default()
             },
             thumb: None,
+        }
+    }
+
+    /// Its size as it is seen: orientations 5 to 8 turn it a quarter.
+    pub fn upright_size(&self) -> (u32, u32) {
+        if (5..=8).contains(&self.orientation) {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
         }
     }
 }
@@ -292,6 +331,37 @@ pub(crate) mod tests {
             assert!(got.text.contains(want), "{want} in {}", got.text);
         }
         assert_eq!(got.extra.at, Some((387_223, -91_393)));
+        let meta = &got.extra.meta;
+        assert_eq!(meta.camera, "Apple iPhone 13");
+        assert_eq!(meta.places.len(), 1);
+        assert_eq!(meta.places[0].town.as_deref(), Some("Lisbon"));
+        assert_eq!(meta.places[0].code.as_deref(), Some("PT"));
+    }
+
+    #[test]
+    fn a_photo_says_its_size_and_front_camera() {
+        let e = |tag: u16, (ty, count, v): (u16, u32, Vec<u8>)| (tag, ty, count, v);
+        let long = |n: u32| (4u16, 1u32, n.to_le_bytes().to_vec());
+        let short = |n: u16| (3u16, 1u32, n.to_le_bytes().to_vec());
+        let ifd0 = vec![e(0x0112, short(6))];
+        let exif = vec![
+            e(0xa002, long(4032)),
+            e(0xa003, long(3024)),
+            e(0xa434, ascii_value("iPhone 12 front camera 2.71mm f/2.2")),
+        ];
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend(tiff(&ifd0, &exif, &[]));
+        let mut bytes = LAKE[..2].to_vec();
+        bytes.extend_from_slice(&[0xff, 0xe1]);
+        bytes.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        bytes.extend(app1);
+        bytes.extend_from_slice(&LAKE[2..]);
+        let info = photo_info(&bytes);
+        assert_eq!((info.width, info.height), (4032, 3024));
+        assert!(info.selfie);
+        let meta = info.extracted(None).extra.meta;
+        assert_eq!((meta.width, meta.height), (3024, 4032), "turned upright");
+        assert!(meta.selfie);
     }
 
     #[test]

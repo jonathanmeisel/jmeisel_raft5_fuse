@@ -61,7 +61,15 @@ impl Extract for Native {
                         let mut got =
                             raft5fs_search::extract::extract_with(&name, &bytes, Some(places()))?;
                         let turned = raft5fs_search::extract::photo::photo_info(&bytes).orientation;
-                        got.thumb = thumbnail(&bytes, turned);
+                        let (thumb, size) = thumbnail_and_size(&bytes, turned);
+                        got.thumb = thumb;
+                        // A picture without EXIF sizes: the decoded size.
+                        let meta = &mut got.extra.meta;
+                        if meta.width == 0
+                            && let Some((w, h)) = size
+                        {
+                            (meta.width, meta.height) = (w, h);
+                        }
                         Some(got)
                     })
                     .await
@@ -70,7 +78,7 @@ impl Extract for Native {
                 }
                 _ => return BuiltIn.extract(name, bytes).await,
             }
-            let text = tokio::task::spawn_blocking(move || pdf_text(&bytes))
+            let (text, pages) = tokio::task::spawn_blocking(move || pdf_pages(&bytes))
                 .await
                 .ok()
                 .flatten()?;
@@ -79,6 +87,10 @@ impl Extract for Native {
                 text,
                 extra: raft5fs_search::record::Extra {
                     reader: raft5fs_search::extract::READER,
+                    meta: raft5fs_search::record::Meta {
+                        pages,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 thumb: None,
@@ -101,11 +113,29 @@ pub fn native_tools() -> Tools {
 /// upright by its EXIF `orientation`, as a JPEG. `None` for a format this
 /// can't decode (HEIC) or a damaged file.
 pub fn thumbnail(bytes: &[u8], orientation: u16) -> Option<Vec<u8>> {
+    thumbnail_and_size(bytes, orientation).0
+}
+
+/// `thumbnail`, and the picture's size in pixels, upright.
+pub fn thumbnail_and_size(bytes: &[u8], orientation: u16) -> (Option<Vec<u8>>, Option<(u32, u32)>) {
+    let Some(decoded) = std::panic::catch_unwind(|| image::load_from_memory(bytes))
+        .ok()
+        .and_then(Result::ok)
+    else {
+        return (None, None);
+    };
+    let (w, h) = (decoded.width(), decoded.height());
+    let size = if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    };
+    (shrink(&decoded, orientation), Some(size))
+}
+
+fn shrink(decoded: &image::DynamicImage, orientation: u16) -> Option<Vec<u8>> {
     use image::imageops::FilterType;
     let px = raft5fs_search::extract::THUMB_PX;
-    let decoded = std::panic::catch_unwind(|| image::load_from_memory(bytes))
-        .ok()?
-        .ok()?;
     let small = decoded.resize(px, px, FilterType::Triangle);
     let upright = match orientation {
         2 => small.fliph(),
@@ -125,10 +155,17 @@ pub fn thumbnail(bytes: &[u8], orientation: u16) -> Option<Vec<u8>> {
 
 /// The text of a PDF, or `None` if it has none or can't be read.
 pub fn pdf_text(bytes: &[u8]) -> Option<String> {
-    let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes))
+    pdf_pages(bytes).map(|(text, _)| text)
+}
+
+/// The text of a PDF and its number of pages, or `None` if it has no text
+/// or can't be read.
+pub fn pdf_pages(bytes: &[u8]) -> Option<(String, u32)> {
+    let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(bytes))
         .ok()?
         .ok()?;
-    (!text.trim().is_empty()).then_some(text)
+    let text = pages.concat();
+    (!text.trim().is_empty()).then_some((text, pages.len() as u32))
 }
 
 #[cfg(test)]
@@ -178,6 +215,7 @@ mod tests {
     fn a_pdf_gives_its_text() {
         let text = pdf_text(&pdf("Quarterly tax receipts")).expect("text");
         assert!(text.contains("Quarterly tax receipts"), "{text:?}");
+        assert_eq!(pdf_pages(&pdf("one page")).map(|p| p.1), Some(1));
     }
 
     #[test]
@@ -201,6 +239,8 @@ mod tests {
         let img = image::load_from_memory(&thumbnail(LAKE, 6).unwrap()).unwrap();
         assert_eq!((img.width(), img.height()), (192, 256));
         assert!(thumbnail(b"not a picture", 1).is_none());
+        assert_eq!(thumbnail_and_size(LAKE, 1).1, Some((320, 240)));
+        assert_eq!(thumbnail_and_size(LAKE, 6).1, Some((240, 320)));
     }
 
     #[test]

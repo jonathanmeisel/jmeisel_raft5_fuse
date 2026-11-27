@@ -12,8 +12,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use super::{Extracted, READER};
-use crate::geo::Places;
-use crate::record::{DocKind, Extra};
+use crate::geo::{Place, Places};
+use crate::record::{Activity, DocKind, Extra, Meta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackKind {
@@ -32,6 +32,8 @@ pub struct Track {
     pub activity: Option<String>,
     /// As the file says it, ISO 8601.
     pub start: Option<String>,
+    /// The last point's time, ISO 8601.
+    pub end: Option<String>,
     /// Latitude, longitude, elevation (m).
     pub points: Vec<(f64, f64, Option<f64>)>,
     /// From the file if it says (TCX laps); else from the points.
@@ -123,7 +125,12 @@ pub fn parse_gpx(xml: &[u8]) -> Option<Track> {
                     p.2 = Some(ele);
                 }
             }
-            ("trkpt", "time") if t.start.is_none() => t.start = Some(text.to_string()),
+            ("trkpt", "time") => {
+                if t.start.is_none() {
+                    t.start = Some(text.to_string());
+                }
+                t.end = Some(text.to_string());
+            }
             ("metadata", "time") if t.start.is_none() => t.start = Some(text.to_string()),
             ("trk" | "rte", "type") => t.activity = Some(text.to_string()),
             ("trk" | "rte" | "wpt" | "metadata", "name" | "desc" | "cmt") => {
@@ -165,6 +172,7 @@ pub fn parse_tcx(xml: &[u8]) -> Option<Track> {
                 }
             }
             ("Activity", "Id") if t.start.is_none() => t.start = Some(text.to_string()),
+            ("Trackpoint", "Time") => t.end = Some(text.to_string()),
             ("Lap", "DistanceMeters") => lap_distance += text.parse::<f64>().unwrap_or(0.0),
             ("Activity" | "Course" | "CoursePoint", "Name" | "Notes") => {
                 t.texts.push(text.to_string())
@@ -343,11 +351,10 @@ pub fn iso_ms(iso: &str) -> Option<u64> {
 }
 
 impl Track {
-    /// The names of where the track goes: its points every
-    /// `PLACE_EVERY_M`, and its start and end, looked up in `places`.
-    /// Towns in the order the track meets them, then regions, then
-    /// countries; each once.
-    pub fn place_names(&self, places: &Places) -> Vec<String> {
+    /// Where the track goes: its points every `PLACE_EVERY_M`, and its
+    /// end, looked up in `places`. Each place once, in the order the track
+    /// meets it.
+    pub fn places_along(&self, places: &Places) -> Vec<Place> {
         let mut samples = Vec::new();
         let mut since = f64::INFINITY;
         for w in self.points.windows(2) {
@@ -360,20 +367,36 @@ impl Track {
         if let Some(&(lat, lon, _)) = self.points.last() {
             samples.push((lat, lon));
         }
-        let (mut towns, mut regions, mut countries) = (Vec::new(), Vec::new(), Vec::new());
-        let add = |list: &mut Vec<String>, name: Option<String>| {
-            if let Some(n) = name
-                && !list.contains(&n)
-            {
-                list.push(n);
-            }
-        };
+        let mut out: Vec<Place> = Vec::new();
         for (lat, lon) in samples {
             let p = places.locate(lat, lon);
-            add(&mut towns, p.town);
-            add(&mut regions, p.region);
-            add(&mut regions, p.region_local);
-            add(&mut countries, p.country);
+            if !p.names().is_empty() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// The names of where the track goes (`places_along`): towns in the
+    /// order the track meets them, then regions, then countries; each once.
+    pub fn place_names(&self, places: &Places) -> Vec<String> {
+        Self::names_of(&self.places_along(places))
+    }
+
+    fn names_of(along: &[Place]) -> Vec<String> {
+        let (mut towns, mut regions, mut countries) = (Vec::new(), Vec::new(), Vec::new());
+        let add = |list: &mut Vec<String>, name: &Option<String>| {
+            if let Some(n) = name
+                && !list.contains(n)
+            {
+                list.push(n.clone());
+            }
+        };
+        for p in along {
+            add(&mut towns, &p.town);
+            add(&mut regions, &p.region);
+            add(&mut regions, &p.region_local);
+            add(&mut countries, &p.country);
         }
         towns.into_iter().chain(regions).chain(countries).collect()
     }
@@ -382,23 +405,34 @@ impl Track {
     /// if `places` is given, and its facts.
     pub fn extracted(&self, places: Option<&Places>) -> Extracted {
         let mut text = self.text();
-        if let Some(places) = places {
-            let names = self.place_names(places);
-            if !names.is_empty() {
-                text.push_str("\nPlaces: ");
-                text.push_str(&names.join(", "));
-            }
+        let mut along = places.map(|p| self.places_along(p)).unwrap_or_default();
+        let names = Self::names_of(&along);
+        if !names.is_empty() {
+            text.push_str("\nPlaces: ");
+            text.push_str(&names.join(", "));
         }
+        along.truncate(crate::record::MAX_PLACES as usize);
         let units = |deg: f64| (deg * 1e4).round() as i32;
+        let start = self.start.as_deref().and_then(iso_ms);
+        let end = self.end.as_deref().and_then(iso_ms);
         Extracted {
             kind: DocKind::Track,
             text,
             extra: Extra {
                 reader: READER,
-                when_ms: self.start.as_deref().and_then(iso_ms).unwrap_or(0),
+                when_ms: start.unwrap_or(0),
                 at: self.points.first().map(|p| (units(p.0), units(p.1))),
                 distance_m: self.distance_m.round() as u32,
                 climb_m: self.climb_m.round() as u32,
+                meta: Meta {
+                    places: along,
+                    activity: self
+                        .activity
+                        .as_deref()
+                        .map_or(Activity::Unknown, Activity::of),
+                    duration_ms: start.zip(end).map_or(0, |(s, e)| e.saturating_sub(s)),
+                    ..Meta::default()
+                },
                 ..Extra::default()
             },
             thumb: None,
@@ -557,6 +591,16 @@ mod tests {
         );
         assert!(!got.text.contains("New Hampshire"), "{}", got.text);
         assert_eq!(got.extra.at, Some((445_361, -720_053)));
+        let meta = &got.extra.meta;
+        assert_eq!(meta.activity, Activity::Ride);
+        assert!(meta.places.len() >= 2, "{:?}", meta.places);
+        assert!(
+            meta.places
+                .iter()
+                .all(|p| p.region.as_deref() == Some("Vermont") && p.code.as_deref() == Some("US")),
+            "{:?}",
+            meta.places
+        );
         assert!(
             (12_000..14_500).contains(&got.extra.distance_m),
             "{}",
@@ -627,6 +671,26 @@ mod tests {
         ]);
         let hits = view.search("bike routes in vermont", 5);
         assert_eq!(hits.first().map(|h| h.ino), Some(1), "{hits:?}");
+    }
+
+    #[test]
+    fn a_track_with_times_says_how_long_it_lasted() {
+        let gpx = r#"<gpx><trk><type>Running</type><trkseg>
+            <trkpt lat="1" lon="2"><time>2024-06-12T09:00:00Z</time></trkpt>
+            <trkpt lat="1.01" lon="2"><time>2024-06-12T09:30:00Z</time></trkpt>
+            <trkpt lat="1.02" lon="2"><time>2024-06-12T10:15:00Z</time></trkpt>
+            </trkseg></trk></gpx>"#;
+        let got = parse_gpx(gpx.as_bytes()).unwrap().extracted(None);
+        assert_eq!(got.extra.meta.duration_ms, 75 * 60 * 1000);
+        assert_eq!(got.extra.meta.activity, Activity::Run);
+        let tcx = r#"<TrainingCenterDatabase><Activities><Activity Sport="Hiking">
+            <Id>2024-06-12T09:00:00Z</Id><Lap><Track>
+            <Trackpoint><Time>2024-06-12T09:00:00Z</Time><Position><LatitudeDegrees>1</LatitudeDegrees><LongitudeDegrees>2</LongitudeDegrees></Position></Trackpoint>
+            <Trackpoint><Time>2024-06-12T11:00:00Z</Time><Position><LatitudeDegrees>1.01</LatitudeDegrees><LongitudeDegrees>2</LongitudeDegrees></Position></Trackpoint>
+            </Track></Lap></Activity></Activities></TrainingCenterDatabase>"#;
+        let got = parse_tcx(tcx.as_bytes()).unwrap().extracted(None);
+        assert_eq!(got.extra.meta.duration_ms, 2 * 3600 * 1000);
+        assert_eq!(got.extra.meta.activity, Activity::Hike);
     }
 
     #[test]

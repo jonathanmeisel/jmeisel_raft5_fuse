@@ -327,6 +327,17 @@ impl Index {
             .collect()
     }
 
+    /// Every live file's row: the generation's, then the recent records'.
+    pub fn all_rows(&self) -> Vec<Row> {
+        let mut out = self.rows();
+        out.extend(
+            self.recent
+                .live_records()
+                .map(|r| Row::of(r, crate::view::MIN_MEANING_WORDS)),
+        );
+        out
+    }
+
     /// Photos, and how many have an image vector from `model`.
     pub fn photos(&self, model: &str) -> (usize, usize) {
         let (mut n, mut with) = self.recent.photos(model);

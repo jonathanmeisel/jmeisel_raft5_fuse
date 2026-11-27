@@ -1510,3 +1510,66 @@ fn a_pass_over_large_files_stores_them_in_several_segments() {
     assert!(segments >= 2, "{segments} segments");
     assert_eq!(search(&backend, &tester, v, "w3x399999"), ["big3.txt"]);
 }
+
+/// The row of the file at `path` in `volume`'s index.
+fn row_of(
+    backend: &Backend,
+    vault: &Vault,
+    volume: u64,
+    path: &str,
+) -> raft5fs_search::generation::Row {
+    let index = opened(backend, vault, volume).expect("the volume has an index");
+    index
+        .index
+        .all_rows()
+        .into_iter()
+        .find(|r| r.path == path)
+        .unwrap_or_else(|| panic!("{path} in the index"))
+}
+
+#[test]
+fn photos_and_tracks_keep_the_facts_filters_read() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    let lisbon = include_bytes!("../../webapp/tests/fixtures/lisbon.jpg");
+    write(&backend, &tester, v, "lisbon.jpg", lisbon);
+    pass(&backend, &tester, v, new_id(), PassKind::Auto).unwrap();
+    let photo = row_of(&backend, &tester, v, "lisbon.jpg");
+    assert_eq!(photo.meta.camera, "Apple iPhone 13");
+    assert_eq!(photo.reader, raft5fs_search::extract::READER);
+    let ride = row_of(&backend, &tester, v, "ride.gpx");
+    assert_eq!(ride.meta.activity, raft5fs_search::record::Activity::Ride);
+}
+
+#[test]
+fn who_made_a_file_comes_from_the_log_and_outlasts_edits() {
+    let backend = Backend::start(TEST_CHUNK_SIZE, false, true);
+    backend.enrol("carol");
+    let rt = &backend.runtime;
+    let tester = vault(&backend, TESTER);
+    let (v, _) = volume(&backend, &tester);
+    rt.block_on(tester.grant(v, "carol", true, OsStr::new("v")))
+        .unwrap();
+    let carol = vault(&backend, "carol");
+    let id = new_id();
+    pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    let first = row_of(&backend, &tester, v, "ride.gpx");
+    assert_eq!(first.meta.added_by, TESTER);
+    assert_eq!(first.meta.changed_by, TESTER);
+    assert!(first.meta.added_ms > 0);
+
+    // Carol changes the ride; the next pass reads the log, not a walk.
+    let ino = rt
+        .block_on(tester.lookup(v, OsStr::new("ride.gpx")))
+        .unwrap()
+        .ino;
+    rt.block_on(carol.write(ino, 0, GPX.replace("40k", "41k").as_bytes()))
+        .unwrap();
+    let stats = pass(&backend, &tester, v, id, PassKind::Auto).unwrap();
+    assert!(!stats.full);
+    let edited = row_of(&backend, &tester, v, "ride.gpx");
+    assert_eq!(edited.meta.added_by, TESTER, "still made by the tester");
+    assert_eq!(edited.meta.added_ms, first.meta.added_ms);
+    assert_eq!(edited.meta.changed_by, "carol");
+}

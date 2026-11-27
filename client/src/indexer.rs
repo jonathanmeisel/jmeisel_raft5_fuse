@@ -47,7 +47,7 @@ use raft5fs_search::INDEX_DIR;
 use raft5fs_search::extract::{self, Extracted, Format};
 use raft5fs_search::generation;
 use raft5fs_search::manifest::{IndexerId, Manifest, decode_manifest, encode_manifest};
-use raft5fs_search::record::{Chunk, DocKind, Entry, Extra, Record, Stamp, Thumb, Vector};
+use raft5fs_search::record::{Chunk, DocKind, Entry, Extra, Meta, Record, Stamp, Thumb, Vector};
 use raft5fs_search::segment::{decode_segment, encode_segment};
 use raft5fs_search::text;
 use raft5fs_search::vector::quantize;
@@ -624,6 +624,22 @@ struct Known {
     image: Option<(String, bool)>,
     /// Whether a chunk is long enough to embed.
     embeddable: bool,
+    /// Who made it and when, and who last changed it (`Meta`), carried to
+    /// the file's next record.
+    added_ms: u64,
+    added_by: String,
+    changed_by: String,
+}
+
+/// What the volume's activity log says of one file.
+#[derive(Debug, Clone, Default)]
+struct Author {
+    /// When it was made, and by whom: 0 and empty if the log doesn't go
+    /// back that far.
+    added_ms: u64,
+    added_by: String,
+    /// Who last made or changed it.
+    changed_by: String,
 }
 
 impl Known {
@@ -640,8 +656,31 @@ impl Known {
             reader: r.reader,
             image: r.image.clone(),
             embeddable: r.embeddable,
+            added_ms: r.meta.added_ms,
+            added_by: r.meta.added_by.clone(),
+            changed_by: r.meta.changed_by.clone(),
         }
     }
+}
+
+/// Each file's author, from `log` (newest first).
+fn authors_of(log: &[Activity]) -> HashMap<u64, Author> {
+    let mut out: HashMap<u64, Author> = HashMap::new();
+    for a in log.iter().filter(|a| a.kind == Kind::File) {
+        let author = out.entry(a.ino).or_default();
+        match a.op {
+            ActivityOp::Created => {
+                author.added_ms = a.at_ms;
+                author.added_by = a.user.clone();
+            }
+            ActivityOp::Edited => {}
+            _ => continue,
+        }
+        if author.changed_by.is_empty() {
+            author.changed_by = a.user.clone();
+        }
+    }
+    out
 }
 
 /// One pass over one volume, under a claim.
@@ -679,6 +718,8 @@ struct Pass<'a> {
     queued: Vec<(Record, Vec<String>)>,
     /// Folder listings, by inode: names of what is in each.
     listings: HashMap<u64, Vec<(String, u64, Kind)>>,
+    /// Who made and changed files, from the activity log the pass read.
+    authors: HashMap<u64, Author>,
     stats: PassStats,
     progress: &'a mut (dyn FnMut(&PassStats) + Send),
     told: Instant,
@@ -1006,10 +1047,12 @@ impl Pass<'_> {
         let stamp = stamp_of(attr);
         let at_ms = clock::now_millis();
         // Another file that was at this path was replaced by this one (as
-        // editors save): it is gone.
+        // editors save): it is gone, and this one was made when it was.
+        let mut replaced = None;
         if let Some(&other) = self.by_path.get(&path)
             && other != ino
         {
+            replaced = self.files.get(&other).cloned();
             self.gone(other).await?;
         }
         if let Some(old) = self.files.get(&ino)
@@ -1086,6 +1129,7 @@ impl Pass<'_> {
         if kind == DocKind::Photo {
             extra.image = image;
         }
+        self.author(ino, replaced.as_ref(), &mut extra.meta);
         // Its thumbnail goes in the thumbnails file of the segment that
         // will hold this record.
         if let Some(jpeg) = thumb {
@@ -1112,6 +1156,33 @@ impl Pass<'_> {
         self.tell();
         rt::sleep(self.config.pace).await;
         Ok(())
+    }
+
+    /// Fills in who made file `ino` and when, and who last changed it:
+    /// from the log, else from its last record, else from the file it
+    /// `replaced` at its path.
+    fn author(&self, ino: u64, replaced: Option<&Known>, meta: &mut Meta) {
+        let log = self.authors.get(&ino);
+        let known = self.files.get(&ino);
+        let carried = known
+            .filter(|k| k.added_ms > 0 || !k.added_by.is_empty())
+            .or(replaced.filter(|k| k.added_ms > 0 || !k.added_by.is_empty()));
+        match (log.filter(|a| a.added_ms > 0), carried) {
+            (_, Some(k)) => {
+                meta.added_ms = k.added_ms;
+                meta.added_by = k.added_by.clone();
+            }
+            (Some(a), None) => {
+                meta.added_ms = a.added_ms;
+                meta.added_by = a.added_by.clone();
+            }
+            (None, None) => {}
+        }
+        meta.changed_by = log
+            .map(|a| a.changed_by.clone())
+            .filter(|c| !c.is_empty())
+            .or_else(|| known.map(|k| k.changed_by.clone()))
+            .unwrap_or_default();
     }
 
     /// Checks file `ino` (in `parent`, below `folders`) as it is now.
@@ -1356,6 +1427,7 @@ async fn run_pass(
         pending_thumbs: Vec::new(),
         queued: Vec::new(),
         listings: HashMap::new(),
+        authors: HashMap::new(),
         stats: PassStats::default(),
         progress,
         told: Instant::now(),
@@ -1386,6 +1458,7 @@ async fn run_pass(
         )
         .await?;
         cursor = log.first().map_or(cursor, |a| a.at_ms.max(cursor));
+        pass.authors = authors_of(&log);
         // A folder that moved changes the paths of everything in it, and the
         // log does not list those: walk instead.
         full = log
@@ -1445,6 +1518,8 @@ async fn run_pass(
     }
     if full {
         pass.stats.full = true;
+        // All the log the server keeps, for who made the files it lists.
+        pass.authors = authors_of(&read_log(vault, volume, pass.dir, 0).await?);
         pass.walk().await?;
         cursor = cursor.max(started);
         pass.mine.full_walk_ms = started;

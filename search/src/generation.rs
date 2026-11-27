@@ -27,15 +27,22 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use raft5fs_wire::{self as wire, Reader};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use crate::Error;
 use crate::cluster::Centres;
-use crate::record::{DocKind, Record, Stamp, Thumb, Vector};
+use crate::geo::Place;
+use crate::record::{Activity, DocKind, MAX_PLACES, Meta, Record, Stamp, Thumb, Vector};
 
 const HEAD_MAGIC: &[u8; 4] = b"r5gh";
 const PIECE_MAGIC: &[u8; 4] = b"r5gp";
-const FORMAT: u8 = 1;
+/// The format of the header and of every piece.
+/// - Format 2: records pieces have each row's `Meta`, with their strings
+///   in a list at the start.
+/// - Format 1: rows have no `Meta`; it reads as empty.
+const FORMAT: u8 = 2;
+const FORMAT_1: u8 = 1;
 /// The most bytes a piece may hold once inflated: a larger one is not ours.
 pub const MAX_PIECE: u64 = 128 << 20;
 /// About how big a server file is: pieces go into one until it passes this.
@@ -266,7 +273,7 @@ pub fn encode_header(h: &Header) -> Vec<u8> {
 
 pub fn decode_header(bytes: &[u8]) -> Result<Header, Error> {
     let mut r = Reader::new(bytes, "a search index generation");
-    if r.array::<4>()? != *HEAD_MAGIC || r.u8()? != FORMAT {
+    if r.array::<4>()? != *HEAD_MAGIC || ![FORMAT, FORMAT_1].contains(&r.u8()?) {
         return Err(r.garbled());
     }
     let id = r.array()?;
@@ -327,8 +334,12 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, Error> {
 
 /// A piece's bytes: its kind, then its body compressed.
 fn seal(kind: Kind, body: &[u8]) -> Vec<u8> {
+    seal_as(FORMAT, kind, body)
+}
+
+fn seal_as(format: u8, kind: Kind, body: &[u8]) -> Vec<u8> {
     let mut out = PIECE_MAGIC.to_vec();
-    wire::put_u8(&mut out, FORMAT);
+    wire::put_u8(&mut out, format);
     wire::put_u8(&mut out, kind.byte());
     let mut z = DeflateEncoder::new(out, Compression::default());
     z.write_all(body).expect("writing to memory doesn't fail");
@@ -337,8 +348,17 @@ fn seal(kind: Kind, body: &[u8]) -> Vec<u8> {
 
 /// A piece's body, if it is a piece of `kind`.
 fn open(kind: Kind, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    open_with_format(kind, bytes).map(|(_, body)| body)
+}
+
+/// A piece's format and body, if it is a piece of `kind`.
+fn open_with_format(kind: Kind, bytes: &[u8]) -> Result<(u8, Vec<u8>), Error> {
     let mut r = Reader::new(bytes, "a search index piece");
-    if r.array::<4>()? != *PIECE_MAGIC || r.u8()? != FORMAT || r.u8()? != kind.byte() {
+    if r.array::<4>()? != *PIECE_MAGIC {
+        return Err(r.garbled());
+    }
+    let format = r.u8()?;
+    if ![FORMAT, FORMAT_1].contains(&format) || r.u8()? != kind.byte() {
         return Err(r.garbled());
     }
     let mut body = Vec::new();
@@ -349,7 +369,7 @@ fn open(kind: Kind, bytes: &[u8]) -> Result<Vec<u8>, Error> {
     if body.len() as u64 > MAX_PIECE {
         return Err(r.garbled());
     }
-    Ok(body)
+    Ok((format, body))
 }
 
 /// One file as a generation keeps it: what search shows and filters by,
@@ -378,6 +398,7 @@ pub struct Row {
     pub chunks: u32,
     /// Whether a chunk is long enough to be embedded.
     pub embeddable: bool,
+    pub meta: Meta,
 }
 
 impl Row {
@@ -405,59 +426,179 @@ impl Row {
             words: r.chunks.iter().map(|c| c.len).fold(0, u32::saturating_add),
             chunks: r.chunks.len() as u32,
             embeddable: r.chunks.iter().any(|c| c.len >= min_words),
+            meta: r.extra.meta.clone(),
         }
     }
+}
+
+/// The strings of a records piece's `Meta`s, each kept once: cameras,
+/// places and accounts repeat across many files.
+#[derive(Default)]
+struct Strings {
+    ids: HashMap<String, u64>,
+    list: Vec<String>,
+}
+
+impl Strings {
+    fn id(&mut self, s: &str) -> u64 {
+        if let Some(&id) = self.ids.get(s) {
+            return id;
+        }
+        let id = self.list.len() as u64;
+        self.ids.insert(s.to_string(), id);
+        self.list.push(s.to_string());
+        id
+    }
+
+    /// 0 for none, else 1 + its number.
+    fn put_opt(&mut self, out: &mut Vec<u8>, s: &Option<String>) {
+        let n = s.as_deref().map_or(0, |s| self.id(s) + 1);
+        wire::put_varint(out, n);
+    }
+
+    fn put(&mut self, out: &mut Vec<u8>, s: &str) {
+        let n = self.id(s);
+        wire::put_varint(out, n);
+    }
+}
+
+fn put_meta(out: &mut Vec<u8>, m: &Meta, strings: &mut Strings) {
+    wire::put_varint(out, m.places.len() as u64);
+    for p in &m.places {
+        for part in [&p.town, &p.region, &p.region_local, &p.country, &p.code] {
+            strings.put_opt(out, part);
+        }
+    }
+    strings.put(out, &m.camera);
+    wire::put_varint(out, m.width.into());
+    wire::put_varint(out, m.height.into());
+    wire::put_u8(out, u8::from(m.selfie));
+    wire::put_varint(out, m.pages.into());
+    wire::put_u8(out, m.activity.byte());
+    wire::put_varint(out, m.duration_ms);
+    wire::put_varint(out, m.added_ms);
+    strings.put(out, &m.added_by);
+    strings.put(out, &m.changed_by);
+}
+
+fn get_meta(r: &mut Reader, strings: &[String]) -> Result<Meta, Error> {
+    let string = |r: &mut Reader| -> Result<String, Error> {
+        let n = r.varint()?;
+        usize::try_from(n)
+            .ok()
+            .and_then(|n| strings.get(n))
+            .cloned()
+            .ok_or_else(|| r.garbled())
+    };
+    let opt = |r: &mut Reader| -> Result<Option<String>, Error> {
+        match r.varint()? {
+            0 => Ok(None),
+            n => usize::try_from(n - 1)
+                .ok()
+                .and_then(|n| strings.get(n))
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| r.garbled()),
+        }
+    };
+    let count = small(r)?;
+    if count > MAX_PLACES {
+        return Err(r.garbled());
+    }
+    let mut places = Vec::new();
+    for _ in 0..count {
+        places.push(Place {
+            town: opt(r)?,
+            region: opt(r)?,
+            region_local: opt(r)?,
+            country: opt(r)?,
+            code: opt(r)?,
+        });
+    }
+    Ok(Meta {
+        places,
+        camera: string(r)?,
+        width: small(r)?,
+        height: small(r)?,
+        selfie: r.u8()? != 0,
+        pages: small(r)?,
+        activity: Activity::from_byte(r.u8()?),
+        duration_ms: r.varint()?,
+        added_ms: r.varint()?,
+        added_by: string(r)?,
+        changed_by: string(r)?,
+    })
 }
 
 pub fn encode_rows(rows: &[Row]) -> Vec<u8> {
+    let mut strings = Strings::default();
     let mut b = Vec::new();
     wire::put_varint(&mut b, rows.len() as u64);
     for row in rows {
-        wire::put_varint(&mut b, row.ino);
-        wire::put_varint(&mut b, row.at_ms);
-        wire::put_varint(&mut b, row.stamp.mtime_ns);
-        wire::put_varint(&mut b, row.stamp.size);
-        put_str(&mut b, &row.path);
-        wire::put_u8(&mut b, row.kind.byte());
-        put_str(&mut b, &row.model);
-        wire::put_varint(&mut b, row.reader.into());
-        wire::put_varint(&mut b, row.when_ms);
-        match row.at {
-            None => wire::put_u8(&mut b, 0),
-            Some((lat, lon)) => {
-                wire::put_u8(&mut b, 1);
-                wire::put_u32(&mut b, lat as u32);
-                wire::put_u32(&mut b, lon as u32);
-            }
-        }
-        wire::put_varint(&mut b, row.distance_m.into());
-        wire::put_varint(&mut b, row.climb_m.into());
-        match &row.thumb {
-            None => wire::put_u8(&mut b, 0),
-            Some(t) => {
-                wire::put_u8(&mut b, 1);
-                put_str(&mut b, &t.file);
-                wire::put_varint(&mut b, t.offset);
-                wire::put_varint(&mut b, t.len.into());
-            }
-        }
-        match &row.image {
-            None => wire::put_u8(&mut b, 0),
-            Some((m, has)) => {
-                wire::put_u8(&mut b, 1 + u8::from(*has));
-                put_str(&mut b, m);
-            }
-        }
-        wire::put_varint(&mut b, row.words.into());
-        wire::put_varint(&mut b, row.chunks.into());
-        wire::put_u8(&mut b, u8::from(row.embeddable));
+        put_row_fields(&mut b, row);
+        put_meta(&mut b, &row.meta, &mut strings);
     }
-    seal(Kind::Records, &b)
+    // The strings go first, so a reader has them before the rows.
+    let mut out = Vec::new();
+    wire::put_varint(&mut out, strings.list.len() as u64);
+    for s in &strings.list {
+        put_str(&mut out, s);
+    }
+    out.extend(b);
+    seal(Kind::Records, &out)
+}
+
+/// A row's fields that format 1 has too.
+fn put_row_fields(b: &mut Vec<u8>, row: &Row) {
+    wire::put_varint(b, row.ino);
+    wire::put_varint(b, row.at_ms);
+    wire::put_varint(b, row.stamp.mtime_ns);
+    wire::put_varint(b, row.stamp.size);
+    put_str(b, &row.path);
+    wire::put_u8(b, row.kind.byte());
+    put_str(b, &row.model);
+    wire::put_varint(b, row.reader.into());
+    wire::put_varint(b, row.when_ms);
+    match row.at {
+        None => wire::put_u8(b, 0),
+        Some((lat, lon)) => {
+            wire::put_u8(b, 1);
+            wire::put_u32(b, lat as u32);
+            wire::put_u32(b, lon as u32);
+        }
+    }
+    wire::put_varint(b, row.distance_m.into());
+    wire::put_varint(b, row.climb_m.into());
+    match &row.thumb {
+        None => wire::put_u8(b, 0),
+        Some(t) => {
+            wire::put_u8(b, 1);
+            put_str(b, &t.file);
+            wire::put_varint(b, t.offset);
+            wire::put_varint(b, t.len.into());
+        }
+    }
+    match &row.image {
+        None => wire::put_u8(b, 0),
+        Some((m, has)) => {
+            wire::put_u8(b, 1 + u8::from(*has));
+            put_str(b, m);
+        }
+    }
+    wire::put_varint(b, row.words.into());
+    wire::put_varint(b, row.chunks.into());
+    wire::put_u8(b, u8::from(row.embeddable));
 }
 
 pub fn decode_rows(bytes: &[u8]) -> Result<Vec<Row>, Error> {
-    let body = open(Kind::Records, bytes)?;
+    let (format, body) = open_with_format(Kind::Records, bytes)?;
     let mut r = Reader::new(&body, "a search index records piece");
+    let mut strings = Vec::new();
+    if format >= FORMAT {
+        for _ in 0..r.varint()? {
+            strings.push(get_str(&mut r)?);
+        }
+    }
     let mut rows = Vec::new();
     for _ in 0..r.varint()? {
         let ino = r.varint()?;
@@ -495,6 +636,11 @@ pub fn decode_rows(bytes: &[u8]) -> Result<Vec<Row>, Error> {
         let words = small(&mut r)?;
         let chunks = small(&mut r)?;
         let embeddable = r.u8()? != 0;
+        let meta = if format >= FORMAT {
+            get_meta(&mut r, &strings)?
+        } else {
+            Meta::default()
+        };
         rows.push(Row {
             ino,
             at_ms,
@@ -512,6 +658,7 @@ pub fn decode_rows(bytes: &[u8]) -> Result<Vec<Row>, Error> {
             words,
             chunks,
             embeddable,
+            meta,
         });
     }
     r.finish()?;
@@ -829,7 +976,63 @@ mod tests {
             words: 40,
             chunks: 2,
             embeddable: true,
+            meta: Meta {
+                places: vec![Place {
+                    town: Some("Lisbon".into()),
+                    region: Some("Lisbon".into()),
+                    region_local: None,
+                    country: Some("Portugal".into()),
+                    code: Some("PT".into()),
+                }],
+                camera: "Apple iPhone 13".into(),
+                width: 4032,
+                height: 3024,
+                selfie: false,
+                pages: 0,
+                activity: Activity::Unknown,
+                duration_ms: 0,
+                added_ms: 12,
+                added_by: "ann".into(),
+                changed_by: "ann".into(),
+            },
         }
+    }
+
+    #[test]
+    fn records_pieces_of_format_1_read_without_meta() {
+        let rows = vec![row(1), row(2)];
+        let mut body = Vec::new();
+        wire::put_varint(&mut body, rows.len() as u64);
+        for r in &rows {
+            put_row_fields(&mut body, r);
+        }
+        let old = seal_as(FORMAT_1, Kind::Records, &body);
+        let read = decode_rows(&old).unwrap();
+        let want: Vec<Row> = rows
+            .into_iter()
+            .map(|r| Row {
+                meta: Meta::default(),
+                ..r
+            })
+            .collect();
+        assert_eq!(read, want);
+    }
+
+    #[test]
+    fn strings_in_meta_are_kept_once_a_piece() {
+        let rows: Vec<Row> = (1..=50).map(row).collect();
+        let bare: Vec<Row> = rows
+            .iter()
+            .map(|r| Row {
+                meta: Meta::default(),
+                ..r.clone()
+            })
+            .collect();
+        let body = |rows: &[Row]| open(Kind::Records, &encode_rows(rows)).unwrap().len();
+        // Each row's `Meta` costs numbers, not the camera's and places'
+        // names again.
+        let per_row = (body(&rows) - body(&bare)) / rows.len();
+        assert!(per_row < 24, "{per_row} bytes a row");
     }
 
     #[test]
@@ -840,6 +1043,7 @@ mod tests {
                 image: None,
                 thumb: None,
                 at: None,
+                meta: Meta::default(),
                 ..row(2)
             },
         ];

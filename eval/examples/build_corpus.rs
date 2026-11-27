@@ -270,6 +270,7 @@ fn main() {
                 lon: Some(lon - jitter),
                 camera: None,
                 orientation: 1,
+                ..PhotoInfo::default()
             };
             let name = places()
                 .locate(lat, lon)
@@ -292,6 +293,7 @@ fn main() {
                 lon: None,
                 camera: None,
                 orientation: 1,
+                ..PhotoInfo::default()
             };
             (info, "unsorted".to_string())
         };

@@ -77,6 +77,9 @@ pub struct Place {
     /// The region's own name, where it has another.
     pub region_local: Option<String>,
     pub country: Option<String>,
+    /// The country's ISO 3166-1 alpha-2 code ("PT"), so a filter can match
+    /// a country by code whatever its name.
+    pub code: Option<String>,
 }
 
 impl Place {
@@ -375,6 +378,10 @@ impl Places {
             country: country
                 .and_then(|c| self.table.countries.get(c as usize))
                 .map(|c| c.name.clone()),
+            code: country
+                .and_then(|c| self.table.countries.get(c as usize))
+                .map(|c| c.code.clone())
+                .filter(|c| !c.is_empty()),
         }
     }
 }

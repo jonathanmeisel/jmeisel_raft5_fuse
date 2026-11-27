@@ -14,12 +14,15 @@ use std::collections::HashMap;
 use raft5fs_wire::{self as wire, Reader};
 
 use crate::Error;
+use crate::geo::Place;
 
 /// The format byte at the start of every entry.
+/// - Format 4 is format 3 with `Meta`.
 /// - Format 3 has varints, and words by number in the segment's list.
 /// - Format 2 has fixed-width numbers and words in full.
 /// - Format 1 is format 2 without `Extra`: its records read with none.
-const FORMAT: u8 = 3;
+const FORMAT: u8 = 4;
+const FORMAT_3: u8 = 3;
 const FORMAT_2: u8 = 2;
 const FORMAT_1: u8 = 1;
 
@@ -123,6 +126,92 @@ pub struct Extra {
     pub thumb: Option<Thumb>,
     /// A photo's image vector, and the model that made it.
     pub image: Option<(String, Vector)>,
+    pub meta: Meta,
+}
+
+/// The facts that search filters by, besides `Extra`'s dates and places.
+/// Each is empty or 0 where it is not known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Meta {
+    /// Where it is: one place for a photo, the places along a track.
+    pub places: Vec<Place>,
+    /// The camera's make and model.
+    pub camera: String,
+    /// A picture's size in pixels, upright (after its EXIF orientation).
+    pub width: u32,
+    pub height: u32,
+    /// A photo taken with a phone's front camera.
+    pub selfie: bool,
+    /// A document's pages.
+    pub pages: u32,
+    pub activity: Activity,
+    /// How long a track, a video or a recording lasts.
+    pub duration_ms: u64,
+    /// When the file was made, and by which account, from the volume's
+    /// activity log; 0 and empty for a file made before the indexer saw
+    /// the log.
+    pub added_ms: u64,
+    pub added_by: String,
+    /// The account that last made or changed it, from the log.
+    pub changed_by: String,
+}
+
+/// What a track records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Activity {
+    #[default]
+    Unknown,
+    Ride,
+    Run,
+    Hike,
+    Walk,
+    Other,
+}
+
+impl Activity {
+    pub fn byte(self) -> u8 {
+        match self {
+            Activity::Unknown => 0,
+            Activity::Ride => 1,
+            Activity::Run => 2,
+            Activity::Hike => 3,
+            Activity::Walk => 4,
+            Activity::Other => 5,
+        }
+    }
+
+    /// The activity a byte names; a byte from a newer writer is `Other`.
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Activity::Unknown,
+            1 => Activity::Ride,
+            2 => Activity::Run,
+            3 => Activity::Hike,
+            4 => Activity::Walk,
+            _ => Activity::Other,
+        }
+    }
+
+    /// The activity a file names ("cycling", "Biking", "Hiking").
+    pub fn of(name: &str) -> Self {
+        let a = name.to_ascii_lowercase();
+        if ["bik", "cycl", "ride", "mtb", "gravel"]
+            .iter()
+            .any(|w| a.contains(w))
+        {
+            Activity::Ride
+        } else if a.contains("run") {
+            Activity::Run
+        } else if ["hik", "trek"].iter().any(|w| a.contains(w)) {
+            Activity::Hike
+        } else if a.contains("walk") {
+            Activity::Walk
+        } else if a.trim().is_empty() {
+            Activity::Unknown
+        } else {
+            Activity::Other
+        }
+    }
 }
 
 /// Where a thumbnail is: bytes `offset..offset + len` of index file `file`.
@@ -282,6 +371,32 @@ fn put_extra(out: &mut Vec<u8>, e: &Extra) {
         wire::put_short_bytes(out, model.as_bytes());
         put_vector(out, v);
     });
+    put_meta(out, &e.meta);
+}
+
+fn put_place_part(out: &mut Vec<u8>, part: &Option<String>) {
+    put_option(out, part.as_ref(), |out, s| {
+        wire::put_short_bytes(out, s.as_bytes())
+    });
+}
+
+fn put_meta(out: &mut Vec<u8>, m: &Meta) {
+    wire::put_varint(out, m.places.len() as u64);
+    for p in &m.places {
+        for part in [&p.town, &p.region, &p.region_local, &p.country, &p.code] {
+            put_place_part(out, part);
+        }
+    }
+    wire::put_short_bytes(out, m.camera.as_bytes());
+    wire::put_varint(out, m.width.into());
+    wire::put_varint(out, m.height.into());
+    wire::put_u8(out, u8::from(m.selfie));
+    wire::put_varint(out, m.pages.into());
+    wire::put_u8(out, m.activity.byte());
+    wire::put_varint(out, m.duration_ms);
+    wire::put_varint(out, m.added_ms);
+    wire::put_short_bytes(out, m.added_by.as_bytes());
+    wire::put_short_bytes(out, m.changed_by.as_bytes());
 }
 
 /// Reads the fields of an entry in any format: formats 1 and 2 have
@@ -395,29 +510,69 @@ impl Fields<'_, '_> {
             climb_m,
             thumb,
             image,
+            meta: Meta::default(),
+        })
+    }
+
+    fn place_part(&mut self) -> Result<Option<String>, Error> {
+        if self.flag()? {
+            Ok(Some(self.string()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `Meta`, which only format 4 has.
+    fn meta(&mut self) -> Result<Meta, Error> {
+        let count = self.n32()?;
+        if count > MAX_PLACES {
+            return Err(self.r.garbled());
+        }
+        let mut places = Vec::new();
+        for _ in 0..count {
+            places.push(Place {
+                town: self.place_part()?,
+                region: self.place_part()?,
+                region_local: self.place_part()?,
+                country: self.place_part()?,
+                code: self.place_part()?,
+            });
+        }
+        Ok(Meta {
+            places,
+            camera: self.string()?,
+            width: self.n32()?,
+            height: self.n32()?,
+            selfie: self.flag()?,
+            pages: self.n32()?,
+            activity: Activity::from_byte(self.r.u8()?),
+            duration_ms: self.n64()?,
+            added_ms: self.n64()?,
+            added_by: self.string()?,
+            changed_by: self.string()?,
         })
     }
 }
+
+/// The most places one record may name: a longer list is not ours.
+pub const MAX_PLACES: u32 = 64;
 
 /// Reads an entry of any format. `words` are its segment's words, which a
 /// format 3 entry names by number; older formats ignore them.
 pub fn decode_entry(bytes: &[u8], words: &[String]) -> Result<Entry, Error> {
     let mut r = Reader::new(bytes, "a search index entry");
     let format = r.u8()?;
-    if ![FORMAT, FORMAT_2, FORMAT_1].contains(&format) {
+    if ![FORMAT, FORMAT_3, FORMAT_2, FORMAT_1].contains(&format) {
         return Err(r.garbled());
     }
-    let mut f = Fields {
-        r,
-        compact: format == FORMAT,
-        words,
-    };
+    let compact = format >= FORMAT_3;
+    let mut f = Fields { r, compact, words };
     let tag = f.r.u8()?;
     let ino = f.n64()?;
     let at_ms = f.n64()?;
     let entry = match tag {
         1 => Entry::Gone { ino, at_ms },
-        2 if format == FORMAT => Entry::Moved {
+        2 if compact => Entry::Moved {
             ino,
             at_ms,
             path: f.string()?,
@@ -460,7 +615,11 @@ pub fn decode_entry(bytes: &[u8], words: &[String]) -> Result<Entry, Error> {
                 extra: if format == FORMAT_1 {
                     Extra::default()
                 } else {
-                    f.extra()?
+                    let mut extra = f.extra()?;
+                    if format >= FORMAT {
+                        extra.meta = f.meta()?;
+                    }
+                    extra
                 },
             })
         }
@@ -521,6 +680,34 @@ mod tests {
                     values: vec![1],
                 },
             )),
+            meta: Meta::default(),
+        };
+        Entry::Record(r)
+    }
+
+    /// `photo`, with every fact filters read.
+    fn photo_with_meta() -> Entry {
+        let Entry::Record(mut r) = photo() else {
+            unreachable!()
+        };
+        r.extra.meta = Meta {
+            places: vec![Place {
+                town: Some("Lisbon".into()),
+                region: None,
+                region_local: Some("Lisboa".into()),
+                country: Some("Portugal".into()),
+                code: Some("PT".into()),
+            }],
+            camera: "Fuji X100".into(),
+            width: 8,
+            height: 6,
+            selfie: true,
+            pages: 2,
+            activity: Activity::Ride,
+            duration_ms: 9,
+            added_ms: 10,
+            added_by: "ann".into(),
+            changed_by: "bo".into(),
         };
         Entry::Record(r)
     }
@@ -534,7 +721,7 @@ mod tests {
     #[test]
     fn entries_round_trip() {
         let gone = Entry::Gone { ino: 3, at_ms: 4 };
-        for e in [sample(), photo(), gone] {
+        for e in [sample(), photo(), photo_with_meta(), gone] {
             assert_eq!(round_trip(&e), e);
         }
     }
@@ -565,13 +752,17 @@ mod tests {
     /// The stored layout of an entry, pinned.
     #[test]
     fn an_entry_keeps_its_bytes() {
-        let golden = "030007e807050907612f622e74787400016d01\
+        let golden = "040007e807050907612f622e74787400016d01\
                       02686902010002013f00000002ff02\
                       020301ffffffff0000000204050101740607\
-                      0101633f0000000101";
+                      0101633f0000000101\
+                      0101064c6973626f6e0001064c6973626f61\
+                      0108506f72747567616c0102505409\
+                      46756a6920583130300806010201090a\
+                      03616e6e02626f";
         let mut words = Words::default();
         assert_eq!(
-            raft5fs_wire::hex(&encode_entry(&photo(), &mut words)),
+            raft5fs_wire::hex(&encode_entry(&photo_with_meta(), &mut words)),
             golden
         );
         assert_eq!(words.into_list(), ["hi"]);
@@ -580,8 +771,38 @@ mod tests {
                 &Entry::Gone { ino: 3, at_ms: 4 },
                 &mut Words::default()
             )),
-            "03010304"
+            "04010304"
         );
+    }
+
+    /// Entries in format 3 still read, with no `Meta`.
+    #[test]
+    fn a_format_3_entry_still_reads() {
+        let golden = "030007e807050907612f622e74787400016d01\
+                      02686902010002013f00000002ff02\
+                      020301ffffffff0000000204050101740607\
+                      0101633f0000000101";
+        let bytes = raft5fs_wire::from_hex(golden).unwrap();
+        assert_eq!(decode_entry(&bytes, &["hi".into()]).unwrap(), photo());
+        let gone = raft5fs_wire::from_hex("03010304").unwrap();
+        assert_eq!(
+            decode_entry(&gone, &[]).unwrap(),
+            Entry::Gone { ino: 3, at_ms: 4 }
+        );
+    }
+
+    #[test]
+    fn activities_read_from_what_files_call_them() {
+        assert_eq!(Activity::of("Biking"), Activity::Ride);
+        assert_eq!(Activity::of("cycling"), Activity::Ride);
+        assert_eq!(Activity::of("Running"), Activity::Run);
+        assert_eq!(Activity::of("hiking"), Activity::Hike);
+        assert_eq!(Activity::of("Walking"), Activity::Walk);
+        assert_eq!(Activity::of("Swimming"), Activity::Other);
+        assert_eq!(Activity::of(""), Activity::Unknown);
+        for a in [Activity::Ride, Activity::Run, Activity::Other] {
+            assert_eq!(Activity::from_byte(a.byte()), a);
+        }
     }
 
     /// Entries in format 2 still read.

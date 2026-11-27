@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn a_segment_keeps_its_bytes() {
         let body = encode_body(&[Entry::Gone { ino: 1, at_ms: 2 }, record(3, &["hi"])]);
-        assert_eq!(raft5fs_wire::hex(&body[..9]), "010268690204030101");
+        assert_eq!(raft5fs_wire::hex(&body[..9]), "010268690204040101");
         let bytes = encode_segment(&[Entry::Gone { ino: 1, at_ms: 2 }]);
         assert_eq!(raft5fs_wire::hex(&bytes[..5]), "7235736702");
     }
