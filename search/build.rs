@@ -58,6 +58,14 @@ fn main() {
         .as_u64()
         .expect("text's search.minWords");
     writeln!(out, "pub const TEXT_MIN_WORDS: u32 = {words};").unwrap();
+    // How close a query word must be to a type for search to suggest it
+    // (query::suggest), and how much closer than to the next type.
+    for (name, field) in [("SUGGEST_MIN", "suggestMin"), ("SUGGEST_GAP", "suggestGap")] {
+        let n = model("text")["search"][field]
+            .as_f64()
+            .unwrap_or_else(|| panic!("text's search.{field}"));
+        writeln!(out, "pub const {name}: f32 = {:?};", n as f32).unwrap();
+    }
     let ranking = &json["ranking"];
     let f = |path: &[&str]| -> f64 {
         let mut v = ranking;

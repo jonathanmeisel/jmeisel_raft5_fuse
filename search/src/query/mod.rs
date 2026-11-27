@@ -23,6 +23,7 @@
 
 pub mod dates;
 pub mod lexicon;
+pub mod suggest;
 
 use std::collections::{HashMap, HashSet};
 

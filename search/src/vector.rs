@@ -31,6 +31,10 @@
 //!   and run raft5fs-eval (and `raft5fs-eval recall`): the ranking's
 //!   numbers in models.json (`ranking`) and the probing in `index` were
 //!   set by measuring with the old one.
+//! - For a text model: write data/type_vectors.bin again (raft5fs-eval's
+//!   `build_type_vectors` example), and set `suggestMin` and `suggestGap`
+//!   in models.json from raft5fs-eval's `suggest` example. Until then,
+//!   search suggests no types.
 //! - A generation's clusters hold vectors of one model. After the change,
 //!   the next compaction trains new centres on the new vectors, and leaves
 //!   the old model's vectors out: until then, search by meaning finds only

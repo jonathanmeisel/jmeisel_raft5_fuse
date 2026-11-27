@@ -1,0 +1,709 @@
+{
+ "about": "Words a query may use for a type that the rule lists don't have, and everyday words that name no type, for measuring e5 type suggestions (search/src/query/suggest.rs). Written for raft5fs.",
+ "words": [
+  {
+   "word": "snapshots",
+   "type": "photo"
+  },
+  {
+   "word": "snaps",
+   "type": "photo"
+  },
+  {
+   "word": "shots",
+   "type": "photo"
+  },
+  {
+   "word": "headshots",
+   "type": "photo"
+  },
+  {
+   "word": "polaroids",
+   "type": "photo"
+  },
+  {
+   "word": "photographs",
+   "type": "photo"
+  },
+  {
+   "word": "photoshoot",
+   "type": "photo"
+  },
+  {
+   "word": "prints",
+   "type": "photo"
+  },
+  {
+   "word": "stills",
+   "type": "photo"
+  },
+  {
+   "word": "portraits",
+   "type": "photo"
+  },
+  {
+   "word": "snapshot",
+   "type": "photo"
+  },
+  {
+   "word": "photography",
+   "type": "photo"
+  },
+  {
+   "word": "footage",
+   "type": "video"
+  },
+  {
+   "word": "film",
+   "type": "video"
+  },
+  {
+   "word": "films",
+   "type": "video"
+  },
+  {
+   "word": "camcorder",
+   "type": "video"
+  },
+  {
+   "word": "tiktoks",
+   "type": "video"
+  },
+  {
+   "word": "vlogs",
+   "type": "video"
+  },
+  {
+   "word": "home movies",
+   "type": "video"
+  },
+  {
+   "word": "reels",
+   "type": "video"
+  },
+  {
+   "word": "trailers",
+   "type": "video"
+  },
+  {
+   "word": "recordings of the game",
+   "type": "video"
+  },
+  {
+   "word": "dashcam",
+   "type": "video"
+  },
+  {
+   "word": "gopro footage",
+   "type": "video"
+  },
+  {
+   "word": "tunes",
+   "type": "audio"
+  },
+  {
+   "word": "soundtrack",
+   "type": "audio"
+  },
+  {
+   "word": "voicemail",
+   "type": "audio"
+  },
+  {
+   "word": "audiobook",
+   "type": "audio"
+  },
+  {
+   "word": "audiobooks",
+   "type": "audio"
+  },
+  {
+   "word": "mp3",
+   "type": "audio"
+  },
+  {
+   "word": "playlist",
+   "type": "audio"
+  },
+  {
+   "word": "tracks from the album",
+   "type": "audio"
+  },
+  {
+   "word": "voice notes",
+   "type": "audio"
+  },
+  {
+   "word": "dictation",
+   "type": "audio"
+  },
+  {
+   "word": "sound clips",
+   "type": "audio"
+  },
+  {
+   "word": "ringtones",
+   "type": "audio"
+  },
+  {
+   "word": "excel",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "sheets",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "workbook",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "workbooks",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "excel files",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "google sheets",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "tables",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "csv",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "budget sheet",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "ledger",
+   "type": "spreadsheet"
+  },
+  {
+   "word": "powerpoint",
+   "type": "presentation"
+  },
+  {
+   "word": "deck",
+   "type": "presentation"
+  },
+  {
+   "word": "decks",
+   "type": "presentation"
+  },
+  {
+   "word": "keynote",
+   "type": "presentation"
+  },
+  {
+   "word": "powerpoints",
+   "type": "presentation"
+  },
+  {
+   "word": "slideshow",
+   "type": "presentation"
+  },
+  {
+   "word": "pitch deck",
+   "type": "presentation"
+  },
+  {
+   "word": "lecture slides",
+   "type": "presentation"
+  },
+  {
+   "word": "scans",
+   "type": "pdf"
+  },
+  {
+   "word": "scanned documents",
+   "type": "pdf"
+  },
+  {
+   "word": "acrobat files",
+   "type": "pdf"
+  },
+  {
+   "word": "ebooks",
+   "type": "pdf"
+  },
+  {
+   "word": "backups",
+   "type": "archive"
+  },
+  {
+   "word": "tarballs",
+   "type": "archive"
+  },
+  {
+   "word": "compressed files",
+   "type": "archive"
+  },
+  {
+   "word": "rar files",
+   "type": "archive"
+  },
+  {
+   "word": "7z",
+   "type": "archive"
+  },
+  {
+   "word": "scripts",
+   "type": "code"
+  },
+  {
+   "word": "repo",
+   "type": "code"
+  },
+  {
+   "word": "source",
+   "type": "code"
+  },
+  {
+   "word": "programs",
+   "type": "code"
+  },
+  {
+   "word": "python",
+   "type": "code"
+  },
+  {
+   "word": "notebooks",
+   "type": "code"
+  },
+  {
+   "word": "snippets",
+   "type": "code"
+  },
+  {
+   "word": "word docs",
+   "type": "document"
+  },
+  {
+   "word": "essays",
+   "type": "document"
+  },
+  {
+   "word": "reports",
+   "type": "document"
+  },
+  {
+   "word": "letters",
+   "type": "document"
+  },
+  {
+   "word": "manuscripts",
+   "type": "document"
+  },
+  {
+   "word": "memos",
+   "type": "document"
+  },
+  {
+   "word": "volcano",
+   "type": null
+  },
+  {
+   "word": "beach",
+   "type": null
+  },
+  {
+   "word": "tax",
+   "type": null
+  },
+  {
+   "word": "receipt",
+   "type": null
+  },
+  {
+   "word": "dog",
+   "type": null
+  },
+  {
+   "word": "wedding",
+   "type": null
+  },
+  {
+   "word": "invoice",
+   "type": null
+  },
+  {
+   "word": "contract",
+   "type": null
+  },
+  {
+   "word": "recipe",
+   "type": null
+  },
+  {
+   "word": "birthday",
+   "type": null
+  },
+  {
+   "word": "kayak",
+   "type": null
+  },
+  {
+   "word": "mountain",
+   "type": null
+  },
+  {
+   "word": "concert",
+   "type": null
+  },
+  {
+   "word": "letter",
+   "type": null
+  },
+  {
+   "word": "notes",
+   "type": null
+  },
+  {
+   "word": "paddle board",
+   "type": null
+  },
+  {
+   "word": "sunset",
+   "type": null
+  },
+  {
+   "word": "lease",
+   "type": null
+  },
+  {
+   "word": "piano",
+   "type": null
+  },
+  {
+   "word": "guitar",
+   "type": null
+  },
+  {
+   "word": "lyrics",
+   "type": null
+  },
+  {
+   "word": "camera",
+   "type": null
+  },
+  {
+   "word": "screen",
+   "type": null
+  },
+  {
+   "word": "selfie stick",
+   "type": null
+  },
+  {
+   "word": "budget",
+   "type": null
+  },
+  {
+   "word": "insurance",
+   "type": null
+  },
+  {
+   "word": "mortgage",
+   "type": null
+  },
+  {
+   "word": "passport",
+   "type": null
+  },
+  {
+   "word": "vaccine",
+   "type": null
+  },
+  {
+   "word": "school",
+   "type": null
+  },
+  {
+   "word": "homework",
+   "type": null
+  },
+  {
+   "word": "garden",
+   "type": null
+  },
+  {
+   "word": "christmas tree",
+   "type": null
+  },
+  {
+   "word": "grandma",
+   "type": null
+  },
+  {
+   "word": "cat",
+   "type": null
+  },
+  {
+   "word": "soccer",
+   "type": null
+  },
+  {
+   "word": "basketball",
+   "type": null
+  },
+  {
+   "word": "marathon",
+   "type": null
+  },
+  {
+   "word": "bike",
+   "type": null
+  },
+  {
+   "word": "hiking boots",
+   "type": null
+  },
+  {
+   "word": "tent",
+   "type": null
+  },
+  {
+   "word": "fishing",
+   "type": null
+  },
+  {
+   "word": "lake",
+   "type": null
+  },
+  {
+   "word": "snow",
+   "type": null
+  },
+  {
+   "word": "rain",
+   "type": null
+  },
+  {
+   "word": "flowers",
+   "type": null
+  },
+  {
+   "word": "wine",
+   "type": null
+  },
+  {
+   "word": "pizza",
+   "type": null
+  },
+  {
+   "word": "bakery",
+   "type": null
+  },
+  {
+   "word": "coffee",
+   "type": null
+  },
+  {
+   "word": "office",
+   "type": null
+  },
+  {
+   "word": "meeting",
+   "type": null
+  },
+  {
+   "word": "project",
+   "type": null
+  },
+  {
+   "word": "plan",
+   "type": null
+  },
+  {
+   "word": "presentation skills",
+   "type": null
+  },
+  {
+   "word": "movie night",
+   "type": null
+  },
+  {
+   "word": "music festival",
+   "type": null
+  },
+  {
+   "word": "photography class",
+   "type": null
+  },
+  {
+   "word": "film festival",
+   "type": null
+  },
+  {
+   "word": "band practice",
+   "type": null
+  },
+  {
+   "word": "theater",
+   "type": null
+  },
+  {
+   "word": "museum",
+   "type": null
+  },
+  {
+   "word": "painting",
+   "type": null
+  },
+  {
+   "word": "drawing",
+   "type": null
+  },
+  {
+   "word": "sculpture",
+   "type": null
+  },
+  {
+   "word": "statue",
+   "type": null
+  },
+  {
+   "word": "bridge",
+   "type": null
+  },
+  {
+   "word": "castle",
+   "type": null
+  },
+  {
+   "word": "church",
+   "type": null
+  },
+  {
+   "word": "temple",
+   "type": null
+  },
+  {
+   "word": "market",
+   "type": null
+  },
+  {
+   "word": "airport",
+   "type": null
+  },
+  {
+   "word": "flight",
+   "type": null
+  },
+  {
+   "word": "hotel",
+   "type": null
+  },
+  {
+   "word": "train ticket",
+   "type": null
+  },
+  {
+   "word": "rental car",
+   "type": null
+  },
+  {
+   "word": "bank statement",
+   "type": null
+  },
+  {
+   "word": "pay stub",
+   "type": null
+  },
+  {
+   "word": "w2",
+   "type": null
+  },
+  {
+   "word": "1099",
+   "type": null
+  },
+  {
+   "word": "resume",
+   "type": null
+  },
+  {
+   "word": "cover letter",
+   "type": null
+  },
+  {
+   "word": "diploma",
+   "type": null
+  },
+  {
+   "word": "transcript",
+   "type": null
+  },
+  {
+   "word": "report card",
+   "type": null
+  },
+  {
+   "word": "medical records",
+   "type": null
+  },
+  {
+   "word": "prescription",
+   "type": null
+  },
+  {
+   "word": "x-ray",
+   "type": null
+  },
+  {
+   "word": "ultrasound",
+   "type": null
+  },
+  {
+   "word": "baby",
+   "type": null
+  },
+  {
+   "word": "puppy",
+   "type": null
+  },
+  {
+   "word": "kitten",
+   "type": null
+  },
+  {
+   "word": "horse",
+   "type": null
+  },
+  {
+   "word": "farm",
+   "type": null
+  },
+  {
+   "word": "tractor",
+   "type": null
+  },
+  {
+   "word": "boat",
+   "type": null
+  },
+  {
+   "word": "sailing",
+   "type": null
+  },
+  {
+   "word": "surf",
+   "type": null
+  },
+  {
+   "word": "ski",
+   "type": null
+  },
+  {
+   "word": "sled",
+   "type": null
+  }
+ ]
+}

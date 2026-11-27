@@ -1924,6 +1924,16 @@ test("photos are found by where and when they were taken, and rides by where the
   await none.getByRole("button", { name: "Without “Photos”" }).click();
   await expect(none.getByRole("option").filter({ hasText: "trips/morning.gpx" })).toBeVisible(SLOW);
 
+  // Words no rule knows may suggest a type, with meaning: only applied
+  // when tapped.
+  const sheet = await search(page, "budget sheet");
+  const only = sheet.getByRole("button", { name: "Only spreadsheets?" });
+  await expect(only).toBeVisible(SLOW);
+  await expect(only).toHaveAttribute("aria-pressed", "false");
+  await only.click();
+  await expect(sheet.getByRole("button", { name: "Remove filter: Spreadsheets" })).toBeVisible(SLOW);
+  await expect(sheet).toContainText("Nothing matches these filters.", SLOW);
+
   // On a phone the chips fit across the screen, and the page doesn't
   // scroll sideways.
   await page.setViewportSize({ width: 390, height: 800 });

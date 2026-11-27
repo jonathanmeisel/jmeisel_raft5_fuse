@@ -34,7 +34,7 @@ use raft5fs_crypto::local::{open_local, seal_local};
 use raft5fs_proto::errno;
 use raft5fs_proto::types::FsError;
 use raft5fs_search::filter::Filter;
-use raft5fs_search::query::{self, Vocabulary};
+use raft5fs_search::query::{self, Vocabulary, suggest};
 use raft5fs_search::record::{DocKind, Thumb};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL};
 use raft5fs_search::view::QueryVector;
@@ -644,6 +644,12 @@ impl Fs {
                     filter.add(t);
                 }
             }
+            let has_type = parsed
+                .filter
+                .terms
+                .iter()
+                .any(|t| matches!(t.clause.key(), "type" | "activity"));
+            let unknown = parsed.unknown;
             let query = parsed.text;
             let listed = query.trim().is_empty() && !filter.is_empty();
             let named = filter.volumes();
@@ -672,6 +678,27 @@ impl Fs {
             } else {
                 None
             };
+            // A type its words may mean: only with meaning, which has the
+            // model at hand.
+            let mut suggested = Vec::new();
+            if meaning
+                && !has_type
+                && let (Some(types), Ok(tools)) = (suggest::pinned(), inner.tools())
+            {
+                let words = suggest::candidates(&unknown);
+                if !words.is_empty()
+                    && let Ok(vectors) = JsEmbed(tools).vectors(words.clone(), true).await
+                    && let Some(t) =
+                        suggest::suggest(types, &words.into_iter().zip(vectors).collect::<Vec<_>>())
+                {
+                    let id = format!("type:{}", t.name());
+                    suggested.push(ChipJs {
+                        applied: on.contains(&id),
+                        id,
+                        label: t.label().to_string(),
+                    });
+                }
+            }
             let image_vector = if meaning && has_images && words {
                 let embedded = match inner.tools() {
                     Ok(tools) => call(&tools.clip, &[JsValue::from_str(&query)])
@@ -717,7 +744,7 @@ impl Fs {
                 images: has_images,
                 meaning_error,
                 chips,
-                suggested: Vec::new(),
+                suggested,
                 listed,
             })
         })

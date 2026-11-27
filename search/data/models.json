@@ -11,7 +11,9 @@
         "floor": 0.75,
         "margin": 0.05,
         "z": 2.0,
-        "minWords": 8
+        "minWords": 8,
+        "suggestMin": 0.55,
+        "suggestGap": 0.15
       },
       "query": "query: ",
       "passage": "passage: ",

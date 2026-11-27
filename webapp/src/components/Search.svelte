@@ -25,6 +25,9 @@
   //   results; tapping it turns it off (and on again), with the query as
   //   typed. A new query turns them all back on. A query of filters alone
   //   lists the files they keep, newest first.
+  // - With meaning, a query that names no type may get a suggested one
+  //   ("excel": Only spreadsheets?), as a dashed chip that applies when
+  //   tapped.
   // - Words first, at once; then meaning, which may need the model loaded
   //   (and the first time, downloaded), so its results replace the first
   //   ones when they come. Where a download is worth asking about (a phone,
@@ -62,6 +65,10 @@
   /// turned off, and the query they are for: a new one turns all on.
   let chips = $state([]);
   let off = $state([]);
+  /// Filters the meaning search suggests (`{id, label, applied}`), and the
+  /// ids of those turned on.
+  let suggested = $state([]);
+  let on = $state([]);
   let chipsFor = "";
   /// Whether the hits are a list of what the filters keep (no words).
   let listed = $state(false);
@@ -176,6 +183,8 @@
     }
     if (q !== chipsFor) {
       off = [];
+      on = [];
+      suggested = [];
       chipsFor = q;
     }
     const mine = ++asked;
@@ -188,7 +197,7 @@
       const loaded = await ensureRead(await scope());
       volumes = loaded.filter((l) => l.downloaded).map((l) => l.volume);
       const found = volumes.length
-        ? await fs.search(q, volumes, 50, false, [...off])
+        ? await fs.search(q, volumes, 50, false, [...off], [...on])
         : { hits: [], meaning: false, chips: [], listed: false };
       if (mine !== asked) return;
       status = loaded;
@@ -226,10 +235,11 @@
           if (s && mine === asked) download = { loaded: s.loaded, total: s.total };
         }, 500);
     try {
-      const found = await fs.search(q, volumes, 50, true, [...off]);
+      const found = await fs.search(q, volumes, 50, true, [...off], [...on]);
       if (mine !== asked) return;
       results = found.hits;
       chips = found.chips;
+      suggested = found.suggested;
       listed = found.listed;
       meaning = found.meaningError ? `Searching by words only: ${found.meaningError}` : "";
     } catch (e) {
@@ -243,6 +253,13 @@
   /// Turns filter `id` off, or on again, and searches again.
   function toggle(id) {
     off = off.includes(id) ? off.filter((x) => x !== id) : [...off, id];
+    run();
+  }
+
+  /// Turns suggested filter `id` on, or off again, and searches again.
+  function toggleSuggested(id) {
+    on = on.includes(id) ? on.filter((x) => x !== id) : [...on, id];
+    suggested = suggested.map((c) => (c.id === id ? { ...c, applied: on.includes(id) } : c));
     run();
   }
 
@@ -286,7 +303,11 @@
   const notHere = $derived(status.filter((s) => s.indexed && !s.off && !s.downloaded && !s.downloading));
   const downloading = $derived(status.filter((s) => s.downloading));
   const turnedOff = $derived(status.filter((s) => s.off).map((s) => s.volume.slice(1)));
-  const applied = $derived(chips.filter((c) => c.applied));
+  /// The filters applied: read in the query, or suggested and turned on.
+  const applied = $derived([
+    ...chips.filter((c) => c.applied).map((c) => ({ ...c, undo: () => toggle(c.id) })),
+    ...suggested.filter((c) => c.applied).map((c) => ({ ...c, undo: () => toggleSuggested(c.id) })),
+  ]);
   const placeholder = $derived(
     everywhere || !volumeOf(folder) ? "Search all folders" : `Search ${volumeOf(folder).slice(1)}`,
   );
@@ -316,7 +337,7 @@
   </button>
   {#if open && query.trim()}
     <div class="results" role="listbox" aria-label="Search results">
-      {#if chips.length}
+      {#if chips.length || suggested.length}
         <div class="chips" role="group" aria-label="Filters">
           {#each chips as chip (chip.id)}
             <button
@@ -331,6 +352,19 @@
               <i class={chip.applied ? "wxi-close" : "wxi-plus"} aria-hidden="true"></i>
             </button>
           {/each}
+          {#each suggested as chip (chip.id)}
+            <button
+              class="chip suggested"
+              class:on={chip.applied}
+              aria-pressed={chip.applied}
+              aria-label={chip.applied ? `Remove filter: ${chip.label}` : `Only ${chip.label.toLowerCase()}?`}
+              title={chip.id}
+              onclick={() => toggleSuggested(chip.id)}
+            >
+              <span class="label">{chip.applied ? chip.label : `Only ${chip.label.toLowerCase()}?`}</span>
+              <i class={chip.applied ? "wxi-close" : "wxi-plus"} aria-hidden="true"></i>
+            </button>
+          {/each}
         </div>
       {/if}
       {#if error}
@@ -342,7 +376,7 @@
           <span>Nothing matches these filters.</span>
           <span class="undo">
             {#each applied as chip (chip.id)}
-              <button onclick={() => toggle(chip.id)}>Without “{chip.label}”</button>
+              <button onclick={chip.undo}>Without “{chip.label}”</button>
             {/each}
           </span>
         </div>
@@ -466,7 +500,8 @@
     color: var(--wx-color-font); font-size: 13px; cursor: pointer;
   }
   .chip.on { background: var(--wx-color-primary); color: #fff; }
-  .chip:not(.on) .label { text-decoration: line-through; opacity: 0.75; }
+  .chip:not(.on):not(.suggested) .label { text-decoration: line-through; opacity: 0.75; }
+  .chip.suggested:not(.on) { border-style: dashed; }
   .chip i { font-size: 16px; }
   .none { display: flex; flex-direction: column; gap: 6px; }
   .undo { display: flex; gap: 6px; flex-wrap: wrap; }

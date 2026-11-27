@@ -19,7 +19,10 @@ use raft5fs_indexer::{Native, native_tools};
 use raft5fs_proto::errno;
 #[cfg(feature = "index")]
 use raft5fs_proto::types::size_text;
+use raft5fs_search::filter::FileType;
 use raft5fs_search::index::Index;
+#[cfg(feature = "index")]
+use raft5fs_search::query::suggest;
 use raft5fs_search::query::{self, Vocabulary};
 use raft5fs_search::vector::{CLIP_MODEL, TEXT_MODEL as MODEL};
 use raft5fs_search::view::QueryVector;
@@ -104,6 +107,28 @@ fn query_vectors(
         None
     };
     (text, image)
+}
+
+/// A type the query's words may mean (`query::suggest`), when it names
+/// none: "excel" may mean spreadsheets.
+#[cfg(feature = "index")]
+fn suggested_type(runtime: &Runtime, unknown: &[String]) -> Option<FileType> {
+    let types = suggest::pinned()?;
+    let words = suggest::candidates(unknown);
+    if words.is_empty() {
+        return None;
+    }
+    let embedder = Embedder::cached();
+    let mut vectors = Vec::new();
+    for w in &words {
+        vectors.push((w.clone(), runtime.block_on(embedder.query(w)).ok()?));
+    }
+    suggest::suggest(types, &vectors)
+}
+
+#[cfg(not(feature = "index"))]
+fn suggested_type(_: &Runtime, _: &[String]) -> Option<FileType> {
+    None
 }
 
 /// A build without the models: words, places and dates only.
@@ -428,6 +453,12 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let parsed = query::parse(&args.query, &vocabulary, now, utc_offset_ms());
+    let has_type = parsed
+        .filter
+        .terms
+        .iter()
+        .any(|t| matches!(t.clause.key(), "type" | "activity"));
+    let unknown = parsed.unknown;
     let read = parsed.filter;
     let filter = read.without(&args.without);
     let text = parsed.text;
@@ -474,6 +505,13 @@ pub fn search(connect: &ConnectArgs, args: SearchArgs) -> Outcome {
         args.limit,
         Some(&filter),
     ));
+    if !has_type && let Some(t) = suggested_type(&runtime, &unknown) {
+        println!(
+            "Only {}? Add type:{} to the query.",
+            t.label().to_lowercase(),
+            t.name()
+        );
+    }
     if merged.is_empty() {
         println!("nothing found");
         return Ok(1);
