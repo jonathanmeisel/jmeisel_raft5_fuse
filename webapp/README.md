@@ -155,6 +155,13 @@ client. The UI is [SVAR File Manager](https://svar.dev/svelte/filemanager/)
     download shows its progress in the results. After keeping an index
     of over 50 MB, the page asks for persistent storage
     (`navigator.storage.persist`).
+  - Filters: the wasm `search` reads the query as filters and words
+    (raft5fs-search's `query`), against the places, cameras, people and
+    folders the searched indexes hold, and returns them as chips, which
+    `Search.svelte` shows above the results. Tapping a chip passes its id
+    in `off`; the query stays as typed. With meaning, a query that names
+    no type may get a suggested one (`query::suggest`), passed in `on`
+    once tapped.
   - Photos' thumbnails, which native devices make, show with results.
   - Photos are found by what they show with CLIP (its multilingual text
     side only, served beside the text model): native devices give photos

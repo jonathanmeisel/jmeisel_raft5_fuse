@@ -1204,9 +1204,58 @@ Excel files (docx, pptx, xlsx), OpenDocument files, PDF, chat exports,
 GPS tracks and routes (GPX, TCX: their names, activity, month, distance,
 climb, and the towns, states and countries they go through), and photos
 (JPEG, HEIC, PNG, WebP, TIFF: when, where and with what camera they were
-taken, from their EXIF data). Every other file is found by its name only.
-So "bike routes in vermont" finds rides through Vermont, and "Lisbon 2024"
-finds the photos taken there then.
+taken, from their EXIF data), and videos and recordings (MP4, QuickTime,
+M4A, MP3, FLAC, WAV: when, where and how long, from their headers only,
+so a video isn't downloaded to index it; Ogg, Matroska and AVI by their
+kind only). Every other file is found by its name only. So "bike routes
+in vermont" finds rides through Vermont, and "Lisbon 2024" finds the
+photos taken there then.
+
+Filters. A search can also keep only some files, for certain: "photos
+from guatemala last summer" keeps photos taken in Guatemala in June to
+August of the summer just past, and "pictures of volcanoes in guatemala" searches
+"volcanoes" among those. A query is read as filters and the words left
+over, by rules that know English:
+
+  type        photos, screenshots, selfies, videos, recordings, PDFs,
+              documents, spreadsheets, presentations, rides, runs,
+              hikes, archives, code ("not pdfs" leaves them out)
+  date        2019, march 2022, the 90s, last summer, christmas 2021,
+              yesterday, last week, 3 years ago, between 2018 and 2020,
+              since may. When a file was taken (photos, videos, rides;
+              else when it last changed), or with "added" or "edited",
+              when it was added or changed
+  place       from lisbon, in vermont, trip to the usa: names of places
+              where the volume's photos, videos and rides are
+  who         by alice, alice's photos, uploaded by bo
+  size        over 10 mb, longer than 10 minutes, more than 100 pages,
+              over 50 km, with 1000 m of climbing
+  camera      taken with an iphone, shot on my pixel 7
+  where kept  in my taxes folder, in CS101 (a volume or group)
+  order       newest, oldest
+
+A word the rules aren't sure of stays a search word: "nice sunset" looks
+for a nice sunset, "sunset in nice" for a sunset in Nice (if the volume
+has photos from there). The web app shows each filter as a chip above
+the results; tapping one turns it off, or on again. Where a query names
+no type, the language model may suggest one ("excel": Only
+spreadsheets?), which applies only when tapped. Filters can also be
+typed as they are written for the CLI:
+
+  raft5fs search "photos from lisbon"
+  Filters: Photos (type:photo), Lisbon (place:Lisbon)
+  raft5fs search "photos from lisbon" --without place:Lisbon
+  raft5fs search "type:pdf added:2026-03.. -in:old receipts"
+
+Each filter has such a form: type:, activity:, taken:, added:,
+modified:, place: (a name, or a country's code such as PT), near:
+(latitude,longitude,km), by:, size:, length:, pages:, distance:,
+climb:, camera:, shape: (portrait, landscape, square, panorama),
+is:selfie, in: (a folder), volume:, and sort:newest or sort:oldest; a
+leading - leaves out what it matches. Who added a file, and when, come
+from the volume's activity log, which the server keeps a week (8): a
+file added before a device first indexed the volume has neither, so
+"added" falls back to when it last changed and "by" leaves it out.
 
 Places are named offline, from a table every client keeps (from GeoNames,
 CC BY 4.0, and Natural Earth; search/data/README.md): where a photo was
@@ -1332,4 +1381,12 @@ owner:
 
 Search is out between steps 1 and 3, until the first pass has written
 something. The first pass reads and embeds every file again.
+
+Upgrading to the version with filters. Its index files are in a newer
+format that older clients can't read, so update every native client and
+the web app together. Nothing needs deleting: the first pass of an
+updated native device reads each file once more, for the facts filters
+need (and embeds it again; a big photo volume takes some hours, in the
+background), and later passes are as before. Until a file is read
+again, filters by place, camera, size, length or who skip it.
 
