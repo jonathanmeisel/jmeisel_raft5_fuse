@@ -102,9 +102,10 @@ impl Vault {
         Ok(roots)
     }
 
-    /// Prunes directory `top` and everything below it, from the top down. A
-    /// node that cannot be pruned is skipped, with everything below it, and
-    /// the walk continues. With `dry_run`, it only counts what it would do.
+    /// Prunes node `top` (a directory and everything below it, or a file)
+    /// from the top down. A node that cannot be pruned is skipped, with
+    /// everything below it, and the walk continues. With `dry_run`, it only
+    /// counts what it would do.
     pub async fn prune_tree(&self, top: u64, dry_run: bool) -> PruneStats {
         self.prune_tree_paced(top, dry_run, Duration::ZERO, &mut |_| {})
             .await
@@ -121,9 +122,19 @@ impl Vault {
         progress: &mut (dyn FnMut(&PruneStats) + Send),
     ) -> PruneStats {
         let mut stats = PruneStats::default();
+        // The servers list files too: a file moved to another directory
+        // gets a new key, and waits for its own prune.
+        let kind = match self.remote.getattr(top).await {
+            Ok(attr) => attr.kind,
+            Err(e) if e.errno == errno::ENOENT => return stats,
+            Err(e) => {
+                stats.skipped.push((top, e));
+                return stats;
+            }
+        };
         let mut queue = VecDeque::from([Visit {
             ino: top,
-            kind: Kind::Directory,
+            kind,
             rotates: false,
         }]);
         while let Some(visit) = queue.pop_front() {
