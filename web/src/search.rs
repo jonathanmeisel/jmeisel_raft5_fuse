@@ -752,6 +752,56 @@ impl Fs {
         })
     }
 
+    /// What the search index holds for the file at `path`, for its
+    /// details pane: `{state, facts}`.
+    ///
+    /// - `state`: "indexed" (with `facts`, `[[label, value]]`), "not
+    ///   indexed" (the index hasn't got it yet), "not read" (its volume's
+    ///   index isn't read in this browser: a search there reads it), or
+    ///   "none" (not in a volume with an index).
+    ///
+    /// Only reads an index this browser already has: never downloads.
+    #[wasm_bindgen(js_name = searchFacts)]
+    pub fn search_facts(&self, path: String) -> Promise {
+        #[derive(Serialize)]
+        struct Facts {
+            state: &'static str,
+            facts: Vec<(&'static str, String)>,
+        }
+        let inner = Rc::clone(&self.0);
+        promise(async move {
+            let answer = |state| Facts {
+                state,
+                facts: Vec::new(),
+            };
+            let loaded = {
+                let views = inner.search.views.borrow();
+                views
+                    .values()
+                    .filter(|l| path.starts_with(&format!("{}/", l.path)))
+                    .max_by_key(|l| l.path.len())
+                    .map(Rc::clone)
+            };
+            let Some(loaded) = loaded else {
+                return Ok(answer("not read"));
+            };
+            if loaded.off {
+                return Ok(answer("none"));
+            }
+            let ino = match inner.resolve(&path).await {
+                Ok(attr) => attr.ino,
+                Err(_) => return Ok(answer("none")),
+            };
+            Ok(match loaded.opened.index.row(ino) {
+                Some(row) => Facts {
+                    state: "indexed",
+                    facts: raft5fs_search::filter::describe(&row),
+                },
+                None => answer("not indexed"),
+            })
+        })
+    }
+
     /// A thumbnail that `search` named (a hit's `thumb`): JPEG bytes.
     #[wasm_bindgen(js_name = searchThumb)]
     pub fn search_thumb(&self, id: String) -> Promise {

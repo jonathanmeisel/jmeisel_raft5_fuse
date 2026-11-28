@@ -814,6 +814,7 @@ const methods = {
     };
   },
   searchThumb: (id) => session().searchThumb(id),
+  searchFacts: (path) => session().searchFacts(path),
   volumeIndexing: (path) => session().volumeIndexing(path),
   setVolumeIndexing: (path, on) => session().setVolumeIndexing(path, on),
   /// Whether this browser keeps the index segments it has read. Turning

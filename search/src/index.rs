@@ -350,6 +350,25 @@ impl Index {
         v
     }
 
+    /// Live file `ino`'s row, at its path now: from the recent segments if
+    /// they have it, else from the generation.
+    pub fn row(&self, ino: u64) -> Option<Row> {
+        if let Some(r) = self.recent.live_records().find(|r| r.ino == ino) {
+            return Some(Row::of(r, crate::view::MIN_MEANING_WORDS));
+        }
+        let s = self.source();
+        let g = s.generation?;
+        let f = g.file_of(ino)?;
+        if s.is_dead(f) {
+            return None;
+        }
+        let mut row = g.rows.get(f as usize)?.clone();
+        if let Some(p) = s.moved_path(f) {
+            row.path = p.to_string();
+        }
+        Some(row)
+    }
+
     /// Every live file's row: the generation's, then the recent records'.
     pub fn all_rows(&self) -> Vec<Row> {
         let mut out = self.rows();

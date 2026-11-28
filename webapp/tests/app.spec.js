@@ -1918,10 +1918,10 @@ test("photos are found by where and when they were taken, and rides by where the
 
   // The CLI shows what the index holds for one file.
   const shown = cli("ned", ["index", "--show", "/trips/IMG_0412.jpg"]);
-  expect(shown).toContain("type:photo");
-  expect(shown).toContain("place: Lisbon, Lisbon, Lisboa, Portugal (PT)");
-  expect(shown).toContain("camera: Apple iPhone 13");
-  expect(shown).toMatch(/taken 2024-06-12 09:15 UTC/);
+  expect(shown).toContain("Indexed as: Photo (type:photo)");
+  expect(shown).toContain("Place: Lisbon, Lisbon, Lisboa, Portugal (PT)");
+  expect(shown).toContain("Camera: Apple iPhone 13");
+  expect(shown).toContain("Taken: 2024-06-12 09:15 UTC");
 
   // Plain English is read as filters, shown as chips that turn off.
   const lisbon = await search(page, "photos from lisbon");
@@ -1955,6 +1955,21 @@ test("photos are found by where and when they were taken, and rides by where the
   await expect(videos.getByRole("option")).toHaveCount(1, SLOW);
   await expect(videos.getByRole("option")).toContainText("trips/IMG_0413.MOV");
   await expect(videos.getByRole("option")).toContainText("2 min");
+
+  // The details pane shows what the index holds for a file, once this
+  // browser has read the folder's index (the searches above did).
+  await videos.getByRole("button", { name: "Close" }).click();
+  await item(page, "IMG_0412.jpg").click();
+  await page.getByRole("button", { name: /^Folder \(/ }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Show details" }).click();
+  const details = page.locator(".wx-filemanager .wx-content > .wx-info");
+  await expect(details).toContainText("Indexed as", SLOW);
+  await expect(details).toContainText("Photo (type:photo)");
+  await expect(details).toContainText("Lisbon, Lisbon, Lisboa, Portugal (PT)");
+  await expect(details).toContainText("Apple iPhone 13");
+  await page.screenshot({ path: new URL("../test-results/filter-chips/details.png", import.meta.url).pathname });
+  await page.getByRole("button", { name: /^Folder \(/ }).click();
+  await page.getByRole("menuitemcheckbox", { name: "Show details" }).click();
 
   // Words no rule knows may suggest a type, with meaning: only applied
   // when tapped.

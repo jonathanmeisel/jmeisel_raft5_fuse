@@ -1077,6 +1077,138 @@ impl fmt::Display for Filter {
     }
 }
 
+/// A time for people: "2024-06-12 09:15 UTC".
+pub fn utc_text(ms: u64) -> String {
+    let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
+    let secs = (ms / 1000) % 86_400;
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        secs / 3600,
+        (secs / 60) % 60
+    )
+}
+
+/// "1 h 5 min", "3 min 20 s", "45 s".
+fn length_text(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min {} s", s / 60, s % 60),
+        _ => format!("{} h {} min", s / 3600, (s / 60) % 60),
+    }
+}
+
+/// What the index holds for a file, as (label, value) lines for people:
+/// what `raft5fs index --show` and the web app's details pane show. The
+/// file's name, size and modified time aren't here: both show those
+/// already. Facts the file lacks are left out.
+pub fn describe(r: &Row) -> Vec<(&'static str, String)> {
+    let m = &r.meta;
+    let facts = Facts::of_row(r);
+    let mut out = vec![(
+        "Indexed as",
+        format!("{:?} (type:{})", r.kind, FileType::of(&facts).name()),
+    )];
+    if r.when_ms > 0 {
+        out.push(("Taken", utc_text(r.when_ms)));
+    }
+    if m.added_ms > 0 {
+        out.push(("Added", utc_text(m.added_ms)));
+    }
+    if !m.added_by.is_empty() {
+        out.push(("Added by", m.added_by.clone()));
+    }
+    if !m.changed_by.is_empty() {
+        out.push(("Last changed by", m.changed_by.clone()));
+    }
+    let places: Vec<String> = m
+        .places
+        .iter()
+        .map(|p| {
+            let names: Vec<&str> = [&p.town, &p.region, &p.region_local, &p.country]
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            match &p.code {
+                Some(c) => format!("{} ({c})", names.join(", ")),
+                None => names.join(", "),
+            }
+        })
+        .collect();
+    out.push((
+        "Place",
+        if places.is_empty() {
+            "none".to_string()
+        } else {
+            places.join("; ")
+        },
+    ));
+    if let Some((lat, lon)) = r.at {
+        out.push((
+            "Position",
+            format!("{:.4}, {:.4}", f64::from(lat) / 1e4, f64::from(lon) / 1e4),
+        ));
+    }
+    if !m.camera.is_empty() {
+        out.push(("Camera", m.camera.clone()));
+    }
+    if m.width > 0 && m.height > 0 {
+        out.push(("Pixels", format!("{} × {}", m.width, m.height)));
+    }
+    if m.selfie {
+        out.push(("Selfie", "yes".to_string()));
+    }
+    if m.pages > 0 {
+        out.push(("Pages", m.pages.to_string()));
+    }
+    if m.activity != Activity::Unknown {
+        out.push(("Activity", activity_name(m.activity).to_string()));
+    }
+    if m.duration_ms > 0 {
+        out.push(("Length", length_text(m.duration_ms)));
+    }
+    if r.distance_m > 0 {
+        out.push((
+            "Distance",
+            format!("{:.1} km", f64::from(r.distance_m) / 1000.0),
+        ));
+    }
+    if r.climb_m > 0 {
+        out.push(("Climb", format!("{} m", r.climb_m)));
+    }
+    let mut search = vec![format!(
+        "{} words in {} chunk{}",
+        r.words,
+        r.chunks,
+        if r.chunks == 1 { "" } else { "s" }
+    )];
+    if !r.model.is_empty() {
+        search.push("by meaning".to_string());
+    }
+    match &r.image {
+        Some((_, true)) => search.push("by what it shows".to_string()),
+        Some((_, false)) => {
+            search.push("not by what it shows (the photo model can't read it)".to_string())
+        }
+        None => {}
+    }
+    out.push(("Searched by", search.join("; ")));
+    let current = crate::extract::READER;
+    out.push((
+        "Reader",
+        if r.reader < current {
+            format!(
+                "{} (older than {current}: read again at an updated device's next pass)",
+                r.reader
+            )
+        } else {
+            r.reader.to_string()
+        },
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1462,58 @@ mod tests {
         assert_eq!(ids, ["type:photo", "place:PT", "-type:pdf"]);
         let less = f.without(&["place:PT".into(), "-type:pdf".into()]);
         assert_eq!(less.to_string(), "type:photo");
+    }
+
+    #[test]
+    fn a_photo_is_described_for_people() {
+        let row = Row {
+            ino: 1,
+            at_ms: 0,
+            stamp: Stamp {
+                mtime_ns: 0,
+                size: 1,
+            },
+            path: "trips/IMG.jpg".into(),
+            kind: DocKind::Photo,
+            model: String::new(),
+            reader: crate::extract::READER - 1,
+            when_ms: 1_718_183_702_000,
+            at: Some((387_223, -91_393)),
+            distance_m: 0,
+            climb_m: 0,
+            thumb: None,
+            image: Some(("clip".into(), true)),
+            words: 9,
+            chunks: 1,
+            embeddable: false,
+            meta: Meta {
+                places: vec![Place {
+                    town: Some("Lisbon".into()),
+                    region: None,
+                    region_local: None,
+                    country: Some("Portugal".into()),
+                    code: Some("PT".into()),
+                }],
+                camera: "Apple iPhone 13".into(),
+                width: 3024,
+                height: 4032,
+                ..Meta::default()
+            },
+        };
+        let lines: std::collections::HashMap<&str, String> = describe(&row).into_iter().collect();
+        assert_eq!(lines["Indexed as"], "Photo (type:photo)");
+        assert_eq!(lines["Taken"], "2024-06-12 09:15 UTC");
+        assert_eq!(lines["Place"], "Lisbon, Portugal (PT)");
+        assert_eq!(lines["Position"], "38.7223, -9.1393");
+        assert_eq!(lines["Camera"], "Apple iPhone 13");
+        assert_eq!(lines["Pixels"], "3024 × 4032");
+        assert_eq!(lines["Searched by"], "9 words in 1 chunk; by what it shows");
+        assert!(
+            lines["Reader"].contains("read again"),
+            "{}",
+            lines["Reader"]
+        );
+        assert!(!lines.contains_key("Pages"), "facts it lacks are left out");
     }
 
     #[test]

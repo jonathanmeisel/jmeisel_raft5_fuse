@@ -94,6 +94,24 @@
   const nameOf = (path) => path.slice(path.lastIndexOf("/") + 1);
   const join = (dir, name) => (dir === "/" ? "" : dir) + "/" + name;
 
+  /// What search's index holds for a file, as rows of SVAR's details pane
+  /// (the wasm `searchFacts`). Only from an index this browser has read:
+  /// it never downloads one.
+  async function indexFacts(item) {
+    if (visitor || item.type !== "file" || item.deleted) return null;
+    const found = await fs.searchFacts(item.id).catch(() => null);
+    switch (found?.state) {
+      case "indexed":
+        return Object.fromEntries(found.facts);
+      case "not indexed":
+        return { Search: "Not indexed yet" };
+      case "not read":
+        return { Search: "Search this folder once to see what its index holds" };
+      default:
+        return null;
+    }
+  }
+
   function entries(dir, list) {
     return list.map((e) => ({
       id: join(dir, e.name),
@@ -1025,6 +1043,7 @@
           readonly={visitor}
           icons={fileIcon}
           previews={(file) => (file.deleted ? null : preview.url(file))}
+          extraInfo={indexFacts}
         />
     {/if}
   </div>

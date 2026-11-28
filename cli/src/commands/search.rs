@@ -443,7 +443,7 @@ fn show(connect: &ConnectArgs, path: &str) -> Outcome {
         Ok(None) => return Err(format!("{label} has no search index yet")),
         Err(e) => return Err(format!("cannot read the index of {label}: {e}")),
     };
-    let Some(row) = opened.index.all_rows().into_iter().find(|r| r.ino == ino) else {
+    let Some(row) = opened.index.row(ino) else {
         println!("{path}: not in the index yet (a native device's next pass indexes it)");
         return Ok(1);
     };
@@ -455,135 +455,20 @@ fn show(connect: &ConnectArgs, path: &str) -> Outcome {
 
 /// What the index holds for a file, as lines for people.
 fn describe_row(r: &raft5fs_search::generation::Row) -> Vec<String> {
-    use raft5fs_search::filter::{Facts, FileType};
-    use raft5fs_search::record::Activity;
-    let when = |ms: u64| {
-        let day = (ms / 86_400_000) as i64;
-        let (y, m, d) = raft5fs_search::filter::civil_from_days(day);
-        let secs = (ms / 1000) % 86_400;
+    use raft5fs_search::filter::{describe, utc_text};
+    let mut out = vec![
+        r.path.clone(),
         format!(
-            "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
-            secs / 3600,
-            (secs / 60) % 60
-        )
-    };
-    let m = &r.meta;
-    let facts = Facts::of_row(r);
-    let current = raft5fs_search::extract::READER;
-    let mut out = vec![r.path.clone()];
-    let reader = if r.reader < current {
-        format!(
-            "read by reader {}, older than this version's {current}: read again at an updated device's next pass",
-            r.reader
-        )
-    } else {
-        format!("read by reader {}", r.reader)
-    };
-    out.push(format!(
-        "  kind: {:?} (type:{}); {reader}",
-        r.kind,
-        FileType::of(&facts).name()
-    ));
-    let mut dates = Vec::new();
-    if r.when_ms > 0 {
-        dates.push(format!("taken {}", when(r.when_ms)));
-    }
-    dates.push(format!("modified {}", when(r.stamp.mtime_ns / 1_000_000)));
-    if m.added_ms > 0 {
-        dates.push(format!("added {}", when(m.added_ms)));
-    }
-    out.push(format!(
-        "  {}; size {}",
-        dates.join(", "),
-        raft5fs_proto::types::size_text(r.stamp.size)
-    ));
-    if m.places.is_empty() {
-        out.push("  place: none".into());
-    }
-    for p in &m.places {
-        let names: Vec<String> = [&p.town, &p.region, &p.region_local, &p.country]
+            "  Modified: {}; size {}",
+            utc_text(r.stamp.mtime_ns / 1_000_000),
+            raft5fs_proto::types::size_text(r.stamp.size)
+        ),
+    ];
+    out.extend(
+        describe(r)
             .into_iter()
-            .flatten()
-            .cloned()
-            .collect();
-        let code = p
-            .code
-            .as_deref()
-            .map(|c| format!(" ({c})"))
-            .unwrap_or_default();
-        out.push(format!("  place: {}{code}", names.join(", ")));
-    }
-    if let Some((lat, lon)) = r.at {
-        out.push(format!(
-            "  at: {:.4}, {:.4}",
-            f64::from(lat) / 1e4,
-            f64::from(lon) / 1e4
-        ));
-    }
-    let mut picture = Vec::new();
-    if !m.camera.is_empty() {
-        picture.push(format!("camera: {}", m.camera));
-    }
-    if m.width > 0 {
-        picture.push(format!("{} × {}", m.width, m.height));
-    }
-    if m.selfie {
-        picture.push("selfie".into());
-    }
-    if !picture.is_empty() {
-        out.push(format!("  {}", picture.join("; ")));
-    }
-    let mut more = Vec::new();
-    if m.pages > 0 {
-        more.push(format!("pages: {}", m.pages));
-    }
-    if m.activity != Activity::Unknown {
-        more.push(format!("activity: {:?}", m.activity).to_lowercase());
-    }
-    if m.duration_ms > 0 {
-        more.push(format!("length: {} s", m.duration_ms / 1000));
-    }
-    if r.distance_m > 0 {
-        more.push(format!(
-            "distance: {:.1} km",
-            f64::from(r.distance_m) / 1000.0
-        ));
-    }
-    if r.climb_m > 0 {
-        more.push(format!("climb: {} m", r.climb_m));
-    }
-    if !more.is_empty() {
-        out.push(format!("  {}", more.join("; ")));
-    }
-    if !m.added_by.is_empty() || !m.changed_by.is_empty() {
-        out.push(format!(
-            "  added by: {}; last changed by: {}",
-            if m.added_by.is_empty() {
-                "unknown"
-            } else {
-                &m.added_by
-            },
-            if m.changed_by.is_empty() {
-                "unknown"
-            } else {
-                &m.changed_by
-            }
-        ));
-    }
-    let vectors = if r.model.is_empty() {
-        "no text vectors".to_string()
-    } else {
-        format!("text vectors: {}", r.model)
-    };
-    let image = match &r.image {
-        Some((model, true)) => format!("; image vector: {model}"),
-        Some((model, false)) => format!("; image vector: none ({model} couldn't read it)"),
-        None => String::new(),
-    };
-    out.push(format!(
-        "  text: {} chunks, {} words; {vectors}{image}",
-        r.chunks, r.words
-    ));
+            .map(|(label, value)| format!("  {label}: {value}")),
+    );
     out
 }
 
