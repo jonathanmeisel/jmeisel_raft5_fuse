@@ -1644,6 +1644,22 @@ async function searchUntil(page, query, path, timeout = 120_000) {
   }
 }
 
+/// Runs the CLI as `user` with `args`, and returns what it printed.
+/// Needs the CLI built: cargo build -p raft5fs --no-default-features --features index
+function cli(user, args) {
+  const binary = new URL("../../target/debug/raft5fs", import.meta.url).pathname;
+  const config = mkdtempSync(join(tmpdir(), "raft5fs-cli-"));
+  try {
+    return execFileSync(binary, ["--server", NATIVE, "--insecure-plaintext", "--user", user, ...args], {
+      env: { ...process.env, XDG_CONFIG_HOME: config, RAFT5FS_PASSWORD: PASSWORD },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+  } finally {
+    rmSync(config, { recursive: true, force: true });
+  }
+}
+
 /// Indexes `folder` of `user`'s as a desktop does, with the models: the
 /// vectors that browsers search by but don't make. Tries again while a
 /// browser's pass holds the folder's claim.
@@ -1899,6 +1915,13 @@ test("photos are found by where and when they were taken, and rides by where the
   const rides = await searchUntil(page, "bike routes in vermont", "trips/morning.gpx");
   await expect(rides.getByRole("option").first()).toContainText("trips/morning.gpx");
   await expect(rides.getByRole("option").first()).toContainText(/Lyndonville|Vermont/);
+
+  // The CLI shows what the index holds for one file.
+  const shown = cli("ned", ["index", "--show", "/trips/IMG_0412.jpg"]);
+  expect(shown).toContain("type:photo");
+  expect(shown).toContain("place: Lisbon, Lisbon, Lisboa, Portugal (PT)");
+  expect(shown).toContain("camera: Apple iPhone 13");
+  expect(shown).toMatch(/taken 2024-06-12 09:15 UTC/);
 
   // Plain English is read as filters, shown as chips that turn off.
   const lisbon = await search(page, "photos from lisbon");
